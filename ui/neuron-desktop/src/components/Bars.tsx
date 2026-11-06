@@ -1,4 +1,4 @@
-import { formatTokens, type SessionState } from '@neuron/client'
+import { formatTokens, sessionAccount, type SessionState } from '@neuron/client'
 
 /** Above the chat: its title, the project and branch, and the engine. */
 export function ChatHeader({
@@ -66,27 +66,64 @@ export function RestartBanner({ state, canRestart, onRestart }: { state: Session
   return null
 }
 
+/** From this share of the context window or of today's allowance the bar tints or warns. */
+const WARN_AT = 80
+
+/** The quota line: nothing below 80% of today's requests or tokens, a quiet warning from there, the reset time at the limit. */
+function quotaNote(state: SessionState): { text: string; limit: boolean } | null {
+  const view = sessionAccount(state)
+  const worst = view.meters
+    .map((meter) => ({ meter, share: (meter.used / meter.limit) * 100 }))
+    .sort((a, b) => b.share - a.share)[0]
+  if (!worst || worst.share < WARN_AT) return null
+  const what = worst.meter.label.startsWith('Requests') ? 'requests' : 'tokens'
+  if (worst.share >= 100) {
+    const at = view.resetsAt ? new Date(view.resetsAt) : null
+    const time = at && !Number.isNaN(at.getTime()) ? at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : null
+    return { text: time ? `Limit reached, resets at ${time}` : 'Limit reached', limit: true }
+  }
+  return { text: `${Math.floor(worst.share)}% of today's ${what} used`, limit: false }
+}
+
 export function StatusBar({ state, onPane }: { state: SessionState; onPane: (pane: 'terminal' | 'tasks') => void }) {
   const usage = state.usage
+  const context = state.status?.context_percent ?? 0
+  const model = state.status?.model ?? ''
+  const served = state.status?.served_model
+  const streaming = state.busy ? (state.turnProgress?.outputTokens ?? 0) : 0
+  const quota = quotaNote(state)
   return (
     <footer className="status-bar">
-      <button className="status-key" onClick={() => onPane('terminal')}>
+      <button className="status-key status-low" onClick={() => onPane('terminal')}>
         Terminal <kbd>Ctrl+`</kbd>
       </button>
-      <span title="Share of the model's context the chat uses">Context {state.status?.context_percent ?? 0}%</span>
+      <span className={`context-meter${context >= WARN_AT ? ' warn' : ''}`} title="Share of the model's context the chat uses">
+        Context {context}%
+      </span>
       {usage && (
-        <span title={usage.estimated ? 'estimated' : 'tokens in this chat'}>
+        <span className="status-low" title={usage.estimated ? 'estimated' : 'tokens in this chat'}>
           ↑{formatTokens(usage.cumulative.input)} ↓{formatTokens(usage.cumulative.output)}
         </span>
       )}
+      {streaming > 0 && <span className="turn-tokens">writing {formatTokens(streaming)} tokens</span>}
+      {quota && (
+        <span className={`quota${quota.limit ? ' limit' : ''}`} role="status">
+          {quota.text}
+        </span>
+      )}
       {state.todos.length > 0 && (
-        <button className="status-link" onClick={() => onPane('tasks')}>
+        <button className="status-link status-low" onClick={() => onPane('tasks')}>
           Tasks {state.todos.filter((todo) => todo.status === 'completed').length}/{state.todos.length}
         </button>
       )}
       <div className="spacer" />
       {state.busy && <span className="busy-label">working…</span>}
-      <span className="model-tag">{state.status?.model ?? ''}</span>
+      {served && served !== model && (
+        <span className="served-model status-low" title="The model that answered, when it is not the one you picked">
+          answered by {served}
+        </span>
+      )}
+      <span className="model-tag">{model}</span>
     </footer>
   )
 }

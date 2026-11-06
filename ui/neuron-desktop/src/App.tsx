@@ -32,6 +32,7 @@ import { Sidebar, type NavTarget } from './components/Sidebar'
 import { SignInPanel } from './components/SignIn'
 import { TrustModal } from './components/TrustModal'
 import { Transcript } from './components/Transcript'
+import { TodoStrip } from './components/TodoStrip' // L1: live transcript
 import { useSession } from './hooks'
 import { LINKS } from './links'
 import type { LaunchOptions, Platform, Project, UpdateInfo } from './platform'
@@ -508,6 +509,7 @@ export function App({ platform }: { platform: Platform }) {
                 }
               />
             )}
+            {!signIn && <TodoStrip todos={state.todos} />} {/* L1: live transcript */}
             <Composer
               ref={composer}
               busy={state.busy}
