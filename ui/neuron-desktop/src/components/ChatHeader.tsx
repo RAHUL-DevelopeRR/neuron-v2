@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 
 import { useFocusTrap } from '../a11y'
-import type { ChatInfo, WorktreeStatus } from '../platform'
+import { ChatError, type ChatInfo, type WorktreeStatus } from '../platform'
+
+/** After a question changes, answers to it wait this long. */
+const CONFIRM_DELAY_MS = 400
 
 /**
  * Under the chat's header, for a chat in a copy of the project of its own: the
@@ -52,7 +55,10 @@ export function DiscardDialog({
   loadStatus,
   discard,
   onClose,
+  notice,
 }: {
+  /** A line before the question, when the person came here by closing the chat. */
+  notice?: string
   info: ChatInfo
   loadStatus: () => Promise<WorktreeStatus>
   discard: (options: { force: boolean; deleteUnmerged: boolean }) => Promise<void>
@@ -64,19 +70,34 @@ export function DiscardDialog({
   const [step, setStep] = useState<1 | 2>(1)
   const [working, setWorking] = useState(false)
   const [problem, setProblem] = useState<string | null>(null)
+  const cancel = useRef<HTMLButtonElement>(null)
+  // When the question last changed: a double click or a double Enter is one answer, not two.
+  const changedAt = useRef(0)
+  const alive = useRef(true)
+  const opened = useRef(true)
+  useEffect(
+    () => () => {
+      alive.current = false
+    },
+    [],
+  )
 
-  useEffect(() => {
-    let cancelled = false
+  const load = () =>
     loadStatus().then(
-      (loaded) => !cancelled && setStatus(loaded),
-      (failure: Error) => !cancelled && setProblem(failure.message),
+      (loaded) => alive.current && setStatus(loaded),
+      (failure: Error) => alive.current && setProblem(failure.message),
     )
-    return () => {
-      cancelled = true
-    }
-    // Read once, when the dialog opens.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  // Read once, when the dialog opens.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => void load(), [])
+
+  // Each question starts with the safe answer in focus.
+  useEffect(() => {
+    // Opening is not a change: the first question can be answered at once.
+    if (opened.current) opened.current = false
+    else changedAt.current = Date.now()
+    cancel.current?.focus()
+  }, [step])
 
   const run = async (deleteUnmerged: boolean) => {
     if (!status) return
@@ -89,10 +110,19 @@ export function DiscardDialog({
     } catch (failure) {
       setProblem(failure instanceof Error ? failure.message : String(failure))
       setWorking(false)
+      // The copy changed since it was shown: look again and ask from the start.
+      if (failure instanceof ChatError && (failure.code === 'dirty' || failure.code === 'unmerged')) {
+        setStep(1)
+        void load()
+      }
     }
   }
 
-  const next = () => (status && status.unmerged > 0 && step === 1 ? setStep(2) : void run(step === 2))
+  const next = () => {
+    if (Date.now() - changedAt.current < CONFIRM_DELAY_MS) return
+    if (status && status.unmerged > 0 && step === 1) setStep(2)
+    else void run(step === 2)
+  }
 
   return (
     <div className="dialog-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !working && onClose()}>
@@ -106,6 +136,7 @@ export function DiscardDialog({
         onKeyDown={(event) => event.key === 'Escape' && !working && onClose()}
       >
         <h2 id="discard-title">{step === 1 ? 'Discard this copy?' : 'Delete its saved changes too?'}</h2>
+        {notice && <p id="discard-notice">{notice}</p>}
         <div id="discard-text">
           {!status && !problem && <p className="muted">Looking at the copy…</p>}
           {status && step === 1 && (
@@ -135,10 +166,10 @@ export function DiscardDialog({
           )}
         </div>
         <div className="dialog-buttons">
-          <button onClick={onClose} data-autofocus disabled={working}>
+          <button ref={cancel} onClick={onClose} data-autofocus disabled={working}>
             Cancel
           </button>
-          <button className="danger" onClick={next} disabled={!status || working}>
+          <button key={step} className="danger" onClick={next} disabled={!status || working}>
             {step === 1 ? (status && status.unmerged > 0 ? 'Continue' : 'Discard the copy') : 'Delete them and discard'}
           </button>
         </div>

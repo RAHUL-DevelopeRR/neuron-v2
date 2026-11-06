@@ -18,6 +18,10 @@ function PaletteBody({ onClose, commands }: { onClose: () => void; commands: Pal
   const shown = useMemo(() => rankCommands(commands, query).slice(0, 50), [commands, query])
   useEffect(() => setIndex(0), [query])
   const current = shown[Math.min(index, shown.length - 1)]
+  // The arrows can go past the visible rows: the chosen one is kept in view.
+  useEffect(() => {
+    if (current) document.getElementById(`palette-${current.id}`)?.scrollIntoView?.({ block: 'nearest' })
+  }, [current])
 
   const run = (command: PaletteCommand | undefined) => {
     if (!command) return
@@ -35,6 +39,7 @@ function PaletteBody({ onClose, commands }: { onClose: () => void; commands: Pal
         ref={dialog}
         onKeyDown={(event) => {
           if (event.key === 'Escape') onClose()
+          else if (event.key === 'Enter' && (event.nativeEvent.isComposing || event.keyCode === 229)) return
           else if (event.key === 'ArrowDown') {
             event.preventDefault()
             setIndex((value) => Math.min(value + 1, shown.length - 1))
@@ -52,6 +57,7 @@ function PaletteBody({ onClose, commands }: { onClose: () => void; commands: Pal
           role="combobox"
           aria-expanded="true"
           aria-controls="palette-list"
+          aria-autocomplete="list"
           aria-activedescendant={current ? `palette-${current.id}` : undefined}
           aria-label="Type a command, chat or session"
           placeholder="Type a command, chat or session"
@@ -59,12 +65,12 @@ function PaletteBody({ onClose, commands }: { onClose: () => void; commands: Pal
           onChange={(event) => setQuery(event.target.value)}
           data-autofocus
         />
-        <ul id="palette-list" role="listbox" aria-label="Results" className="palette-list">
-          {shown.length === 0 && (
-            <li className="muted pad small" role="presentation">
-              Nothing matches.
-            </li>
-          )}
+        {shown.length === 0 && (
+          <p className="muted pad small" role="status">
+            Nothing matches.
+          </p>
+        )}
+        <ul id="palette-list" role="listbox" aria-label="Results" className="palette-list" hidden={shown.length === 0}>
           {shown.map((command, position) => (
             <li
               key={command.id}

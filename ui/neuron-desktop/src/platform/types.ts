@@ -175,7 +175,7 @@ export interface ChatInfo {
 }
 
 /** Why a refused host call was refused, for the few the UI answers itself. */
-export type ChatErrorCode = 'cap_reached' | 'too_many_chats' | 'unmerged' | 'dirty'
+export type ChatErrorCode = 'cap_reached' | 'too_many_chats' | 'unmerged' | 'dirty' | 'has_worktree' | 'discarding' | 'starting'
 
 export class ChatError extends Error {
   constructor(
@@ -197,6 +197,7 @@ export interface ChatHost {
   /** A new engine for the chat; also starts a stopped one. `resume`: a session id, `''` for a fresh one. */
   resume(id: string, options?: { resume?: string | null; trustOnce?: boolean }): Promise<void>
   stop(id: string): Promise<void>
+  /** Closes the chat. Rejects with a {@link ChatError} `has_worktree` for a chat with a copy of its own: discard the copy first. */
   close(id: string): Promise<void>
   /** The chat in view. Files, git and terminals follow it. */
   activate(id: string | null): void

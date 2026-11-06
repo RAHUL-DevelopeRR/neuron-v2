@@ -156,6 +156,8 @@ export interface FakePlatformOptions {
   hostReport?: string | null
   /** L4: several chats at once; the `FakeEngine` passed in is the first chat's. */
   multiChat?: boolean
+  /** The platform's kind (default `tauri`; the browser build is `host`). */
+  kind?: 'tauri' | 'host'
 }
 
 /** A platform over a {@link FakeEngine} and a small in-memory workspace with git. */
@@ -164,7 +166,7 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
   let project: Project = { name: 'app', path: '/work/app' }
   const saved = new Map<string, unknown>([['settings', { firstRunDone: true, ...options.settings }]])
   const platform: FakePlatform = {
-    kind: 'host',
+    kind: options.kind ?? 'tauri',
     label: 'test',
     can: { openProject: true, restart: true, terminal: false, git: true, pickFolder: true, updates: true, multiChat: options.multiChat === true },
     opened: [],
@@ -311,6 +313,8 @@ export class FakeChats implements ChatHost {
   worktreeState: Omit<WorktreeStatus, 'branch' | 'path'> = { dirty: 0, unmerged: 0 }
   /** Rejects the next `open` with this host error text (`cap_reached`, ...). */
   failNext: string | null = null
+  /** Rejects `close` of these chats with the host's code `has_worktree` until their copy is discarded. */
+  closeNeedsDiscard = new Set<string>()
   private count = 0
   private active: string | null = null
   private stoppedListeners = new Set<(id: string, reason: string) => void>()
@@ -365,6 +369,7 @@ export class FakeChats implements ChatHost {
   }
 
   async close(id: string) {
+    if (this.closeNeedsDiscard.has(id)) throw new ChatError('This chat works in its own copy of the project. Discard the copy to close the chat, or keep it.', 'has_worktree')
     this.closed.push(id)
     this.infos.delete(id)
   }
@@ -408,6 +413,7 @@ export class FakeChats implements ChatHost {
     if (this.worktreeState.unmerged > 0 && !options.deleteUnmerged) throw new ChatError('This copy has saved changes that the main folder lacks.', 'unmerged', this.worktreeState.unmerged)
     if (this.worktreeState.dirty > 0 && !options.force) throw new ChatError('This copy has unsaved changes.', 'dirty', this.worktreeState.dirty)
     this.discards.push({ id, ...options })
+    this.closeNeedsDiscard.delete(id)
     this.infos.delete(id)
   }
 }

@@ -9,7 +9,7 @@ import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
 
 import { chatActivity, openQuestionItem, type SessionController, type SessionState } from '@neuron/client'
 
-import type { ChatError, ChatHost, ChatInfo, Platform } from './platform'
+import { ChatError, type ChatHost, type ChatInfo, type Platform } from './platform'
 
 export type Activity = ReturnType<typeof chatActivity>
 
@@ -106,6 +106,8 @@ interface Tracked {
   needsSince: number | null
   stopNote: string | null
   reported: string
+  /** The engine's connection at the last look: a change away from `ready` is a restart. */
+  connection: SessionState['connection'] | null
   unsubscribe: () => void
 }
 
@@ -151,6 +153,7 @@ export class ChatsStore {
       needsSince: null,
       stopNote: null,
       reported: '',
+      connection: null,
       unsubscribe: controller.subscribe(() => this.refresh()),
     }
     this.tracked.set(info.id, tracked)
@@ -208,8 +211,13 @@ export class ChatsStore {
   async close(id: string): Promise<void> {
     const tracked = this.tracked.get(id)
     if (!tracked) return
+    // A chat with a copy of its own is refused by the host: the chat stays, the caller asks about the copy.
+    await this.options.host?.close(id).catch((failure: unknown) => {
+      if (failure instanceof ChatError && failure.code === 'has_worktree') throw failure
+    })
     const index = this.order.indexOf(id)
     tracked.unsubscribe()
+    this.forgetNotified(id)
     this.tracked.delete(id)
     this.order = this.order.filter((other) => other !== id)
     const unread = new Set(this.unread)
@@ -222,7 +230,6 @@ export class ChatsStore {
       else this.options.host?.activate(null)
     }
     this.refresh()
-    await this.options.host?.close(id).catch(() => {})
   }
 
   /** The chat that needs the user longest, in view. Returns its id. */
@@ -247,8 +254,13 @@ export class ChatsStore {
     if (this.order.length < 2) return null
     const index = Math.max(0, this.order.indexOf(this.activeId ?? ''))
     const next = this.order[(index + delta + this.order.length) % this.order.length]
-    this.setActive(next)
+    // Passing over a stopped chat does not start its engine; choosing it does.
+    this.setActive(next, false)
     return next
+  }
+
+  private forgetNotified(id: string): void {
+    for (const key of this.notified) if (key.startsWith(`${id}:`)) this.notified.delete(key)
   }
 
   dispose(): void {
@@ -276,6 +288,12 @@ export class ChatsStore {
       const state = tracked.controller.getState()
       const activity = chatActivity(state)
       const before = tracked.activity
+      // A new engine (the old one went, or is starting again) may number its requests the same way.
+      if (state.connection !== tracked.connection) {
+        if (state.connection !== 'ready') this.forgetNotified(id)
+        tracked.connection = state.connection
+      }
+      if (before === 'needs_you' && activity !== 'needs_you') this.forgetNotified(id)
       if (activity !== before) {
         this.unread = nextUnread(this.unread, id, before, activity, id === this.activeId)
         if (activity === 'needs_you') tracked.needsSince = now
@@ -287,7 +305,9 @@ export class ChatsStore {
         const permission = state.permissions[0]
         const question = permission ? null : openQuestionItem(state)
         const key = permission ? `p${permission.id}` : question ? `q${question.id}` : ''
-        if (key && !this.notified.has(`${id}:${key}`)) {
+        // Seen in view, it is not news: the key stays free until the user looks away.
+        const looking = (this.options.isFocused?.() ?? true) && id === this.activeId
+        if (key && !looking && !this.notified.has(`${id}:${key}`)) {
           this.notified.add(`${id}:${key}`)
           toNotify.push({ id, kind: permission ? 'permission' : 'question', key })
         }
@@ -342,8 +362,6 @@ export class ChatsStore {
 
   /** A system notification, when the user is not looking at that chat. */
   private async tell({ id, kind }: { id: string; kind: 'permission' | 'question' }, items: ChatItem[]): Promise<void> {
-    const looking = (this.options.isFocused?.() ?? true) && id === this.activeId
-    if (looking) return
     const item = items.find((entry) => entry.id === id)
     if (!item) return
     this.notifiedAt = this.now()
@@ -384,6 +402,10 @@ function startChats(platform: Platform): { store: ChatsStore; ready: Promise<voi
     })()
     entry = { store, ready }
     started.set(platform, entry)
+    // A start that failed is not remembered: Retry starts again.
+    ready.catch(() => {
+      if (started.get(platform) === entry) started.delete(platform)
+    })
   }
   return entry
 }
@@ -392,6 +414,11 @@ function startChats(platform: Platform): { store: ChatsStore; ready: Promise<voi
 export function useChats(platform: Platform, ready: boolean, onToast: (message: string) => void) {
   const [store, setStore] = useState<ChatsStore | null>(null)
   const [launchError, setLaunchError] = useState<string | null>(null)
+  const [attempt, setAttempt] = useState(0)
+  const retry = useCallback(() => {
+    setLaunchError(null)
+    setAttempt((count) => count + 1)
+  }, [])
 
   useEffect(() => {
     if (!ready) return
@@ -407,7 +434,7 @@ export function useChats(platform: Platform, ready: boolean, onToast: (message: 
     }
     // The settings were read once; later changes apply to the next engine.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [platform, ready])
+  }, [platform, ready, attempt])
   useEffect(() => {
     if (store) store.toast = onToast
   }, [store, onToast])
@@ -417,14 +444,18 @@ export function useChats(platform: Platform, ready: boolean, onToast: (message: 
     store?.getSnapshot ?? (() => EMPTY),
     store?.getSnapshot ?? (() => EMPTY),
   )
-  const focus = useCallback(() => store?.onWindowFocus(), [store])
+  // With a dialog open (a question the person is answering) the window does not jump away.
+  const focus = useCallback(() => {
+    if (document.querySelector('[aria-modal="true"]')) return
+    store?.onWindowFocus()
+  }, [store])
   useEffect(() => {
     window.addEventListener('focus', focus)
     return () => window.removeEventListener('focus', focus)
   }, [focus])
 
   const active = snapshot.items.find((item) => item.id === snapshot.activeId) ?? null
-  return { store, snapshot, active, launchError }
+  return { store, snapshot, active, launchError, retry }
 }
 
 const EMPTY: ChatsSnapshot = { items: [], activeId: null, needsYouCount: 0 }
