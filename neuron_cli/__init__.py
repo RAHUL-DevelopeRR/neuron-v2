@@ -1,9 +1,11 @@
 """NeuronCLI - Python launcher for the native Neuron binary.
 
 The first launch downloads the release binary that matches this package
-version, verifies it against the release's SHA-256 file and caches it together
-with a ``.sha256`` sidecar. Later launches run the cached binary without any
-network access.
+version, verifies it against the release's SHA-256 file *and* the release's
+``SHA256SUMS`` and caches it together with a ``.sha256`` sidecar and a
+``.verified`` stamp (size and mtime). Later launches run the cached binary
+without any network access; a binary whose size or mtime changed since it was
+verified is hashed again and refused when it no longer matches its sidecar.
 
 On a terminal, a bare ``neuron`` opens Neuron's full-screen UI: the launcher
 gets ``neuron-tui`` the same way (once, verified and cached) and tells
@@ -14,6 +16,8 @@ Environment:
     NEURON_BINARY_PATH     run this native binary instead (development)
     NEURON_CACHE_DIR       cache root (default: the platform user cache)
     NEURON_DOWNLOAD_BASE   release download base URL (HTTPS, or loopback HTTP)
+    NEURON_CHECKSUMS_BASE  where SHA256SUMS comes from (default: the GitHub
+                           release, even when a mirror serves the binary)
     NEURON_NO_TUI          1 keeps the line REPL and skips the UI download
     NEURON_TUI_BIN         the full-screen UI to use (passed on unchanged)
 """
@@ -118,6 +122,30 @@ def _download_base() -> str:
     raise LauncherError(f"NEURON_DOWNLOAD_BASE must be an HTTPS URL (or loopback HTTP): {base}")
 
 
+def _checksums_base() -> str:
+    """Where SHA256SUMS comes from: the GitHub release unless NEURON_CHECKSUMS_BASE says otherwise."""
+    base = (os.environ.get("NEURON_CHECKSUMS_BASE") or DEFAULT_DOWNLOAD_BASE).rstrip("/")
+    parts = urlsplit(base)
+    if parts.scheme == "https" or (parts.scheme == "http" and _is_loopback(parts.hostname or "")):
+        return base
+    raise LauncherError(f"NEURON_CHECKSUMS_BASE must be an HTTPS URL (or loopback HTTP): {base}")
+
+
+def _parse_sums(text: str, asset: str) -> Optional[str]:
+    """The hash listed for ``asset`` in a SHA256SUMS file (``<hash>  <name>`` or ``<hash> *<name>``)."""
+    for line in text.splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) != 2:
+            continue
+        name = fields[1].strip()
+        if name.startswith("*"):
+            name = name[1:]
+        digest = _parse_checksum(fields[0])
+        if digest is not None and name == asset:
+            return digest
+    return None
+
+
 def _digest(path: Path) -> str:
     checksum = hashlib.sha256()
     with path.open("rb") as stream:
@@ -140,17 +168,53 @@ def _sidecar(binary: Path) -> Path:
     return binary.with_name(binary.name + ".sha256")
 
 
+def _stamp_path(binary: Path) -> Path:
+    return binary.with_name(binary.name + ".verified")
+
+
+def _stamp_of(binary: Path) -> str:
+    info = binary.stat()
+    return f"{info.st_size} {info.st_mtime_ns}\n"
+
+
+def _write_stamp(binary: Path) -> None:
+    try:
+        _stamp_path(binary).write_text(_stamp_of(binary), encoding="ascii")
+    except OSError:
+        pass  # a read-only cache only costs a re-hash on the next launch
+
+
 def _cached_binary(cache: Path, asset: str) -> Optional[Path]:
-    """The cached binary when it was verified at download time (sidecar present)."""
+    """The cached binary when it was verified at download time (sidecar present).
+
+    Its size and mtime are compared with the ``.verified`` stamp; when they differ the file is
+    hashed again, and a hash that no longer matches the sidecar raises instead of running it.
+    """
     binary = cache / asset
     sidecar = _sidecar(binary)
     if not binary.is_file() or not sidecar.is_file():
         return None
     try:
-        if _parse_checksum(sidecar.read_text(encoding="ascii", errors="replace")) is None:
-            return None
+        expected = _parse_checksum(sidecar.read_text(encoding="ascii", errors="replace"))
     except OSError:
         return None
+    if expected is None:
+        return None
+    try:
+        try:
+            if _stamp_path(binary).read_text(encoding="ascii") == _stamp_of(binary):
+                return binary
+        except OSError:
+            pass  # no stamp yet: hash below
+        matches = _digest(binary) == expected
+    except OSError:
+        matches = False
+    if not matches:
+        raise LauncherError(
+            f"{binary} does not match its recorded SHA-256 ({sidecar}), so it was not run. Delete "
+            f"{binary}, {sidecar} and {_stamp_path(binary)} to download a fresh, verified copy."
+        )
+    _write_stamp(binary)
     return binary
 
 
@@ -186,6 +250,7 @@ def _download_binary(version: str, asset: str, cache: Path, label: str = "Neuron
     base = f"{_download_base()}/v{version}"
     binary_url = f"{base}/{asset}"
     checksum_url = f"{binary_url}.sha256"
+    sums_url = f"{_checksums_base()}/v{version}/SHA256SUMS"
     destination = cache / asset
     try:
         cache.mkdir(parents=True, exist_ok=True)
@@ -193,6 +258,16 @@ def _download_binary(version: str, asset: str, cache: Path, label: str = "Neuron
         raise LauncherError(f"Cannot create the Neuron cache directory {cache}: {error}. Set NEURON_CACHE_DIR.") from error
 
     print(f"Downloading {label} {version} ({asset}) to {cache} ...", file=sys.stderr, flush=True)
+    try:
+        with urlopen(sums_url, timeout=CHECKSUM_TIMEOUT_SECONDS) as response:
+            sums_text = response.read(1024 * 1024).decode("utf-8", errors="replace")
+    except (HTTPError, URLError, OSError) as error:
+        raise _network_error(sums_url, version, cache, error) from error
+    listed = _parse_sums(sums_text, asset)
+    if listed is None:
+        raise LauncherError(
+            f"The release SHA256SUMS ({sums_url}) is empty or does not list {asset}. Nothing was cached."
+        )
     try:
         with urlopen(checksum_url, timeout=CHECKSUM_TIMEOUT_SECONDS) as response:
             checksum_text = response.read(4096).decode("ascii", errors="replace")
@@ -225,6 +300,11 @@ def _download_binary(version: str, asset: str, cache: Path, label: str = "Neuron
                 f"Neuron {version} ({asset}) failed its SHA-256 check: expected {expected}, got {actual}. "
                 "The download was discarded; nothing was cached."
             )
+        if actual != listed:
+            raise LauncherError(
+                f"Neuron {version} ({asset}) is not what the release SHA256SUMS ({sums_url}) lists: it lists "
+                f"{listed}, got {actual}. The download was discarded; nothing was cached."
+            )
         if os.name != "nt":
             temporary.chmod(0o755)
 
@@ -235,6 +315,7 @@ def _download_binary(version: str, asset: str, cache: Path, label: str = "Neuron
             _sidecar(destination),
             lambda temporary: temporary.write_text(f"{expected}  {asset}\n", encoding="ascii"),
         )
+        _write_stamp(destination)
     except OSError as error:
         raise LauncherError(
             f"Cannot write Neuron to {cache}: {error}. Free some disk space or set NEURON_CACHE_DIR."

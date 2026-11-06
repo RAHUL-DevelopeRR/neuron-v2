@@ -146,8 +146,11 @@ def stage_release(
     asset: Optional[str] = None,
     data: Optional[bytes] = None,
     checksum: Optional[str] = None,
+    sums: Optional[str] = None,
 ) -> Path:
-    """Write a release asset and its .sha256 under ``root/v<version>/``."""
+    """Write a release asset and its .sha256 under ``root/v<version>/``.
+
+    ``sums`` replaces the release SHA256SUMS verbatim (default: a line for every staged asset)."""
     asset = asset or current_asset()
     data = dummy_binary_bytes(version) if data is None else data
     directory = root / f"v{version}"
@@ -155,6 +158,7 @@ def stage_release(
     sidecar = checksum if checksum is not None else checksum_line(data, asset)
     (directory / f"{asset}.sha256").write_text(sidecar, encoding="ascii")
     # The installers also check the release's SHA256SUMS; merge this asset's line into it.
+    sums_override = sums
     sums = directory / "SHA256SUMS"
     kept = [
         line
@@ -162,7 +166,7 @@ def stage_release(
         if not line.endswith(f"  {asset}")
     ]
     kept.append(checksum_line(data, asset).strip())
-    sums.write_text("\n".join(kept) + "\n", encoding="ascii")
+    sums.write_text("\n".join(kept) + "\n" if sums_override is None else sums_override, encoding="ascii")
     return directory / asset
 
 
