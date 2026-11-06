@@ -1,6 +1,6 @@
 /**
- * The desktop UI inside Tauri: the app's Rust side (src-tauri) runs
- * `neuron engine --stdio` in the open project and passes its lines through.
+ * The desktop UI inside Tauri: the app's Rust side (src-tauri) runs one
+ * `neuron engine --stdio` per chat and passes its lines through (chat-host.ts).
  * Commands go out with `invoke`; engine lines and terminal output come back
  * as events. Each engine the app starts has a generation, so the last lines of
  * one that was restarted never reach the next.
@@ -12,123 +12,12 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open } from '@tauri-apps/plugin-dialog'
 import { load, type Store } from '@tauri-apps/plugin-store'
 import { check } from '@tauri-apps/plugin-updater'
-import {
-  DESKTOP_CAPABILITIES,
-  SessionController,
-  parseUiEventLine,
-  type ClientMessage,
-  type EngineTransport,
-  type SessionAction,
-  type TransportClose,
-} from '@neuron/client'
+import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
+import { DESKTOP_CAPABILITIES, type SessionController } from '@neuron/client'
 
+import { createChatHost } from './chat-host'
 import { createUpdateChecker } from './updates'
 import type { DirListing, FileContent, GitStatusView, KeyValueStore, LaunchOptions, Platform, Project, TerminalSession } from './types'
-
-interface EngineLine {
-  generation: number
-  line: string
-}
-
-interface EngineExit {
-  generation: number
-  code: number | null
-  error: string | null
-}
-
-interface Started {
-  generation: number
-  project: Project
-}
-
-class TauriTransport implements EngineTransport {
-  readonly echoesActions = false
-  project: Project | null = null
-  private generation = -1
-  private listeners = new Set<(action: SessionAction) => void>()
-  private closeListeners = new Set<(close: TransportClose) => void>()
-  private unlisten: UnlistenFn[] = []
-  private ready = false
-  private waiting: { resolve: () => void; reject: (error: Error) => void } | null = null
-  private launchError: string | null = null
-  options: LaunchOptions = {}
-
-  private async listenOnce(): Promise<void> {
-    if (this.unlisten.length) return
-    this.unlisten.push(
-      await listen<EngineLine>('neuron://engine', ({ payload }) => {
-        if (payload.generation !== this.generation) return
-        const parsed = parseUiEventLine(payload.line)
-        if (!parsed.ok) return
-        if (parsed.event.type === 'ready') {
-          this.ready = true
-          this.waiting?.resolve()
-        } else if (parsed.event.type === 'error' && !this.ready) {
-          this.launchError = parsed.event.message
-        }
-        for (const listener of [...this.listeners]) listener(parsed.event)
-      }),
-      await listen<EngineExit>('neuron://engine-exit', ({ payload }) => {
-        if (payload.generation !== this.generation) return
-        const wasReady = this.ready
-        this.ready = false
-        const error =
-          this.launchError ?? payload.error ?? (payload.code !== 0 || !wasReady ? `The Neuron engine stopped (exit code ${payload.code}).` : null)
-        this.waiting?.reject(new Error(error ?? 'The Neuron engine stopped before it was ready.'))
-        for (const listener of [...this.closeListeners]) listener({ code: payload.code, error })
-      }),
-    )
-  }
-
-  /** Runs `launch` (which starts an engine and returns its generation), then waits for its `ready`. */
-  private async launch(launch: () => Promise<Started>): Promise<void> {
-    await this.listenOnce()
-    this.ready = false
-    this.launchError = null
-    const readyOrFailed = new Promise<void>((resolve, reject) => (this.waiting = { resolve, reject }))
-    const started = await launch()
-    this.generation = started.generation
-    this.project = started.project
-    try {
-      await readyOrFailed
-    } finally {
-      this.waiting = null
-    }
-  }
-
-  start(): Promise<void> {
-    return this.launch(() => invoke<Started>('engine_start', { options: this.options }))
-  }
-
-  restart(resume: string | null, trustOnce = false): Promise<void> {
-    return this.launch(() => invoke<Started>('engine_restart', { resume, options: this.options, trustOnce }))
-  }
-
-  openProject(path: string, resume: string | null): Promise<void> {
-    return this.launch(() => invoke<Started>('project_open', { path, resume, options: this.options }))
-  }
-
-  send(message: ClientMessage): void {
-    if (!this.ready) throw new Error('The Neuron engine is not running.')
-    void invoke('engine_send', { line: JSON.stringify(message) })
-  }
-
-  subscribe(listener: (action: SessionAction) => void): () => void {
-    this.listeners.add(listener)
-    return () => this.listeners.delete(listener)
-  }
-
-  onClose(listener: (close: TransportClose) => void): () => void {
-    this.closeListeners.add(listener)
-    return () => this.closeListeners.delete(listener)
-  }
-
-  async close(): Promise<void> {
-    await invoke('engine_stop')
-    for (const unlisten of this.unlisten) unlisten()
-    this.unlisten = []
-  }
-}
 
 interface TerminalOutput {
   id: number
@@ -151,34 +40,41 @@ function tauriStore(): KeyValueStore {
 }
 
 export function tauriPlatform(): Platform {
-  const transport = new TauriTransport()
+  let launchOptions: LaunchOptions = {}
+  const chats = createChatHost(
+    { invoke, listen: (event, handler) => listen(event, ({ payload }) => handler(payload as never)) },
+    { capabilities: DESKTOP_CAPABILITIES, launchOptions: () => launchOptions },
+  )
   // Once per window: React may run the effect that connects twice.
   let connecting: Promise<SessionController> | null = null
-  let controller: SessionController | null = null
   // The updater needs a public key; builds without one point to the releases page.
   const updates = createUpdateChecker({ signed: import.meta.env.VITE_NEURON_UPDATER_SIGNED === 'true', check })
+  // The host calls that read a folder take the chat in view.
+  const chat = () => chats.activeId()
+  let permission: Promise<boolean> | null = null
+  const allowed = () =>
+    (permission ??= isPermissionGranted().then(async (granted) => granted || (await requestPermission()) === 'granted'))
   return {
     kind: 'tauri',
     label: 'this device',
-    can: { openProject: true, restart: true, terminal: true, git: true, pickFolder: true, updates: true },
+    can: { openProject: true, restart: true, terminal: true, git: true, pickFolder: true, updates: true, multiChat: true },
     store: tauriStore(),
     setLaunchOptions(options) {
-      transport.options = options
+      launchOptions = options
     },
+    // The first chat, in the folder the app opened with; later ones come through `chats`.
     connect() {
-      connecting ??= (async () => {
-        controller = new SessionController(transport, { client: 'desktop', capabilities: DESKTOP_CAPABILITIES })
-        await controller.start()
+      connecting ??= chats.open({}).then(({ info, controller }) => {
+        chats.activate(info.id)
         return controller
-      })()
+      })
       return connecting
     },
-    project: () => transport.project,
+    project: () => (chat() ? (chats.info(chat()!)?.project ?? null) : null),
     recentProjects: () => invoke<Project[]>('projects_recent'),
     async openProject(path, resume = null) {
-      // The old chat belongs to the old folder.
-      controller?.apply({ type: 'local/reset' })
-      await transport.openProject(path, resume)
+      const { info } = await chats.open({ path, resume })
+      chats.activate(info.id)
     },
     async pickFolder() {
       const picked = await open({ directory: true, multiple: false, title: 'Open a project folder' })
@@ -187,18 +83,19 @@ export function tauriPlatform(): Platform {
     appVersion: () => getVersion(),
     manualUpdates: updates.manual,
     checkForUpdate: () => updates.check(),
-    restart(resume, options) {
-      // Until the new engine is ready, nothing can be sent.
-      controller?.apply({ type: 'local/connecting' })
-      return transport.restart(resume, options?.trustOnce === true)
+    async restart(resume, options) {
+      const id = chat()
+      if (!id) throw new Error('No chat is open.')
+      // Until the new engine is ready, nothing can be sent (the host marks the chat as connecting).
+      await chats.resume(id, { resume, trustOnce: options?.trustOnce === true })
     },
-    list: (path) => invoke<DirListing>('fs_list', { path }),
-    read: (path) => invoke<FileContent>('fs_read', { path }),
-    searchFiles: (query) => invoke<string[]>('fs_search', { query }),
-    gitStatus: () => invoke<GitStatusView | null>('git_status'),
-    gitDiff: (path) => invoke<string>('git_diff', { path }),
+    list: (path) => invoke<DirListing>('fs_list', { path, chat: chat() }),
+    read: (path) => invoke<FileContent>('fs_read', { path, chat: chat() }),
+    searchFiles: (query) => invoke<string[]>('fs_search', { query, chat: chat() }),
+    gitStatus: () => invoke<GitStatusView | null>('git_status', { chat: chat() }),
+    gitDiff: (path) => invoke<string>('git_diff', { path, chat: chat() }),
     async openTerminal(cols, rows): Promise<TerminalSession> {
-      const id = await invoke<number>('term_open', { cols, rows })
+      const id = await invoke<number>('term_open', { cols, rows, chat: chat() })
       const dataListeners = new Set<(data: string) => void>()
       const exitListeners = new Set<(code: number | null) => void>()
       const unlisten = [
@@ -227,5 +124,17 @@ export function tauriPlatform(): Platform {
       }
     },
     openExternal: (url) => void invoke('open_external', { url }),
+    // L4: multi-chat
+    chats,
+    async notify({ title, body }) {
+      try {
+        if (!(await allowed())) return 'denied'
+        sendNotification({ title, body })
+        return 'shown'
+      } catch {
+        return 'unsupported'
+      }
+    },
+    setAttention: (count) => void invoke('attention_set', { count }).catch(() => {}),
   }
 }

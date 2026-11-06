@@ -1,0 +1,159 @@
+import { describe, expect, test } from 'bun:test'
+
+import { chatChatsHost, FakeIpc, summary } from './fake-ipc'
+import { ChatError } from '../src/platform'
+
+const ready = JSON.stringify({ type: 'ready', protocol: 2, version: '1.0.0', features: [] })
+const status = (session: string) => JSON.stringify({ type: 'status', model: 'm', permission_mode: 'workspace-write', session_id: session, cwd: '/work/app', workspace_trusted: true })
+
+describe('the chat host over IPC', () => {
+  test('lines that arrive before chat_open returns are kept and delivered', async () => {
+    const ipc = new FakeIpc()
+    // The engine says ready while the host call is still returning.
+    ipc.on('chat_open', () => {
+      ipc.emit('neuron://chat-line', { chat: 'c1aaaaaa', generation: 1, line: ready })
+      ipc.emit('neuron://chat-line', { chat: 'c1aaaaaa', generation: 1, line: status('s-1') })
+      return summary('c1aaaaaa', 1)
+    })
+    const host = chatChatsHost(ipc)
+    const { info, controller } = await host.open({ path: '/work/app' })
+    expect(info.id).toBe('c1aaaaaa')
+    expect(controller.getState().connection).toBe('ready')
+    expect(controller.getState().status?.session_id).toBe('s-1')
+    expect(ipc.calls('chat_open')[0]).toMatchObject({ path: '/work/app', resume: null, worktree: null })
+  })
+
+  test('lines older than two seconds are dropped, not delivered late', async () => {
+    let now = 1000
+    const ipc = new FakeIpc()
+    const host = chatChatsHost(ipc, () => now)
+    ipc.on('chat_open', () => {
+      ipc.emit('neuron://chat-line', { chat: 'c2bbbbbb', generation: 1, line: status('too-old') })
+      now += 5000
+      ipc.emit('neuron://chat-line', { chat: 'c2bbbbbb', generation: 1, line: ready })
+      return summary('c2bbbbbb', 1)
+    })
+    const { controller } = await host.open({})
+    expect(controller.getState().connection).toBe('ready')
+    expect(controller.getState().status).toBeNull()
+  })
+
+  test('each chat gets only its own lines, and an old generation is ignored', async () => {
+    const ipc = new FakeIpc()
+    let count = 0
+    ipc.on('chat_open', () => {
+      const id = count++ === 0 ? 'c1aaaaaa' : 'c2bbbbbb'
+      ipc.emit('neuron://chat-line', { chat: id, generation: count, line: ready })
+      return summary(id, count)
+    })
+    const host = chatChatsHost(ipc)
+    const first = await host.open({ path: '/a' })
+    const second = await host.open({ path: '/b' })
+    ipc.emit('neuron://chat-line', { chat: 'c2bbbbbb', generation: 2, line: status('only-second') })
+    ipc.emit('neuron://chat-line', { chat: 'c2bbbbbb', generation: 99, line: status('stale') })
+    expect(second.controller.getState().status?.session_id).toBe('only-second')
+    expect(first.controller.getState().status).toBeNull()
+  })
+
+  test('messages go out through chat_send with the chat id', async () => {
+    const ipc = new FakeIpc()
+    ipc.on('chat_open', () => {
+      ipc.emit('neuron://chat-line', { chat: 'c1aaaaaa', generation: 1, line: ready })
+      return summary('c1aaaaaa', 1)
+    })
+    const host = chatChatsHost(ipc)
+    const { controller } = await host.open({})
+    controller.interrupt()
+    const sent = ipc.calls('chat_send')
+    expect(sent.length).toBeGreaterThan(0)
+    expect(sent[0].chat).toBe('c1aaaaaa')
+    expect(typeof sent[0].line).toBe('string')
+  })
+
+  test('the host\'s own spawn error reaches the caller unchanged', async () => {
+    const ipc = new FakeIpc()
+    ipc.on('chat_open', () => Promise.reject('[engine:quarantined] Could not start neuron.exe'))
+    const host = chatChatsHost(ipc)
+    await expect(host.open({})).rejects.toThrow('[engine:quarantined] Could not start neuron.exe')
+  })
+
+  test('a full house is a ChatError with a plain message', async () => {
+    const ipc = new FakeIpc()
+    ipc.on('chat_open', () => Promise.reject('cap_reached'))
+    const host = chatChatsHost(ipc)
+    const error = (await host.open({}).catch((failure: unknown) => failure)) as ChatError
+    expect(error).toBeInstanceOf(ChatError)
+    expect(error.code).toBe('cap_reached')
+    expect(error.message).toBe('4 chats are working. Stop one to open another.')
+  })
+
+  test('an engine that ends before it is ready fails the open and the chat is closed', async () => {
+    const ipc = new FakeIpc()
+    ipc.on('chat_open', () => {
+      ipc.emit('neuron://chat-exit', { chat: 'c1aaaaaa', generation: 1, code: 1, error: 'bad launch', reason: 'exited' })
+      return summary('c1aaaaaa', 1)
+    })
+    const host = chatChatsHost(ipc)
+    await expect(host.open({})).rejects.toThrow('bad launch')
+    expect(ipc.calls('chat_close')[0]).toEqual({ chat: 'c1aaaaaa' })
+  })
+
+  test('onStopped reports why an engine ended, and the controller shows it stopped', async () => {
+    const ipc = new FakeIpc()
+    ipc.on('chat_open', () => {
+      ipc.emit('neuron://chat-line', { chat: 'c1aaaaaa', generation: 1, line: ready })
+      return summary('c1aaaaaa', 1)
+    })
+    const host = chatChatsHost(ipc)
+    const stopped: Array<[string, string]> = []
+    host.onStopped((id, reason) => stopped.push([id, reason]))
+    const { controller } = await host.open({})
+    ipc.emit('neuron://chat-exit', { chat: 'c1aaaaaa', generation: 1, code: null, error: null, reason: 'idle' })
+    expect(stopped).toEqual([['c1aaaaaa', 'idle']])
+    expect(controller.getState().connection).toBe('exited')
+  })
+
+  test('resume starts a new generation; a fresh session is asked for with an empty id', async () => {
+    const ipc = new FakeIpc()
+    ipc.on('chat_open', () => {
+      ipc.emit('neuron://chat-line', { chat: 'c1aaaaaa', generation: 1, line: ready })
+      return summary('c1aaaaaa', 1)
+    })
+    ipc.on('chat_resume', () => {
+      ipc.emit('neuron://chat-line', { chat: 'c1aaaaaa', generation: 2, line: ready })
+      return summary('c1aaaaaa', 2)
+    })
+    const host = chatChatsHost(ipc)
+    const { controller } = await host.open({})
+    await host.resume('c1aaaaaa')
+    await host.resume('c1aaaaaa', { resume: null, trustOnce: true })
+    const [first, second] = ipc.calls('chat_resume')
+    expect(first).toMatchObject({ chat: 'c1aaaaaa', resume: null, trustOnce: false })
+    expect(second).toMatchObject({ resume: '', trustOnce: true })
+    expect(controller.getState().connection).toBe('ready')
+  })
+
+  test('discarding a copy maps the host\'s questions to codes and counts', async () => {
+    const ipc = new FakeIpc()
+    ipc.on('chat_open', () => {
+      ipc.emit('neuron://chat-line', { chat: 'c1aaaaaa', generation: 1, line: ready })
+      return summary('c1aaaaaa', 1)
+    })
+    ipc.on('worktree_discard', () => Promise.reject('unmerged:2'))
+    const host = chatChatsHost(ipc)
+    await host.open({ worktree: { name: 'x' } })
+    const error = (await host.discardWorktree('c1aaaaaa', { force: false, deleteUnmerged: false }).catch((failure: unknown) => failure)) as ChatError
+    expect(error.code).toBe('unmerged')
+    expect(error.count).toBe(2)
+    expect(ipc.calls('worktree_discard')[0]).toEqual({ chat: 'c1aaaaaa', force: false, deleteUnmerged: false })
+  })
+
+  test('the active chat is tracked and sent to the host', async () => {
+    const ipc = new FakeIpc()
+    const host = chatChatsHost(ipc)
+    host.activate('c1aaaaaa')
+    expect(host.activeId()).toBe('c1aaaaaa')
+    host.activate(null)
+    expect(ipc.calls('chat_activate')).toEqual([{ chat: 'c1aaaaaa' }, { chat: null }])
+  })
+})

@@ -32,7 +32,7 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
     kind: 'host',
     label: new URL(options.url.replace(/^ws/, 'http')).host,
     // A host serves one workspace; it restarts its engine for clients on its machine.
-    can: { openProject: false, restart: true, terminal: true, git: true, pickFolder: false, updates: false },
+    can: { openProject: false, restart: true, terminal: true, git: true, pickFolder: false, updates: false, multiChat: false },
     store: browserStore('neuron.desktop.'),
     // The host starts its engine with its own options.
     setLaunchOptions: () => {},
@@ -91,5 +91,8 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
       }
     },
     openExternal: (url) => window.open(url, '_blank', 'noopener,noreferrer'),
+    // L4: multi-chat. A host serves one engine: no chats, no notifications.
+    notify: async () => 'unsupported',
+    setAttention: () => {},
   }
 }
