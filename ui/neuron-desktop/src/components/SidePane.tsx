@@ -494,6 +494,7 @@ export function SidePane({
   terminalOpened,
   state = null,
   controller = null,
+  chatKey,
 }: {
   platform: Platform
   tab: PaneTab
@@ -507,6 +508,8 @@ export function SidePane({
   /** The session, for the engine's changes, commit card and restore points (L2). */
   state?: SessionState | null
   controller?: ReviewController | null
+  /** L4: the chat in view; the terminal opens in its folder. */
+  chatKey?: string | null
 }) {
   const tabs: Array<[PaneTab, string]> = [
     ['changes', 'Changes'],
@@ -530,7 +533,7 @@ export function SidePane({
       {terminalOpened && (
         <div className="terminal-tab" hidden={tab !== 'terminal'}>
           <Suspense fallback={<div className="muted pad">Loading the terminal…</div>}>
-            <TerminalPane platform={platform} />
+            <TerminalPane platform={platform} folder={chatKey ?? undefined} />
           </Suspense>
         </div>
       )}

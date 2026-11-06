@@ -20,6 +20,8 @@ import {
 
 import { AccountRow, SignOutDialog, type AccountAction } from './components/AccountMenu'
 import { ChatHeader, RestartBanner, StatusBar } from './components/Bars'
+import { ChatContextBar, DiscardDialog } from './components/ChatHeader'
+import { CommandPalette, ShortcutsSheet } from './components/CommandPalette'
 import { Composer, EffortPicker, ModeMenu, nextMode, type ComposerHandle } from './components/Composer'
 import { ExtensionsPanel } from './components/ExtensionsPanel'
 import { FirstRun } from './components/FirstRun'
@@ -35,14 +37,17 @@ import { SignInPanel } from './components/SignIn'
 import { TrustModal } from './components/TrustModal'
 import { Transcript } from './components/Transcript'
 import { TodoStrip } from './components/TodoStrip' // L1: live transcript
+import { useChats } from './chats'
 import { buildDiagnostics, engineProblemFor, parseEngineProblem } from './engineProblems'
 import { exportName, transcriptJson, transcriptMarkdown, type DesktopCommand } from './commands'
 import { useSession } from './hooks'
 import { LINKS } from './links'
 import type { EngineInfo, LaunchOptions, Platform, Project, UpdateInfo } from './platform'
 import { safeExternalUrl } from './platform/links'
+import type { PaletteCommand } from './palette'
 import { noteSeen, sessionRows, type SessionRow } from './sessions'
 import { useSeen, useSettings, type Settings } from './settings'
+import { shortcutFor, shortcutKeys, type ShortcutId } from './shortcuts'
 
 type ToolItem = Extract<TranscriptItem, { kind: 'tool' }>
 type View = 'chat' | NavTarget | 'settings'
@@ -79,10 +84,28 @@ function launchOptions(settings: Settings, folder: string | null, reasoningEffor
 }
 
 export function App({ platform }: { platform: Platform }) {
-  const [controller, setController] = useState<SessionController | null>(null)
-  const [launchError, setLaunchError] = useState<string | null>(null)
-  const state = useSession(controller)
   const [settings, updateSettings, settingsLoaded] = useSettings(platform.store)
+  // L4: a message for the user (a full house of chats, notifications off).
+  const [toast, setToast] = useState<string | null>(null)
+  // A restart that failed; the engines' own start errors come from `useChats`.
+  const [restartError, setLaunchError] = useState<string | null>(null)
+  const [palette, setPalette] = useState(false)
+  const [shortcutsOpen, setShortcutsOpen] = useState(false)
+  const [discarding, setDiscarding] = useState(false)
+  // L3: composer. The reasoning effort new engines start with, and a change waiting for the turn to end.
+  const [effort, setEffort] = useState<LaunchOptions['reasoningEffort']>(undefined)
+  const [effortPending, setEffortPending] = useState(false)
+  const effortRef = useRef<LaunchOptions['reasoningEffort']>(undefined)
+  // The engines start once the settings say how.
+  useEffect(() => {
+    if (settingsLoaded) platform.setLaunchOptions(launchOptions(settings, null, effortRef.current))
+    // Settings changed later apply to the next engine, not this one.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [platform, settingsLoaded])
+  const { store: chats, snapshot, active, launchError } = useChats(platform, settingsLoaded, setToast)
+  const multi = platform.can.multiChat && chats !== null
+  const controller: SessionController | null = active?.controller ?? null
+  const state = useSession(controller)
   const [seen, updateSeen] = useSeen(platform.store)
   const [view, setView] = useState<View>('chat')
   const [section, setSection] = useState<SettingsSection>('account')
@@ -103,28 +126,8 @@ export function App({ platform }: { platform: Platform }) {
   const [engineInfo, setEngineInfo] = useState<EngineInfo | null>(null) // L5
   const search = useRef<HTMLInputElement>(null)
   const composer = useRef<ComposerHandle>(null)
-  // L3: composer. The reasoning effort new engines start with, and a change waiting for the turn to end.
-  const [effort, setEffort] = useState<LaunchOptions['reasoningEffort']>(undefined)
-  const [effortPending, setEffortPending] = useState(false)
-  const effortRef = useRef<LaunchOptions['reasoningEffort']>(undefined)
   const [modelSignal, setModelSignal] = useState(0)
   const narrow = useNarrow()
-
-  // The engine starts once the settings say how.
-  useEffect(() => {
-    if (!settingsLoaded) return
-    let cancelled = false
-    platform.setLaunchOptions(launchOptions(settings, null, effortRef.current))
-    platform.connect().then(
-      (connected) => !cancelled && setController(connected),
-      (error: Error) => !cancelled && setLaunchError(error.message),
-    )
-    return () => {
-      cancelled = true
-    }
-    // Settings changed later apply to the next engine, not this one.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [platform, settingsLoaded])
 
   // The version, and whether a newer release exists, once per launch.
   useEffect(() => {
@@ -142,10 +145,12 @@ export function App({ platform }: { platform: Platform }) {
   }, [platform])
   useEffect(() => refreshRecent(), [refreshRecent])
 
+  // With several chats, one that is working does not stop the others being opened.
+  const uiBusy = multi ? switching : state.busy || switching
   const history = hasFeature(state, FEATURE_SESSIONS)
   const ready = state.connection === 'ready'
   const sessionId = state.status?.session_id || null
-  const project = platform.project()
+  const project = multi ? (active?.info.project ?? null) : platform.project()
   const folder = state.status?.cwd ?? project?.path ?? null
 
   // The session list follows the engine: after it starts, after every turn, and on a switch.
@@ -192,6 +197,17 @@ export function App({ platform }: { platform: Platform }) {
     [state.sessions, project, sessionId, state.busy, seen],
   )
 
+  // Open chats are listed above the history, not in it.
+  const historyRows = useMemo(() => {
+    if (!rows) return rows
+    const open = new Set(snapshot.items.map((item) => item.sessionId).filter(Boolean))
+    return rows.filter((row) => !open.has(row.id))
+  }, [rows, snapshot.items])
+  // L2 + L4: the chat bar's "Open in editor" opens the chat's own folder (its copy of the project).
+  const openInEditor = useCallback(() => {
+    void platform.openInEditor('.').catch((failure: Error) => setToast(failure.message))
+  }, [platform])
+
   const openPane = useCallback((tab: PaneTab) => {
     if (tab === 'terminal') setTerminalOpened(true)
     setPaneTab(tab)
@@ -202,12 +218,39 @@ export function App({ platform }: { platform: Platform }) {
     if (ready) controller?.listExtensions()
   }, [controller, ready])
 
+  // L4: a chat in its own folder or copy; a refusal (the 4 working chats) is told, not thrown.
+  const openChat = useCallback(
+    async (request: { path?: string; resume?: string | null; worktree?: { name?: string } }) => {
+      if (!chats) return
+      setSwitching(true)
+      try {
+        await chats.open(request)
+        setToolKey(null)
+        setView('chat')
+      } catch (failure) {
+        setToast(failure instanceof Error ? failure.message : String(failure))
+        throw failure
+      } finally {
+        setSwitching(false)
+      }
+    },
+    [chats],
+  )
+
   const newSession = useCallback(() => {
+    if (multi) {
+      void openChat({ path: project?.path }).catch(() => {})
+      return
+    }
     if (!controller || state.busy) return
     setToolKey(null)
     setView('chat')
     controller.newChat()
-  }, [controller, state.busy])
+  }, [multi, openChat, project, controller, state.busy])
+
+  const newWorktreeChat = useCallback(() => {
+    if (multi) void openChat({ path: project?.path, worktree: {} }).catch(() => {})
+  }, [multi, openChat, project])
 
   const openFolder = useCallback(
     async (path: string, resume: string | null = null) => {
@@ -216,18 +259,27 @@ export function App({ platform }: { platform: Platform }) {
       try {
         platform.setLaunchOptions(launchOptions(settings, path, effortRef.current))
         modeApplied.current = path
-        await platform.openProject(path, resume)
+        if (multi && chats) {
+          // A chat already open is shown, not opened twice.
+          const open = resume ? chats.findSession(resume) : chats.findProject(path)
+          if (open) chats.setActive(open.id)
+          else await chats.open({ path, resume })
+        } else {
+          await platform.openProject(path, resume)
+        }
         setToolKey(null)
         setView('chat')
         refreshRecent()
       } catch (failure) {
-        setProjectError(failure instanceof Error ? failure.message : String(failure))
+        const message = failure instanceof Error ? failure.message : String(failure)
+        setProjectError(message)
+        if (multi) setToast(message)
         throw failure
       } finally {
         setSwitching(false)
       }
     },
-    [platform, settings, refreshRecent],
+    [platform, settings, refreshRecent, multi, chats],
   )
 
   const pickFolder = useCallback(async () => {
@@ -240,10 +292,11 @@ export function App({ platform }: { platform: Platform }) {
       if (!controller) return
       setToolKey(null)
       setView('chat')
-      if (!row.project.path || row.project.path === project?.path) controller.resume(row.id)
+      if (multi) void openFolder(row.project.path || project?.path || '', row.id).catch(() => {})
+      else if (!row.project.path || row.project.path === project?.path) controller.resume(row.id)
       else void openFolder(row.project.path, row.id).catch(() => {})
     },
-    [controller, project, openFolder],
+    [controller, project, openFolder, multi],
   )
 
   const rail = railOverride ?? (settings.sidebar === 'rail' || (settings.sidebar === 'auto' && narrow))
@@ -256,6 +309,24 @@ export function App({ platform }: { platform: Platform }) {
     setView('settings')
   }, [section])
 
+  // L4: the shortcuts of `shortcuts.ts`, which the shortcuts sheet lists too.
+  const runShortcut = useCallback(
+    (id: ShortcutId) => {
+      if (id === 'palette') setPalette(true)
+      else if (id === 'newChat') newSession()
+      else if (id === 'newWorktreeChat') newWorktreeChat()
+      else if (id === 'nextWaiting') chats?.jumpToWaiting()
+      else if (id === 'previousChat') chats?.step(-1)
+      else if (id === 'nextChat') chats?.step(1)
+      else setShortcutsOpen(true)
+    },
+    [newSession, newWorktreeChat, chats],
+  )
+
+  // The handler reads the latest actions, so a key pressed as the chats appear is not lost.
+  const shortcutAction = useRef(runShortcut)
+  shortcutAction.current = runShortcut
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && view !== 'chat' && !document.querySelector('[aria-modal="true"], [role="menu"]')) {
@@ -263,6 +334,12 @@ export function App({ platform }: { platform: Platform }) {
         return
       }
       if (!(event.ctrlKey || event.metaKey)) return
+      const shortcut = shortcutFor(event)
+      if (shortcut) {
+        event.preventDefault()
+        shortcutAction.current(shortcut)
+        return
+      }
       const key = event.key.toLowerCase()
       if (event.key === '`') {
         event.preventDefault()
@@ -274,12 +351,6 @@ export function App({ platform }: { platform: Platform }) {
       } else if (key === 'b') {
         event.preventDefault()
         setPaneOpen((open) => !open)
-      } else if (key === 'n') {
-        event.preventDefault()
-        newSession()
-      } else if (key === 'k') {
-        event.preventDefault()
-        focusSearch()
       } else if (event.key === ',') {
         event.preventDefault()
         openSettings()
@@ -287,7 +358,53 @@ export function App({ platform }: { platform: Platform }) {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [paneOpen, paneTab, openPane, newSession, focusSearch, openSettings, rail, view])
+  }, [paneOpen, paneTab, openPane, openSettings, rail, view])
+
+  // L4: what the palette lists. Other lanes append their own commands here.
+  const closeChat = useCallback(
+    async (id: string) => {
+      if (!chats) return
+      await chats.close(id)
+      // A window always has a chat: closing the last one opens a fresh one.
+      if (chats.getSnapshot().items.length === 0) await openChat({ path: project?.path }).catch(() => {})
+    },
+    [chats, openChat, project],
+  )
+  const paletteCommands = useMemo<PaletteCommand[]>(() => {
+    const actions: PaletteCommand[] = [
+      { id: 'new-chat', title: 'New chat', group: 'Actions', keys: shortcutKeys('newChat'), run: newSession },
+      ...(multi ? [{ id: 'new-copy', title: 'New chat in its own copy of the project', group: 'Actions', keys: shortcutKeys('newWorktreeChat'), run: newWorktreeChat }] : []),
+      ...(multi && snapshot.needsYouCount > 0
+        ? [{ id: 'jump', title: 'Go to the chat that needs you', group: 'Actions', keys: shortcutKeys('nextWaiting'), run: () => void chats?.jumpToWaiting() }]
+        : []),
+      ...(multi && snapshot.items.length > 0 && active
+        ? [{ id: 'close-chat', title: 'Close this chat', group: 'Actions', run: () => void closeChat(active.id) }]
+        : []),
+      { id: 'search', title: 'Search sessions', group: 'Actions', run: focusSearch },
+      { id: 'projects', title: 'Projects', group: 'Actions', run: () => setView('projects') },
+      { id: 'extensions', title: 'Extensions', group: 'Actions', run: () => setView('extensions') },
+      { id: 'settings', title: 'Settings', group: 'Actions', keys: 'Ctrl+,', run: () => openSettings() },
+      { id: 'shortcuts', title: 'Keyboard shortcuts', group: 'Actions', keys: shortcutKeys('shortcuts'), run: () => setShortcutsOpen(true) },
+    ]
+    const openChats: PaletteCommand[] = multi
+      ? snapshot.items.map((item) => ({ id: `chat-${item.id}`, title: `${item.title} (${item.projectName})`, group: 'Chats', run: () => chats?.setActive(item.id) }))
+      : []
+    const sessions: PaletteCommand[] = (rows ?? []).slice(0, 40).map((row) => ({ id: `session-${row.id}`, title: row.title, group: 'Sessions', run: () => openSession(row) }))
+    return [...actions, ...openChats, ...sessions]
+  }, [multi, snapshot, chats, active, rows, newSession, newWorktreeChat, closeChat, focusSearch, openSettings, openSession])
+
+  // A chat switch starts on the chat's own page, with nothing selected.
+  useEffect(() => {
+    setToolKey(null)
+    setView('chat')
+  }, [active?.id])
+
+  // A message stays a few seconds.
+  useEffect(() => {
+    if (!toast) return
+    const timer = setTimeout(() => setToast(null), 8000)
+    return () => clearTimeout(timer)
+  }, [toast])
 
   // Signing out: the engine forgets the sign-in, then a fresh engine shows the sign-in screen.
   useEffect(() => {
@@ -377,6 +494,8 @@ export function App({ platform }: { platform: Platform }) {
     )
   }
 
+  // A start that failed: the first chat's engine (L4), or a restart before a chat was in view.
+  const startError = launchError ?? restartError
   // L5: the support report, and restarting the engine with a card when that fails.
   const copyDiagnostics = async () => {
     const hostReport = await platform.hostDiagnostics().catch(() => null)
@@ -386,7 +505,7 @@ export function App({ platform }: { platform: Platform }) {
       hostReport,
       engine: { version: state.version, protocol: state.protocol, features: state.features },
       connection: state.connection,
-      lastError: state.connectionError ?? launchError ?? (lastItem && 'text' in lastItem ? lastItem.text : null),
+      lastError: state.connectionError ?? startError ?? (lastItem && 'text' in lastItem ? lastItem.text : null),
       updates: platform.manualUpdates ? 'manual' : platform.can.updates ? 'signed' : 'none',
     })
     await navigator.clipboard.writeText(text)
@@ -403,15 +522,15 @@ export function App({ platform }: { platform: Platform }) {
     return (
       <div className="splash">
         <PixelLogo pixel={10} />
-        {launchError ? (
-          parseEngineProblem(launchError) ? (
+        {startError ? (
+          parseEngineProblem(startError) ? (
             <EngineProblemCard
-              problem={parseEngineProblem(launchError)!}
+              problem={parseEngineProblem(startError)!}
               actions={{ onRestart: () => window.location.reload(), onCopyDiagnostics: copyDiagnostics, onOpenLink: openLink }}
             />
           ) : (
             <div className="error-line" role="alert">
-              {launchError}
+              {startError}
             </div>
           )
         ) : (
@@ -501,11 +620,11 @@ export function App({ platform }: { platform: Platform }) {
         ref={search}
         rail={rail}
         onToggleRail={() => setRailOverride(!rail)}
-        rows={history ? rows : null}
+        rows={history ? (multi ? historyRows : rows) : null}
         open={project}
         groupBy={settings.groupBy}
         onGroupBy={(groupBy) => updateSettings({ groupBy })}
-        busy={state.busy || switching}
+        busy={uiBusy}
         historyAvailable={history}
         page={view}
         onNewSession={newSession}
@@ -518,6 +637,13 @@ export function App({ platform }: { platform: Platform }) {
         onSettings={() => openSettings()}
         onSearch={focusSearch}
         footer={footer}
+        // L4: multi-chat
+        chats={multi ? snapshot.items : undefined}
+        activeChat={snapshot.activeId}
+        onOpenChat={(id) => chats?.setActive(id)}
+        needsYouCount={multi ? snapshot.needsYouCount : 0}
+        onJumpWaiting={() => chats?.jumpToWaiting()}
+        onNewWorktreeChat={multi ? newWorktreeChat : undefined}
       />
       <main className="chat" aria-label={view === 'chat' ? 'Session' : undefined}>
         {view === 'settings' && (
@@ -550,7 +676,7 @@ export function App({ platform }: { platform: Platform }) {
             counts={(rows ?? []).reduce<Record<string, number>>((counts, row) => ({ ...counts, [row.project.path]: (counts[row.project.path] ?? 0) + 1 }), {})}
             canPickFolder={platform.can.pickFolder}
             canOpen={platform.can.openProject}
-            busy={state.busy || switching}
+            busy={uiBusy}
             error={projectError}
             onPick={() => void pickFolder()}
             onOpen={(path) => void openFolder(path).catch(() => {})}
@@ -558,7 +684,7 @@ export function App({ platform }: { platform: Platform }) {
           />
         )}
         {view === 'sessions' && (
-          <AllSessionsPage rows={rows ?? []} groupBy={settings.groupBy} busy={state.busy || switching} onOpen={openSession} onClose={() => setView('chat')} />
+          <AllSessionsPage rows={rows ?? []} groupBy={settings.groupBy} busy={uiBusy} onOpen={openSession} onClose={() => setView('chat')} />
         )}
         {view === 'extensions' && (
           <ExtensionsPage onClose={() => setView('chat')}>
@@ -583,6 +709,10 @@ export function App({ platform }: { platform: Platform }) {
               sidePaneOpen={paneOpen}
               onToggleSidePane={() => setPaneOpen(!paneOpen)}
             />
+            {/* L4: the copy this chat works in */}
+            {multi && active && (
+              <ChatContextBar info={active.info} onDiscard={() => setDiscarding(true)} onOpenInEditor={openInEditor} />
+            )}
             <RestartBanner
               state={state}
               canRestart={platform.can.restart}
@@ -619,7 +749,7 @@ export function App({ platform }: { platform: Platform }) {
                         </button>
                       ))}
                     </div>
-                    <p className="muted small">@ adds a file · / runs a command · Ctrl+N new session · Ctrl+K search · Ctrl+B side panel</p>
+                    <p className="muted small">@ adds a file · / runs a command · Ctrl+N new session · Ctrl+K commands · Ctrl+B side panel</p>
                   </div>
                 }
               />
@@ -703,6 +833,7 @@ export function App({ platform }: { platform: Platform }) {
           terminalOpened={terminalOpened}
           state={state}
           controller={controller}
+          chatKey={active?.id}
         />
       )}
       <StatusBar state={state} onPane={openPane} />
@@ -751,6 +882,28 @@ export function App({ platform }: { platform: Platform }) {
             setView('chat')
           }}
         />
+      )}
+      {/* L4: multi-chat */}
+      <CommandPalette open={palette} onClose={() => setPalette(false)} commands={paletteCommands} />
+      <ShortcutsSheet open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+      {discarding && multi && active?.info.worktree && platform.chats && (
+        <DiscardDialog
+          info={active.info}
+          loadStatus={() => platform.chats!.worktreeStatus(active.id)}
+          discard={async (options) => {
+            await platform.chats!.discardWorktree(active.id, options)
+            await closeChat(active.id)
+          }}
+          onClose={() => setDiscarding(false)}
+        />
+      )}
+      {toast && (
+        <div className="toast" role="status">
+          <span>{toast}</span>
+          <button className="icon-button" aria-label="Dismiss" onClick={() => setToast(null)}>
+            ✕
+          </button>
+        </div>
       )}
     </div>
   )

@@ -398,6 +398,8 @@ mod tests {
         assert!(revert(&root, "nothing.txt")
             .unwrap_err()
             .contains("no changes"));
+        // `.` opens the folder in an editor (L4's chat bar); it never reverts it.
+        assert!(revert(&root, ".").unwrap_err().contains("no changes"));
         assert!(outside.exists());
         assert_eq!(fs::read_to_string(repo.join("b.txt")).unwrap(), "changed\n");
         let _ = fs::remove_file(outside);

@@ -9,6 +9,8 @@ use std::process::{Command, Stdio};
 use crate::git::path_problem;
 
 /// The file's real path, which must exist and sit inside `root` (canonical).
+/// `.` is `root` itself: the chat bar opens a chat's own folder (or its copy of
+/// the project) that way. Empty, `..`, absolute and option-like paths stay refused.
 pub fn resolve(root: &Path, file: &str) -> Result<PathBuf, String> {
     if let Some(problem) = path_problem(file) {
         return Err(problem.into());
@@ -159,6 +161,18 @@ mod tests {
             "That file is not there."
         );
         let _ = fs::remove_file(sibling);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// L4's chat bar opens the chat's own folder as `.`; nothing else gets looser.
+    #[test]
+    fn the_folder_itself_resolves_as_dot() {
+        let root = temp("dot");
+        assert_eq!(resolve(&root, ".").unwrap(), root);
+        assert_eq!(resolve(&root, "./").unwrap(), root);
+        for bad in ["", "..", "./..", ".\\..", "-", "--", "/", "\\"] {
+            assert!(resolve(&root, bad).is_err(), "{bad:?}");
+        }
         let _ = fs::remove_dir_all(root);
     }
 

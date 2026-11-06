@@ -135,7 +135,7 @@ export function AccountRow({
           )}
         </button>
         {!rail && (
-          <button className="icon-button" aria-label="Find a session" title="Find a session (Ctrl+K)" onClick={onSearch}>
+          <button className="icon-button" aria-label="Find a session" title="Find a session" onClick={onSearch}>
             ⌕
           </button>
         )}

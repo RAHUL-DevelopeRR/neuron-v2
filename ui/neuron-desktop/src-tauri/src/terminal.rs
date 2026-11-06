@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -18,6 +18,8 @@ struct Terminal {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Where it was opened, so a removed worktree can close the shells inside it.
+    cwd: PathBuf,
 }
 
 #[derive(Default)]
@@ -86,6 +88,7 @@ impl Terminals {
                 master: pair.master,
                 writer,
                 killer,
+                cwd: cwd.to_path_buf(),
             },
         );
 
@@ -145,6 +148,15 @@ impl Terminals {
         }
     }
 
+    /// Closes the terminals opened in `root` or below it.
+    pub fn close_under(&self, root: &Path) {
+        for terminal in lock(&self.open).values_mut() {
+            if terminal.cwd.starts_with(root) {
+                let _ = terminal.killer.kill();
+            }
+        }
+    }
+
     pub fn close_all(&self) {
         for terminal in lock(&self.open).values_mut() {
             let _ = terminal.killer.kill();
@@ -180,6 +192,43 @@ mod tests {
         assert_eq!(utf8_prefix_len(b"abc"), 3);
         assert_eq!(utf8_prefix_len(&[b'a', euro[0], euro[1]]), 1);
         assert_eq!(utf8_prefix_len(&[0xff, b'a']), 2);
+    }
+
+    #[test]
+    fn closes_only_the_terminals_under_a_folder() {
+        let base = std::env::temp_dir().join(format!("neuron-term-{}", std::process::id()));
+        let (inside, outside) = (base.join("wt").join("one"), base.join("other"));
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let terminals = Terminals::default();
+        let (exit_tx, exit) = mpsc::channel::<u32>();
+        let mut ids = Vec::new();
+        for cwd in [&inside, &outside] {
+            let tx = exit_tx.clone();
+            ids.push(
+                terminals
+                    .open(
+                        cwd,
+                        80,
+                        24,
+                        |_, _| {},
+                        move |id, _| {
+                            let _ = tx.send(id);
+                        },
+                    )
+                    .expect("a terminal"),
+            );
+        }
+        terminals.close_under(&base.join("wt"));
+        let closed = exit
+            .recv_timeout(Duration::from_secs(20))
+            .expect("one closes");
+        assert_eq!(closed, ids[0]);
+        // The other keeps running.
+        assert!(exit.recv_timeout(Duration::from_millis(800)).is_err());
+        terminals.close_all();
+        assert_eq!(exit.recv_timeout(Duration::from_secs(20)).unwrap(), ids[1]);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

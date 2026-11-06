@@ -33,7 +33,7 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
     kind: 'host',
     label: new URL(options.url.replace(/^ws/, 'http')).host,
     // A host serves one workspace; it restarts its engine for clients on its machine.
-    can: { openProject: false, restart: true, terminal: true, git: true, pickFolder: false, updates: false },
+    can: { openProject: false, restart: true, terminal: true, git: true, pickFolder: false, updates: false, multiChat: false },
     store: browserStore('neuron.desktop.'),
     // The host starts its engine with its own options.
     setLaunchOptions: () => {},
@@ -104,5 +104,8 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
     // L2: review and git: the browser build has no way to change or open files on the host.
     gitRevert: () => Promise.reject(new Error('Reverting a file needs the desktop app.')),
     openInEditor: () => Promise.reject(new Error('Opening a file in an editor needs the desktop app.')),
+    // L4: multi-chat. A host serves one engine: no chats, no notifications.
+    notify: async () => 'unsupported',
+    setAttention: () => {},
   }
 }

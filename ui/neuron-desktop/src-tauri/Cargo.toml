@@ -26,6 +26,12 @@ portable-pty = "0.9"
 tauri-plugin-dialog = "=2.8.1"
 tauri-plugin-store = "=2.5.0"
 tauri-plugin-updater = "=2.13.2"
+# L4: desktop notifications when a background chat needs the user.
+tauri-plugin-notification = "=2.8.0"
+
+# L4: one Job Object per app, so engines (and what they started) die with it.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 # No debuginfo: a Tauri debug build is several GB with it.
 [profile.dev]

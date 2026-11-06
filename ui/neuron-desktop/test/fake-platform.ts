@@ -7,7 +7,21 @@ import {
   type UiEvent,
 } from '@neuron/client'
 
-import type { DirListing, EngineInfo, FileContent, GitStatusView, LaunchOptions, Platform, Project, TerminalSession, UpdateInfo } from '../src/platform'
+import {
+  ChatError,
+  type ChatHost,
+  type ChatInfo,
+  type DirListing,
+  type EngineInfo,
+  type FileContent,
+  type GitStatusView,
+  type LaunchOptions,
+  type Platform,
+  type Project,
+  type TerminalSession,
+  type UpdateInfo,
+  type WorktreeStatus,
+} from '../src/platform'
 import type { Settings } from '../src/settings'
 
 export const ALL_FEATURES = [
@@ -118,6 +132,17 @@ export interface FakePlatform extends Platform {
   reverted: string[]
   /** Paths `openInEditor` was asked for. */
   editorOpens: string[]
+  /** L2 + L4: which chat was in view for each revert and editor call (`null` with one chat). */
+  reviewChats: Array<{ call: 'gitRevert' | 'openInEditor'; path: string; chat: string | null }>
+  // L4: multi-chat
+  /** Notifications the app asked for. */
+  notifications: Array<{ chat: string; title: string; body: string }>
+  /** Every count the app put on the taskbar icon. */
+  attention: number[]
+  /** What `notify` answers next. */
+  notifyResult: 'shown' | 'denied' | 'unsupported'
+  /** The chats, when the platform was made with `multiChat`. */
+  fakeChats: FakeChats | null
 }
 
 export interface FakePlatformOptions {
@@ -129,6 +154,8 @@ export interface FakePlatformOptions {
   // L5: extensions and resilience
   engine?: EngineInfo | null
   hostReport?: string | null
+  /** L4: several chats at once; the `FakeEngine` passed in is the first chat's. */
+  multiChat?: boolean
 }
 
 /** A platform over a {@link FakeEngine} and a small in-memory workspace with git. */
@@ -139,7 +166,7 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
   const platform: FakePlatform = {
     kind: 'host',
     label: 'test',
-    can: { openProject: true, restart: true, terminal: false, git: true, pickFolder: true, updates: true },
+    can: { openProject: true, restart: true, terminal: false, git: true, pickFolder: true, updates: true, multiChat: options.multiChat === true },
     opened: [],
     restarts: [],
     trustedOnce: [],
@@ -158,6 +185,16 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     exportPath: '/saved/chat.md',
     reverted: [],
     editorOpens: [],
+    reviewChats: [],
+    notifications: [],
+    attention: [],
+    notifyResult: 'shown',
+    fakeChats: options.multiChat ? new FakeChats(engine) : null,
+    notify: async (notification) => {
+      platform.notifications.push(notification)
+      return platform.notifyResult
+    },
+    setAttention: (count) => void platform.attention.push(count),
     store: {
       get: async <T,>(key: string) => saved.get(key) as T | undefined,
       set: async (key, value) => void saved.set(key, value),
@@ -196,6 +233,9 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     async restart(resume, options) {
       if (options?.trustOnce) platform.trustedOnce.push(resume)
       platform.restarts.push(resume)
+      // L4: with several chats, the chat in view gets the new engine (tauri.ts does the same).
+      const active = platform.fakeChats?.activeId()
+      if (platform.fakeChats && active) await platform.fakeChats.resume(active, { resume, trustOnce: options?.trustOnce === true })
     },
     async list(path: string): Promise<DirListing> {
       const prefix = path === '.' ? '' : `${path}/`
@@ -243,11 +283,131 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     // L2: review and git
     async gitRevert(path) {
       platform.reverted.push(path)
+      platform.reviewChats.push({ call: 'gitRevert', path, chat: platform.fakeChats?.activeId() ?? null })
       if (platform.git) platform.git = { ...platform.git, changes: platform.git.changes.filter((change) => change.path !== path) }
     },
     async openInEditor(path) {
       platform.editorOpens.push(path)
+      platform.reviewChats.push({ call: 'openInEditor', path, chat: platform.fakeChats?.activeId() ?? null })
     },
   }
+  if (platform.fakeChats) platform.chats = platform.fakeChats
   return platform
+}
+
+/** The chats of a multi-chat platform: each has its own {@link FakeEngine}. */
+export class FakeChats implements ChatHost {
+  engines = new Map<string, FakeEngine>()
+  controllers = new Map<string, SessionController>()
+  infos = new Map<string, ChatInfo>()
+  opened: Array<{ path?: string; resume?: string | null; worktree?: { name?: string } }> = []
+  activated: Array<string | null> = []
+  stopped: string[] = []
+  closed: string[] = []
+  resumed: Array<{ id: string; options?: { resume?: string | null; trustOnce?: boolean } }> = []
+  activities = new Map<string, { busy: boolean; waiting: boolean }>()
+  discards: Array<{ id: string; force: boolean; deleteUnmerged: boolean }> = []
+  /** What `worktreeStatus` answers, and what a discard checks. */
+  worktreeState: Omit<WorktreeStatus, 'branch' | 'path'> = { dirty: 0, unmerged: 0 }
+  /** Rejects the next `open` with this host error text (`cap_reached`, ...). */
+  failNext: string | null = null
+  private count = 0
+  private active: string | null = null
+  private stoppedListeners = new Set<(id: string, reason: string) => void>()
+
+  constructor(private readonly first: FakeEngine) {}
+
+  ids(): string[] {
+    return [...this.infos.keys()]
+  }
+
+  async open(request: { path?: string; resume?: string | null; worktree?: { name?: string } }) {
+    this.opened.push(request)
+    if (this.failNext) {
+      const text = this.failNext
+      this.failNext = null
+      throw text === 'cap_reached' ? new ChatError('4 chats are working. Stop one to open another.', 'cap_reached') : new ChatError(text)
+    }
+    const index = this.count++
+    const id = `c${index + 1}test`
+    const path = request.path ?? '/work/app'
+    const slug = request.worktree ? (request.worktree.name ?? `chat-${index + 1}`).toLowerCase().replace(/[^a-z0-9]+/g, '-') : null
+    const engine = index === 0 ? this.first : new FakeEngine({ cwd: path })
+    const info: ChatInfo = {
+      id,
+      project: { name: path.split('/').pop() ?? path, path },
+      cwd: slug ? `/wt/${slug}` : path,
+      branch: slug ? `neuron/${slug}` : 'main',
+      worktree: slug ? { path: `/wt/${slug}`, branch: `neuron/${slug}`, base: 'main' } : null,
+    }
+    const controller = new SessionController(engine)
+    this.engines.set(id, engine)
+    this.controllers.set(id, controller)
+    this.infos.set(id, info)
+    await controller.start()
+    return { info, controller }
+  }
+
+  async reattach() {
+    return []
+  }
+
+  async resume(id: string, options?: { resume?: string | null; trustOnce?: boolean }) {
+    this.resumed.push({ id, options })
+    const controller = this.controllers.get(id)
+    controller?.apply({ type: 'local/connecting' })
+    await this.engines.get(id)?.start()
+  }
+
+  async stop(id: string) {
+    this.stopped.push(id)
+    this.emitStopped(id, 'exited')
+  }
+
+  async close(id: string) {
+    this.closed.push(id)
+    this.infos.delete(id)
+  }
+
+  activate(id: string | null) {
+    this.activated.push(id)
+    this.active = id
+  }
+
+  /** The chat in view, as the host knows it. */
+  activeId(): string | null {
+    return this.active
+  }
+
+  reportActivity(id: string, activity: { busy: boolean; waiting: boolean }) {
+    this.activities.set(id, activity)
+  }
+
+  onStopped(listener: (id: string, reason: string) => void) {
+    this.stoppedListeners.add(listener)
+    return () => this.stoppedListeners.delete(listener)
+  }
+
+  /** The host ended a chat's engine (idle, evicted, ...). */
+  emitStopped(id: string, reason: string) {
+    for (const listener of this.engines.get(id)?.closeListeners ?? []) listener({ code: 0, error: null })
+    for (const listener of [...this.stoppedListeners]) listener(id, reason)
+  }
+
+  async list() {
+    return [...this.infos.values()]
+  }
+
+  async worktreeStatus(id: string): Promise<WorktreeStatus> {
+    const info = this.infos.get(id)
+    return { branch: info?.worktree?.branch ?? '', path: info?.worktree?.path ?? '', ...this.worktreeState }
+  }
+
+  async discardWorktree(id: string, options: { force: boolean; deleteUnmerged: boolean }) {
+    // The host checks in this order and removes nothing until both are answered.
+    if (this.worktreeState.unmerged > 0 && !options.deleteUnmerged) throw new ChatError('This copy has saved changes that the main folder lacks.', 'unmerged', this.worktreeState.unmerged)
+    if (this.worktreeState.dirty > 0 && !options.force) throw new ChatError('This copy has unsaved changes.', 'dirty', this.worktreeState.dirty)
+    this.discards.push({ id, ...options })
+    this.infos.delete(id)
+  }
 }

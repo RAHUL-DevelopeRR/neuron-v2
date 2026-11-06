@@ -2,6 +2,9 @@ import { hostPlatform } from './host'
 import type { Platform } from './types'
 
 export type {
+  ChatErrorCode,
+  ChatHost,
+  ChatInfo,
   DirEntry,
   DirListing,
   EngineInfo,
@@ -14,7 +17,10 @@ export type {
   Project,
   TerminalSession,
   UpdateInfo,
+  WorktreeInfo,
+  WorktreeStatus,
 } from './types'
+export { ChatError } from './types'
 export { browserStore } from './store'
 
 /** Inside Tauri, its bridge; in a browser, the host named by the page's settings. */
