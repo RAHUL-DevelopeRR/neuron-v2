@@ -3257,7 +3257,10 @@ mod tests {
         assert!(!loader.workspace_is_trusted());
         assert!(loader.workspace_changed_since_trust());
         let dropped = loader.load().expect("load");
-        assert!(dropped.hooks().pre_tool_use().is_empty());
+        assert_eq!(
+            dropped.hooks().pre_tool_use(),
+            [] as [std::string::String; 0]
+        );
         assert!(dropped
             .ignored_project_settings()
             .iter()
