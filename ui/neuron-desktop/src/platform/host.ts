@@ -1,6 +1,6 @@
 /** The desktop UI in a browser, attached to a Neuron host over WebSocket. */
 
-import { SessionController, WebSocketTransport, type SocketLike } from '@neuron/client'
+import { DESKTOP_CAPABILITIES, SessionController, WebSocketTransport, type SocketLike } from '@neuron/client'
 
 import { browserStore } from './store'
 import type { DirListing, FileContent, GitStatusView, Platform, Project, TerminalSession } from './types'
@@ -38,7 +38,7 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
     setLaunchOptions: () => {},
     connect() {
       connecting ??= (async () => {
-        controller = new SessionController(transport, { client: 'desktop' })
+        controller = new SessionController(transport, { client: 'desktop', capabilities: DESKTOP_CAPABILITIES })
         await controller.start()
         return controller
       })()

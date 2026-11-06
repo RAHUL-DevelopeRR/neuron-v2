@@ -10,6 +10,7 @@ type ToolItem = Extract<TranscriptItem, { kind: 'tool' }>
 type QuestionItem = Extract<TranscriptItem, { kind: 'question' }>
 
 const STATE_LABEL: Record<ToolState, string> = {
+  writing: 'writing',
   running: 'running',
   awaiting_permission: 'waiting for you',
   done: 'done',

@@ -13,6 +13,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { load, type Store } from '@tauri-apps/plugin-store'
 import { check } from '@tauri-apps/plugin-updater'
 import {
+  DESKTOP_CAPABILITIES,
   SessionController,
   parseUiEventLine,
   type ClientMessage,
@@ -163,7 +164,7 @@ export function tauriPlatform(): Platform {
     },
     connect() {
       connecting ??= (async () => {
-        controller = new SessionController(transport, { client: 'desktop' })
+        controller = new SessionController(transport, { client: 'desktop', capabilities: DESKTOP_CAPABILITIES })
         await controller.start()
         return controller
       })()

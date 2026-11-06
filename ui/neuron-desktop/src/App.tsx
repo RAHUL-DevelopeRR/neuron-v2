@@ -294,7 +294,7 @@ export function App({ platform }: { platform: Platform }) {
   const changes = useMemo(() => changedPaths(state), [state])
   // Re-read the tree, git and open files whenever a call finishes.
   const refreshKey = useMemo(
-    () => state.items.filter((item) => item.kind === 'tool' && item.state !== 'running' && item.state !== 'awaiting_permission').length,
+    () => state.items.filter((item) => item.kind === 'tool' && item.state !== 'writing' && item.state !== 'running' && item.state !== 'awaiting_permission').length,
     [state.items],
   )
   const tool = (state.items.find((item) => item.key === toolKey) as ToolItem | undefined) ?? null
