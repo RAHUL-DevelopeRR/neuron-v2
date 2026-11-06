@@ -48,7 +48,20 @@ async function startApp() {
   await host.start()
   render(<App platform={hostPlatform({ url: host.url, token: TOKEN, connect: (url) => new BunWebSocket(url) })} />)
   await element('textarea[aria-label="Message Neuron"]')
+  // A fresh home: the first-run steps, then the folder trust gate, as a new user sees them.
+  fireEvent.click(await button('.first-run button', 'Get started'))
+  fireEvent.click(await button('.first-run button', 'Use workspace'))
+  fireEvent.click(await button('.trust-dialog button', 'Allow Neuron in this folder'))
+  await until('the folder allowed', () => !document.querySelector('.trust-dialog'))
+  await until('the message box on', () => !document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message Neuron"]')!.disabled)
   return home
+}
+
+/** The first `selector` whose text starts with `label`, once there. */
+async function button(selector: string, label: string): Promise<HTMLElement> {
+  const find = () => [...document.querySelectorAll<HTMLElement>(selector)].find((el) => el.textContent?.trim().startsWith(label))
+  await until(label, () => find() !== undefined)
+  return find()!
 }
 
 function send(prompt: string) {
@@ -59,6 +72,7 @@ function send(prompt: string) {
 
 afterEach(async () => {
   cleanup()
+  localStorage.clear()
   await host?.stop()
   mock?.stop()
   home?.remove()
@@ -113,18 +127,18 @@ describe.skipIf(!haveEngineBinaries)('Neuron Desktop on the real engine', () => 
   )
 
   test(
-    'chat history: a new chat, the list, and back to the first chat',
+    'session history: a new session, the list, and back to the first one',
     async () => {
       await startApp()
       send('PARITY_SCENARIO:write_file_allowed')
       await until('the reply', () => text('[data-testid="assistant-message"]').includes('write_file succeeded'))
-      await until('the chat in the list', () => text('.chat-list').includes('PARITY_SCENARIO:write_file_allowed'))
-      fireEvent.click(await element('.new-chat'))
-      await until('an empty chat', () => document.querySelector('[data-testid="assistant-message"]') === null)
-      await until('the old chat in the list, not current', () =>
-        [...document.querySelectorAll('.chat-row:not(.current)')].some((row) => row.textContent?.includes('write_file_allowed')),
+      await until('the session in the list', () => text('.session-list').includes('PARITY_SCENARIO:write_file_allowed'))
+      fireEvent.click(await button('.nav-item .nav-label', 'New session'))
+      await until('an empty session', () => document.querySelector('[data-testid="assistant-message"]') === null)
+      await until('the old session in the list, not current', () =>
+        [...document.querySelectorAll('.session-row:not(.current)')].some((row) => row.textContent?.includes('write_file_allowed')),
       )
-      fireEvent.click([...document.querySelectorAll<HTMLElement>('.chat-row:not(.current)')].find((row) => row.textContent?.includes('write_file_allowed'))!)
+      fireEvent.click([...document.querySelectorAll<HTMLElement>('.session-row:not(.current)')].find((row) => row.textContent?.includes('write_file_allowed'))!)
       await until('the old conversation', () => text('[data-testid="assistant-message"]').includes('write_file succeeded'))
       expect(text('[data-testid="tool-card"] .tool-state')).toBe('done')
       expect(text('.chat-header-title')).toBe('PARITY_SCENARIO:write_file_allowed')

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The main window: core events only. The app's own commands do the rest.",
+  "description": "The main window: core events, the folder picker, the settings store and the update check. The app's own commands do the rest.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:allow-open", "store:default", "updater:allow-check"]
 }

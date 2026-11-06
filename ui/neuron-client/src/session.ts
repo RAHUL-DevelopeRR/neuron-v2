@@ -6,6 +6,7 @@
  */
 
 import type {
+  AccountDetails,
   AccountInfo,
   Attachment,
   DefinitionInfo,
@@ -20,8 +21,10 @@ import type {
   TodoItem,
   TokenCounts,
   TranscriptEntry,
+  TrustPreviewEvent,
   UiEvent,
 } from './protocol'
+import { gatewayProblem, type GatewayProblem } from './gateway'
 import { toolView, withResult, type ToolView } from './tools'
 
 export type ToolState = 'running' | 'awaiting_permission' | 'done' | 'error' | 'denied' | 'cut_off'
@@ -64,7 +67,13 @@ export type TranscriptItem =
       id?: number
       options?: string[]
     }
-  | { kind: 'error'; key: string; text: string }
+  | {
+      kind: 'error'
+      key: string
+      text: string
+      /** A gateway failure the user can act on (sign in, plan, quota, retry, connection). */
+      problem?: GatewayProblem
+    }
 
 export interface Extensions {
   mcpServers: McpServerInfo[]
@@ -99,6 +108,10 @@ export interface SessionState {
   restartRequired: boolean
   /** MCP servers, plugins, skills and agents, once asked for (feature `extensions`). */
   extensions: Extensions | null
+  /** The Zero-X account, from `account` events (feature `account`); `null` before one or when signed out. */
+  account: AccountDetails | null
+  /** What trusting the workspace would turn on, once asked for (feature `trust_preview`). */
+  trustPreview: TrustPreviewEvent | null
   models: ModelInfo[]
   /** The current turn (or slash command) has not finished. */
   busy: boolean
@@ -108,6 +121,13 @@ export interface SessionState {
   items: TranscriptItem[]
   permissions: PendingPermission[]
   usage: { turn: TokenCounts; cumulative: TokenCounts; estimated: boolean } | null
+  /** The latest gateway failure, until the next prompt or sign-in. */
+  problem: GatewayProblem | null
+  /**
+   * A prompt a gateway failure stopped before any reply: UIs put it back in the
+   * message box, so nothing typed is lost.
+   */
+  unsent: { text: string; attachments: Attachment[] } | null
   nextKey: number
 }
 
@@ -122,6 +142,8 @@ export const initialSession = (): SessionState => ({
   todos: [],
   restartRequired: false,
   extensions: null,
+  account: null,
+  trustPreview: null,
   models: [],
   busy: false,
   sessionStarting: false,
@@ -129,6 +151,8 @@ export const initialSession = (): SessionState => ({
   items: [],
   permissions: [],
   usage: null,
+  problem: null,
+  unsent: null,
   nextKey: 1,
 })
 
@@ -209,11 +233,14 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         const question = state.items[unanswered] as Extract<TranscriptItem, { kind: 'question' }>
         next = { ...state, items: replaceAt(state.items, unanswered, { ...question, answered: true }) }
       }
-      next = push(next, { kind: 'user', text: action.text, attachments: action.attachments ?? [] })
+      next = push({ ...next, problem: null, unsent: null }, { kind: 'user', text: action.text, attachments: action.attachments ?? [] })
       return unanswered >= 0 ? next : { ...next, busy: true }
     }
     case 'local/slash':
-      return { ...push(state, { kind: 'user', text: `/${action.command}${action.args ? ` ${action.args}` : ''}`, attachments: [] }), busy: true }
+      return {
+        ...push({ ...state, problem: null }, { kind: 'user', text: `/${action.command}${action.args ? ` ${action.args}` : ''}`, attachments: [] }),
+        busy: true,
+      }
     case 'local/permission_answered':
     case 'local/permission_resolved': {
       const pending = state.permissions.find((permission) => permission.id === action.id)
@@ -247,8 +274,10 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
         protocol: action.protocol,
         features: action.features ?? [],
         restartRequired: false,
-        // A restarted engine may load other servers and plugins.
+        // A restarted engine may load other servers and plugins, in another folder.
         extensions: null,
+        trustPreview: null,
+        problem: null,
       }
     case 'status': {
       // `/clear` and `/resume` switch sessions. Engines with transcripts say so first
@@ -262,7 +291,7 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
     case 'session_starting':
       return { ...state, sessionStarting: true, signInCode: null }
     case 'sign_in_code':
-      return { ...state, signInCode: action, busy: true }
+      return { ...state, signInCode: action, busy: true, problem: null }
     case 'models':
       return { ...state, models: action.models }
     case 'text_delta': {
@@ -368,18 +397,27 @@ export function reduceSession(state: SessionState, action: SessionAction): Sessi
       )
       return { ...state, items, busy: false, sessionStarting: false, signInCode: null, permissions: [] }
     }
-    case 'error':
+    case 'error': {
+      const problem = gatewayProblem(action)
+      const item = problem ? { kind: 'error' as const, text: action.message, problem } : { kind: 'error' as const, text: action.message }
+      const next = problem ? { ...state, problem, unsent: unsentPrompt(state) ?? state.unsent } : state
       if (state.connection !== 'ready') {
-        return push({ ...state, connectionError: action.message }, { kind: 'error', text: action.message })
+        return push({ ...next, connectionError: action.message }, item)
       }
-      return push({ ...state, items: closeStreams(state.items) }, { kind: 'error', text: action.message })
+      return push({ ...next, items: closeStreams(next.items) }, item)
+    }
     case 'sessions':
       return { ...state, sessions: action.sessions }
     case 'transcript':
       return restoreTranscript(state, action.session_id, action.entries, action.truncated)
+    case 'account':
+      return { ...state, account: action.signed_in ? action.account : null }
+    case 'trust_preview':
+      return { ...state, trustPreview: action }
     case 'workspace_trusted':
       return {
         ...state,
+        trustPreview: null,
         restartRequired: action.restart_required,
         status: state.status ? { ...state.status, workspace_trusted: true } : state.status,
       }
@@ -482,6 +520,21 @@ function sameJson(a: string, b: string): boolean {
 // ---------------------------------------------------------------- selectors
 
 /** The sign-in screen is needed: use this, not `signed_in` (API-key sessions need none). */
+/**
+ * The prompt of the turn now failing, if nothing answered it yet: the last
+ * user message, with no reply, tool call or question after it.
+ */
+function unsentPrompt(state: SessionState): { text: string; attachments: Attachment[] } | null {
+  const index = findLastIndex(state.items, (item) => item.kind === 'user')
+  if (index < 0) return null
+  const user = state.items[index] as Extract<TranscriptItem, { kind: 'user' }>
+  if (user.text.startsWith('/')) return null
+  const answered = state.items
+    .slice(index + 1)
+    .some((item) => item.kind === 'assistant' || item.kind === 'tool' || item.kind === 'question')
+  return answered ? null : { text: user.text, attachments: user.attachments }
+}
+
 export function needsSignIn(state: SessionState): boolean {
   return state.status?.sign_in_required === true
 }

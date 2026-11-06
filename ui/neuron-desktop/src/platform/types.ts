@@ -53,22 +53,52 @@ export interface Project {
   path: string
 }
 
+/** Small values the app keeps between launches: settings, and which sessions were looked at. */
+export interface KeyValueStore {
+  get<T>(key: string): Promise<T | undefined>
+  set(key: string, value: unknown): Promise<void>
+}
+
+/** What new engines start with: Settings › Sessions. */
+export interface LaunchOptions {
+  model?: string
+  permissionMode?: string
+}
+
+export interface UpdateInfo {
+  version: string
+  notes: string | null
+}
+
 export interface Platform {
   kind: 'tauri' | 'host'
   /** Where the engine runs, for the title bar. */
   label: string
   /** What this platform can do beyond chatting. */
-  can: { openProject: boolean; restart: boolean; terminal: boolean; git: boolean }
+  can: { openProject: boolean; restart: boolean; terminal: boolean; git: boolean; pickFolder: boolean; updates: boolean }
+  store: KeyValueStore
+  /** For the engines started from now on. */
+  setLaunchOptions(options: LaunchOptions): void
   /** Starts (or attaches to) the engine. */
   connect(): Promise<SessionController>
   /** The open project, once connected. */
   project(): Project | null
   /** Projects opened before, newest first. */
   recentProjects(): Promise<Project[]>
-  /** Opens another folder: a new engine there, a fresh chat. */
-  openProject(path: string): Promise<void>
-  /** A new engine on the same project, continuing `resume` (a session id). */
-  restart(resume: string | null): Promise<void>
+  /** Opens another folder: a new engine there, on a fresh chat or continuing `resume`. */
+  openProject(path: string, resume?: string | null): Promise<void>
+  /** The system's folder picker; `null` when cancelled. */
+  pickFolder(): Promise<string | null>
+  /** This app's version; `null` in a browser build. */
+  appVersion(): Promise<string | null>
+  /** A newer release, if the update manifest names one. */
+  checkForUpdate(): Promise<UpdateInfo | null>
+  /**
+   * A new engine on the same project, continuing `resume` (a session id).
+   * `trustOnce` trusts the folder for that engine only (the home folder, which
+   * is never recorded).
+   */
+  restart(resume: string | null, options?: { trustOnce?: boolean }): Promise<void>
   list(path: string): Promise<DirListing>
   read(path: string): Promise<FileContent>
   /** Workspace files whose path contains `query`, for `@` mentions. */

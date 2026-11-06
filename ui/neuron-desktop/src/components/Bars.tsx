@@ -1,17 +1,18 @@
-import { formatTokens, needsSignIn, type SessionState } from '@neuron/client'
+import { formatTokens, type SessionState } from '@neuron/client'
 
-import { accountLabel } from './SignIn'
-
-/** Above the chat: its title, the branch, trust, and who is signed in. */
+/** Above the chat: its title, the project and branch, and the engine. */
 export function ChatHeader({
   state,
   title,
+  project,
   where,
   sidePaneOpen,
   onToggleSidePane,
 }: {
   state: SessionState
   title: string
+  /** The open project's name. */
+  project: string | null
   where: string
   sidePaneOpen: boolean
   onToggleSidePane: () => void
@@ -20,9 +21,10 @@ export function ChatHeader({
   const git = status?.git
   return (
     <header className="chat-header">
-      <div className="chat-header-title" title={title}>
+      {project && <span className="chat-header-project">{project}</span>}
+      <h1 className="chat-header-title" title={title}>
         {title}
-      </div>
+      </h1>
       {git?.branch && (
         <span className="git" title={`${git.changed} changed`}>
           ⎇ {git.branch}
@@ -34,28 +36,21 @@ export function ChatHeader({
       <span className={`connection ${state.connection}`} title={state.connectionError ?? `Engine on ${where}`}>
         {state.connection === 'ready' ? `engine ${state.version ?? ''}` : state.connection}
       </span>
-      <span className="account">{accountLabel(status?.account, status?.signed_in, needsSignIn(state))}</span>
-      <button className="icon-button" aria-pressed={sidePaneOpen} title="Show or hide the side panel (Ctrl+B)" onClick={onToggleSidePane}>
+      <button
+        className="icon-button"
+        aria-pressed={sidePaneOpen}
+        aria-label="Side panel"
+        title="Show or hide the side panel (Ctrl+B)"
+        onClick={onToggleSidePane}
+      >
         ◨
       </button>
     </header>
   )
 }
 
-/** An untrusted folder runs without its own settings; trusting it needs a restart to load them. */
-export function TrustBanner({
-  state,
-  canTrust,
-  canRestart,
-  onTrust,
-  onRestart,
-}: {
-  state: SessionState
-  canTrust: boolean
-  canRestart: boolean
-  onTrust: () => void
-  onRestart: () => void
-}) {
+/** After the folder was allowed: its own settings, hooks and MCP servers load once the engine restarts. */
+export function RestartBanner({ state, canRestart, onRestart }: { state: SessionState; canRestart: boolean; onRestart: () => void }) {
   if (state.restartRequired) {
     return (
       <div className="banner" role="status">
@@ -65,16 +60,6 @@ export function TrustBanner({
             Restart engine
           </button>
         )}
-      </div>
-    )
-  }
-  if (state.status && !state.status.workspace_trusted && canTrust) {
-    return (
-      <div className="banner warn" role="status">
-        <span>
-          This folder isn't trusted, so its own settings, hooks and MCP servers are off. Trust it only if you trust its contents.
-        </span>
-        <button onClick={onTrust}>Trust folder</button>
       </div>
     )
   }

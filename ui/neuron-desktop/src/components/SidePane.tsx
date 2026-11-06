@@ -1,17 +1,16 @@
 import { lazy, Suspense, useEffect, useState } from 'react'
 
-import { additionDiff, parseUnifiedDiff, type Diff, type Extensions, type TodoItem, type TranscriptItem } from '@neuron/client'
+import { additionDiff, parseUnifiedDiff, type Diff, type TodoItem, type TranscriptItem } from '@neuron/client'
 
 import type { FileContent, GitStatusView, Platform } from '../platform'
 import { DiffView } from './DiffView'
-import { ExtensionsPanel } from './ExtensionsPanel'
 import { FileTree } from './FileTree'
 
 // xterm only loads when the terminal first opens.
 const TerminalPane = lazy(() => import('./TerminalPane').then((module) => ({ default: module.TerminalPane })))
 
 type ToolItem = Extract<TranscriptItem, { kind: 'tool' }>
-export type PaneTab = 'changes' | 'files' | 'tasks' | 'extensions' | 'terminal'
+export type PaneTab = 'changes' | 'files' | 'tasks' | 'terminal'
 
 const STATUS_LABEL: Record<string, string> = { M: 'modified', A: 'added', D: 'deleted', R: 'renamed', C: 'copied', U: 'conflict', '?': 'new' }
 
@@ -183,8 +182,6 @@ export function SidePane({
   tool,
   todos,
   subagents,
-  extensions,
-  onRefreshExtensions,
   terminalOpened,
 }: {
   platform: Platform
@@ -195,16 +192,12 @@ export function SidePane({
   tool: ToolItem | null
   todos: TodoItem[]
   subagents: ToolItem[]
-  /** `undefined` when the engine has no extensions inventory (feature `extensions`). */
-  extensions: Extensions | null | undefined
-  onRefreshExtensions: () => void
   terminalOpened: boolean
 }) {
   const tabs: Array<[PaneTab, string]> = [
     ['changes', 'Changes'],
     ['files', 'Files'],
     ['tasks', todos.length ? `Tasks ${todos.filter((todo) => todo.status === 'completed').length}/${todos.length}` : 'Tasks'],
-    ...(extensions !== undefined ? ([['extensions', 'Extensions']] as Array<[PaneTab, string]>) : []),
     ...(platform.can.terminal ? ([['terminal', 'Terminal']] as Array<[PaneTab, string]>) : []),
   ]
   return (
@@ -219,7 +212,6 @@ export function SidePane({
       {tab === 'changes' && <ChangesPanel platform={platform} refreshKey={refreshKey} tool={tool} />}
       {tab === 'files' && <FilesPanel platform={platform} refreshKey={refreshKey} changed={changed} />}
       {tab === 'tasks' && <TasksPanel todos={todos} subagents={subagents} />}
-      {tab === 'extensions' && extensions !== undefined && <ExtensionsPanel extensions={extensions} onRefresh={onRefreshExtensions} />}
       {/* The terminal stays mounted once opened, so its shell lives on across tabs. */}
       {terminalOpened && (
         <div className="terminal-tab" hidden={tab !== 'terminal'}>

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use engine::{EngineExit, EngineProcess, Env, Launch};
@@ -29,6 +29,56 @@ struct AppState {
     workspace: Mutex<Workspace>,
     engine: Mutex<Option<(u64, EngineProcess)>>,
     generation: AtomicU64,
+    /// What the window last asked engines to start with (its Settings).
+    options: Mutex<LaunchOptions>,
+    /// The session the running engine last reported, so a reloaded window continues it.
+    session: Mutex<Option<String>>,
+}
+
+/// The session id in a `status` line, if it is one.
+fn status_session(line: &str) -> Option<String> {
+    if !line.contains("\"status\"") {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("type")?.as_str()? != "status" {
+        return None;
+    }
+    value
+        .get("session_id")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// The window's defaults for new engines: Settings › Sessions.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LaunchOptions {
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
+}
+
+const PERMISSION_MODES: [&str; 3] = ["read-only", "workspace-write", "danger-full-access"];
+
+impl LaunchOptions {
+    /// Drops what an engine would refuse: an unknown mode, or a model name with
+    /// control characters or that could read as a flag.
+    fn checked(self) -> Self {
+        let model = self
+            .model
+            .map(|model| model.trim().to_string())
+            .filter(|model| {
+                !model.is_empty() && !model.starts_with('-') && !model.chars().any(char::is_control)
+            });
+        let permission_mode = self
+            .permission_mode
+            .filter(|mode| PERMISSION_MODES.contains(&mode.as_str()));
+        Self {
+            model,
+            permission_mode,
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -78,8 +128,14 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Starts an engine in the open project (continuing `resume`), replacing any that
-/// runs. Returns its generation.
-fn launch(app: &AppHandle, state: &AppState, resume: Option<String>) -> Result<Started, String> {
+/// runs. `trust_once` trusts the workspace for this engine only (the home folder,
+/// which is never recorded). Returns its generation.
+fn launch(
+    app: &AppHandle,
+    state: &AppState,
+    resume: Option<String>,
+    trust_once: bool,
+) -> Result<Started, String> {
     if let Some((_, old)) = lock(&state.engine).take() {
         old.stop();
     }
@@ -88,9 +144,15 @@ fn launch(app: &AppHandle, state: &AppState, resume: Option<String>) -> Result<S
         "Could not find the `neuron` binary. Install Neuron, or set NEURON_BIN to its path.",
     )?;
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    // Settings first; the environment is for development.
+    let options = lock(&state.options).clone();
     let launch = Launch {
-        model: std::env::var("NEURON_DESKTOP_MODEL").ok(),
-        permission_mode: std::env::var("NEURON_DESKTOP_PERMISSION_MODE").ok(),
+        model: options
+            .model
+            .or_else(|| std::env::var("NEURON_DESKTOP_MODEL").ok()),
+        permission_mode: options
+            .permission_mode
+            .or_else(|| std::env::var("NEURON_DESKTOP_PERMISSION_MODE").ok()),
         resume: resume.filter(|id| !id.is_empty()),
     };
     let lines = app.clone();
@@ -99,8 +161,22 @@ fn launch(app: &AppHandle, state: &AppState, resume: Option<String>) -> Result<S
         &binary,
         workspace.root(),
         &launch,
-        &Env::Inherit(Vec::new()),
+        &Env::Inherit(if trust_once {
+            vec![("NEURON_TRUST_WORKSPACE".to_string(), "1".to_string())]
+        } else {
+            Vec::new()
+        }),
         move |line| {
+            if let Some(session) = status_session(&line) {
+                if let Some(state) = lines.try_state::<AppState>() {
+                    if lock(&state.engine)
+                        .as_ref()
+                        .is_none_or(|(current, _)| *current == generation)
+                    {
+                        *lock(&state.session) = Some(session);
+                    }
+                }
+            }
             let _ = lines.emit("neuron://engine", EngineLine { generation, line });
         },
         move |exit: EngineExit| {
@@ -132,16 +208,27 @@ fn launch(app: &AppHandle, state: &AppState, resume: Option<String>) -> Result<S
     })
 }
 
-#[tauri::command]
-fn engine_start(app: AppHandle, state: State<'_, AppState>) -> Result<Started, String> {
-    // The window may ask twice (React runs the effect twice in development).
-    if let Some((generation, _)) = lock(&state.engine).as_ref() {
-        return Ok(Started {
-            generation: *generation,
-            project: Project::of(&lock(&state.workspace)),
-        });
+/// Keeps the window's launch options for this and later engines.
+fn remember_options(state: &AppState, options: Option<LaunchOptions>) {
+    if let Some(options) = options {
+        *lock(&state.options) = options.checked();
     }
-    launch(&app, &state, None)
+}
+
+#[tauri::command]
+fn engine_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    options: Option<LaunchOptions>,
+) -> Result<Started, String> {
+    remember_options(&state, options);
+    // A running engine means the window was reloaded: its `ready` is gone, so a fresh
+    // engine continues the session it was on.
+    let resume = lock(&state.engine)
+        .is_some()
+        .then(|| lock(&state.session).clone())
+        .flatten();
+    launch(&app, &state, resume, false)
 }
 
 #[tauri::command]
@@ -149,18 +236,25 @@ fn engine_restart(
     app: AppHandle,
     state: State<'_, AppState>,
     resume: Option<String>,
+    options: Option<LaunchOptions>,
+    trust_once: Option<bool>,
 ) -> Result<Started, String> {
-    launch(&app, &state, resume)
+    remember_options(&state, options);
+    launch(&app, &state, resume, trust_once.unwrap_or(false))
 }
 
-/// Opens another folder: a new engine there, on a fresh chat.
+/// Opens another folder: a new engine there, on a fresh chat or continuing
+/// `resume` (a chat of that folder).
 #[tauri::command]
 fn project_open(
     app: AppHandle,
     state: State<'_, AppState>,
     terminals: State<'_, Terminals>,
     path: String,
+    resume: Option<String>,
+    options: Option<LaunchOptions>,
 ) -> Result<Started, String> {
+    remember_options(&state, options);
     let workspace = Workspace::new(path.trim())?;
     if !workspace.root().is_dir() {
         return Err(format!("{} is not a folder.", workspace.display_root()));
@@ -168,7 +262,7 @@ fn project_open(
     // Terminals belong to the old folder.
     terminals.close_all();
     *lock(&state.workspace) = workspace;
-    launch(&app, &state, None)
+    launch(&app, &state, resume, false)
 }
 
 #[tauri::command]
@@ -304,15 +398,20 @@ fn open_external(url: String) -> Result<(), String> {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let handle = app.handle().clone();
             let workspace = Workspace::new(first_workspace(&handle))
                 .or_else(|_| Workspace::new("."))
-                .map_err(|error| Box::<dyn std::error::Error>::from(error))?;
+                .map_err(Box::<dyn std::error::Error>::from)?;
             app.manage(AppState {
                 workspace: Mutex::new(workspace),
                 engine: Mutex::new(None),
                 generation: AtomicU64::new(0),
+                options: Mutex::new(LaunchOptions::default()),
+                session: Mutex::new(None),
             });
             Ok(())
         })
@@ -347,4 +446,57 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running Neuron Desktop");
+}
+#[cfg(test)]
+mod tests {
+    use super::{status_session, LaunchOptions};
+
+    #[test]
+    fn status_lines_name_the_session() {
+        assert_eq!(
+            status_session(r#"{"type":"status","session_id":"session-7","model":"sonnet"}"#)
+                .as_deref(),
+            Some("session-7")
+        );
+        assert_eq!(status_session(r#"{"type":"status","session_id":""}"#), None);
+        assert_eq!(
+            status_session(r#"{"type":"text_delta","text":"\"status\""}"#),
+            None
+        );
+        assert_eq!(status_session("not json \"status\""), None);
+    }
+
+    #[test]
+    fn launch_options_keep_only_what_an_engine_takes() {
+        let options = LaunchOptions {
+            model: Some("  sonnet ".into()),
+            permission_mode: Some("workspace-write".into()),
+        }
+        .checked();
+        assert_eq!(options.model.as_deref(), Some("sonnet"));
+        assert_eq!(options.permission_mode.as_deref(), Some("workspace-write"));
+
+        let refused = LaunchOptions {
+            model: Some("--dangerously-skip-permissions".into()),
+            permission_mode: Some("bypass".into()),
+        }
+        .checked();
+        assert_eq!(refused, LaunchOptions::default());
+        let control = LaunchOptions {
+            model: Some("gpt\n--x".into()),
+            permission_mode: None,
+        }
+        .checked();
+        assert_eq!(control.model, None);
+    }
+
+    #[test]
+    fn launch_options_read_the_window_names() {
+        let options: LaunchOptions =
+            serde_json::from_str(r#"{"model":"opus","permissionMode":"read-only"}"#).unwrap();
+        assert_eq!(options.model.as_deref(), Some("opus"));
+        assert_eq!(options.permission_mode.as_deref(), Some("read-only"));
+        let empty: LaunchOptions = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, LaunchOptions::default());
+    }
 }

@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import type { ClientMessage } from '@neuron/client'
 
 import { App } from '../src/App'
-import { FakeEngine, fakePlatform } from './fake-platform'
+import { FakeEngine, fakePlatform, type FakePlatformOptions } from './fake-platform'
 
 afterEach(() => {
   cleanup()
@@ -15,9 +15,9 @@ afterEach(() => {
   }
 })
 
-async function start(statusOverrides: Record<string, unknown> = {}, features?: string[]) {
+async function start(statusOverrides: Record<string, unknown> = {}, features?: string[], options?: FakePlatformOptions) {
   const engine = new FakeEngine(statusOverrides, features)
-  const platform = fakePlatform(engine)
+  const platform = fakePlatform(engine, options)
   render(<App platform={platform} />)
   await screen.findByLabelText('Message Neuron')
   return { engine, platform }
@@ -242,29 +242,29 @@ describe('Neuron Desktop: approvals, questions, tasks, sub-agents', () => {
   })
 })
 
-describe('Neuron Desktop: chats, projects, trust, panes, settings', () => {
+describe('Neuron Desktop: sessions, projects, trust, panes, settings', () => {
   const sessions = [
     { id: 'session-1', title: 'Fix the login bug', model: 'sonnet', message_count: 6, updated_at_ms: Date.now() - 60_000, current: true, branch: null },
     { id: 'session-0', title: 'Write the release notes', model: 'sonnet', message_count: 4, updated_at_ms: Date.now() - 3 * 86_400_000, current: false, branch: null },
   ]
 
-  test('the chat list: open one, search, start a new chat', async () => {
+  test('the session list: open one, search, start a new session', async () => {
     const { engine } = await start()
     await emit(engine, { type: 'sessions', current: 'session-1', sessions })
-    const chats = screen.getByRole('navigation', { name: 'Chats' })
-    expect(within(chats).getByRole('button', { name: /Fix the login bug/ }).getAttribute('aria-current')).toBe('true')
+    const sidebar = screen.getByRole('navigation', { name: 'Neuron' })
+    expect(within(sidebar).getByRole('button', { name: /Fix the login bug/ }).getAttribute('aria-current')).toBe('true')
     expect(screen.getByText('Fix the login bug', { selector: '.chat-header-title' })).toBeTruthy()
-    fireEvent.click(within(chats).getByRole('button', { name: /Write the release notes/ }))
+    fireEvent.click(within(sidebar).getByRole('button', { name: /Write the release notes/ }))
     expect(sent(engine, 'resume')).toEqual({ kind: 'command', type: 'resume', session: 'session-0' })
 
-    fireEvent.change(within(chats).getByLabelText('Search chats'), { target: { value: 'login' } })
-    expect(within(chats).queryByRole('button', { name: /release notes/ })).toBeNull()
+    fireEvent.change(within(sidebar).getByLabelText('Search sessions'), { target: { value: 'login' } })
+    expect(within(sidebar).queryByRole('button', { name: /release notes/ })).toBeNull()
 
-    fireEvent.click(within(chats).getByRole('button', { name: /New chat/ }))
+    fireEvent.click(within(sidebar).getByRole('button', { name: /New session/ }))
     expect(sent(engine, 'slash')).toEqual({ kind: 'command', type: 'slash', command: 'clear', args: '--confirm' })
   })
 
-  test('a resumed chat comes back from its transcript', async () => {
+  test('a resumed session comes back from its transcript', async () => {
     const { engine } = await start()
     await emit(
       engine,
@@ -283,21 +283,14 @@ describe('Neuron Desktop: chats, projects, trust, panes, settings', () => {
     expect(screen.getByTestId('assistant-message').textContent).toContain('Done: see NOTES.md.')
   })
 
-  test('switching the project', async () => {
+  test('switching the project from the Projects page', async () => {
     const { platform } = await start()
-    fireEvent.click(screen.getByRole('button', { name: 'Project' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Open a project' })
-    fireEvent.click(await within(dialog).findByRole('button', { name: /website/ }))
-    await waitFor(() => expect(platform.openedProjects).toEqual(['/work/website']))
-  })
-
-  test('an untrusted folder: trust it, then restart to load its settings', async () => {
-    const { engine, platform } = await start({ workspace_trusted: false })
-    fireEvent.click(screen.getByRole('button', { name: 'Trust folder' }))
-    expect(sent(engine, 'trust_workspace')).toBeTruthy()
-    await emit(engine, { type: 'workspace_trusted', cwd: '/work/app', restart_required: true })
-    fireEvent.click(screen.getByRole('button', { name: 'Restart engine' }))
-    await waitFor(() => expect(platform.restarts).toEqual(['session-1']))
+    fireEvent.click(screen.getByRole('button', { name: 'Projects' }))
+    const list = await screen.findByRole('list', { name: 'Recent projects' })
+    fireEvent.click(await within(list).findByRole('button', { name: /website/ }))
+    await waitFor(() => expect(platform.projectOpens).toEqual([['/work/website', null]]))
+    // The new engine starts with the default mode.
+    expect(platform.launches.at(-1)).toEqual({ model: undefined, permissionMode: 'workspace-write' })
   })
 
   test('the Changes tab lists git changes and shows their diffs', async () => {
@@ -324,7 +317,7 @@ describe('Neuron Desktop: chats, projects, trust, panes, settings', () => {
 
   test('signed out: the sign-in panel, then the device code', async () => {
     const { engine, platform } = await start({ sign_in_required: true, signed_in: false, account: null, session_id: '' })
-    expect(screen.getByText('Signed out')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Sign in to Zero-X' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Sign in' }))
     expect(sent(engine, 'slash')).toEqual({ kind: 'command', type: 'slash', command: 'login', args: '' })
     await emit(engine, {
@@ -343,11 +336,11 @@ describe('Neuron Desktop: chats, projects, trust, panes, settings', () => {
   test('settings: the light theme and Ctrl+Enter to send', async () => {
     const { engine } = await start()
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
-    const dialog = screen.getByRole('dialog', { name: 'Settings' })
-    fireEvent.change(within(dialog).getByLabelText('Theme'), { target: { value: 'light' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Appearance' }))
+    fireEvent.change(screen.getByLabelText('Theme'), { target: { value: 'light' } })
     expect(document.documentElement.dataset.theme).toBe('light')
-    fireEvent.click(within(dialog).getByLabelText(/Enter sends/))
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }))
+    fireEvent.click(screen.getByLabelText(/Enter sends/))
+    fireEvent.click(screen.getByRole('button', { name: 'Close settings' }))
     const box = screen.getByLabelText('Message Neuron')
     fireEvent.change(box, { target: { value: 'two\nlines' } })
     fireEvent.keyDown(box, { key: 'Enter' })
@@ -356,9 +349,9 @@ describe('Neuron Desktop: chats, projects, trust, panes, settings', () => {
     expect(sent(engine, 'submit')).toMatchObject({ text: 'two\nlines' })
   })
 
-  test('the Extensions tab: MCP servers with their status, plugins, skills and agents', async () => {
+  test('the Extensions page: MCP servers with their status, plugins, skills and agents', async () => {
     const { engine } = await start()
-    fireEvent.click(screen.getByRole('tab', { name: 'Extensions' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Extensions' }))
     expect(sent(engine, 'list_extensions')).toEqual({ kind: 'command', type: 'list_extensions' })
     expect(screen.getByText('Asking the engine…')).toBeTruthy()
     await emit(engine, {
@@ -404,7 +397,7 @@ describe('Neuron Desktop: chats, projects, trust, panes, settings', () => {
 
   test('a server still starting is asked about again', async () => {
     const { engine } = await start()
-    fireEvent.click(screen.getByRole('tab', { name: 'Extensions' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Extensions' }))
     const count = () => engine.commands().filter((message) => message.kind === 'command' && message.type === 'list_extensions').length
     await emit(engine, {
       type: 'extensions',
@@ -417,10 +410,9 @@ describe('Neuron Desktop: chats, projects, trust, panes, settings', () => {
     await waitFor(() => expect(count()).toBe(before + 1), { timeout: 3_500 })
   })
 
-  test('an older engine without history: no chat list, chatting still works', async () => {
+  test('an older engine without history: no session list, chatting still works', async () => {
     const { engine } = await start({}, [])
-    expect(screen.queryByRole('tab', { name: 'Extensions' })).toBeNull()
-    expect(screen.getByText(/no chat history/)).toBeTruthy()
+    expect(screen.getByText(/keeps no session history/)).toBeTruthy()
     expect(sent(engine, 'capabilities')).toBeUndefined()
     type('hello')
     expect(sent(engine, 'submit')).toMatchObject({ text: 'hello' })

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type ReactNode } from 'react'
 
 import type { Attachment } from '@neuron/client'
 
@@ -34,16 +34,14 @@ function mentionAt(text: string, caret: number): { start: number; query: string 
   return match ? { start: caret - match[2].length - 1, query: match[2] } : null
 }
 
-export function Composer({
-  busy,
-  disabled,
-  questionWaiting,
-  enterSends,
-  searchFiles,
-  toolbar,
-  onSend,
-  onInterrupt,
-}: {
+/** What the window can do with the message box from outside it. */
+export interface ComposerHandle {
+  /** Sends what is in the box (a card's Retry). */
+  submit(): void
+  focus(): void
+}
+
+interface ComposerProps {
   busy: boolean
   disabled: boolean
   /** The agent asked something: the next message answers it. */
@@ -52,9 +50,18 @@ export function Composer({
   searchFiles: (query: string) => Promise<string[]>
   /** The mode and model menus. */
   toolbar?: ReactNode
+  /** A prompt to put back in an empty box (one a gateway failure stopped). */
+  restore?: { text: string; attachments: Attachment[] } | null
+  /** Why the box is off, for its placeholder; "not connected" by default. */
+  disabledReason?: string
   onSend: (text: string, attachments: Attachment[]) => void
   onInterrupt: () => void
-}) {
+}
+
+export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Composer(
+  { busy, disabled, questionWaiting, enterSends, searchFiles, toolbar, restore, disabledReason, onSend, onInterrupt },
+  ref,
+) {
   const [text, setText] = useState('')
   const [caret, setCaret] = useState(0)
   const [files, setFiles] = useState<string[]>([])
@@ -62,6 +69,13 @@ export function Composer({
   const [pick, setPick] = useState(0)
   const box = useRef<HTMLTextAreaElement>(null)
   const mention = mentionAt(text, caret)
+
+  // Nothing typed is lost: a prompt the gateway refused comes back, unless something new is being typed.
+  useEffect(() => {
+    if (!restore) return
+    setText((current) => (current.trim() ? current : restore.text))
+    setFiles((current) => (current.length ? current : restore.attachments.filter((item) => item.kind === 'file').map((item) => item.path)))
+  }, [restore])
 
   useEffect(() => {
     if (!mention) {
@@ -120,6 +134,8 @@ export function Composer({
     setPick(0)
   }
 
+  useImperativeHandle(ref, () => ({ submit: send, focus: () => box.current?.focus() }))
+
   return (
     <div className="composer">
       {suggestions.length > 0 && (
@@ -153,7 +169,7 @@ export function Composer({
           aria-label="Message Neuron"
           placeholder={
             disabled
-              ? 'Neuron is not connected'
+              ? (disabledReason ?? 'Neuron is not connected')
               : questionWaiting
                 ? 'Your answer…'
                 : 'Ask Neuron to build, fix or explain…  @ adds a file, / runs a command'
@@ -227,7 +243,7 @@ export function Composer({
       </div>
     </div>
   )
-}
+})
 
 /** The permission mode and plan mode, in one menu. */
 export function ModeMenu({
