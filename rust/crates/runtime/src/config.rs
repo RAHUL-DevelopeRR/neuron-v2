@@ -1036,6 +1036,7 @@ impl ConfigLoader {
     /// this loader's trust: read from the files, starting or running nothing. A file that
     /// cannot be read or parsed is listed and contributes nothing.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn workspace_trust_preview(&self) -> WorkspaceTrustPreview {
         let mut preview = WorkspaceTrustPreview::default();
         let mut servers: BTreeMap<String, PreviewMcpServer> = BTreeMap::new();
@@ -3326,7 +3327,7 @@ mod tests {
         .expect("settings");
         crate::workspace_trust::trust_workspace_root(&cwd).expect("trust the folder");
         assert!(loader.workspace_is_trusted());
-        assert!(loader.workspace_changed_settings().is_empty());
+        assert_eq!(loader.workspace_changed_settings(), Vec::<String>::new());
 
         // Key order and spacing are not a change; restrictions are not either.
         fs::write(
@@ -3353,7 +3354,7 @@ mod tests {
         // Accepting records the new values.
         crate::workspace_trust::trust_workspace_root(&cwd).expect("trust again");
         assert!(loader.workspace_is_trusted());
-        assert!(loader.workspace_changed_settings().is_empty());
+        assert_eq!(loader.workspace_changed_settings(), Vec::<String>::new());
 
         // `model`, a plugin switch, apiKeyHelper, a status line, a non-restrictive permission
         // mode, a new key: each asks again, and only the changed keys are named.
@@ -3396,7 +3397,7 @@ mod tests {
         )
         .expect("record an old-style fingerprint");
         assert!(!loader.workspace_is_trusted());
-        assert!(loader.workspace_changed_settings().is_empty());
+        assert_eq!(loader.workspace_changed_settings(), Vec::<String>::new());
 
         match original_neuron_home {
             Some(value) => std::env::set_var("NEURON_HOME", value),
@@ -3444,12 +3445,10 @@ mod tests {
             "{refused:?}"
         );
         assert!(!loader.workspace_is_trusted(), "nothing was trusted");
-        assert!(loader
-            .load()
-            .expect("load")
-            .hooks()
-            .pre_tool_use()
-            .is_empty());
+        assert_eq!(
+            loader.load().expect("load").hooks().pre_tool_use(),
+            Vec::<String>::new()
+        );
 
         // Shown again, unchanged: trusted, and what was recorded is what was shown.
         let shown = loader.workspace_config_fingerprint();

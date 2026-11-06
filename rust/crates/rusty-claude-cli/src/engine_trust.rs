@@ -22,14 +22,17 @@ fn remember_shown(cwd: &Path, fingerprint: Option<String>) {
     *SHOWN.lock().unwrap_or_else(PoisonError::into_inner) = Some((cwd.to_path_buf(), fingerprint));
 }
 
+/// The fingerprint a trust screen was drawn from (`None`: it listed nothing).
+struct ShownFingerprint(Option<String>);
+
 /// The fingerprint the trust screen for `cwd` was drawn from, if one was shown.
-fn shown_fingerprint(cwd: &Path) -> Option<Option<String>> {
+fn shown_fingerprint(cwd: &Path) -> Option<ShownFingerprint> {
     SHOWN
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .as_ref()
         .filter(|(shown_for, _)| shown_for == cwd)
-        .map(|(_, fingerprint)| fingerprint.clone())
+        .map(|(_, fingerprint)| ShownFingerprint(fingerprint.clone()))
 }
 
 /// `TrustWorkspace`: records trust for the working directory's git root (the folder itself
@@ -39,7 +42,9 @@ fn shown_fingerprint(cwd: &Path) -> Option<Option<String>> {
 /// servers load when a session starts, so the UI restarts the engine to use them.
 pub(crate) fn trust_workspace_events(cwd: &Path) -> Vec<UiEvent> {
     let result = match shown_fingerprint(cwd) {
-        Some(shown) => runtime::workspace_trust::trust_workspace_root_shown(cwd, shown.as_deref()),
+        Some(shown) => {
+            runtime::workspace_trust::trust_workspace_root_shown(cwd, shown.0.as_deref())
+        }
         None => {
             runtime::workspace_trust::trust_workspace_root(cwd).map_err(TrustWorkspaceError::Io)
         }

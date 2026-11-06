@@ -318,11 +318,9 @@ impl From<io::Error> for TrustWorkspaceError {
 /// is what the folder asks for now; use [`trust_workspace_root_shown`] when a screen listed
 /// it first.
 pub fn trust_workspace_root(cwd: &Path) -> io::Result<TrustRoot> {
-    trust_workspace_root_checked(cwd, None).map_err(|error| match error {
+    trust_workspace_root_checked(cwd, Shown::Unchecked).map_err(|error| match error {
         TrustWorkspaceError::Io(error) => error,
-        TrustWorkspaceError::ChangedSinceShown => {
-            io::Error::new(io::ErrorKind::Other, error.to_string())
-        }
+        TrustWorkspaceError::ChangedSinceShown => io::Error::other(error.to_string()),
     })
 }
 
@@ -334,18 +332,27 @@ pub fn trust_workspace_root_shown(
     cwd: &Path,
     shown: Option<&str>,
 ) -> Result<TrustRoot, TrustWorkspaceError> {
-    trust_workspace_root_checked(cwd, Some(shown))
+    trust_workspace_root_checked(cwd, Shown::Screen(shown))
+}
+
+/// What the files are compared with before they are trusted.
+#[derive(Clone, Copy)]
+enum Shown<'a> {
+    /// No screen listed them (a caller that has none): trust what they say now.
+    Unchecked,
+    /// The fingerprint a screen was drawn from (`None`: it listed nothing).
+    Screen(Option<&'a str>),
 }
 
 fn trust_workspace_root_checked(
     cwd: &Path,
-    shown: Option<Option<&str>>,
+    shown: Shown<'_>,
 ) -> Result<TrustRoot, TrustWorkspaceError> {
     let root = trust_root(cwd);
     // One read of the files decides both the comparison and what is recorded.
     let preview = crate::ConfigLoader::default_for(cwd).workspace_trust_preview();
     let fingerprint = preview.config_fingerprint();
-    if shown.is_some_and(|shown| shown != fingerprint.as_deref()) {
+    if matches!(shown, Shown::Screen(screen) if screen != fingerprint.as_deref()) {
         return Err(TrustWorkspaceError::ChangedSinceShown);
     }
     let fingerprint_result =

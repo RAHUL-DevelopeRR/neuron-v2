@@ -385,7 +385,7 @@ const INTERPRETER_SAFE_FLAGS: &[&str] = &[
     "--allow-read",
 ];
 
-/// Whether `name` is a PyPy interpreter (`pypy`, `pypy3`, `pypy3.10`).
+/// Whether `name` is a `PyPy` interpreter (`pypy`, `pypy3`, `pypy3.10`).
 fn is_pypy(name: &str) -> bool {
     name.strip_prefix("pypy")
         .is_some_and(|version| version.chars().all(|ch| ch.is_ascii_digit() || ch == '.'))
@@ -5155,6 +5155,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn shells_and_package_runners_are_narrowed_to_one_script_or_asked_every_time() {
         let none = Vec::<Vec<String>>::new;
         let words =
@@ -5223,13 +5224,19 @@ mod tests {
         );
         assert!(covered(
             "pwsh -File build.ps1 -Release",
-            &[approved.clone()]
+            std::slice::from_ref(&approved)
         ));
-        assert!(!covered("pwsh -File other.ps1", &[approved.clone()]));
-        assert!(!covered("pwsh -Command Get-Date", &[approved.clone()]));
+        assert!(!covered(
+            "pwsh -File other.ps1",
+            std::slice::from_ref(&approved)
+        ));
+        assert!(!covered(
+            "pwsh -Command Get-Date",
+            std::slice::from_ref(&approved)
+        ));
         assert!(!covered(
             "pwsh -File build.ps1; pwsh -File evil.ps1",
-            &[approved.clone()]
+            std::slice::from_ref(&approved)
         ));
         assert!(!covered("cmd /c del x", &[approved]));
         // A stale or hand-written bare prefix no longer covers an inline-code or `cmd` call.
@@ -5279,11 +5286,11 @@ mod tests {
             vec![words("npm exec prettier")]
         );
         let npx = words("npx prettier");
-        assert!(posix("npx prettier --write x").covered_by_prefixes(&[npx.clone()]));
-        assert!(!posix("npx evil-package").covered_by_prefixes(&[npx.clone()]));
+        assert!(posix("npx prettier --write x").covered_by_prefixes(std::slice::from_ref(&npx)));
+        assert!(!posix("npx evil-package").covered_by_prefixes(std::slice::from_ref(&npx)));
         assert!(!posix("npx -c 'rm x'").covered_by_prefixes(&[npx]));
         let uv = words("uv run build.py");
-        assert!(!posix("uv run python -c 'x'").covered_by_prefixes(&[uv.clone()]));
+        assert!(!posix("uv run python -c 'x'").covered_by_prefixes(std::slice::from_ref(&uv)));
         assert!(!posix("uv run other.py").covered_by_prefixes(&[uv]));
     }
 
