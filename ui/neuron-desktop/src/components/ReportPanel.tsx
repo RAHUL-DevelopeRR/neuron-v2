@@ -2,6 +2,7 @@ import { memo, useId, useState } from 'react'
 
 import type { TranscriptItem } from '@neuron/client'
 
+import { linkTitle } from '../links'
 import { CopyButton, Markdown } from './Markdown'
 
 type ReportItem = Extract<TranscriptItem, { kind: 'report' }>
@@ -37,7 +38,7 @@ export const ReportPanel = memo(function ReportPanel({ item, onLink }: { item: R
           {item.links.length > 0 && (
             <div className="report-links">
               {item.links.map((link) => (
-                <button key={link.url} className="link-button" onClick={() => onLink?.(link.url)}>
+                <button key={link.url} className="link-button" title={linkTitle(link.url)} onClick={() => onLink?.(link.url)}>
                   {link.label}
                 </button>
               ))}

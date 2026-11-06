@@ -12,3 +12,13 @@ export const LINKS = {
   releases: 'https://github.com/RAHUL-DevelopeRR/neuron-v2/releases',
   changelog: `${SITE}/changelog`,
 } as const
+
+/** Where a link really goes (host and path), for a `title`: link text can say anything. */
+export function linkTitle(url: string): string {
+  try {
+    const parsed = new URL(url)
+    return `${parsed.host}${parsed.pathname === '/' ? '' : parsed.pathname}` || url
+  } catch {
+    return url
+  }
+}

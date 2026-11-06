@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 
+import { Markdown } from '../src/components/Markdown'
+import { ReportPanel } from '../src/components/ReportPanel'
 import { App } from '../src/App'
 import { hostPlatform } from '../src/platform/host'
 import { safeExternalUrl } from '../src/platform/links'
@@ -53,3 +55,17 @@ describe('external links', () => {
     expect(platform.opened).toEqual(['https://zero-x.live/dashboard'])
   })
 })
+
+describe('link targets', () => {
+  test('a Markdown link shows its real host and path', () => {
+    render(<Markdown text="[Totally safe](https://evil.example/phish/page?x=1)" />)
+    expect(screen.getByRole('link', { name: 'Totally safe' }).getAttribute('title')).toBe('evil.example/phish/page')
+  })
+
+  test('a report link shows its real host and path', () => {
+    const item = { kind: 'report', id: 'r', command: 'usage', title: 'T', sections: [], links: [{ label: 'Dashboard', url: 'https://zero-x.live/dashboard' }] }
+    render(<ReportPanel item={item as unknown as Parameters<typeof ReportPanel>[0]['item']} />)
+    expect(screen.getByRole('button', { name: 'Dashboard' }).getAttribute('title')).toBe('zero-x.live/dashboard')
+  })
+})
+
