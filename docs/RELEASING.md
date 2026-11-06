@@ -115,6 +115,11 @@ bun run tauri signer generate -w ~/.tauri/neuron-updater.key
   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 - WP3 puts the public key in `tauri.conf.json` (`plugins.updater.pubkey`), with
   the endpoint `https://zero-x.live/releases/desktop/updater.json`.
+- Leave `TAURI_SIGNING_PRIVATE_KEY` unset until the public key is in `tauri.conf.json`. With a
+  private key and an empty `pubkey`, every build fails at "failed to decode pubkey". The workflow
+  only uses the key when `plugins.updater.pubkey` is set; otherwise it warns and builds without
+  updater artifacts. Until then the app has no in-place updates: its update check points to the
+  releases page.
 - Keep an offline copy of the private key. Without it, installed apps can never
   receive another in-place update.
 
@@ -158,14 +163,20 @@ bun run tauri signer generate -w ~/.tauri/neuron-updater.key
 gh workflow run desktop-release.yml --repo RAHUL-DevelopeRR/neuron-v2 --ref <branch> -f platforms=alpha -f dry_run=true
 ```
 
-A dry run builds the engine and the app for every platform, signs with
+`alpha` (the default) builds Windows x64 (NSIS), macOS (universal dmg) and Linux x64 (AppImage,
+deb, rpm). `all` adds Windows x64 MSI and Windows arm64 (NSIS). A dispatch from a branch is
+always artifacts-only.
+
+A dry run builds the engine and the app for the chosen platforms, signs with
 whatever secrets exist, and installs each build on a fresh runner:
 
 - Windows: a silent NSIS install, the Authenticode checks, `neuron.exe
   --version`, then a silent uninstall.
 - macOS: mount the dmg, copy `Neuron.app`, check that both binaries are
   universal, the `codesign`/`stapler`/`spctl` checks.
-- Linux: install the deb, extract the AppImage.
+- Linux (Ubuntu 24.04): install the deb, extract the AppImage and run its engine, and list the
+  rpm's files (`rpm -qpl`) to check that it holds the app and the engine. The rpm is not
+  installed: the runner is Debian-based, so only its contents are tested.
 
 On each runner, the bundled engine must answer `ready` to
 `neuron engine --stdio`, and the app must still be running after 15 seconds.
@@ -296,7 +307,7 @@ compares with `install.npm.version`, because npm can lag.
 
 The alpha's notice (D23) needs only `version` and `download_url`: "Neuron 0.2.1
 is available", linking to the downloads page. With `platforms: all`, the file
-kinds `msi`, `appimage`, `deb` and `updater` appear too.
+kinds `msi` appears too; Linux (`appimage`, `deb`, `rpm`) is in the default set.
 
 `releases/desktop/updater.json` (P1) is Tauri's static updater format
 (`version`, `notes`, `pub_date`, `platforms.<os-arch>.{signature,url}`). It is
@@ -435,8 +446,8 @@ pointing them at the previous good version.
 ## First runs and limits
 
 - **Untested paths.** The macOS universal build, notarization and Windows
-  signing have not run yet. Neither have the P1 platforms (Windows arm64
-  cross-compiled on x64, MSI, AppImage and deb) and the updater artifacts.
+  signing have not run yet. Neither have Windows arm64 (cross-compiled on x64),
+  MSI, the Linux packages (AppImage, deb and rpm) and the updater artifacts.
   Their first runs are the dry runs above.
 - **The Windows sidecar layout is confirmed.** A local NSIS build with
   `tauri.release.conf.json` produced an installer holding `neuron-desktop.exe`
@@ -444,9 +455,24 @@ pointing them at the previous good version.
 - **The engine name.** The desktop binary is named `neuron-desktop`
   (`mainBinaryName`), so it never collides with the engine's `neuron` on
   case-insensitive file systems.
-- **The deb (P1)** installs the engine as `/usr/bin/neuron`. A CLI installed by
+- **The deb and rpm** install the engine as `/usr/bin/neuron`. A CLI installed by
   `install.sh` in `~/.local/bin` may shadow it, or be shadowed by it, depending
   on `PATH`.
 - **Actions** are pinned to major versions, like the rest of the repository.
   The mobile workflow takes the latest `eas-cli`; pin it after the first good
   build.
+
+## Installing an unsigned build
+
+Until the signing phase, v1 installers are unsigned. Each OS warns on the first run:
+
+- **Windows.** SmartScreen shows "Windows protected your PC": choose More info, then Run anyway.
+  Defender may also quarantine the bundled engine, `neuron.exe`, as a false positive. The app then
+  cannot start its engine: restore the file from Windows Security, Protection history, or reinstall
+  after allowing it.
+- **macOS.** Gatekeeper says the app "cannot be opened because the developer cannot be verified".
+  Open System Settings, Privacy & Security, scroll down and choose Open Anyway. Or remove the
+  quarantine flag: `xattr -dr com.apple.quarantine /Applications/Neuron.app`. (macOS 15 removed
+  the right-click, Open shortcut.)
+- **Linux.** The AppImage must be executable: `chmod +x Neuron_*.AppImage`. The `.deb` and `.rpm`
+  install normally with the package manager.
