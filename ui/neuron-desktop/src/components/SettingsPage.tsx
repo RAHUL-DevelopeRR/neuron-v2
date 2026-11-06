@@ -280,7 +280,7 @@ export function SettingsPage({
                     {update.state === 'latest' && 'Neuron is up to date.'}
                     {update.state === 'manual' && 'Updates are manual in this build: a new version is on the releases page when there is one.'}
                     {update.state === 'manual' && <External label="Releases page" url={LINKS.releases} onOpen={onOpenLink} />}
-                  {update.state === 'available' && `Neuron ${update.update.version} is available.`}
+                    {update.state === 'available' && `Neuron ${update.update.version} is available.`}
                   </span>
                   {update.state === 'available' && <External label="Download" url={LINKS.download} onOpen={onOpenLink} />}
                 </div>
