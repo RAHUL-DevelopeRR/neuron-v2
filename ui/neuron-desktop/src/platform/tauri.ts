@@ -22,6 +22,7 @@ import {
   type TransportClose,
 } from '@neuron/client'
 
+import { createUpdateChecker } from './updates'
 import type { DirListing, FileContent, GitStatusView, KeyValueStore, LaunchOptions, Platform, Project, TerminalSession } from './types'
 
 interface EngineLine {
@@ -154,6 +155,8 @@ export function tauriPlatform(): Platform {
   // Once per window: React may run the effect that connects twice.
   let connecting: Promise<SessionController> | null = null
   let controller: SessionController | null = null
+  // The updater needs a public key; builds without one point to the releases page.
+  const updates = createUpdateChecker({ signed: import.meta.env.VITE_NEURON_UPDATER_SIGNED === 'true', check })
   return {
     kind: 'tauri',
     label: 'this device',
@@ -182,15 +185,8 @@ export function tauriPlatform(): Platform {
       return typeof picked === 'string' ? picked : null
     },
     appVersion: () => getVersion(),
-    async checkForUpdate() {
-      try {
-        const update = await check()
-        return update ? { version: update.version, notes: update.body ?? null } : null
-      } catch {
-        // No manifest yet, offline, or not signed: no notice.
-        return null
-      }
-    },
+    manualUpdates: updates.manual,
+    checkForUpdate: () => updates.check(),
     restart(resume, options) {
       // Until the new engine is ready, nothing can be sent.
       controller?.apply({ type: 'local/connecting' })

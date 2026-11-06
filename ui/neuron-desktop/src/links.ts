@@ -9,5 +9,6 @@ export const LINKS = {
   download: `${SITE}/download`,
   help: `${SITE}/docs`,
   providerKeys: `${SITE}/docs/providers`,
+  releases: 'https://github.com/RAHUL-DevelopeRR/neuron-v2/releases',
   changelog: `${SITE}/changelog`,
 } as const

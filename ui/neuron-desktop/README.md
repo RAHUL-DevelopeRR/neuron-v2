@@ -60,3 +60,18 @@ shell.
 
 `src-tauri` is a Cargo project of its own, so the engine's workspace in `rust/` never builds
 Tauri. Its dev profile has no debuginfo, which keeps `target/` near 1 GB instead of several.
+
+## Installing an unsigned build
+
+Until the signing phase, v1 installers are unsigned. Each OS warns on the first run:
+
+- **Windows.** SmartScreen shows "Windows protected your PC": choose More info, then Run anyway.
+  Defender may also quarantine the bundled engine, `neuron.exe`, as a false positive. The app then
+  cannot start its engine: restore the file from Windows Security, Protection history, or reinstall
+  after allowing it.
+- **macOS.** Gatekeeper says the app "cannot be opened because the developer cannot be verified".
+  Open System Settings, Privacy & Security, scroll down and choose Open Anyway. Or remove the
+  quarantine flag: `xattr -dr com.apple.quarantine /Applications/Neuron.app`. (macOS 15 removed
+  the right-click, Open shortcut.)
+- **Linux.** The AppImage must be executable: `chmod +x Neuron_*.AppImage`. The `.deb` and `.rpm`
+  install normally with the package manager.

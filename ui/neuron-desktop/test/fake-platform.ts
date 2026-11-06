@@ -99,6 +99,8 @@ export interface FakePlatform extends Platform {
   /** What the folder picker returns next. */
   picked: string | null
   update: UpdateInfo | null
+  /** How many times the updater was asked. */
+  checks: number
   saved: Map<string, unknown>
 }
 
@@ -106,6 +108,8 @@ export interface FakePlatformOptions {
   /** Settings already saved; the welcome steps count as done unless these say otherwise. */
   settings?: Partial<Settings>
   update?: UpdateInfo | null
+  /** A build without an updater key: updates come from the releases page. */
+  manualUpdates?: boolean
 }
 
 /** A platform over a {@link FakeEngine} and a small in-memory workspace with git. */
@@ -125,6 +129,8 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     launches: [],
     picked: '/work/picked',
     update: options.update ?? null,
+    checks: 0,
+    manualUpdates: options.manualUpdates ?? false,
     saved,
     store: {
       get: async <T,>(key: string) => saved.get(key) as T | undefined,
@@ -135,7 +141,10 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     },
     pickFolder: async () => platform.picked,
     appVersion: async () => '0.2.0',
-    checkForUpdate: async () => platform.update,
+    checkForUpdate: async () => {
+      platform.checks++
+      return platform.update
+    },
     git: {
       branch: 'main',
       changes: [

@@ -127,7 +127,7 @@ jobs:
       fail-fast: false
       matrix:
         # Windows and macOS are the alpha platforms; Linux is P1.
-        os: [windows-2022, macos-14, ubuntu-22.04]
+        os: [windows-2022, macos-15, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     defaults:

@@ -3,18 +3,20 @@ name: Desktop release
 # Builds Neuron Desktop with the engine inside it: `neuron` is built from
 # rust/ and bundled as a Tauri sidecar (src-tauri/tauri.release.conf.json,
 # externalBin), next to the app's executable, where the app looks for it.
-# - Alpha (default): an NSIS installer for Windows x64 and a universal dmg for
-#   macOS.
+# - Alpha (default): an NSIS installer for Windows x64, a universal dmg for
+#   macOS, and an AppImage, a deb and an rpm for Linux x64.
 # - `platforms: all` (or the DESKTOP_PLATFORMS variable, P1) adds an MSI for
-#   Windows x64, an NSIS installer for Windows arm64, and an AppImage and a deb
-#   for Linux x64.
+#   Windows x64 and an NSIS installer for Windows arm64.
 #
 # Signing uses the secrets that are set and skips, with a notice, the ones that
 # are not (docs/RELEASING.md lists them):
 # - Windows Authenticode: a PFX certificate, or Azure Artifact Signing.
 # - macOS: a Developer ID Application certificate, and notarization with an App
 #   Store Connect API key or an Apple ID app-specific password.
-# - Tauri updater signatures (P1), with the updater private key.
+# - Tauri updater signatures (P1), with the updater private key. They also need
+#   a public key in tauri.conf.json (plugins.updater.pubkey): with the key
+#   secret set and no pubkey every build fails ("failed to decode pubkey"), so
+#   the key is only used when a pubkey is configured.
 # Each build is installed on a fresh runner, which then starts the bundled
 # engine (`neuron engine --stdio` must answer `ready`) and the app.
 #
@@ -36,7 +38,7 @@ on:
   workflow_dispatch:
     inputs:
       platforms:
-        description: alpha (Windows x64 NSIS, macOS universal dmg) or all (adds Windows MSI and arm64, Linux AppImage and deb)
+        description: alpha (Windows x64 NSIS, macOS universal dmg, Linux x64 AppImage, deb and rpm) or all (adds Windows MSI and Windows arm64)
         type: choice
         options: [alpha, all]
         default: alpha
@@ -113,9 +115,13 @@ jobs:
               dict(name='windows-x64', runner='windows-2022', test_runner='windows-2022',
                    target='x86_64-pc-windows-msvc', rust_targets='x86_64-pc-windows-msvc', sidecar='x86_64-pc-windows-msvc',
                    bundles='nsis,msi' if platforms == 'all' else 'nsis', updater='windows-x86_64'),
-              dict(name='macos-universal', runner='macos-14', test_runner='macos-14',
+              dict(name='macos-universal', runner='macos-15', test_runner='macos-15',
                    target='universal-apple-darwin', rust_targets='aarch64-apple-darwin,x86_64-apple-darwin', sidecar='universal-apple-darwin',
                    bundles='app,dmg', updater='darwin-aarch64,darwin-x86_64'),
+              # Built on 22.04 for an older glibc floor, installed on 24.04.
+              dict(name='linux-x64', runner='ubuntu-22.04', test_runner='ubuntu-24.04',
+                   target='x86_64-unknown-linux-gnu', rust_targets='x86_64-unknown-linux-gnu', sidecar='x86_64-unknown-linux-gnu',
+                   bundles='appimage,deb,rpm', updater='linux-x86_64'),
           ]
           if platforms == 'all':
               matrix += [
@@ -123,10 +129,6 @@ jobs:
                   dict(name='windows-arm64', runner='windows-2022', test_runner='windows-11-arm',
                        target='aarch64-pc-windows-msvc', rust_targets='aarch64-pc-windows-msvc', sidecar='aarch64-pc-windows-msvc',
                        bundles='nsis', updater='windows-aarch64'),
-                  # Built on 22.04 for an older glibc floor, installed on 24.04.
-                  dict(name='linux-x64', runner='ubuntu-22.04', test_runner='ubuntu-24.04',
-                       target='x86_64-unknown-linux-gnu', rust_targets='x86_64-unknown-linux-gnu', sidecar='x86_64-unknown-linux-gnu',
-                       bundles='appimage,deb', updater='linux-x86_64'),
               ]
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
               output.write(f'version={version}\nengine_version={engine_version}\ntag=desktop-v{version}\n')
@@ -195,8 +197,13 @@ jobs:
             echo "::notice title=Notarization skipped::No App Store Connect API key or Apple ID credentials, so the signed app is not notarized. A tag build stays a draft."
           fi
 
+          # The key is only used with a real public key: with a key and an empty
+          # pubkey every build fails at "failed to decode pubkey".
+          pubkey="$(python3 -c "import json; print(json.load(open('ui/neuron-desktop/src-tauri/tauri.conf.json')).get('plugins', {}).get('updater', {}).get('pubkey', '').strip())")"
           updater=false
-          if set_ TAURI_SIGNING_PRIVATE_KEY; then
+          if set_ TAURI_SIGNING_PRIVATE_KEY && [ -z "$pubkey" ]; then
+            echo "::warning title=Updater signatures skipped::TAURI_SIGNING_PRIVATE_KEY is set but plugins.updater.pubkey in tauri.conf.json is empty, so the key is not used."
+          elif set_ TAURI_SIGNING_PRIVATE_KEY; then
             updater=true
           else
             echo "::notice title=Updater signatures skipped::No TAURI_SIGNING_PRIVATE_KEY, so no in-place update artifacts (P1). The update notice does not need them."
@@ -432,6 +439,7 @@ jobs:
             linux-*)
               file="$(one "$bundle/appimage/*.AppImage")" && take "$file" "$prefix.AppImage"
               file="$(one "$bundle/deb/*.deb")" && take "$file" "$prefix.deb"
+              file="$(one "$bundle/rpm/*.rpm")" && take "$file" "$prefix.rpm"
               ;;
           esac
           ls -l out/dist
@@ -617,9 +625,13 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ./artifact/dist/*.deb xvfb
+          sudo apt-get install -y --no-install-recommends ./artifact/dist/*.deb xvfb rpm
           dpkg -L neuron | grep -E '/usr/bin/' || true
           test -x /usr/bin/neuron-desktop && test -x /usr/bin/neuron
+          # The rpm cannot be installed on Ubuntu: list its files instead, and
+          # check that it carries the app and the engine.
+          rpm -qpl artifact/dist/*.rpm | tee "$RUNNER_TEMP/rpm-files.txt"
+          grep -qx '/usr/bin/neuron-desktop' "$RUNNER_TEMP/rpm-files.txt" && grep -qx '/usr/bin/neuron' "$RUNNER_TEMP/rpm-files.txt"
           # The AppImage carries the same sidecar.
           appimage="$(ls artifact/dist/*.AppImage)"
           chmod +x "$appimage"
@@ -726,7 +738,7 @@ jobs:
           sums = {p.name: (dist / f'{p.name}.sha256').read_text().split()[0] for p in files}
           (dist / 'SHA256SUMS').write_text(''.join(f'{digest}  {name}\n' for name, digest in sums.items()), encoding='utf-8')
 
-          kinds = {'-setup.exe': 'nsis', '.msi': 'msi', '.dmg': 'dmg', '.app.tar.gz': 'updater', '.AppImage': 'appimage', '.deb': 'deb'}
+          kinds = {'-setup.exe': 'nsis', '.msi': 'msi', '.dmg': 'dmg', '.app.tar.gz': 'updater', '.AppImage': 'appimage', '.deb': 'deb', '.rpm': 'rpm'}
           platforms = {}
           for name, meta in builds.items():
               entry = {'signed': meta['signed'], 'files': {}}

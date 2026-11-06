@@ -116,7 +116,7 @@ export function App({ platform }: { platform: Platform }) {
   // The version, and whether a newer release exists, once per launch.
   useEffect(() => {
     void platform.appVersion().then(setAppVersion, () => {})
-    if (platform.can.updates) void platform.checkForUpdate().then(setUpdate, () => {})
+    if (platform.can.updates && !platform.manualUpdates) void platform.checkForUpdate().then(setUpdate, () => {})
   }, [platform])
 
   const refreshRecent = useCallback(() => {
@@ -337,6 +337,7 @@ export function App({ platform }: { platform: Platform }) {
     else setSigningOut('confirm')
   }
   const checkUpdates = () => {
+    if (platform.manualUpdates) return setUpdateCheck({ state: 'manual' })
     setUpdateCheck({ state: 'checking' })
     void platform.checkForUpdate().then(
       (found) => {

@@ -451,6 +451,19 @@ describe('D8, D11, D23: settings, the folder picker, version and updates', () =>
     await expectAccessible()
   })
 
+  test('an unsigned build sends the user to the releases page, and shows no false update notice', async () => {
+    const { platform } = await start({}, { manualUpdates: true })
+    await waitFor(() => expect(platform.checks).toBe(0))
+    expect(within(sidebar()).queryByRole('status')).toBeNull()
+    fireEvent.click(within(sidebar()).getByRole('button', { name: 'Settings' }))
+    fireEvent.click(screen.getByRole('button', { name: 'About' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Check for updates' }))
+    await waitFor(() => expect(screen.getByText(/new version is on the releases page/i)).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: /Releases page/ }))
+    expect(platform.opened.at(-1)).toBe(LINKS.releases)
+    expect(platform.checks).toBe(0)
+  })
+
   test('the settings page and the sidebar pass axe', async () => {
     const { engine } = await start()
     await emit(engine, { type: 'sessions', current: 'session-1', sessions: threeProjects() } as UiEvent)

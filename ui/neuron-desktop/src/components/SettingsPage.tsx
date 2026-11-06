@@ -17,7 +17,7 @@ const SECTIONS: Array<[SettingsSection, string]> = [
   ['about', 'About'],
 ]
 
-export type UpdateCheck = { state: 'idle' } | { state: 'checking' } | { state: 'latest' } | { state: 'available'; update: UpdateInfo }
+export type UpdateCheck = { state: 'idle' } | { state: 'checking' } | { state: 'latest' } | { state: 'manual' } | { state: 'available'; update: UpdateInfo }
 
 function External({ label, url, onOpen }: { label: string; url: string; onOpen: (url: string) => void }) {
   return (
@@ -278,7 +278,9 @@ export function SettingsPage({
                   </button>
                   <span className="muted small" role="status">
                     {update.state === 'latest' && 'Neuron is up to date.'}
-                    {update.state === 'available' && `Neuron ${update.update.version} is available.`}
+                    {update.state === 'manual' && 'Updates are manual in this build: a new version is on the releases page when there is one.'}
+                    {update.state === 'manual' && <External label="Releases page" url={LINKS.releases} onOpen={onOpenLink} />}
+                  {update.state === 'available' && `Neuron ${update.update.version} is available.`}
                   </span>
                   {update.state === 'available' && <External label="Download" url={LINKS.download} onOpen={onOpenLink} />}
                 </div>
