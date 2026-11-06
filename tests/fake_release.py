@@ -154,6 +154,15 @@ def stage_release(
     write_executable(directory / asset, data)
     sidecar = checksum if checksum is not None else checksum_line(data, asset)
     (directory / f"{asset}.sha256").write_text(sidecar, encoding="ascii")
+    # The installers also check the release's SHA256SUMS; merge this asset's line into it.
+    sums = directory / "SHA256SUMS"
+    kept = [
+        line
+        for line in (sums.read_text(encoding="ascii").splitlines() if sums.exists() else [])
+        if not line.endswith(f"  {asset}")
+    ]
+    kept.append(checksum_line(data, asset).strip())
+    sums.write_text("\n".join(kept) + "\n", encoding="ascii")
     return directory / asset
 
 

@@ -29,7 +29,8 @@
 
 .NOTES
     Environment: NEURON_VERSION, NEURON_INSTALL_DIR, NEURON_DOWNLOAD_BASE (HTTPS, or loopback HTTP
-    for testing), NEURON_RELEASES_API, GITHUB_TOKEN, NEURON_NO_TUI (1 skips the full-screen UI).
+    for testing), NEURON_CHECKSUMS_BASE (where SHA256SUMS comes from; default the GitHub release),
+    NEURON_RELEASES_API, GITHUB_TOKEN, NEURON_NO_TUI (1 skips the full-screen UI).
 #>
 [CmdletBinding()]
 param(
@@ -211,7 +212,19 @@ function Install-NeuronBinary([string]$Source, [string]$Destination) {
 
 # The full-screen UI, verified and self-checked like neuron.exe. Any failure is a warning: neuron
 # runs its line REPL without it.
-function Install-NeuronUi([string]$Base, [string]$Version, [string]$Work, [string]$Target) {
+# Succeeds only when the release's SHA256SUMS lists exactly this hash for this asset. The file is
+# fetched from the GitHub release (NEURON_CHECKSUMS_BASE overrides it for tests), never from the
+# mirror the binary may have come from.
+function Test-NeuronSums([string]$SumsFile, [string]$Asset, [string]$Hash) {
+    foreach ($line in [System.IO.File]::ReadAllLines($SumsFile)) {
+        $parts = $line.Trim() -split '\s+', 2
+        if ($parts.Count -ne 2) { continue }
+        if ($parts[1].TrimStart('*') -eq $Asset) { return ($parts[0].ToLowerInvariant() -eq $Hash) }
+    }
+    return $false
+}
+
+function Install-NeuronUi([string]$Base, [string]$Version, [string]$Work, [string]$Target, [string]$SumsFile) {
     $url = "$Base/v$Version/$NeuronUiAsset"
     try {
         $checksumFile = Join-Path $Work "$NeuronUiAsset.sha256"
@@ -223,6 +236,7 @@ function Install-NeuronUi([string]$Base, [string]$Version, [string]$Work, [strin
         $download = Join-Path $Work $NeuronUiAsset
         Get-NeuronDownload $url $download $Version
         if ((Get-NeuronSha256 $download) -ne $expected) { throw "checksum mismatch for $NeuronUiAsset" }
+        if (-not (Test-NeuronSums $SumsFile $NeuronUiAsset $expected)) { throw "$NeuronUiAsset is not listed in the release SHA256SUMS with that checksum" }
         $preference = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
@@ -263,6 +277,11 @@ function Install-Neuron {
     $base = $base.TrimEnd('/')
     if (-not (Test-AllowedUrl $base)) { throw "NEURON_DOWNLOAD_BASE must be an HTTPS URL (or loopback HTTP): $base" }
 
+    $checksumsBase = $env:NEURON_CHECKSUMS_BASE
+    if (-not $checksumsBase) { $checksumsBase = "https://github.com/$NeuronRepository/releases/download" }
+    $checksumsBase = $checksumsBase.TrimEnd('/')
+    if (-not (Test-AllowedUrl $checksumsBase)) { throw "NEURON_CHECKSUMS_BASE must be an HTTPS URL (or loopback HTTP): $checksumsBase" }
+
     $resolved = (Resolve-NeuronVersion $Version).Trim()
     if ($resolved.StartsWith('v')) { $resolved = $resolved.Substring(1) }
     if ($resolved -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$') {
@@ -283,6 +302,8 @@ function Install-Neuron {
     $work = Join-Path ([System.IO.Path]::GetTempPath()) ("neuron-install-" + [System.Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $work | Out-Null
     try {
+        $sumsFile = Join-Path $work 'SHA256SUMS'
+        Get-NeuronDownload "$checksumsBase/v$resolved/SHA256SUMS" $sumsFile $resolved
         $checksumFile = Join-Path $work "$NeuronAsset.sha256"
         Get-NeuronDownload "$url.sha256" $checksumFile $resolved
         $checksumText = [System.IO.File]::ReadAllText($checksumFile).Trim()
@@ -296,7 +317,10 @@ function Install-Neuron {
         if ($actual -ne $expected) {
             throw "checksum mismatch for ${NeuronAsset}: expected $expected, got $actual. Nothing was installed."
         }
-        Write-Detail "verified SHA-256 $actual"
+        if (-not (Test-NeuronSums $sumsFile $NeuronAsset $actual)) {
+            throw "the release SHA256SUMS ($checksumsBase/v$resolved/SHA256SUMS) does not list $NeuronAsset with SHA-256 $actual. Nothing was installed."
+        }
+        Write-Detail "verified SHA-256 $actual (matches the per-file checksum and SHA256SUMS)"
 
         # Native stderr must not become a terminating error under 'Stop' in Windows PowerShell 5.1.
         $preference = $ErrorActionPreference
@@ -319,7 +343,7 @@ function Install-Neuron {
 
         if (@('', '0', 'false', 'no') -contains "$env:NEURON_NO_TUI".Trim().ToLowerInvariant()) {
             Write-Detail 'installing the full-screen UI (neuron-tui.exe) ...'
-            Install-NeuronUi $base $resolved $work $target
+            Install-NeuronUi $base $resolved $work $target $sumsFile
         } else {
             Write-Detail 'NEURON_NO_TUI is set; skipped the full-screen UI.'
         }

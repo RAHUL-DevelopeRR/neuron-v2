@@ -18,6 +18,8 @@
 #   NEURON_INSTALL_DIR     install directory (default: $HOME/.local/bin)
 #   NEURON_DOWNLOAD_BASE   release download base URL (default: GitHub Releases);
 #                          must be HTTPS unless it points at a loopback host
+#   NEURON_CHECKSUMS_BASE  where SHA256SUMS is fetched from (default: the GitHub release,
+#                          whatever NEURON_DOWNLOAD_BASE is); HTTPS unless loopback
 #   NEURON_RELEASES_API    URL of the "latest release" JSON (default: GitHub API)
 #   GITHUB_TOKEN           optional token for the GitHub API rate limit
 #   NEURON_NO_TUI          1 skips the full-screen UI
@@ -289,6 +291,10 @@ info "from ${URL}"
 fetch_or_die() {
     status=0
     fetch "$1" "$2" || status=$?
+    # A downloader that reports success but leaves nothing behind counts as a failure.
+    if [ "${status}" = 0 ] && [ ! -s "$2" ]; then
+        status=22
+    fi
     case "${status}" in
         0) return 0 ;;
         22 | 8)
@@ -302,6 +308,18 @@ fetch_or_die() {
     esac
 }
 
+CHECKSUMS_BASE="${NEURON_CHECKSUMS_BASE:-${DEFAULT_DOWNLOAD_BASE}}"
+CHECKSUMS_BASE="${CHECKSUMS_BASE%/}"
+is_allowed_url "${CHECKSUMS_BASE}" || die "NEURON_CHECKSUMS_BASE must be an HTTPS URL (or loopback HTTP): ${CHECKSUMS_BASE}"
+SUMS_FILE="${TMP_DIR}/SHA256SUMS"
+fetch_or_die "${CHECKSUMS_BASE}/v${VERSION}/SHA256SUMS" "${SUMS_FILE}"
+
+# verify_against_sums ASSET HASH: succeeds only when SHA256SUMS has exactly that hash for ASSET.
+verify_against_sums() {
+    listed="$(awk -v name="$1" '{ f = $2; sub(/^\*/, "", f); if (f == name) { print tolower($1); exit } }' "${SUMS_FILE}")"
+    [ -n "${listed}" ] && [ "${listed}" = "$2" ]
+}
+
 fetch_or_die "${URL}.sha256" "${TMP_DIR}/${ASSET}.sha256"
 EXPECTED="$(awk 'NR == 1 {print tolower($1)}' "${TMP_DIR}/${ASSET}.sha256")"
 if ! printf '%s\n' "${EXPECTED}" | grep -Eq '^[0-9a-f]{64}$'; then
@@ -313,7 +331,10 @@ ACTUAL="$(sha256_of "${TMP_DIR}/${ASSET}")"
 if [ "${ACTUAL}" != "${EXPECTED}" ]; then
     die "checksum mismatch for ${ASSET}: expected ${EXPECTED}, got ${ACTUAL}. Nothing was installed."
 fi
-info "verified SHA-256 ${ACTUAL}"
+# A second, independent check: the hash must also match the release's SHA256SUMS, fetched from
+# the GitHub release even when the binary came from a mirror. Fails closed.
+verify_against_sums "${ASSET}" "${ACTUAL}" || die "the release SHA256SUMS (${CHECKSUMS_BASE}/v${VERSION}/SHA256SUMS) does not list ${ASSET} with SHA-256 ${ACTUAL}. Nothing was installed."
+info "verified SHA-256 ${ACTUAL} (matches the per-file checksum and SHA256SUMS)"
 
 # Stage and self-check inside the install directory, not the temporary directory:
 # /tmp is often mounted noexec, and the final rename stays on one filesystem.
@@ -343,6 +364,10 @@ install_ui() {
     fetch "${UI_URL}" "${TMP_DIR}/${UI_ASSET}" || return 1
     if [ "$(sha256_of "${TMP_DIR}/${UI_ASSET}")" != "${UI_EXPECTED}" ]; then
         warn "checksum mismatch for ${UI_ASSET}; it was not installed."
+        return 1
+    fi
+    if ! verify_against_sums "${UI_ASSET}" "${UI_EXPECTED}"; then
+        warn "${UI_ASSET} is not listed in the release SHA256SUMS with that checksum; it was not installed."
         return 1
     fi
     STAGED="${INSTALL_DIR}/.neuron-tui.$$.tmp"
