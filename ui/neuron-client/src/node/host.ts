@@ -282,6 +282,10 @@ export class NeuronHost {
     if (message.type === 'shutdown') return refuse('Only the machine running Neuron can stop the engine.')
     // The host speaks for all its clients.
     if (message.type === 'capabilities') return
+    // These change the workspace, the history or the user's settings, and the phone app has no screen for them yet.
+    if (message.type === 'commit' || message.type === 'set_mcp_server_enabled' || (message.type === 'rewind' && message.dry_run !== true)) {
+      return refuse('Only the Neuron desktop app can change your files, history or settings.')
+    }
     if (message.type === 'trust_workspace' && !socket.data.local) {
       return refuse('Only the machine running Neuron can trust its workspace.')
     }

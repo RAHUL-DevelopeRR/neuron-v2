@@ -4,6 +4,8 @@ import path from 'path'
 import react from '@vitejs/plugin-react'
 import { defineConfig } from 'vite'
 
+import { isUpdaterSigned } from './scripts/updater-signed'
+
 // In a browser, the app attaches to a Neuron host (`bun run host --mock` in
 // ui/neuron-client). Its URL comes from NEURON_HOST_URL and its pairing token
 // from the file NEURON_HOST_TOKEN_FILE names, so the token is never typed or
@@ -13,7 +15,7 @@ const hostToken = tokenFile && fs.existsSync(tokenFile) ? fs.readFileSync(tokenF
 
 // The updater only works with a public key (tauri.conf.json); without one the app links to the releases page.
 const tauriConf = JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname, 'src-tauri/tauri.conf.json'), 'utf8'))
-const updaterSigned = Boolean(tauriConf.plugins?.updater?.pubkey)
+const updaterSigned = isUpdaterSigned(tauriConf)
 
 export default defineConfig({
   plugins: [react()],

@@ -489,3 +489,109 @@ describe('chatActivity', () => {
     expect(chatActivity(asked)).toBe('stopped')
   })
 })
+
+describe('reused tool-call ids', () => {
+  const result = (id: string, output: string, name = 'bash'): SessionAction => ({ type: 'tool_result', id, name, output, is_error: false })
+  const twoTurns = (extra: SessionAction[] = []) =>
+    run(
+      [
+        { type: 'local/submitted', text: 'one' },
+        writing('call_0', 'bash'),
+        callStarted('call_0', '{"command":"a"}', false, 'bash'),
+        delta('call_0', 'stdout', 'first live'),
+        result('call_0', 'first out'),
+        { type: 'turn_finished' },
+        { type: 'local/submitted', text: 'two' },
+        writing('call_0', 'bash'),
+        callStarted('call_0', '{"command":"b"}', false, 'bash'),
+        delta('call_0', 'stdout', 'second live'),
+        ...extra,
+        result('call_0', 'second out'),
+      ],
+      ready(),
+    )
+
+  test('two turns that both use call_0 keep both cards, each with its own output', () => {
+    const state = twoTurns()
+    const calls = tools(state)
+    expect(calls).toHaveLength(2)
+    expect(calls.map((c) => c.output)).toEqual(['first out', 'second out'])
+    expect(calls.map((c) => c.state)).toEqual(['done', 'done'])
+    expect(calls.map((c) => c.input)).toEqual(['{"command":"a"}', '{"command":"b"}'])
+  })
+
+  test('a duplicate tool_input_started or tool_call_started for an open call is ignored', () => {
+    const state = run([writing('call_0', 'bash'), writing('call_0', 'bash'), callStarted('call_0', '{}', false, 'bash'), callStarted('call_0', '{"x":1}', false, 'bash')], ready())
+    expect(tools(state)).toHaveLength(1)
+    expect(tools(state)[0].state).toBe('running')
+    expect(tools(state)[0].input).toBe('{}')
+  })
+
+  test('a call that finished does not take the next writing event', () => {
+    const state = run([callStarted('call_0', '{}', false, 'bash'), result('call_0', 'o'), writing('call_0', 'bash')], ready())
+    expect(tools(state).map((c) => c.state)).toEqual(['done', 'writing'])
+  })
+
+  test('progress and sub-agent events go to the open call with the id', () => {
+    const state = run(
+      [
+        callStarted('call_0', '{}', false, 'agent'),
+        result('call_0', 'o', 'agent'),
+        callStarted('call_0', '{}', false, 'agent'),
+        { type: 'subagent_started', id: 'call_0', description: 'd', subagent_type: null },
+        { type: 'tool_input_progress', id: 'call_0', bytes: 3, lines: 1, target: null, preview: null },
+      ] as SessionAction[],
+      ready(),
+    )
+    const [first, second] = tools(state)
+    expect(first.subagent).toBeUndefined()
+    expect(second.subagent?.running).toBe(true)
+    expect(second.progress?.bytes).toBe(3)
+  })
+})
+
+describe('live output after a result', () => {
+  test('tool_result frees the live output but keeps the full output', () => {
+    const state = run(
+      [callStarted('t1', '{}', false, 'bash'), delta('t1', 'stdout', 'abc'), { type: 'tool_result', id: 't1', name: 'bash', output: 'abc', is_error: false }],
+      ready(),
+    )
+    expect(tools(state)[0].live).toBeNull()
+    expect(tools(state)[0].output).toBe('abc')
+  })
+
+  test('trimming never splits a surrogate pair', () => {
+    const emoji = '\u{1F600}'
+    // One unit over the limit: the cut would land between the pair's halves.
+    const text = emoji.repeat(LIVE_OUTPUT_LIMIT / 2) + 'x'
+    const state = run([callStarted('t1', '{}', false, 'bash'), delta('t1', 'stdout', text)], ready())
+    const out = tools(state)[0].live!.chunks.map((c) => c.text).join('')
+    const code = out.charCodeAt(0)
+    expect(code >= 0xdc00 && code <= 0xdfff).toBe(false)
+    expect(out.length).toBeLessThanOrEqual(LIVE_OUTPUT_LIMIT)
+    expect(out.startsWith(emoji)).toBe(true)
+    expect(out.endsWith('x')).toBe(true)
+  })
+})
+
+describe('rewinding with pending permissions', () => {
+  test('a real rewind drops permissions whose call it removed', () => {
+    const request = { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: 'r', input: '{"command":"a"}', session_prefixes: [] }
+    const before = run(
+      [
+        { type: 'local/submitted', text: 'one' },
+        { type: 'turn_finished' },
+        { type: 'local/submitted', text: 'two' },
+        callStarted('t1', '{"command":"a"}', false, 'bash'),
+        { type: 'permission_requested', id: 9, request },
+        { type: 'permission_requested', id: 10, request: { ...request, tool: 'other' } },
+      ] as SessionAction[],
+      ready(),
+    )
+    expect(before.permissions.map((p) => p.id)).toEqual([9, 10])
+    const dry = reduceSession(before, rewound({ dry_run: true, removed_turns: 1 }))
+    expect(dry.permissions).toHaveLength(2)
+    const after = reduceSession(before, rewound({ removed_turns: 1 }))
+    expect(after.permissions.map((p) => p.id)).toEqual([10])
+  })
+})

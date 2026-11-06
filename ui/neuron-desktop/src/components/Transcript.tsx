@@ -327,6 +327,11 @@ export function Transcript({
                 {item.text}
               </div>
             )
+          default: {
+            // A new item kind must be rendered above: this stops compiling until it is.
+            const unhandled: never = item
+            return unhandled
+          }
         }
       })}
       {busy && (

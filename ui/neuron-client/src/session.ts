@@ -310,17 +310,28 @@ function appendLive(live: LiveOutput | null | undefined, stream: OutputStream, t
       excess -= head.text.length
       dropped += head.text.length
     } else {
-      chunks[0] = { stream: head.stream, text: head.text.slice(excess) }
-      dropped += excess
+      // Never start in the middle of a surrogate pair.
+      let cut = excess
+      const code = head.text.charCodeAt(cut)
+      if (code >= 0xdc00 && code <= 0xdfff) cut += 1
+      chunks[0] = { stream: head.stream, text: head.text.slice(cut) }
+      dropped += cut
       excess = 0
     }
   }
   return { chunks, dropped }
 }
 
-/** The tool call this id names, with its index. */
+const isOpenTool = (item: TranscriptItem): item is ToolItem =>
+  item.kind === 'tool' && (item.state === 'writing' || item.state === 'running' || item.state === 'awaiting_permission')
+
+/**
+ * The tool call this id names, with its index. Some providers reuse ids
+ * (`call_0` in every response), so the last open call wins, then the last call.
+ */
 function findTool(items: readonly TranscriptItem[], id: string): { index: number; item: ToolItem } | null {
-  const index = findLastIndex(items, (item) => item.kind === 'tool' && item.id === id)
+  let index = findLastIndex(items, (item) => isOpenTool(item) && item.id === id)
+  if (index < 0) index = findLastIndex(items, (item) => item.kind === 'tool' && item.id === id)
   return index < 0 ? null : { index, item: items[index] as ToolItem }
 }
 
@@ -456,7 +467,7 @@ export function reduceSession(state: SessionState, action: SessionAction, now?: 
       )
     }
     case 'tool_input_started': {
-      if (action.id && findTool(state.items, action.id)) return state
+      if (action.id && state.items.some((item) => isOpenTool(item) && item.id === action.id)) return state
       return push(
         { ...state, items: closeStreams(state.items) },
         {
@@ -500,10 +511,12 @@ export function reduceSession(state: SessionState, action: SessionAction, now?: 
     }
     case 'tool_call_started': {
       const view = toolView(action.name, action.input, state.status?.cwd)
-      const found = action.id ? findTool(state.items, action.id) : null
-      if (found) {
+      const lastIndex = action.id ? findLastIndex(state.items, (item) => item.kind === 'tool' && item.id === action.id) : -1
+      const found = lastIndex < 0 ? null : { index: lastIndex, item: state.items[lastIndex] as ToolItem }
+      // A finished call with this id is an earlier one: a reused id starts a new card.
+      if (found && (found.item.state === 'running' || found.item.state === 'awaiting_permission')) return state
+      if (found && found.item.state === 'writing') {
         // The call the model was writing: the input is complete now.
-        if (found.item.state !== 'writing') return state
         const item: ToolItem = {
           ...found.item,
           input: action.input,
@@ -536,7 +549,7 @@ export function reduceSession(state: SessionState, action: SessionAction, now?: 
       const open = (item: TranscriptItem) =>
         item.kind === 'tool' && (item.state === 'running' || item.state === 'awaiting_permission' || item.state === 'cut_off')
       let index = action.id
-        ? state.items.findIndex((item) => item.kind === 'tool' && item.id === action.id)
+        ? (findTool(state.items, action.id)?.index ?? -1)
         : state.items.findIndex((item) => open(item) && item.kind === 'tool' && item.name === action.name)
       if (index < 0) {
         // A result for a call this client never saw (it attached late).
@@ -553,6 +566,8 @@ export function reduceSession(state: SessionState, action: SessionAction, now?: 
         ...item,
         state: denied ? 'denied' : action.is_error ? (item.state === 'cut_off' ? 'cut_off' : 'error') : 'done',
         output: action.output,
+        // The full output is in `output`: free the live copy.
+        live: null,
         view: withResult(item.view, item.name, action.output, action.is_error),
         endedAt: now ?? null,
       }
@@ -618,10 +633,13 @@ export function reduceSession(state: SessionState, action: SessionAction, now?: 
       return { ...state, checkpoints: action.items }
     case 'rewound': {
       if (action.dry_run) return { ...state, rewound: action }
+      const items = dropRewoundTurns(state.items, action.removed_turns)
+      const keys = new Set(items.map((item) => item.key))
       return {
         ...state,
         rewound: action,
-        items: dropRewoundTurns(state.items, action.removed_turns),
+        items,
+        permissions: state.permissions.filter((permission) => permission.toolKey === null || keys.has(permission.toolKey)),
         unsent: action.prompt ? { text: action.prompt, attachments: [] } : state.unsent,
         // The list changed: the UI asks again.
         checkpoints: null,

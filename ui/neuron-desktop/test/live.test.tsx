@@ -97,6 +97,11 @@ describe('live shell output', () => {
     expect(container.querySelector('.tool-output')).toBeNull()
   })
 
+  test('is not a live region: screen readers hear the card state, not every chunk', () => {
+    render(<LiveOutput live={{ chunks: [{ stream: 'stdout', text: 'a' }], dropped: 0 }} />)
+    expect(screen.getByRole('region', { name: 'Live output' }).getAttribute('aria-live')).toBe('off')
+  })
+
   test('says how much was dropped from the front', () => {
     render(<LiveOutput live={{ chunks: [{ stream: 'stdout', text: 'tail' }], dropped: 1234 }} />)
     expect(screen.getByText('… 1234 earlier characters not shown')).toBeTruthy()
