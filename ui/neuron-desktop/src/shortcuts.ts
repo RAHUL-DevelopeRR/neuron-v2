@@ -4,7 +4,7 @@
  * Mac (the handler takes either).
  */
 
-export type ShortcutId = 'palette' | 'newChat' | 'newWorktreeChat' | 'nextWaiting' | 'previousChat' | 'nextChat' | 'shortcuts'
+export type ShortcutId = 'palette' | 'newChat' | 'newWorktreeChat' | 'nextWaiting' | 'previousChat' | 'nextChat' | 'shortcuts' | 'cycleMode'
 
 export interface Shortcut {
   id: ShortcutId
@@ -23,6 +23,7 @@ export const SHORTCUTS: readonly Shortcut[] = [
   { id: 'previousChat', key: 'arrowup', alt: true, title: 'Previous chat' },
   { id: 'nextChat', key: 'arrowdown', alt: true, title: 'Next chat' },
   { id: 'shortcuts', key: '/', title: 'Show these shortcuts' },
+  { id: 'cycleMode', key: 'm', shift: true, title: 'Cycle the permission mode' },
 ]
 
 /** Shortcuts that already existed outside this table, listed on the sheet too. */
