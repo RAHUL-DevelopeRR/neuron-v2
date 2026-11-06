@@ -1,0 +1,226 @@
+name: Apps CI
+
+# The desktop app (Tauri 2 + React), the mobile app (Expo), their shared client
+# (ui/neuron-client) and the brand lint (scripts/brand-lint.mjs). Each package
+# runs its own `test` script, which is `bun test` (happy-dom for the desktop).
+#
+# Runs on every pull request so that "Apps CI result" can be a required check:
+# the `changes` job skips the jobs a pull request does not touch, and a skipped
+# job counts as passed. A path filter on the trigger would leave a required
+# check waiting forever on pull requests outside those paths.
+#
+# Nothing here signs, publishes or reads a secret.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - ux-audit-fixes
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apps-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  changes:
+    name: Changed areas
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      apps: ${{ steps.filter.outputs.apps }}
+      brand: ${{ steps.filter.outputs.brand }}
+    steps:
+      - name: Match the pull request's files
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          # Pushes and manual runs check everything.
+          if [ -z "$PR" ]; then
+            echo "apps=true" >> "$GITHUB_OUTPUT"
+            echo "brand=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files?per_page=100" --jq '.[].filename' > files.txt
+          count="$(wc -l < files.txt)"
+          echo "$count changed files"
+          # The API lists at most 3000 files; past that, check everything.
+          if [ "$count" -ge 3000 ]; then
+            echo "apps=true" >> "$GITHUB_OUTPUT"
+            echo "brand=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          touches() { if grep -Eq "$1" files.txt; then echo true; else echo false; fi; }
+          apps="$(touches '^(ui/neuron-(client|desktop|mobile)/|\.github/workflows/apps-ci\.yml$)')"
+          # Brand lint reads ui/neuron-* and the engine's help, prompt and request identity.
+          brand="$(touches '^(ui/neuron-|rust/crates/|scripts/brand-lint|\.github/workflows/apps-ci\.yml$)')"
+          echo "apps=$apps" >> "$GITHUB_OUTPUT"
+          echo "brand=$brand" >> "$GITHUB_OUTPUT"
+          echo "apps: $apps, brand-lint: $brand"
+
+  client:
+    name: neuron-client (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.apps == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ui/neuron-client
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # Every ui/ package pins this version (packageManager).
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      # The engine integration tests skip themselves unless the engine is built.
+      - run: bun run test
+
+  desktop:
+    name: neuron-desktop UI (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.apps == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ui/neuron-desktop
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run test
+      - name: Build the web UI
+        run: bun run build
+
+  desktop-tauri:
+    name: neuron-desktop src-tauri (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.apps == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows and macOS are the alpha platforms; Linux is P1.
+        os: [windows-2022, macos-14, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the WebKitGTK build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ui/neuron-desktop/src-tauri -> target
+      - name: Build the web UI (tauri::generate_context! embeds it)
+        working-directory: ui/neuron-desktop
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+      - name: cargo test
+        working-directory: ui/neuron-desktop/src-tauri
+        # The engine bridge test skips itself unless the engine and the mock service are built.
+        run: cargo test --locked
+
+  mobile:
+    name: neuron-mobile
+    needs: changes
+    if: needs.changes.outputs.apps == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ui/neuron-mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun run test
+
+  brand-lint:
+    name: Brand lint
+    needs: changes
+    if: needs.changes.outputs.brand == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Install the TypeScript compiler the lint parses UI code with
+        working-directory: ui/neuron-client
+        run: bun install --frozen-lockfile
+      - name: Test the lint (planted leaks must fail)
+        run: node --test scripts/brand-lint.test.mjs
+      - name: Lint UI strings, help, command summaries and the system prompt
+        env:
+          # Unset: new leaks fail and the baseline (known leaks with an owner) warns.
+          # `report`: nothing fails. `strict`: the baseline fails too (once WP1's T6 fixes land).
+          MODE: ${{ vars.BRAND_LINT_MODE }}
+        run: |
+          case "$MODE" in
+            '') node scripts/brand-lint.mjs ;;
+            report) node scripts/brand-lint.mjs --report ;;
+            strict) node scripts/brand-lint.mjs --strict ;;
+            *) echo "::error::BRAND_LINT_MODE must be empty, report or strict, not '$MODE'"; exit 1 ;;
+          esac
+
+  result:
+    # Make this job the required check: it fails when any job above failed or
+    # was cancelled, and passes when they passed or were skipped.
+    name: Apps CI result
+    needs: [changes, client, desktop, desktop-tauri, mobile, brand-lint]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the jobs' results
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          if echo "$RESULTS" | jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' > /dev/null; then
+            echo "::error::a required Apps CI job failed or was cancelled"
+            exit 1
+          fi

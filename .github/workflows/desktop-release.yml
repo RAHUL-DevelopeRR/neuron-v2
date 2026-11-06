@@ -1,0 +1,931 @@
+name: Desktop release
+
+# Builds Neuron Desktop with the engine inside it: `neuron` is built from
+# rust/ and bundled as a Tauri sidecar (src-tauri/tauri.release.conf.json,
+# externalBin), next to the app's executable, where the app looks for it.
+# - Alpha (default): an NSIS installer for Windows x64 and a universal dmg for
+#   macOS.
+# - `platforms: all` (or the DESKTOP_PLATFORMS variable, P1) adds an MSI for
+#   Windows x64, an NSIS installer for Windows arm64, and an AppImage and a deb
+#   for Linux x64.
+#
+# Signing uses the secrets that are set and skips, with a notice, the ones that
+# are not (docs/RELEASING.md lists them):
+# - Windows Authenticode: a PFX certificate, or Azure Artifact Signing.
+# - macOS: a Developer ID Application certificate, and notarization with an App
+#   Store Connect API key or an Apple ID app-specific password.
+# - Tauri updater signatures (P1), with the updater private key.
+# Each build is installed on a fresh runner, which then starts the bundled
+# engine (`neuron engine --stdio` must answer `ready`) and the app.
+#
+# A tag push (desktop-vX.Y.Z, matching the version in tauri.conf.json) makes a
+# draft GitHub release. Desktop releases are never marked "Latest": install.sh
+# and install.ps1 take the CLI from the release with that mark. Only a fully
+# signed (and, on macOS, notarized) build is published, after approval in the
+# `desktop-release` environment, and gets its version manifest uploaded
+# (releases/desktop/latest.json, read by the app's update notice). An unsigned
+# build stays a draft. Manual runs and pull requests that
+# change the release files are dry runs: they build, sign when they can, test,
+# write the manifests and keep everything as workflow artifacts, and create no
+# release.
+
+on:
+  push:
+    tags:
+      - 'desktop-v*'
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: alpha (Windows x64 NSIS, macOS universal dmg) or all (adds Windows MSI and arm64, Linux AppImage and deb)
+        type: choice
+        options: [alpha, all]
+        default: alpha
+      dry_run:
+        description: Build and test only. Unchecked on a desktop-v* tag, the run makes the release like a tag push.
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - .github/workflows/desktop-release.yml
+      - ui/neuron-desktop/src-tauri/tauri.release.conf.json
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  metadata:
+    name: Release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      engine_version: ${{ steps.version.outputs.engine_version }}
+      tag: ${{ steps.version.outputs.tag }}
+      is_release: ${{ steps.version.outputs.is_release }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      matrix: ${{ steps.version.outputs.matrix }}
+      windows_signing: ${{ steps.signing.outputs.windows }}
+      macos_signing: ${{ steps.signing.outputs.macos }}
+      notarize: ${{ steps.signing.outputs.notarize }}
+      updater: ${{ steps.signing.outputs.updater }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the versions and choose the platforms
+        id: version
+        env:
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+          PLATFORMS: ${{ inputs.platforms || vars.DESKTOP_PLATFORMS || 'alpha' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, tomllib
+
+          app = pathlib.Path('ui/neuron-desktop')
+          versions = {
+              'src-tauri/tauri.conf.json': json.loads((app / 'src-tauri/tauri.conf.json').read_text())['version'],
+              'src-tauri/Cargo.toml': tomllib.loads((app / 'src-tauri/Cargo.toml').read_text())['package']['version'],
+              'package.json': json.loads((app / 'package.json').read_text())['version'],
+          }
+          if len(set(versions.values())) != 1:
+              raise SystemExit(f'::error::the desktop versions disagree: {versions}')
+          version = versions['src-tauri/tauri.conf.json']
+          engine_version = tomllib.loads(pathlib.Path('rust/Cargo.toml').read_text())['workspace']['package']['version']
+
+          is_tag = os.environ['GITHUB_REF'].startswith('refs/tags/desktop-v')
+          if is_tag and os.environ['GITHUB_REF_NAME'] != f'desktop-v{version}':
+              raise SystemExit(f"::error::tag {os.environ['GITHUB_REF_NAME']} does not match the desktop version {version}")
+          event = os.environ['GITHUB_EVENT_NAME']
+          is_release = is_tag and (event == 'push' or (event == 'workflow_dispatch' and os.environ['DRY_RUN_INPUT'] == 'false'))
+
+          platforms = os.environ['PLATFORMS']
+          if platforms not in ('alpha', 'all'):
+              raise SystemExit(f'::error::platforms must be alpha or all, not {platforms}')
+          # name: artifact names; runner builds, test_runner installs it fresh.
+          # sidecar: the triple Tauri expects on target/sidecar/neuron-<triple>.
+          # updater: the Tauri updater platform keys this build serves.
+          matrix = [
+              dict(name='windows-x64', runner='windows-2022', test_runner='windows-2022',
+                   target='x86_64-pc-windows-msvc', rust_targets='x86_64-pc-windows-msvc', sidecar='x86_64-pc-windows-msvc',
+                   bundles='nsis,msi' if platforms == 'all' else 'nsis', updater='windows-x86_64'),
+              dict(name='macos-universal', runner='macos-14', test_runner='macos-14',
+                   target='universal-apple-darwin', rust_targets='aarch64-apple-darwin,x86_64-apple-darwin', sidecar='universal-apple-darwin',
+                   bundles='app,dmg', updater='darwin-aarch64,darwin-x86_64'),
+          ]
+          if platforms == 'all':
+              matrix += [
+                  # Cross-compiled on x64 (MSVC ARM64 tools and clang for ring), installed on Windows 11 on Arm.
+                  dict(name='windows-arm64', runner='windows-2022', test_runner='windows-11-arm',
+                       target='aarch64-pc-windows-msvc', rust_targets='aarch64-pc-windows-msvc', sidecar='aarch64-pc-windows-msvc',
+                       bundles='nsis', updater='windows-aarch64'),
+                  # Built on 22.04 for an older glibc floor, installed on 24.04.
+                  dict(name='linux-x64', runner='ubuntu-22.04', test_runner='ubuntu-24.04',
+                       target='x86_64-unknown-linux-gnu', rust_targets='x86_64-unknown-linux-gnu', sidecar='x86_64-unknown-linux-gnu',
+                       bundles='appimage,deb', updater='linux-x86_64'),
+              ]
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'version={version}\nengine_version={engine_version}\ntag=desktop-v{version}\n')
+              output.write(f"is_release={str(is_release).lower()}\nprerelease={str('-' in version).lower()}\n")
+              output.write(f"matrix={json.dumps({'include': matrix})}\n")
+          print(f'desktop {version} with engine {engine_version}; release: {is_release}; platforms: {platforms}')
+          PY
+
+      - name: See which signing secrets are set
+        id: signing
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          # Only whether each secret is set leaves this step, never a value.
+          set_() { [ -n "${!1:-}" ]; }
+          all_set() { for name in "$@"; do set_ "$name" || return 1; done; }
+          some_set() { for name in "$@"; do set_ "$name" && return 0; done; return 1; }
+
+          windows=none
+          if all_set WINDOWS_CERTIFICATE WINDOWS_CERTIFICATE_PASSWORD; then
+            windows=pfx
+          elif all_set AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_TENANT_ID AZURE_SIGNING_ENDPOINT AZURE_SIGNING_ACCOUNT AZURE_SIGNING_PROFILE; then
+            windows=azure
+          else
+            if some_set WINDOWS_CERTIFICATE WINDOWS_CERTIFICATE_PASSWORD AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_TENANT_ID AZURE_SIGNING_ENDPOINT AZURE_SIGNING_ACCOUNT AZURE_SIGNING_PROFILE; then
+              echo "::warning title=Windows signing incomplete::Some Windows signing settings are set but not a complete set (docs/RELEASING.md, Windows)."
+            fi
+            echo "::notice title=Windows signing skipped::No Windows signing secrets, so the Windows installers are unsigned and SmartScreen warns about them. A tag build stays a draft."
+          fi
+
+          macos=false
+          if all_set APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD; then
+            macos=true
+          else
+            if some_set APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD; then
+              echo "::warning title=macOS signing incomplete::Set both APPLE_CERTIFICATE and APPLE_CERTIFICATE_PASSWORD."
+            fi
+            echo "::notice title=macOS signing skipped::No Developer ID certificate, so the app is ad-hoc signed and Gatekeeper blocks it on other Macs. A tag build stays a draft."
+          fi
+
+          notarize=none
+          if all_set APPLE_API_ISSUER APPLE_API_KEY_ID APPLE_API_PRIVATE_KEY; then
+            notarize=api-key
+          elif all_set APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; then
+            notarize=apple-id
+          fi
+          if [ "$macos" = false ]; then
+            notarize=none
+          elif [ "$notarize" = none ]; then
+            echo "::notice title=Notarization skipped::No App Store Connect API key or Apple ID credentials, so the signed app is not notarized. A tag build stays a draft."
+          fi
+
+          updater=false
+          if set_ TAURI_SIGNING_PRIVATE_KEY; then
+            updater=true
+          else
+            echo "::notice title=Updater signatures skipped::No TAURI_SIGNING_PRIVATE_KEY, so no in-place update artifacts (P1). The update notice does not need them."
+          fi
+
+          {
+            echo "windows=$windows"
+            echo "macos=$macos"
+            echo "notarize=$notarize"
+            echo "updater=$updater"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: build-${{ matrix.name }}
+    needs: metadata
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.metadata.outputs.matrix) }}
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      NAME: ${{ matrix.name }}
+      TAURI_TARGET: ${{ matrix.target }}
+      WINDOWS_SIGNING: ${{ needs.metadata.outputs.windows_signing }}
+      MACOS_SIGNING: ${{ needs.metadata.outputs.macos_signing }}
+      NOTARIZE: ${{ needs.metadata.outputs.notarize }}
+      UPDATER: ${{ needs.metadata.outputs.updater }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the WebKitGTK build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf file
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust -> target
+            ui/neuron-desktop/src-tauri -> target
+          key: desktop-${{ matrix.name }}
+
+      - name: Build the engine sidecar
+        shell: bash
+        env:
+          RUST_TARGETS: ${{ matrix.rust_targets }}
+          SIDECAR: ${{ matrix.sidecar }}
+        run: |
+          set -euo pipefail
+          ext=''
+          if [ "$RUNNER_OS" = Windows ]; then ext=.exe; fi
+          dir=ui/neuron-desktop/src-tauri/target/sidecar
+          mkdir -p "$dir"
+          built=()
+          IFS=, read -ra targets <<< "$RUST_TARGETS"
+          for target in "${targets[@]}"; do
+            cargo build --manifest-path rust/Cargo.toml --release --locked -p rusty-claude-cli --target "$target"
+            built+=("rust/target/$target/release/neuron$ext")
+            # A universal build compiles each architecture, and tauri-build wants each one's sidecar.
+            cp "rust/target/$target/release/neuron$ext" "$dir/neuron-$target$ext"
+          done
+          sidecar="$dir/neuron-$SIDECAR$ext"
+          if [ "${#built[@]}" -gt 1 ]; then
+            lipo -create -output "$sidecar" "${built[@]}"
+            lipo -archs "$sidecar"
+          else
+            cp "${built[0]}" "$sidecar"
+          fi
+          # A cross-compiled sidecar cannot run here; the install test runs it.
+          if [ "$NAME" != windows-arm64 ]; then "$sidecar" --version; fi
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install the app's dependencies
+        working-directory: ui/neuron-desktop
+        run: bun install --frozen-lockfile
+
+      - name: Import the Windows signing certificate
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING == 'pfx'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL || 'http://timestamp.digicert.com' }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password |
+            Where-Object HasPrivateKey | Select-Object -First 1
+          Remove-Item $pfx
+          if (-not $cert) { throw 'WINDOWS_CERTIFICATE has no certificate with a private key' }
+          Write-Host "Signing with $($cert.Subject), valid until $($cert.NotAfter)"
+          "WINDOWS_CERT_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          @{ bundle = @{ windows = @{
+            certificateThumbprint = $cert.Thumbprint
+            digestAlgorithm = 'sha256'
+            timestampUrl = $env:TIMESTAMP_URL
+          } } } | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $env:RUNNER_TEMP 'signing.conf.json') -Encoding utf8
+
+      - name: Set up Azure Artifact Signing
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING == 'azure'
+        shell: pwsh
+        env:
+          ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          PROFILE: ${{ vars.AZURE_SIGNING_PROFILE }}
+        run: |
+          # Signs through signtool and the Azure CLI, both on the runner image.
+          cargo install artifact-signing-cli --version 0.12.0 --locked
+          @{ bundle = @{ windows = @{
+            signCommand = "artifact-signing-cli -e $env:ENDPOINT -a $env:ACCOUNT -c $env:PROFILE -d Neuron %1"
+          } } } | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $env:RUNNER_TEMP 'signing.conf.json') -Encoding utf8
+
+      - name: Import the Developer ID certificate
+        if: runner.os == 'macOS' && env.MACOS_SIGNING == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(openssl rand -hex 24)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          if [ -z "$IDENTITY" ]; then
+            IDENTITY="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -n 1)"
+          fi
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::APPLE_CERTIFICATE holds no Developer ID Application identity"
+            exit 1
+          fi
+          echo "Signing as $IDENTITY"
+          echo "APPLE_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Write the App Store Connect key
+        if: runner.os == 'macOS' && env.NOTARIZE == 'api-key'
+        env:
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          key="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s\n' "$APPLE_API_PRIVATE_KEY" > "$key"
+          chmod 600 "$key"
+          echo "APPLE_API_KEY_PATH=$key" >> "$GITHUB_ENV"
+
+      - name: Sign ad hoc without a certificate
+        if: runner.os == 'macOS' && env.MACOS_SIGNING != 'true'
+        run: echo '{"bundle":{"macOS":{"signingIdentity":"-"}}}' > "$RUNNER_TEMP/signing.conf.json"
+
+      - name: Turn on updater artifacts
+        if: env.UPDATER == 'true'
+        shell: bash
+        run: echo '{"bundle":{"createUpdaterArtifacts":true}}' > "$RUNNER_TEMP/updater.conf.json"
+
+      - name: Build the app and its installers
+        working-directory: ui/neuron-desktop
+        shell: bash
+        env:
+          BUNDLES: ${{ matrix.bundles }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # linuxdeploy runs without FUSE.
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: |
+          set -euo pipefail
+          # Tauri acts on these when they are set at all, even empty, so unset the missing ones.
+          for name in TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_TENANT_ID \
+            APPLE_API_ISSUER APPLE_API_KEY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name:-}" ]; then unset "$name"; fi
+          done
+          case "$NOTARIZE" in
+            api-key) unset APPLE_ID APPLE_PASSWORD ;;
+            apple-id) unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH ;;
+            *) unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH APPLE_ID APPLE_PASSWORD ;;
+          esac
+          if [ "$UPDATER" != true ]; then unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; fi
+          configs=(--config src-tauri/tauri.release.conf.json)
+          for extra in "$RUNNER_TEMP/signing.conf.json" "$RUNNER_TEMP/updater.conf.json"; do
+            if [ -f "$extra" ]; then configs+=(--config "$extra"); fi
+          done
+          bun run tauri build "${configs[@]}" --target "$TAURI_TARGET" --bundles "$BUNDLES" --ci
+
+      - name: Collect the installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="ui/neuron-desktop/src-tauri/target/$TAURI_TARGET/release/bundle"
+          find "$bundle" -maxdepth 2 -type f | sort
+          mkdir -p out/dist out/meta
+          take() { # source, published name: copies the file and its updater signature
+            cp "$1" "out/dist/$2"
+            if [ -f "$1.sig" ]; then cp "$1.sig" "out/dist/$2.sig"; fi
+          }
+          one() { # the single file matching a glob
+            local matches=($1)
+            if [ "${#matches[@]}" -ne 1 ] || [ ! -e "${matches[0]}" ]; then echo "::error::expected one $1, found: ${matches[*]}" >&2; return 1; fi
+            echo "${matches[0]}"
+          }
+          prefix="Neuron_${VERSION}_${NAME}"
+          case "$NAME" in
+            windows-*)
+              file="$(one "$bundle/nsis/*-setup.exe")" && take "$file" "$prefix-setup.exe"
+              if [ -d "$bundle/msi" ]; then file="$(one "$bundle/msi/*.msi")" && take "$file" "$prefix.msi"; fi
+              ;;
+            macos-*)
+              file="$(one "$bundle/dmg/*.dmg")" && take "$file" "$prefix.dmg"
+              if [ -f "$bundle/macos/Neuron.app.tar.gz" ]; then take "$bundle/macos/Neuron.app.tar.gz" "$prefix.app.tar.gz"; fi
+              ;;
+            linux-*)
+              file="$(one "$bundle/appimage/*.AppImage")" && take "$file" "$prefix.AppImage"
+              file="$(one "$bundle/deb/*.deb")" && take "$file" "$prefix.deb"
+              ;;
+          esac
+          ls -l out/dist
+
+      - name: Check the Windows signatures
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem out/dist -Include *.exe, *.msi -Recurse
+          $signed = $env:WINDOWS_SIGNING -ne 'none'
+          foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature $file.FullName
+            Write-Host "$($file.Name): $($signature.Status) $($signature.SignerCertificate.Subject)"
+            if ($signed -and $signature.Status -ne 'Valid') { throw "$($file.Name) is not validly signed: $($signature.StatusMessage)" }
+          }
+          if (-not $signed) { Write-Host '::notice::Windows installers are unsigned (no signing secrets).' }
+
+      - name: Check the macOS signature, then sign, notarize and staple the dmg
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          app="ui/neuron-desktop/src-tauri/target/$TAURI_TARGET/release/bundle/macos/Neuron.app"
+          for binary in "$app/Contents/MacOS/neuron-desktop" "$app/Contents/MacOS/neuron"; do
+            echo "$binary: $(lipo -archs "$binary")"
+          done
+          codesign --verify --deep --strict --verbose=2 "$app"
+          if [ "$MACOS_SIGNING" != true ]; then
+            echo "::notice::The app is ad-hoc signed (no Developer ID certificate)."
+            exit 0
+          fi
+          for binary in "$app" "$app/Contents/MacOS/neuron"; do
+            details="$(codesign --display --verbose=4 "$binary" 2>&1)"
+            grep -q '^Authority=Developer ID Application' <<< "$details" || { echo "::error::$binary is not signed with Developer ID"; exit 1; }
+            grep -q 'flags=.*runtime' <<< "$details" || { echo "::error::$binary lacks the hardened runtime"; exit 1; }
+          done
+          dmg="$(ls out/dist/*.dmg)"
+          codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$dmg"
+          if [ "$NOTARIZE" = none ]; then
+            echo "::notice::Signed but not notarized (no notarization credentials)."
+            exit 0
+          fi
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+          case "$NOTARIZE" in
+            api-key) auth=(--key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER") ;;
+            apple-id) auth=(--apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID") ;;
+          esac
+          xcrun notarytool submit "$dmg" "${auth[@]}" --wait --timeout 30m
+          xcrun stapler staple "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+          # Updater signatures sign the archive's bytes; the dmg changed, the archive did not.
+        env:
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Record checksums and signing status
+        shell: bash
+        env:
+          UPDATER_KEYS: ${{ matrix.updater }}
+        run: |
+          set -euo pipefail
+          signed=false
+          notarized=null
+          case "$NAME" in
+            windows-*) if [ "$WINDOWS_SIGNING" != none ]; then signed=true; fi ;;
+            macos-*)
+              notarized=false
+              if [ "$MACOS_SIGNING" = true ]; then signed=true; fi
+              if [ "$signed" = true ] && [ "$NOTARIZE" != none ]; then notarized=true; fi
+              ;;
+            # Linux packages are not code-signed; checksums cover them.
+            linux-*) signed=true ;;
+          esac
+          cd out/dist
+          for file in *; do
+            case "$file" in *.sha256) continue ;; esac
+            if command -v sha256sum > /dev/null; then sum="$(sha256sum "$file")"; else sum="$(shasum -a 256 "$file")"; fi
+            printf '%s  %s\n' "${sum%% *}" "$file" > "$file.sha256"
+          done
+          cat ./*.sha256
+          printf '{"name":"%s","signed":%s,"notarized":%s,"updater":"%s"}\n' "$NAME" "$signed" "$notarized" "$UPDATER_KEYS" > "../meta/$NAME.json"
+          cat "../meta/$NAME.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.name }}
+          path: out/
+          if-no-files-found: error
+
+      - name: Remove the signing material
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${SIGNING_KEYCHAIN:-}" ]; then security delete-keychain "$SIGNING_KEYCHAIN" || true; fi
+          rm -f "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/signing.pfx"
+          if [ -n "${WINDOWS_CERT_THUMBPRINT:-}" ]; then
+            pwsh -NoProfile -Command "Remove-Item -Path Cert:\\CurrentUser\\My\\$WINDOWS_CERT_THUMBPRINT -DeleteKey -ErrorAction SilentlyContinue"
+          fi
+
+  install-test:
+    name: install-${{ matrix.name }}
+    needs: [metadata, build]
+    # Test every platform that built, even when another one failed; a platform
+    # whose build failed fails here at the download.
+    if: ${{ !cancelled() && needs.metadata.result == 'success' }}
+    runs-on: ${{ matrix.test_runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.metadata.outputs.matrix) }}
+    env:
+      NAME: ${{ matrix.name }}
+      WINDOWS_SIGNING: ${{ needs.metadata.outputs.windows_signing }}
+      MACOS_SIGNING: ${{ needs.metadata.outputs.macos_signing }}
+      NOTARIZE: ${{ needs.metadata.outputs.notarize }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-${{ matrix.name }}
+          path: artifact
+
+      - name: Check the checksums
+        shell: bash
+        working-directory: artifact/dist
+        run: |
+          for file in *.sha256; do
+            if command -v sha256sum > /dev/null; then sha256sum --check --strict "$file"; else shasum -a 256 --check "$file"; fi
+          done
+
+      - name: Install on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem artifact/dist/*-setup.exe | Select-Object -First 1
+          $dir = Join-Path $env:RUNNER_TEMP 'Neuron'
+          # NSIS: /S is silent, /D= (last, unquoted) is the install folder.
+          $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S', "/D=$dir" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "the installer exited with $($process.ExitCode)" }
+          Get-ChildItem $dir | Format-Table Name, Length
+          $app = Join-Path $dir 'neuron-desktop.exe'
+          $engine = Join-Path $dir 'neuron.exe'
+          foreach ($file in $app, $engine) { if (-not (Test-Path $file)) { throw "missing $file" } }
+          if ($env:WINDOWS_SIGNING -ne 'none') {
+            foreach ($file in $app, $engine, (Join-Path $dir 'uninstall.exe')) {
+              $signature = Get-AuthenticodeSignature $file
+              if ($signature.Status -ne 'Valid') { throw "$file is not validly signed: $($signature.StatusMessage)" }
+            }
+          }
+          "APP=$app" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ENGINE=$engine" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "INSTALL_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install on macOS
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          dmg="$(ls artifact/dist/*.dmg)"
+          mount="$RUNNER_TEMP/dmg"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg"
+          ls -la "$mount"
+          mkdir -p "$RUNNER_TEMP/Applications"
+          cp -R "$mount/Neuron.app" "$RUNNER_TEMP/Applications/"
+          hdiutil detach "$mount"
+          app="$RUNNER_TEMP/Applications/Neuron.app"
+          for binary in "$app/Contents/MacOS/neuron-desktop" "$app/Contents/MacOS/neuron"; do
+            archs="$(lipo -archs "$binary")"
+            echo "$binary: $archs"
+            case "$archs" in *x86_64*arm64*|*arm64*x86_64*) ;; *) echo "::error::$binary is not universal"; exit 1 ;; esac
+          done
+          codesign --verify --deep --strict --verbose=2 "$app"
+          if [ "$NOTARIZE" != none ]; then
+            xcrun stapler validate "$app"
+            spctl --assess --type execute --verbose=2 "$app"
+          fi
+          echo "APP=$app/Contents/MacOS/neuron-desktop" >> "$GITHUB_ENV"
+          echo "ENGINE=$app/Contents/MacOS/neuron" >> "$GITHUB_ENV"
+
+      - name: Install on Linux
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ./artifact/dist/*.deb xvfb
+          dpkg -L neuron | grep -E '/usr/bin/' || true
+          test -x /usr/bin/neuron-desktop && test -x /usr/bin/neuron
+          # The AppImage carries the same sidecar.
+          appimage="$(ls artifact/dist/*.AppImage)"
+          chmod +x "$appimage"
+          (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/$appimage" --appimage-extract > /dev/null)
+          "$RUNNER_TEMP/squashfs-root/usr/bin/neuron" --version
+          echo "APP=/usr/bin/neuron-desktop" >> "$GITHUB_ENV"
+          echo "ENGINE=/usr/bin/neuron" >> "$GITHUB_ENV"
+
+      - name: Start the bundled engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then ENGINE="$(cygpath -u "$ENGINE")"; fi
+          "$ENGINE" --version
+          if [ "$RUNNER_OS" = macOS ]; then
+            if arch -x86_64 /usr/bin/true 2> /dev/null; then arch -x86_64 "$ENGINE" --version; else echo "::notice::No Rosetta 2 here; the x86_64 slice was not run."; fi
+          fi
+          # The app's own launch: `neuron engine --stdio`, signed out, in a fresh home.
+          # It must print `ready` first and exit 0 at the end of its input.
+          home="$RUNNER_TEMP/engine-home"
+          mkdir -p "$home" "$RUNNER_TEMP/engine-workspace"
+          cd "$RUNNER_TEMP/engine-workspace"
+          HOME="$home" USERPROFILE="$home" NEURON_HOME="$home/neuron" NEURON_NO_BROWSER=1 \
+            "$ENGINE" engine --stdio < /dev/null > events.jsonl 2> engine.log || { cat engine.log; exit 1; }
+          head -n 3 events.jsonl
+          if ! head -n 1 events.jsonl | grep -q '^{"type":"ready"'; then
+            echo "::error::the engine did not answer ready"
+            cat engine.log
+            exit 1
+          fi
+
+      - name: Start the app
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then APP="$(cygpath -u "$APP")"; fi
+          # It must still be running after 15 seconds.
+          if [ "$RUNNER_OS" = Linux ]; then
+            status=0
+            timeout 15 xvfb-run -a "$APP" > app.log 2>&1 || status=$?
+            cat app.log
+            if [ "$status" -ne 124 ]; then echo "::error::the app exited with $status"; exit 1; fi
+            exit 0
+          fi
+          "$APP" > app.log 2>&1 &
+          pid=$!
+          sleep 15
+          if ! kill -0 "$pid" 2> /dev/null; then
+            wait "$pid" || status=$?
+            cat app.log
+            echo "::error::the app exited with ${status:-0}"
+            exit 1
+          fi
+          kill "$pid" || true
+          if [ "$RUNNER_OS" = Windows ]; then taskkill //F //IM neuron-desktop.exe > /dev/null 2>&1 || true; fi
+          cat app.log
+
+      - name: Uninstall on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Process neuron-desktop, neuron -ErrorAction SilentlyContinue | Stop-Process -Force
+          $uninstaller = Join-Path $env:INSTALL_DIR 'uninstall.exe'
+          $process = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "the uninstaller exited with $($process.ExitCode)" }
+          # The uninstaller copies itself to a temp folder and finishes from there.
+          for ($i = 0; $i -lt 30 -and (Test-Path (Join-Path $env:INSTALL_DIR 'neuron.exe')); $i++) { Start-Sleep 1 }
+          if (Test-Path (Join-Path $env:INSTALL_DIR 'neuron.exe')) { throw 'the uninstaller left neuron.exe behind' }
+
+  assemble:
+    name: Manifests and checksums
+    needs: [metadata, build, install-test]
+    runs-on: ubuntu-latest
+    outputs:
+      publishable: ${{ steps.assemble.outputs.publishable }}
+      manifest_key: ${{ steps.assemble.outputs.manifest_key }}
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      ENGINE_VERSION: ${{ needs.metadata.outputs.engine_version }}
+      TAG: ${{ needs.metadata.outputs.tag }}
+      PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+      IS_RELEASE: ${{ needs.metadata.outputs.is_release }}
+      DOWNLOAD_PAGE_URL: ${{ vars.DOWNLOAD_PAGE_URL || 'https://zero-x.live/download' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          path: out
+          merge-multiple: true
+
+      - name: Write SHA256SUMS, the version manifest and the updater manifest
+        id: assemble
+        run: |
+          python3 - <<'PY'
+          import datetime, json, os, pathlib
+
+          out = pathlib.Path('out')
+          dist = out / 'dist'
+          version, tag, repo = os.environ['VERSION'], os.environ['TAG'], os.environ['GITHUB_REPOSITORY']
+          download = f'https://github.com/{repo}/releases/download/{tag}'
+          builds = {meta['name']: meta for meta in (json.loads(p.read_text()) for p in sorted((out / 'meta').glob('*.json')))}
+
+          files = sorted(p for p in dist.iterdir() if p.suffix not in ('.sha256',))
+          sums = {p.name: (dist / f'{p.name}.sha256').read_text().split()[0] for p in files}
+          (dist / 'SHA256SUMS').write_text(''.join(f'{digest}  {name}\n' for name, digest in sums.items()), encoding='utf-8')
+
+          kinds = {'-setup.exe': 'nsis', '.msi': 'msi', '.dmg': 'dmg', '.app.tar.gz': 'updater', '.AppImage': 'appimage', '.deb': 'deb'}
+          platforms = {}
+          for name, meta in builds.items():
+              entry = {'signed': meta['signed'], 'files': {}}
+              if meta['notarized'] is not None:
+                  entry['notarized'] = meta['notarized']
+              for file in files:
+                  if not file.name.startswith(f'Neuron_{version}_{name}') or file.name.endswith('.sig'):
+                      continue
+                  kind = next((k for suffix, k in kinds.items() if file.name.endswith(suffix)), None)
+                  if kind:
+                      entry['files'][kind] = {'name': file.name, 'url': f'{download}/{file.name}', 'sha256': sums[file.name]}
+              platforms[name] = entry
+
+          now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+          prerelease = os.environ['PRERELEASE'] == 'true'
+          manifest = {
+              'schema': 1,
+              'product': 'neuron-desktop',
+              'channel': 'prerelease' if prerelease else 'stable',
+              'version': version,
+              'tag': tag,
+              'engine_version': os.environ['ENGINE_VERSION'],
+              'published_at': now,
+              'notes_url': f'https://github.com/{repo}/releases/tag/{tag}',
+              'download_url': os.environ['DOWNLOAD_PAGE_URL'],
+              'platforms': platforms,
+          }
+          key = 'releases/desktop/prerelease.json' if prerelease else 'releases/desktop/latest.json'
+          target = out / 'manifest' / key
+          target.parent.mkdir(parents=True, exist_ok=True)
+          target.write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+
+          # Tauri updater (P1): one entry per platform key, when every build has its signature.
+          updater = {}
+          for name, meta in builds.items():
+              archive = next((f for f in files if f.name.startswith(f'Neuron_{version}_{name}') and f.name.endswith(('.app.tar.gz', '-setup.exe', '.AppImage'))
+                              and (dist / f'{f.name}.sig').exists()), None)
+              if archive:
+                  for platform_key in meta['updater'].split(','):
+                      updater[platform_key] = {'signature': (dist / f'{archive.name}.sig').read_text().strip(), 'url': f'{download}/{archive.name}'}
+          wanted = {k for meta in builds.values() for k in meta['updater'].split(',')}
+          if updater and set(updater) == wanted and not prerelease:
+              updater_manifest = {'version': version, 'notes': f'Neuron Desktop {version}', 'pub_date': now, 'platforms': updater}
+              (out / 'manifest' / 'releases' / 'desktop' / 'updater.json').write_text(json.dumps(updater_manifest, indent=2) + '\n', encoding='utf-8')
+
+          publishable = all(meta['signed'] and meta['notarized'] is not False for meta in builds.values())
+          rows = '\n'.join(
+              f"| {name} | {', '.join(f['name'] for f in entry['files'].values())} | {'yes' if entry['signed'] else 'no'}"
+              f"{'' if 'notarized' not in entry else (', notarized' if entry['notarized'] else ', not notarized')} |"
+              for name, entry in platforms.items())
+          table = f'| Platform | Files | Signed |\n|---|---|---|\n{rows}'
+          (out / 'notes.md').write_text(
+              f'Neuron Desktop {version}, with the Neuron engine {os.environ["ENGINE_VERSION"]} inside.\n\n{table}\n\n'
+              f'`SHA256SUMS` lists every file\'s checksum. Downloads and install steps: {os.environ["DOWNLOAD_PAGE_URL"]}\n', encoding='utf-8')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f"publishable={str(publishable).lower()}\nmanifest_key={key}\n")
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write(f'## Neuron Desktop {version}\n\n{table}\n\nPublishable: {publishable}\n\n### {key}\n\n```json\n{json.dumps(manifest, indent=2)}\n```\n')
+          print(json.dumps(manifest, indent=2))
+          PY
+          ls -lR out/dist out/manifest
+
+      - name: Explain an unsigned tag build
+        if: env.IS_RELEASE == 'true' && steps.assemble.outputs.publishable != 'true'
+        run: echo "::warning title=Release stays a draft::Some installers are unsigned or not notarized, so $TAG stays a draft and no manifest is uploaded. Add the signing secrets (docs/RELEASING.md) and push a new tag, or publish the draft by hand, unchecking 'Set as the latest release'."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-release
+          path: |
+            out/dist
+            out/manifest
+            out/notes.md
+          if-no-files-found: error
+
+  release:
+    name: Draft GitHub release
+    needs: [metadata, assemble]
+    if: needs.metadata.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.metadata.outputs.tag }}
+      VERSION: ${{ needs.metadata.outputs.version }}
+      PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-release
+          path: out
+
+      - name: Upload the files to a draft release
+        run: |
+          set -euo pipefail
+          files=(out/dist/*)
+          cp "out/manifest/${{ needs.assemble.outputs.manifest_key }}" out/desktop-manifest.json
+          files+=(out/desktop-manifest.json)
+          if [ -f out/manifest/releases/desktop/updater.json ]; then files+=(out/manifest/releases/desktop/updater.json); fi
+          if draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$draft" != true ]; then
+              echo "::error::$TAG is already published and its files are never replaced; ship a new version"
+              exit 1
+            fi
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "${files[@]}" --clobber
+          else
+            # Never "Latest": install.sh and install.ps1 take the CLI from that release.
+            flags=(--draft --verify-tag --latest=false --title "Neuron Desktop $VERSION" --notes-file out/notes.md)
+            if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" "${flags[@]}" "${files[@]}"
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
+
+  publish:
+    name: Publish the release
+    needs: [metadata, assemble, release]
+    if: needs.assemble.outputs.publishable == 'true'
+    runs-on: ubuntu-latest
+    # Give this environment a required reviewer so a person approves each publish
+    # after looking at the draft (docs/RELEASING.md).
+    environment:
+      name: desktop-release
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ needs.metadata.outputs.tag }}
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.metadata.outputs.tag }}
+    steps:
+      - name: Publish without the "Latest" mark
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
+
+      - name: Check every public download
+        run: |
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          failed=0
+          for name in $(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'); do
+            ok=0
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              if curl --fail --silent --location --range 0-0 --output /dev/null "$base/$name"; then ok=1; break; fi
+              sleep 15
+            done
+            if [ "$ok" = 1 ]; then echo "ok $name"; else echo "::error::not reachable: $base/$name"; failed=1; fi
+          done
+          exit "$failed"
+
+  manifest:
+    name: Upload the version manifest
+    needs: [metadata, assemble, publish]
+    runs-on: ubuntu-latest
+    # Holds the bucket keys; it downloads the manifests and copies them, nothing else.
+    environment:
+      name: release-manifests
+    permissions: {}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.RELEASES_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.RELEASES_R2_SECRET_ACCESS_KEY }}
+      R2_ACCOUNT_ID: ${{ vars.RELEASES_R2_ACCOUNT_ID }}
+      R2_BUCKET: ${{ vars.RELEASES_R2_BUCKET }}
+      PUBLIC_BASE: ${{ vars.RELEASES_PUBLIC_URL || 'https://zero-x.live/releases' }}
+      VERSION: ${{ needs.metadata.outputs.version }}
+      KEY: ${{ needs.assemble.outputs.manifest_key }}
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+    steps:
+      - name: Check the bucket settings
+        id: config
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ] || [ -z "$R2_ACCOUNT_ID" ] || [ -z "$R2_BUCKET" ]; then
+            echo "::notice::Not uploaded: set the RELEASES_R2_ACCESS_KEY_ID and RELEASES_R2_SECRET_ACCESS_KEY secrets and the RELEASES_R2_ACCOUNT_ID and RELEASES_R2_BUCKET variables (docs/RELEASING.md). The manifests are in this run's desktop-release artifact and on the release."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/download-artifact@v4
+        if: steps.config.outputs.ready == 'true'
+        with:
+          name: desktop-release
+          path: out
+      - name: Upload the manifests
+        if: steps.config.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          for key in "$KEY" releases/desktop/updater.json; do
+            if [ ! -f "out/manifest/$key" ]; then continue; fi
+            aws s3 cp "out/manifest/$key" "s3://$R2_BUCKET/$key" \
+              --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" \
+              --content-type application/json --cache-control 'public, max-age=300' --no-progress
+            echo "Uploaded $key for $VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Check the public copy
+        if: steps.config.outputs.ready == 'true'
+        run: |
+          url="$PUBLIC_BASE/${KEY#releases/}"
+          if served="$(curl -fsSL -H 'Cache-Control: no-cache' "$url" | jq -r .version)" && [ "$served" = "$VERSION" ]; then
+            echo "ok $url serves $VERSION"
+          else
+            echo "::warning::$url does not serve $VERSION yet (got '${served:-nothing}'). Check that the gateway routes /releases/ to the bucket, or wait for the 5-minute cache."
+          fi

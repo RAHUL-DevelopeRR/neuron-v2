@@ -94,8 +94,8 @@ async function attach(kind: 'desktop' | 'mobile', token = TOKEN) {
   return { transport, controller }
 }
 
-const until = async (label: string, predicate: () => boolean) => {
-  const deadline = Date.now() + 5_000
+const until = async (label: string, predicate: () => boolean, timeoutMs = 5_000) => {
+  const deadline = Date.now() + timeoutMs
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`)
     await Bun.sleep(10)
@@ -246,11 +246,13 @@ describe('NeuronHost', () => {
     })
     const { id } = await transport.rpc<{ id: number }>('term.open', { cols: 100, rows: 30 })
     transport.terminalResize(id, 120, 40)
-    transport.terminalInput(id, 'echo neuron-term-$(1+1)\r')
-    await until('the echo', () => output.includes('neuron-term-2'))
+    // $((1+1)) is 2 in both PowerShell (Windows) and POSIX shells.
+    transport.terminalInput(id, 'echo neuron-term-$((1+1))\r')
+    // A cold Windows PowerShell can take several seconds to start on CI runners.
+    await until('the echo', () => output.includes('neuron-term-2'), 15_000)
     transport.terminalInput(id, 'exit\r')
     await until('the shell to exit', () => exited !== undefined)
-  }, 20_000)
+  }, 30_000)
 
   test('a client from another machine gets no terminal', async () => {
     await startHost({ remoteOnly: true })
