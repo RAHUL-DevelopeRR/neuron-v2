@@ -206,7 +206,7 @@ fi
 # fetch URL OUTPUT
 fetch() {
     if [ "${DOWNLOADER}" = "curl" ]; then
-        curl --fail --silent --show-error --location --retry 3 --connect-timeout 20 -o "$2" "$1"
+        curl --fail --silent --show-error --location --proto-redir =https --retry 3 --connect-timeout 20 -o "$2" "$1"
     else
         wget --quiet --tries=3 --timeout=30 -O "$2" "$1"
     fi
@@ -234,7 +234,7 @@ fetch_releases_api() {
         return
     fi
     printf 'header = "Authorization: Bearer %s"\n' "${GITHUB_TOKEN}" |
-        curl --fail --silent --show-error --location --retry 3 --connect-timeout 20 --config - -o "$2" "$1"
+        curl --fail --silent --show-error --location --proto-redir =https --retry 3 --connect-timeout 20 --config - -o "$2" "$1"
 }
 
 sha256_of() {

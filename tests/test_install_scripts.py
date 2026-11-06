@@ -344,6 +344,18 @@ class InstallShTests(unittest.TestCase):
         self.assertIn("Next steps:", result.stderr)
         self.assertEqual(self.installed().read_bytes(), STDIN_READING_BINARY)
 
+    def test_every_curl_call_refuses_a_redirect_away_from_https(self) -> None:
+        # A mirror or release redirecting to plain HTTP must not be followed (--proto-redir
+        # only limits redirects; a loopback http base given on purpose still works).
+        calls = [
+            line.strip()
+            for line in INSTALL_SH.read_text(encoding="utf-8").splitlines()
+            if line.lstrip().startswith("curl ") and "--fail" in line
+        ]
+        self.assertGreaterEqual(len(calls), 2, calls)
+        for call in calls:
+            self.assertIn("--proto-redir =https", call)
+
     def test_unpublished_version_points_at_the_releases_page(self) -> None:
         result = self.run_installer(NEURON_VERSION="9.9.9")
         self.assertEqual(result.returncode, 1)
