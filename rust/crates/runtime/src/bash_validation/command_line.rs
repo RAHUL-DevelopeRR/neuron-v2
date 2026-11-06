@@ -351,6 +351,8 @@ const RUNNER_PROGRAMS: &[&str] = &[
     "su",
     "doas",
     "runas",
+    // `cmd /c ...` and `/k ...` run a command line; a bare `cmd` is a shell.
+    "cmd",
     "eval",
     "exec",
     "env",
@@ -383,9 +385,149 @@ const INTERPRETER_SAFE_FLAGS: &[&str] = &[
     "--allow-read",
 ];
 
+/// Whether `name` is a PyPy interpreter (`pypy`, `pypy3`, `pypy3.10`).
+fn is_pypy(name: &str) -> bool {
+    name.strip_prefix("pypy")
+        .is_some_and(|version| version.chars().all(|ch| ch.is_ascii_digit() || ch == '.'))
+}
+
+fn is_powershell(name: &str) -> bool {
+    matches!(name, "pwsh" | "powershell")
+}
+
 fn is_interpreter(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    is_python(&name) || INTERPRETERS.contains(&name.as_str())
+    is_python(&name) || is_pypy(&name) || is_powershell(&name) || INTERPRETERS.contains(&name.as_str())
+}
+
+/// The prefix a session approval of a `PowerShell` call covers: `-File script.ps1` (after
+/// options that only tune the host) and nothing else. `-Command`, `-EncodedCommand`, a
+/// positional command, an abbreviated `-File` and a bare shell offer no prefix.
+fn powershell_prefix(words: &[String]) -> Option<Vec<String>> {
+    let mut prefix = vec![words[0].clone()];
+    let mut index = 1;
+    while let Some(word) = words.get(index) {
+        match word.to_ascii_lowercase().as_str() {
+            "-noprofile" | "-nop" | "-nologo" | "-noninteractive" | "-noni" | "-mta" | "-sta" => {
+                prefix.push(word.clone());
+                index += 1;
+            }
+            "-executionpolicy" | "-ep" | "-windowstyle" => {
+                prefix.push(word.clone());
+                prefix.push(words.get(index + 1)?.clone());
+                index += 2;
+            }
+            _ => break,
+        }
+    }
+    let flag = words.get(index)?;
+    if !matches!(flag.to_ascii_lowercase().as_str(), "-file" | "-f") {
+        return None;
+    }
+    let script = words.get(index + 1)?;
+    // An expansion's value is unknown (the lexer keeps it as an empty word).
+    if script.is_empty() || script.starts_with('-') || script.contains(['$', '`', '*', '?']) {
+        return None;
+    }
+    prefix.push(flag.clone());
+    prefix.push(script.clone());
+    Some(prefix)
+}
+
+/// Flags of `npx`, `bunx` and `pnpx` that only tune how the package is fetched.
+const PACKAGE_RUNNER_SAFE_FLAGS: &[&str] = &["-y", "--yes", "--no", "--no-install", "-q", "--quiet"];
+
+/// The prefix for `npx pkg` / `bunx pkg`: the runner, its harmless flags and the one
+/// package. `-c`, `--package` and any other option, or no package, offer none.
+fn package_runner_prefix(words: &[String]) -> Option<Vec<String>> {
+    let mut prefix = vec![words[0].clone()];
+    let mut rest = words[1..].iter();
+    for word in rest.by_ref() {
+        if PACKAGE_RUNNER_SAFE_FLAGS.contains(&word.as_str()) {
+            prefix.push(word.clone());
+            continue;
+        }
+        let plain = !word.starts_with('-')
+            && word
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '@' | '/' | '.' | '_' | '-' | ':'));
+        if !plain {
+            return None;
+        }
+        prefix.push(word.clone());
+        return Some(prefix);
+    }
+    None
+}
+
+/// What a session approval can say about one call.
+enum Narrowing {
+    /// Nothing special: the generic [`suggested_prefix`].
+    Generic,
+    /// Exactly this prefix.
+    Prefix(Vec<String>),
+    /// No prefix can say what will run: ask on every call.
+    EveryTime,
+}
+
+/// The start of `words` that names a wrapper and the program it starts (`uv run X`,
+/// `npm exec X`, `pnpm dlx X`), as the number of words before that program.
+fn wrapped_command_start(words: &[String], program: &str) -> Option<usize> {
+    let subcommands: &[&str] = match program {
+        "uv" => &["run"],
+        "npm" | "pnpm" | "yarn" | "bun" => &["exec", "x", "dlx"],
+        _ => return None,
+    };
+    words
+        .get(1)
+        .filter(|second| subcommands.contains(&second.as_str()))
+        .map(|_| 2)
+}
+
+fn narrowing(words: &[String], dialect: ShellDialect) -> Narrowing {
+    let program = build_program_name(&words[0], dialect).to_ascii_lowercase();
+    if RUNNER_PROGRAMS.contains(&program.as_str()) {
+        return Narrowing::EveryTime;
+    }
+    if is_powershell(&program) {
+        return powershell_prefix(words).map_or(Narrowing::EveryTime, Narrowing::Prefix);
+    }
+    if is_interpreter(&program) {
+        return interpreter_prefix(words, dialect).map_or(Narrowing::EveryTime, Narrowing::Prefix);
+    }
+    if matches!(program.as_str(), "npx" | "bunx" | "pnpx") {
+        return package_runner_prefix(words).map_or(Narrowing::EveryTime, Narrowing::Prefix);
+    }
+    if let Some(start) = wrapped_command_start(words, &program) {
+        let inner = &words[start..];
+        if inner.first().is_none_or(|word| word.starts_with('-')) {
+            return Narrowing::EveryTime;
+        }
+        let mut prefix = words[..start].to_vec();
+        return match narrowing(inner, dialect) {
+            Narrowing::EveryTime => Narrowing::EveryTime,
+            Narrowing::Prefix(inner_prefix) => {
+                prefix.extend(inner_prefix);
+                Narrowing::Prefix(prefix)
+            }
+            Narrowing::Generic => {
+                prefix.extend(suggested_prefix(inner, dialect));
+                Narrowing::Prefix(prefix)
+            }
+        };
+    }
+    // `uv --quiet run x`, `npm --prefix p exec x`: the wrapped program is hidden behind options.
+    let hides_wrapper = match program.as_str() {
+        "uv" => words[1..].iter().any(|word| word == "run"),
+        "npm" | "pnpm" | "yarn" | "bun" => words[1..]
+            .iter()
+            .any(|word| matches!(word.as_str(), "exec" | "dlx")),
+        _ => false,
+    };
+    if hides_wrapper && words[1].starts_with('-') {
+        return Narrowing::EveryTime;
+    }
+    Narrowing::Generic
 }
 
 /// The prefix a session approval of an interpreter call covers: the interpreter and the
@@ -405,12 +547,12 @@ fn interpreter_prefix(words: &[String], dialect: ShellDialect) -> Option<Vec<Str
         }
     }
     let first = rest.next()?;
-    if first == "-m" && is_python(&program.to_ascii_lowercase()) {
+    if first == "-m" && (is_python(&program.to_ascii_lowercase()) || is_pypy(&program.to_ascii_lowercase())) {
         prefix.push(first.clone());
         prefix.push(rest.next()?.clone());
         return Some(prefix);
     }
-    if first.starts_with('-') || first.contains(['$', '`', '*', '?']) {
+    if first.is_empty() || first.starts_with('-') || first.contains(['$', '`', '*', '?']) {
         return None;
     }
     prefix.push(first.clone());
@@ -427,29 +569,20 @@ fn interpreter_prefix(words: &[String], dialect: ShellDialect) -> Option<Vec<Str
     Some(prefix)
 }
 
-/// Like [`suggested_prefix`], but narrowed for interpreters and never offered for
-/// runner programs (the segment is then not prefix-coverable, see
-/// [`classify_segment`]).
+/// Like [`suggested_prefix`], but narrowed for interpreters, shells and package runners, and
+/// never offered for programs that run anything (the segment is then not prefix-coverable,
+/// see [`classify_segment`]).
 fn approval_prefix(words: &[String], dialect: ShellDialect) -> Vec<String> {
-    let program = build_program_name(&words[0], dialect);
-    if is_interpreter(&program) {
-        if let Some(prefix) = interpreter_prefix(words, dialect) {
-            return prefix;
-        }
+    match narrowing(words, dialect) {
+        Narrowing::Prefix(prefix) => prefix,
+        Narrowing::Generic | Narrowing::EveryTime => suggested_prefix(words, dialect),
     }
-    suggested_prefix(words, dialect)
 }
 
-/// Whether one approval cannot be narrowed to what this call runs: a runner program, or
-/// an interpreter call without a single named script.
+/// Whether one approval cannot be narrowed to what this call runs: a runner program, a
+/// shell or interpreter call without a single named script, or a wrapper around one.
 fn needs_per_call_approval(words: &[String], dialect: ShellDialect) -> bool {
-    let Some(first) = words.first() else {
-        return false;
-    };
-    let program = build_program_name(first, dialect);
-    let lowered = program.to_ascii_lowercase();
-    RUNNER_PROGRAMS.contains(&lowered.as_str())
-        || (is_interpreter(&program) && interpreter_prefix(words, dialect).is_none())
+    !words.is_empty() && matches!(narrowing(words, dialect), Narrowing::EveryTime)
 }
 
 fn suggested_prefix(words: &[String], dialect: ShellDialect) -> Vec<String> {
@@ -3195,8 +3328,9 @@ fn jq_reads_environment(program: &str) -> bool {
 fn check_jq_args(args: &[Word]) -> Result<(), String> {
     for arg in args {
         let text = arg.text.as_str();
+        // Everything after `--` is scanned too: `jq -n -- env` still runs `env`.
         if text == "--" {
-            break;
+            continue;
         }
         let is_short_cluster = text.starts_with('-') && !text.starts_with("--") && text.len() > 1;
         let loads_code = matches!(text, "--from-file" | "--library-path")
@@ -4616,11 +4750,20 @@ mod tests {
         assert_escalates("jq -n 'env.NEURON_TOKEN'");
         assert_escalates("jq -rn '[env | keys[]]'");
         assert_escalates("jq -n '{a: env}'");
+        // Everything after `--` is still scanned: it can be the program text.
+        assert_escalates("jq -n -- env");
+        assert_escalates("jq -n -- '$ENV'");
+        assert_escalates("jq -n -- '$ENV.PATH'");
+        assert_escalates("jq -n -- -f prog.jq");
+        assert_escalates("jq -- 'import \"m\" as m; .' data.json");
+        assert_read_only("jq -r -- .name package.json");
         assert_escalates("jq -f prog.jq data.json");
         assert_escalates("jq --from-file prog.jq data.json");
         assert_escalates("jq -L ./mods 'include \"m\"; .' data.json");
         assert_escalates("jq 'import \"m\" as m; .' data.json");
         assert_escalates("cat /proc/self/environ");
+        assert_escalates("cat /tmp/../proc/self/environ");
+        assert_escalates("cat /proc/../proc/self/environ");
         assert_escalates("sed -n p /proc/self/environ");
         assert_read_only("jq .name package.json");
         assert_read_only("jq '.items[] | .environment' data.json");
@@ -5003,6 +5146,105 @@ mod tests {
                 "build.ts".to_string()
             ]]
         );
+    }
+
+    #[test]
+    fn shells_and_package_runners_are_narrowed_to_one_script_or_asked_every_time() {
+        let none = Vec::<Vec<String>>::new;
+        let words = |text: &str| -> Vec<String> { text.split(' ').map(ToString::to_string).collect() };
+        let powershell = |command: &str| classify_powershell_command(command, Some(&workspace()));
+        // Inline code, encoded code, `cmd /c` and `/k`, and a bare shell: asked every time, in
+        // every dialect, so one Allow never covers a later call.
+        for command in [
+            "pwsh -Command Get-Date",
+            "pwsh -c 'Remove-Item x'",
+            "pwsh -NoProfile -Command \"iex $x\"",
+            "powershell -EncodedCommand SQBFAFgA",
+            "powershell -enc SQBFAFgA",
+            "powershell.exe -Command Remove-Item x",
+            "pwsh -ec SQBFAFgA",
+            "pwsh Remove-Item x",
+            "pwsh",
+            "pwsh -",
+            "pwsh -File $script",
+            "pwsh -fi x.ps1",
+            "cmd /c del x",
+            "cmd /C del x",
+            "cmd /k calc",
+            "cmd.exe /c echo hi > x",
+            "CMD /R del x",
+            "cmd",
+            "pypy -c 'print(1)'",
+            "pypy3 -c 'print(1)'",
+            "pypy3.10 -",
+            "pypy",
+            "npx -c 'rm x'",
+            "npx --call 'rm x'",
+            "npx --package evil evil-cmd",
+            "npx -y",
+            "npx",
+            "bunx --bun evil",
+            "uv run",
+            "uv run --with evil x.py",
+            "uv run -- python -c 'x'",
+            "uv run python -c 'import os'",
+            "uv run bash -c id",
+            "uv --quiet run x.py",
+            "npm exec -- evil",
+            "npm exec --package evil cmd",
+            "npm exec",
+            "npm exec node -- -e x",
+            "pnpm dlx --package evil cmd",
+        ] {
+            let program = command.split(' ').next().unwrap();
+            for classification in [posix(command), cmd(command), powershell(command)] {
+                assert_eq!(classification.approval_prefixes(), none(), "{command}");
+                assert!(
+                    !classification.covered_by_prefixes(&[words(program)]),
+                    "{command}"
+                );
+            }
+        }
+        // `-File x.ps1` is that one script; other scripts, inline code and `cmd` stay uncovered.
+        let approved = words("pwsh -File build.ps1");
+        let covered = |command: &str, approved: &[Vec<String>]| {
+            powershell(command).covered_by_prefixes(approved)
+        };
+        assert_eq!(
+            powershell("pwsh -File build.ps1 -Release").approval_prefixes(),
+            vec![approved.clone()]
+        );
+        assert!(covered("pwsh -File build.ps1 -Release", &[approved.clone()]));
+        assert!(!covered("pwsh -File other.ps1", &[approved.clone()]));
+        assert!(!covered("pwsh -Command Get-Date", &[approved.clone()]));
+        assert!(!covered("pwsh -File build.ps1; pwsh -File evil.ps1", &[approved.clone()]));
+        assert!(!covered("cmd /c del x", &[approved]));
+        // A stale or hand-written bare prefix no longer covers an inline-code or `cmd` call.
+        for command in ["pwsh -Command Get-Date", "powershell -c x", "cmd /c del x"] {
+            assert!(!covered(command, &[words("pwsh")]), "{command}");
+            assert!(!covered(command, &[words("powershell")]), "{command}");
+            assert!(!covered(command, &[words("cmd")]), "{command}");
+        }
+        assert_eq!(
+            powershell("powershell.exe -NoProfile -ExecutionPolicy Bypass -File ci\\run.ps1 x").approval_prefixes(),
+            vec![words("powershell.exe -NoProfile -ExecutionPolicy Bypass -File ci\\run.ps1")]
+        );
+        // The same narrowing for pypy, package runners and wrappers.
+        assert_eq!(posix("pypy3 build.py --fast").approval_prefixes(), vec![words("pypy3 build.py")]);
+        assert_eq!(posix("pypy -m pytest -q").approval_prefixes(), vec![words("pypy -m pytest")]);
+        assert_eq!(posix("npx -y prettier --write .").approval_prefixes(), vec![words("npx -y prettier")]);
+        assert_eq!(posix("bunx cowsay hi").approval_prefixes(), vec![words("bunx cowsay")]);
+        assert_eq!(posix("uv run build.py --fast").approval_prefixes(), vec![words("uv run build.py")]);
+        assert_eq!(posix("uv run pytest -q").approval_prefixes(), vec![words("uv run pytest")]);
+        assert_eq!(posix("uv run python build.py").approval_prefixes(), vec![words("uv run python build.py")]);
+        assert_eq!(posix("npm exec prettier -- --check .").approval_prefixes(), vec![words("npm exec prettier")]);
+        let npx = words("npx prettier");
+        assert!(posix("npx prettier --write x").covered_by_prefixes(&[npx.clone()]));
+        assert!(!posix("npx evil-package").covered_by_prefixes(&[npx.clone()]));
+        assert!(!posix("npx -c 'rm x'").covered_by_prefixes(&[npx]));
+        let uv = words("uv run build.py");
+        assert!(!posix("uv run python -c 'x'").covered_by_prefixes(&[uv.clone()]));
+        assert!(!posix("uv run other.py").covered_by_prefixes(&[uv]));
     }
 
     #[test]
