@@ -397,7 +397,10 @@ fn is_powershell(name: &str) -> bool {
 
 fn is_interpreter(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    is_python(&name) || is_pypy(&name) || is_powershell(&name) || INTERPRETERS.contains(&name.as_str())
+    is_python(&name)
+        || is_pypy(&name)
+        || is_powershell(&name)
+        || INTERPRETERS.contains(&name.as_str())
 }
 
 /// The prefix a session approval of a `PowerShell` call covers: `-File script.ps1` (after
@@ -435,7 +438,8 @@ fn powershell_prefix(words: &[String]) -> Option<Vec<String>> {
 }
 
 /// Flags of `npx`, `bunx` and `pnpx` that only tune how the package is fetched.
-const PACKAGE_RUNNER_SAFE_FLAGS: &[&str] = &["-y", "--yes", "--no", "--no-install", "-q", "--quiet"];
+const PACKAGE_RUNNER_SAFE_FLAGS: &[&str] =
+    &["-y", "--yes", "--no", "--no-install", "-q", "--quiet"];
 
 /// The prefix for `npx pkg` / `bunx pkg`: the runner, its harmless flags and the one
 /// package. `-c`, `--package` and any other option, or no package, offer none.
@@ -448,9 +452,9 @@ fn package_runner_prefix(words: &[String]) -> Option<Vec<String>> {
             continue;
         }
         let plain = !word.starts_with('-')
-            && word
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '@' | '/' | '.' | '_' | '-' | ':'));
+            && word.chars().all(|ch| {
+                ch.is_ascii_alphanumeric() || matches!(ch, '@' | '/' | '.' | '_' | '-' | ':')
+            });
         if !plain {
             return None;
         }
@@ -547,7 +551,9 @@ fn interpreter_prefix(words: &[String], dialect: ShellDialect) -> Option<Vec<Str
         }
     }
     let first = rest.next()?;
-    if first == "-m" && (is_python(&program.to_ascii_lowercase()) || is_pypy(&program.to_ascii_lowercase())) {
+    if first == "-m"
+        && (is_python(&program.to_ascii_lowercase()) || is_pypy(&program.to_ascii_lowercase()))
+    {
         prefix.push(first.clone());
         prefix.push(rest.next()?.clone());
         return Some(prefix);
@@ -5151,7 +5157,8 @@ mod tests {
     #[test]
     fn shells_and_package_runners_are_narrowed_to_one_script_or_asked_every_time() {
         let none = Vec::<Vec<String>>::new;
-        let words = |text: &str| -> Vec<String> { text.split(' ').map(ToString::to_string).collect() };
+        let words =
+            |text: &str| -> Vec<String> { text.split(' ').map(ToString::to_string).collect() };
         let powershell = |command: &str| classify_powershell_command(command, Some(&workspace()));
         // Inline code, encoded code, `cmd /c` and `/k`, and a bare shell: asked every time, in
         // every dialect, so one Allow never covers a later call.
@@ -5214,10 +5221,16 @@ mod tests {
             powershell("pwsh -File build.ps1 -Release").approval_prefixes(),
             vec![approved.clone()]
         );
-        assert!(covered("pwsh -File build.ps1 -Release", &[approved.clone()]));
+        assert!(covered(
+            "pwsh -File build.ps1 -Release",
+            &[approved.clone()]
+        ));
         assert!(!covered("pwsh -File other.ps1", &[approved.clone()]));
         assert!(!covered("pwsh -Command Get-Date", &[approved.clone()]));
-        assert!(!covered("pwsh -File build.ps1; pwsh -File evil.ps1", &[approved.clone()]));
+        assert!(!covered(
+            "pwsh -File build.ps1; pwsh -File evil.ps1",
+            &[approved.clone()]
+        ));
         assert!(!covered("cmd /c del x", &[approved]));
         // A stale or hand-written bare prefix no longer covers an inline-code or `cmd` call.
         for command in ["pwsh -Command Get-Date", "powershell -c x", "cmd /c del x"] {
@@ -5226,18 +5239,45 @@ mod tests {
             assert!(!covered(command, &[words("cmd")]), "{command}");
         }
         assert_eq!(
-            powershell("powershell.exe -NoProfile -ExecutionPolicy Bypass -File ci\\run.ps1 x").approval_prefixes(),
-            vec![words("powershell.exe -NoProfile -ExecutionPolicy Bypass -File ci\\run.ps1")]
+            powershell("powershell.exe -NoProfile -ExecutionPolicy Bypass -File ci\\run.ps1 x")
+                .approval_prefixes(),
+            vec![words(
+                "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ci\\run.ps1"
+            )]
         );
         // The same narrowing for pypy, package runners and wrappers.
-        assert_eq!(posix("pypy3 build.py --fast").approval_prefixes(), vec![words("pypy3 build.py")]);
-        assert_eq!(posix("pypy -m pytest -q").approval_prefixes(), vec![words("pypy -m pytest")]);
-        assert_eq!(posix("npx -y prettier --write .").approval_prefixes(), vec![words("npx -y prettier")]);
-        assert_eq!(posix("bunx cowsay hi").approval_prefixes(), vec![words("bunx cowsay")]);
-        assert_eq!(posix("uv run build.py --fast").approval_prefixes(), vec![words("uv run build.py")]);
-        assert_eq!(posix("uv run pytest -q").approval_prefixes(), vec![words("uv run pytest")]);
-        assert_eq!(posix("uv run python build.py").approval_prefixes(), vec![words("uv run python build.py")]);
-        assert_eq!(posix("npm exec prettier -- --check .").approval_prefixes(), vec![words("npm exec prettier")]);
+        assert_eq!(
+            posix("pypy3 build.py --fast").approval_prefixes(),
+            vec![words("pypy3 build.py")]
+        );
+        assert_eq!(
+            posix("pypy -m pytest -q").approval_prefixes(),
+            vec![words("pypy -m pytest")]
+        );
+        assert_eq!(
+            posix("npx -y prettier --write .").approval_prefixes(),
+            vec![words("npx -y prettier")]
+        );
+        assert_eq!(
+            posix("bunx cowsay hi").approval_prefixes(),
+            vec![words("bunx cowsay")]
+        );
+        assert_eq!(
+            posix("uv run build.py --fast").approval_prefixes(),
+            vec![words("uv run build.py")]
+        );
+        assert_eq!(
+            posix("uv run pytest -q").approval_prefixes(),
+            vec![words("uv run pytest")]
+        );
+        assert_eq!(
+            posix("uv run python build.py").approval_prefixes(),
+            vec![words("uv run python build.py")]
+        );
+        assert_eq!(
+            posix("npm exec prettier -- --check .").approval_prefixes(),
+            vec![words("npm exec prettier")]
+        );
         let npx = words("npx prettier");
         assert!(posix("npx prettier --write x").covered_by_prefixes(&[npx.clone()]));
         assert!(!posix("npx evil-package").covered_by_prefixes(&[npx.clone()]));

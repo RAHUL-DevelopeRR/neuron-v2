@@ -833,7 +833,13 @@ mod tests {
                 "{key}"
             );
         }
-        for key in ["DSNAME", "MYURI", "PURI", "CURL_CA_BUNDLE", "REDIS_URL_FILE_NOT"] {
+        for key in [
+            "DSNAME",
+            "MYURI",
+            "PURI",
+            "CURL_CA_BUNDLE",
+            "REDIS_URL_FILE_NOT",
+        ] {
             assert!(
                 !is_credential_env(OsStr::new(key), OsStr::new("plain-value")),
                 "{key}"
