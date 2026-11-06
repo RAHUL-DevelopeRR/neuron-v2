@@ -5,8 +5,9 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -165,11 +166,77 @@ mod job {
     }
 }
 
+/// Client messages waiting for the engine to read them.
+const WRITE_QUEUE: usize = 64;
+
+/// Writes to an engine's stdin from a thread of its own, fed by a bounded
+/// channel, so an engine that stops reading never holds a lock or a command:
+/// `send` only queues, and says so when the queue is full.
+struct StdinWriter {
+    queue: Mutex<Option<SyncSender<String>>>,
+}
+
+impl StdinWriter {
+    fn new(mut pipe: impl Write + Send + 'static) -> Self {
+        let (queue, lines) = sync_channel::<String>(WRITE_QUEUE);
+        thread::spawn(move || {
+            // Ends when the queue is closed (after what is queued is written)
+            // or when the pipe breaks.
+            for line in lines {
+                let written = pipe
+                    .write_all(line.as_bytes())
+                    .and_then(|()| pipe.write_all(b"\n"))
+                    .and_then(|()| pipe.flush());
+                if written.is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            queue: Mutex::new(Some(queue)),
+        }
+    }
+
+    fn send(&self, line: &str) -> Result<(), String> {
+        if line.contains('\n') {
+            return Err("a client message is one line".into());
+        }
+        let queue = lock(&self.queue);
+        let queue = queue.as_ref().ok_or("The Neuron engine is not running.")?;
+        queue
+            .try_send(line.to_string())
+            .map_err(|error| match error {
+                TrySendError::Full(_) => {
+                    "The Neuron engine is not keeping up. Try again in a moment.".to_string()
+                }
+                TrySendError::Disconnected(_) => "The Neuron engine is not running.".to_string(),
+            })
+    }
+
+    /// No more messages; what is queued is still written.
+    fn close(&self) {
+        lock(&self.queue).take();
+    }
+}
+
+/// Runs something once, the first time it is asked to.
+#[derive(Default)]
+struct Once(AtomicBool);
+
+impl Once {
+    /// `true` for the first call only.
+    fn first(&self) -> bool {
+        !self.0.swap(true, Ordering::SeqCst)
+    }
+}
+
 /// A running engine.
 pub struct EngineProcess {
-    stdin: Mutex<Option<ChildStdin>>,
+    stdin: Option<StdinWriter>,
     pid: u32,
     exited: Arc<AtomicBool>,
+    /// The grace-kill thread starts once, however often `stop` is called.
+    grace: Once,
 }
 
 impl EngineProcess {
@@ -219,7 +286,7 @@ impl EngineProcess {
             job::assign(child.as_raw_handle());
         }
         let pid = child.id();
-        let stdin = child.stdin.take();
+        let stdin = child.stdin.take().map(StdinWriter::new);
         let stdout = child.stdout.take().ok_or("the engine has no stdout")?;
         let stderr = child.stderr.take().ok_or("the engine has no stderr")?;
         let exited = Arc::new(AtomicBool::new(false));
@@ -267,9 +334,10 @@ impl EngineProcess {
         });
 
         Ok(Self {
-            stdin: Mutex::new(stdin),
+            stdin,
             pid,
             exited,
+            grace: Once::default(),
         })
     }
 
@@ -279,22 +347,22 @@ impl EngineProcess {
 
     /// Writes one client message (a JSON line) to the engine.
     pub fn send(&self, line: &str) -> Result<(), String> {
-        if line.contains('\n') {
-            return Err("a client message is one line".into());
-        }
-        let mut stdin = lock(&self.stdin);
-        let pipe = stdin.as_mut().ok_or("The Neuron engine is not running.")?;
-        pipe.write_all(line.as_bytes())
-            .and_then(|()| pipe.write_all(b"\n"))
-            .and_then(|()| pipe.flush())
-            .map_err(|error| format!("The Neuron engine is not running ({error})."))
+        self.stdin
+            .as_ref()
+            .ok_or("The Neuron engine is not running.")?
+            .send(line)
     }
 
     /// Asks the engine to save and stop (a shutdown and the end of its input),
     /// and ends it, with what it started, if it hasn't exited after a grace period.
     pub fn stop(&self) {
         let _ = self.send(r#"{"kind":"command","type":"shutdown"}"#);
-        lock(&self.stdin).take();
+        if let Some(stdin) = &self.stdin {
+            stdin.close();
+        }
+        if !self.grace.first() {
+            return;
+        }
         let (pid, exited) = (self.pid, Arc::clone(&self.exited));
         thread::spawn(move || {
             thread::sleep(SHUTDOWN_GRACE);
@@ -306,7 +374,9 @@ impl EngineProcess {
 
     /// Ends the engine and its whole process tree at once.
     pub fn kill_tree(&self) {
-        lock(&self.stdin).take();
+        if let Some(stdin) = &self.stdin {
+            stdin.close();
+        }
         if !self.exited.load(Ordering::SeqCst) {
             kill_tree_pid(self.pid);
         }
@@ -342,6 +412,73 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    /// A pipe nobody reads: every write waits for the flag.
+    struct Stalled(Arc<AtomicBool>);
+
+    impl Write for Stalled {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            while !self.0.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_stalled_pipe_never_blocks_send_or_close() {
+        let release = Arc::new(AtomicBool::new(false));
+        let writer = StdinWriter::new(Stalled(Arc::clone(&release)));
+        let started = std::time::Instant::now();
+        let mut refused = 0;
+        for _ in 0..(WRITE_QUEUE * 3) {
+            if writer.send(r#"{"kind":"command"}"#).is_err() {
+                refused += 1;
+            }
+        }
+        writer.close();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(refused > 0, "the queue is bounded");
+        assert!(writer.send("{}").unwrap_err().contains("not running"));
+        release.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn queued_messages_are_written_in_order_then_the_pipe_closes() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                lock(&self.0).extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let writer = StdinWriter::new(sink.clone());
+        writer.send("one").unwrap();
+        writer.send("two").unwrap();
+        assert!(writer.send("a\nb").is_err());
+        writer.close();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while lock(&sink.0).len() < 8 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(lock(&sink.0).as_slice(), b"one\ntwo\n");
+    }
+
+    #[test]
+    fn the_grace_kill_starts_once() {
+        let once = Once::default();
+        assert!(once.first());
+        assert!(!once.first());
+        assert!(!once.first());
+    }
 
     #[test]
     fn launch_flags_carry_the_reasoning_effort() {
