@@ -91,5 +91,8 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
       }
     },
     openExternal: (url) => window.open(url, '_blank', 'noopener,noreferrer'),
+    // L3: composer. A Neuron host has no staging folder or save dialog on this side.
+    stageAttachment: () => Promise.reject(new Error('Images can only be attached in the Neuron desktop app.')),
+    exportSave: () => Promise.reject(new Error('Saving a chat is only available in the Neuron desktop app.')),
   }
 }

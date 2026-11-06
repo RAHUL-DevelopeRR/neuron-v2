@@ -227,5 +227,11 @@ export function tauriPlatform(): Platform {
       }
     },
     openExternal: (url) => void invoke('open_external', { url }),
+    // L3: composer
+    stageAttachment: (name, data, mediaType) =>
+      invoke<{ path: string; media_type: string }>('attachment_stage', data, {
+        headers: { 'x-attachment-name': encodeURIComponent(name), 'x-media-type': mediaType },
+      }),
+    exportSave: (suggestedName, content) => invoke<string | null>('export_save', { suggestedName, content }),
   }
 }

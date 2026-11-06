@@ -63,6 +63,8 @@ export interface KeyValueStore {
 export interface LaunchOptions {
   model?: string
   permissionMode?: string
+  /** L3: how hard the model thinks, for models that take it; the engine's own default when absent. */
+  reasoningEffort?: 'low' | 'medium' | 'high'
 }
 
 export interface UpdateInfo {
@@ -112,4 +114,14 @@ export interface Platform {
   /** A shell in the workspace; rejects where there is none. */
   openTerminal(cols: number, rows: number): Promise<TerminalSession>
   openExternal(url: string): void
+  /**
+   * L3: copies a pasted or dropped image into the app's staging folder and returns the
+   * path the engine can read. Png, jpeg, gif and webp, at most 10 MB; rejects otherwise.
+   */
+  stageAttachment(name: string, data: Uint8Array, mediaType: string): Promise<{ path: string; media_type: string }>
+  /**
+   * L3: saves a chat export. The system's save dialog picks the file (the app never
+   * names the path); returns the saved path, or `null` when cancelled.
+   */
+  exportSave(suggestedName: string, content: string): Promise<string | null>
 }
