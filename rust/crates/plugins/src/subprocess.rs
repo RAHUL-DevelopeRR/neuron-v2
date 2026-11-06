@@ -33,15 +33,43 @@ pub const CREDENTIAL_ENV_VARS: &[&str] = &[
     "GROK_API_KEY",
     "DASHSCOPE_API_KEY",
     "OPENROUTER_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "DATABASE_URL",
 ];
 
 /// Name suffixes that mark any other variable as a secret (`GITHUB_TOKEN`,
 /// `STRIPE_SECRET`, `MISTRAL_API_KEY`); matched after a `_` or as the whole
 /// name, ignoring case.
-pub const CREDENTIAL_ENV_SUFFIXES: &[&str] = &["API_KEY", "TOKEN", "SECRET"];
+pub const CREDENTIAL_ENV_SUFFIXES: &[&str] = &[
+    "API_KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIALS",
+    "SECRET_KEY",
+    "ACCESS_KEY",
+    "PRIVATE_KEY",
+    "SECRET_ACCESS_KEY",
+    "CONNECTION_STRING",
+];
 
-/// Value prefixes of Zero-X credentials (`ses_` CLI sessions, `nzx_` API keys).
-pub const CREDENTIAL_VALUE_PREFIXES: &[&str] = &["ses_", "nzx_"];
+/// Value prefixes of Zero-X credentials (`ses_` CLI sessions, `nzx_` API keys)
+/// and of common provider keys (`sk-`, GitHub `ghp_`/`gho_`/`ghs_`/`github_pat_`,
+/// AWS `AKIA`/`ASIA`, Slack `xox`).
+pub const CREDENTIAL_VALUE_PREFIXES: &[&str] = &[
+    "ses_",
+    "nzx_",
+    "sk-",
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "github_pat_",
+    "AKIA",
+    "ASIA",
+    "xoxb-",
+    "xoxp-",
+];
 
 /// Default timeout for hook commands.
 pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_mins(1);
@@ -737,6 +765,42 @@ mod tests {
         assert!(!is_credential_env(
             OsStr::new("SESSION_NAME"),
             OsStr::new("my-ses_name")
+        ));
+    }
+
+    #[test]
+    fn detects_more_secret_names_and_provider_value_prefixes() {
+        for key in [
+            "DB_PASSWORD",
+            "POSTGRES_PASSWD",
+            "GOOGLE_CREDENTIALS",
+            "DJANGO_SECRET_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "SIGNING_PRIVATE_KEY",
+            "DATABASE_URL",
+            "AZURE_STORAGE_CONNECTION_STRING",
+        ] {
+            assert!(
+                is_credential_env(OsStr::new(key), OsStr::new("plain-value")),
+                "{key}"
+            );
+        }
+        for value in [
+            "sk-live-abc",
+            "ghp_abc",
+            "github_pat_abc",
+            "AKIAABCDEFG",
+            "xoxb-1-2",
+        ] {
+            assert!(
+                is_credential_env(OsStr::new("SOME_VAR"), OsStr::new(value)),
+                "{value}"
+            );
+        }
+        assert!(!is_credential_env(
+            OsStr::new("PASSWORD_POLICY"),
+            OsStr::new("strict")
         ));
     }
 

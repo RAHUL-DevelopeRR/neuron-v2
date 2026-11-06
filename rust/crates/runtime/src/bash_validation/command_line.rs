@@ -2261,7 +2261,6 @@ const PLAIN_READ_ONLY_PROGRAMS: &[&str] = &[
     "grep",
     "egrep",
     "fgrep",
-    "jq",
     "nproc",
     "arch",
     "cal",
@@ -2371,6 +2370,10 @@ fn classify_program(
         } else {
             Ok(())
         };
+    }
+    if name == "jq" {
+        check_jq_args(args)?;
+        return check_args(context);
     }
     if PLAIN_READ_ONLY_PROGRAMS.contains(&name)
         || (context.dialect == ShellDialect::Cmd && CMD_ONLY_READ_ONLY_PROGRAMS.contains(&name))
@@ -3012,6 +3015,12 @@ fn check_awk_program(program: &str) -> Result<(), String> {
             "awk program uses `{token}`, which can run commands or write files"
         ));
     }
+    if program.contains("ENVIRON") {
+        return Err(
+            "awk program uses `ENVIRON`, which prints environment variables that can hold credentials"
+                .to_string(),
+        );
+    }
     if program.contains("ARGV") {
         return Err(
             "awk program uses `ARGV`, which can make it read files not named on the command line"
@@ -3041,6 +3050,54 @@ fn awk_at_directive(program: &str) -> Option<String> {
         name.starts_with(|ch: char| ch.is_ascii_alphabetic() || ch == '_')
             .then(|| format!("@{name}"))
     })
+}
+
+/// Whether `program` calls jq's `env` builtin or reads `$ENV`: `env` as a whole
+/// identifier that is not a `.env` field access or part of a longer name.
+fn jq_reads_environment(program: &str) -> bool {
+    if program.contains("$ENV") {
+        return true;
+    }
+    let bytes = program.as_bytes();
+    let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    program.match_indices("env").any(|(start, _)| {
+        let before = start.checked_sub(1).map(|index| bytes[index]);
+        let after = bytes.get(start + 3).copied();
+        !before.is_some_and(|byte| is_ident(byte) || byte == b'.' || byte == b'$')
+            && !after.is_some_and(is_ident)
+    })
+}
+
+/// jq prints `env` and `$ENV` (the process environment, with every secret in
+/// it) and loads programs and modules from files that cannot be inspected.
+/// Only the plain filter-a-file shape is read-only.
+fn check_jq_args(args: &[Word]) -> Result<(), String> {
+    for arg in args {
+        let text = arg.text.as_str();
+        if text == "--" {
+            break;
+        }
+        let is_short_cluster = text.starts_with('-') && !text.starts_with("--") && text.len() > 1;
+        let loads_code = matches!(text, "--from-file" | "--library-path")
+            || text.starts_with("--from-file=")
+            || text.starts_with("--library-path=")
+            || (is_short_cluster && text[1..].chars().any(|flag| matches!(flag, 'f' | 'L')));
+        if loads_code {
+            return Err(format!(
+                "`jq {text}` loads a program or module from a file, which cannot be inspected"
+            ));
+        }
+        if jq_reads_environment(text) {
+            return Err(
+                "jq program uses `env` or `$ENV`, which prints environment variables that can hold credentials"
+                    .to_string(),
+            );
+        }
+        if text.contains("import ") || text.contains("include ") {
+            return Err("jq program imports a module from a file".to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Checks the options and program text of an awk invocation and returns the
@@ -4425,6 +4482,29 @@ mod tests {
         assert_escalates("env FOO=1 ls");
         assert_escalates_in_workspace("FOO=bar ls");
         assert_escalates("GIT_EXTERNAL_DIFF=./evil git diff");
+    }
+
+    #[test]
+    fn awk_and_jq_cannot_print_the_environment_without_approval() {
+        assert_escalates("awk 'BEGIN { for (k in ENVIRON) print k, ENVIRON[k] }'");
+        assert_escalates("awk 'BEGIN{print ENVIRON[\"NEURON_TOKEN\"]}'");
+        assert_escalates("gawk -e 'BEGIN { print ENVIRON[\"HOME\"] }'");
+        assert_escalates("jq -n env");
+        assert_escalates("jq -n '$ENV'");
+        assert_escalates("jq -n '$ENV.PATH'");
+        assert_escalates("jq -n 'env.NEURON_TOKEN'");
+        assert_escalates("jq -rn '[env | keys[]]'");
+        assert_escalates("jq -n '{a: env}'");
+        assert_escalates("jq -f prog.jq data.json");
+        assert_escalates("jq --from-file prog.jq data.json");
+        assert_escalates("jq -L ./mods 'include \"m\"; .' data.json");
+        assert_escalates("jq 'import \"m\" as m; .' data.json");
+        assert_escalates("cat /proc/self/environ");
+        assert_escalates("sed -n p /proc/self/environ");
+        assert_read_only("jq .name package.json");
+        assert_read_only("jq '.items[] | .environment' data.json");
+        assert_read_only("jq -r '.scripts.test' package.json");
+        assert_read_only("awk '{ print $1 }' data.txt");
     }
 
     #[test]
