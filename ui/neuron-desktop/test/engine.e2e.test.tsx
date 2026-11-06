@@ -88,13 +88,13 @@ describe.skipIf(!haveEngineBinaries)('Neuron Desktop on the real engine', () => 
       const { workspace } = await startApp()
       expect((await element('.connection.ready')).textContent).toMatch(/^engine \d/)
       send('PARITY_SCENARIO:bash_permission_prompt_approved')
-      const dialog = await element('[role="dialog"]')
+      const dialog = await element('[role="alertdialog"]')
       expect(within(dialog).getByText("$ printf 'approved via prompt' | tee approved.txt")).toBeTruthy()
       fireEvent.click(within(dialog).getByRole('button', { name: /allow once/i }))
       await until('the reply', () => text('[data-testid="assistant-message"]').includes('bash approved and executed'))
       await until('the turn to end', () => document.querySelector('.composer button.stop') === null)
       expect(text('[data-testid="tool-card"] .tool-state')).toBe('done')
-      expect(document.querySelector('[role="dialog"]')).toBeNull()
+      expect(document.querySelector('[role="alertdialog"]')).toBeNull()
       expect(fs.readFileSync(path.join(workspace, 'approved.txt'), 'utf8')).toBe('approved via prompt')
     },
     90_000,

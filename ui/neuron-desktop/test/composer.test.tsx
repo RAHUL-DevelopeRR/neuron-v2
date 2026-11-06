@@ -351,14 +351,14 @@ describe('Approvals', () => {
       { type: 'tool_call_started', id: 't', name: 'bash', input, cut_off: false },
       { type: 'permission_requested', id: 7, request: { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: null, input, session_prefixes } },
     )
-    await new Promise((resolve) => setTimeout(resolve, 350))
+    await new Promise((resolve) => setTimeout(resolve, 750))
   }
   const reply = (engine: FakeEngine) => engine.sent.at(-1)
 
   test('focus moves into the dialog, and Enter allows once', async () => {
     const { engine } = await start()
     await ask(engine)
-    const dialog = screen.getByRole('dialog')
+    const dialog = screen.getByRole('alertdialog')
     expect(dialog.contains(document.activeElement)).toBe(true)
     fireEvent.keyDown(document.activeElement ?? window, { key: 'Enter' })
     expect(reply(engine)).toEqual({ kind: 'permission_reply', id: 7, decision: { kind: 'allow_once' } })
@@ -371,10 +371,86 @@ describe('Approvals', () => {
     expect(reply(engine)).toEqual({ kind: 'permission_reply', id: 7, decision: { kind: 'deny', note: null } })
   })
 
+  test('keys meant for something else never answer', async () => {
+    const { engine } = await start()
+    await ask(engine, ['git'])
+    const target = document.activeElement ?? window
+    const before = engine.sent.length
+    for (const init of [
+      { key: 'Enter', ctrlKey: true },
+      { key: 'Enter', metaKey: true },
+      { key: 'y', altKey: true },
+      { key: 'Enter', repeat: true },
+      { key: 'Escape', repeat: true },
+      { key: 'n', ctrlKey: true },
+    ]) {
+      fireEvent.keyDown(target, init)
+    }
+    expect(engine.sent.length).toBe(before)
+    expect(screen.getByRole('alertdialog')).toBeTruthy()
+  })
+
+  test('bare letters work only while focus is inside the dialog', async () => {
+    const { engine } = await start()
+    await ask(engine)
+    const before = engine.sent.length
+    fireEvent.keyDown(document.body, { key: 'y' })
+    fireEvent.keyDown(window, { key: 'n' })
+    expect(engine.sent.length).toBe(before)
+    fireEvent.keyDown(document.activeElement ?? window, { key: 'y' })
+    expect(reply(engine)).toEqual({ kind: 'permission_reply', id: 7, decision: { kind: 'allow_once' } })
+  })
+
+  test('refocusing the dialog restarts the guard', async () => {
+    const { engine } = await start()
+    await ask(engine)
+    const dialog = screen.getByRole('alertdialog')
+    const button = within(dialog).getAllByRole('button')[0]
+    act(() => button.focus())
+    fireEvent.keyDown(dialog, { key: 'Escape' })
+    expect(screen.getByRole('alertdialog')).toBeTruthy()
+    await new Promise((resolve) => setTimeout(resolve, 750))
+    fireEvent.keyDown(dialog, { key: 'Escape' })
+    expect(reply(engine)).toEqual({ kind: 'permission_reply', id: 7, decision: { kind: 'deny', note: null } })
+  })
+
+  test('a composer that holds text keeps focus; Tab moves into the dialog', async () => {
+    const { engine } = await start()
+    type('first')
+    box().focus()
+    fireEvent.change(box(), { target: { value: 'half a sentence', selectionStart: 15 } })
+    const input = '{"command":"git push"}'
+    await emit(
+      engine,
+      { type: 'tool_call_started', id: 't', name: 'bash', input, cut_off: false },
+      { type: 'permission_requested', id: 7, request: { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: null, input, session_prefixes: [] } },
+    )
+    await new Promise((resolve) => setTimeout(resolve, 750))
+    const dialog = screen.getByRole('alertdialog')
+    expect(document.activeElement).toBe(box())
+    // Keys typed into the composer never answer.
+    const before = engine.sent.length
+    fireEvent.keyDown(box(), { key: 'Enter' })
+    fireEvent.keyDown(box(), { key: 'y' })
+    expect(engine.sent.filter((m) => m.kind === 'permission_reply')).toEqual([])
+    expect(engine.sent.length).toBe(before)
+    fireEvent.keyDown(box(), { key: 'Tab' })
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true))
+  })
+
+  test('focus that falls to the page goes back into the dialog', async () => {
+    const { engine } = await start()
+    await ask(engine)
+    const dialog = screen.getByRole('alertdialog')
+    act(() => within(dialog).getAllByRole('button')[0].focus())
+    act(() => (document.activeElement as HTMLElement | null)?.blur())
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true))
+  })
+
   test('the buttons show their keys', async () => {
     const { engine } = await start()
     await ask(engine)
-    const dialog = screen.getByRole('dialog')
+    const dialog = screen.getByRole('alertdialog')
     expect(within(dialog).getByRole('button', { name: /allow once/i }).textContent).toContain('Enter')
     expect(within(dialog).getByRole('button', { name: /^deny esc/i }).textContent).toContain('Esc')
   })
@@ -382,11 +458,11 @@ describe('Approvals', () => {
   test('deny with a note sends the note, and Esc in the note goes back instead of denying', async () => {
     const { engine } = await start()
     await ask(engine)
-    const dialog = screen.getByRole('dialog')
+    const dialog = screen.getByRole('alertdialog')
     fireEvent.click(within(dialog).getByRole('button', { name: /deny with a note/i }))
     const note = within(dialog).getByPlaceholderText('Tell Neuron what to do instead')
     fireEvent.keyDown(note, { key: 'Escape' })
-    expect(screen.getByRole('dialog')).toBeTruthy()
+    expect(screen.getByRole('alertdialog')).toBeTruthy()
     expect(within(dialog).queryByPlaceholderText('Tell Neuron what to do instead')).toBeNull()
     fireEvent.click(within(dialog).getByRole('button', { name: /deny with a note/i }))
     const again = within(dialog).getByPlaceholderText('Tell Neuron what to do instead')
@@ -398,7 +474,7 @@ describe('Approvals', () => {
   test('Tab stays inside the dialog', async () => {
     const { engine } = await start()
     await ask(engine, ['git'])
-    const dialog = screen.getByRole('dialog')
+    const dialog = screen.getByRole('alertdialog')
     const buttons = within(dialog).getAllByRole('button')
     buttons.at(-1)!.focus()
     fireEvent.keyDown(buttons.at(-1)!, { key: 'Tab' })
@@ -416,7 +492,7 @@ describe('Approvals', () => {
     type('queued')
     await expectAccessible(document.querySelector('.composer')!)
     await ask(engine, ['git'])
-    await expectAccessible(screen.getByRole('dialog'))
+    await expectAccessible(screen.getByRole('alertdialog'))
   })
 })
 
