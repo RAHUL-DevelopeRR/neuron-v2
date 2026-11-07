@@ -910,6 +910,16 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
+            name: "neuron_status",
+            description: "Read-only live status of this Neuron session: today's date and time, whether the user is signed in (display name only), plan, requests and tokens used versus limits, the rolling token window and when it resets, the current model and context size, workspace trust, permission mode and the tools registered. Call it for any question about usage, limits, plan, username, date or your own capabilities. Takes no arguments.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "Sleep",
             description: "Wait for a specified duration without holding a shell process.",
             input_schema: json!({
@@ -1503,6 +1513,40 @@ fn change_watcher_slot() -> &'static std::sync::RwLock<Option<ChangeWatcher>> {
     SLOT.get_or_init(|| std::sync::RwLock::new(None))
 }
 
+/// Produces the text of the read-only `neuron_status` tool.
+pub type StatusProvider = fn() -> String;
+
+fn status_provider_slot() -> &'static std::sync::RwLock<Option<StatusProvider>> {
+    static SLOT: std::sync::OnceLock<std::sync::RwLock<Option<StatusProvider>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Installs what answers `neuron_status`: the account and session live in the CLI, which
+/// registers its reader here.
+pub fn set_status_provider(provider: StatusProvider) {
+    *status_provider_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(provider);
+}
+
+/// Removes the status provider.
+pub fn clear_status_provider() {
+    *status_provider_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+fn run_neuron_status() -> String {
+    let provider = *status_provider_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    provider.map_or_else(
+        || "Neuron status is not available in this context (no account or session reader is installed).".to_string(),
+        |provider| provider(),
+    )
+}
+
 /// Tells `watcher` before every built-in tool call that may change files runs, once its
 /// permission check passed: the agent's own calls and its sub-agents' alike, on whichever
 /// thread runs them. The full-screen engine saves its checkpoints from here. MCP and
@@ -1604,6 +1648,7 @@ fn execute_tool_with_enforcer_and_cancel(
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
+        "neuron_status" => Ok(run_neuron_status()),
         "NotebookEdit" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
             let edit = from_value::<NotebookEditInput>(input)?;
@@ -8331,6 +8376,31 @@ mod tests {
                 .contains("requires 'danger-full-access' permission"),
             "denial should come from dynamic bash classification"
         );
+    }
+
+    #[test]
+    fn neuron_status_is_read_only_default_advertised_and_provider_backed() {
+        let spec = mvp_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "neuron_status")
+            .expect("neuron_status is a built-in tool");
+        assert_eq!(spec.required_permission, PermissionMode::ReadOnly);
+        assert_eq!(
+            crate::tool_advertisement("neuron_status"),
+            crate::ToolAdvertisement::Default
+        );
+        assert!(GlobalToolRegistry::builtin()
+            .definitions(None)
+            .iter()
+            .any(|tool| tool.name == "neuron_status"));
+        // One test: the provider slot is process-wide.
+        crate::clear_status_provider();
+        let without = execute_tool("neuron_status", &json!({})).expect("answers without a reader");
+        assert!(without.contains("not available"));
+        crate::set_status_provider(|| "Neuron status\n- Account: not signed in".to_string());
+        let with = execute_tool("neuron_status", &json!({})).expect("answers with a reader");
+        assert!(with.contains("not signed in"));
+        crate::clear_status_provider();
     }
 
     #[test]

@@ -471,6 +471,29 @@ fn assemble_conversation_runtime(
     tool_registry.set_enforcer(runtime::permission_enforcer::PermissionEnforcer::new(
         policy.clone(),
     ));
+    // What the model is told about its own session and account (no network call), and
+    // what the `neuron_status` tool reports.
+    crate::awareness::apply(
+        &mut system_prompt,
+        crate::awareness::SessionFacts {
+            model: crate::gateway_catalog::prompt_model_name(&model)
+                .unwrap_or_else(|| "auto".to_string()),
+            context_tokens: api::model_token_limit(crate::provider::shown_model(&model))
+                .map(|limit| u64::from(limit.context_window_tokens)),
+            permission_mode: permission_mode.as_str().to_string(),
+            trusted: std::env::current_dir()
+                .ok()
+                .map(|cwd| runtime::ConfigLoader::default_for(&cwd).workspace_is_trusted()),
+            tools: if enable_tools {
+                filter_tool_specs(&tool_registry, allowed_tools.as_ref())
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        },
+    );
     let tool_schema_tokens = if enable_tools {
         estimate_tool_schema_tokens(&filter_tool_specs(&tool_registry, allowed_tools.as_ref()))
     } else {
