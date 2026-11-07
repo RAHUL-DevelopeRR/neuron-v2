@@ -33,15 +33,51 @@ pub const CREDENTIAL_ENV_VARS: &[&str] = &[
     "GROK_API_KEY",
     "DASHSCOPE_API_KEY",
     "OPENROUTER_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "PGPASSWORD",
+    "MYSQL_PWD",
+    "KUBECONFIG",
 ];
 
 /// Name suffixes that mark any other variable as a secret (`GITHUB_TOKEN`,
 /// `STRIPE_SECRET`, `MISTRAL_API_KEY`); matched after a `_` or as the whole
 /// name, ignoring case.
-pub const CREDENTIAL_ENV_SUFFIXES: &[&str] = &["API_KEY", "TOKEN", "SECRET"];
+pub const CREDENTIAL_ENV_SUFFIXES: &[&str] = &[
+    "API_KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIALS",
+    "SECRET_KEY",
+    "ACCESS_KEY",
+    "PRIVATE_KEY",
+    "SECRET_ACCESS_KEY",
+    "CONNECTION_STRING",
+    "DSN",
+    "URI",
+];
 
 /// Value prefixes of Zero-X credentials (`ses_` CLI sessions, `nzx_` API keys).
 pub const CREDENTIAL_VALUE_PREFIXES: &[&str] = &["ses_", "nzx_"];
+
+/// Value prefixes of common provider keys (`sk-`, GitHub `ghp_`/`gho_`/`ghs_`/
+/// `github_pat_`, AWS `AKIA`/`ASIA`, Slack `xox`). They mark an inherited variable
+/// as a secret for the scrubber; a variable an MCP profile names on purpose is
+/// still passed on.
+pub const PROVIDER_SECRET_VALUE_PREFIXES: &[&str] = &[
+    "sk-",
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "github_pat_",
+    "AKIA",
+    "ASIA",
+    "xoxb-",
+    "xoxp-",
+];
 
 /// Default timeout for hook commands.
 pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_mins(1);
@@ -106,6 +142,7 @@ pub fn is_credential_env(key: &OsStr, value: &OsStr) -> bool {
     let value = value.to_string_lossy();
     CREDENTIAL_VALUE_PREFIXES
         .iter()
+        .chain(PROVIDER_SECRET_VALUE_PREFIXES)
         .any(|prefix| value.starts_with(prefix))
 }
 
@@ -441,12 +478,37 @@ impl BoundedOutput {
     }
 }
 
+/// Which pipe of a child a piece of output came from ([`run_bounded_observed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputPipe {
+    Stdout,
+    Stderr,
+}
+
 struct PipeReader {
     buffer: Arc<Mutex<Vec<u8>>>,
     handle: Option<JoinHandle<()>>,
+    /// Bytes already handed to the observer.
+    reported: usize,
 }
 
 impl PipeReader {
+    /// Hands what the pipe captured since the last call to `on_output`. The
+    /// bytes are copied out first, so the reader thread never waits on the
+    /// observer.
+    fn report_new(&mut self, pipe: OutputPipe, on_output: &mut dyn FnMut(OutputPipe, &[u8])) {
+        let fresh = {
+            let buffer = self.buffer.lock().unwrap_or_else(PoisonError::into_inner);
+            if buffer.len() <= self.reported {
+                return;
+            }
+            let fresh = buffer[self.reported..].to_vec();
+            self.reported = buffer.len();
+            fresh
+        };
+        on_output(pipe, &fresh);
+    }
+
     fn spawn<R: Read + Send + 'static>(pipe: Option<R>) -> Self {
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let handle = pipe.map(|mut pipe| {
@@ -467,7 +529,11 @@ impl PipeReader {
                 }
             })
         });
-        Self { buffer, handle }
+        Self {
+            buffer,
+            handle,
+            reported: 0,
+        }
     }
 
     fn is_finished(&self) -> bool {
@@ -500,7 +566,14 @@ pub fn run_bounded(
     timeout: Option<Duration>,
     is_cancelled: &dyn Fn() -> bool,
 ) -> io::Result<BoundedOutput> {
-    run_bounded_with_spawn_hook(command, stdin, timeout, is_cancelled, &mut |_| Ok(()))
+    run_bounded_hooked(
+        command,
+        stdin,
+        timeout,
+        is_cancelled,
+        &mut |_| Ok(()),
+        &mut |_, _| {},
+    )
 }
 
 /// [`run_bounded`] with `after_spawn` called on the child right after it
@@ -513,6 +586,47 @@ pub fn run_bounded_with_spawn_hook(
     timeout: Option<Duration>,
     is_cancelled: &dyn Fn() -> bool,
     after_spawn: &mut dyn FnMut(&Child) -> io::Result<()>,
+) -> io::Result<BoundedOutput> {
+    run_bounded_hooked(
+        command,
+        stdin,
+        timeout,
+        is_cancelled,
+        after_spawn,
+        &mut |_, _| {},
+    )
+}
+
+/// Like [`run_bounded`], but `on_output` hears the output as it arrives: every
+/// few milliseconds while the child runs, with what each pipe captured since the
+/// last call, and once more after the pipes drained. It runs on the calling
+/// thread. What it hears is what the result holds (at most
+/// [`MAX_CAPTURED_BYTES`] per pipe).
+pub fn run_bounded_observed(
+    command: &mut Command,
+    stdin: Option<&[u8]>,
+    timeout: Option<Duration>,
+    is_cancelled: &dyn Fn() -> bool,
+    on_output: &mut dyn FnMut(OutputPipe, &[u8]),
+) -> io::Result<BoundedOutput> {
+    run_bounded_hooked(
+        command,
+        stdin,
+        timeout,
+        is_cancelled,
+        &mut |_| Ok(()),
+        on_output,
+    )
+}
+
+/// [`run_bounded_with_spawn_hook`] and [`run_bounded_observed`] together.
+pub fn run_bounded_hooked(
+    command: &mut Command,
+    stdin: Option<&[u8]>,
+    timeout: Option<Duration>,
+    is_cancelled: &dyn Fn() -> bool,
+    after_spawn: &mut dyn FnMut(&Child) -> io::Result<()>,
+    on_output: &mut dyn FnMut(OutputPipe, &[u8]),
 ) -> io::Result<BoundedOutput> {
     command
         .stdin(if stdin.is_some() {
@@ -540,11 +654,13 @@ pub fn run_bounded_with_spawn_hook(
         }
         _ => None,
     };
-    let stdout = PipeReader::spawn(child.stdout.take());
-    let stderr = PipeReader::spawn(child.stderr.take());
+    let mut stdout = PipeReader::spawn(child.stdout.take());
+    let mut stderr = PipeReader::spawn(child.stderr.take());
 
     let started = Instant::now();
     let (termination, status) = loop {
+        stdout.report_new(OutputPipe::Stdout, on_output);
+        stderr.report_new(OutputPipe::Stderr, on_output);
         if let Some(status) = child.try_wait()? {
             break (Termination::Exited, Some(status));
         }
@@ -565,6 +681,8 @@ pub fn run_bounded_with_spawn_hook(
     {
         thread::sleep(POLL_INTERVAL);
     }
+    stdout.report_new(OutputPipe::Stdout, on_output);
+    stderr.report_new(OutputPipe::Stderr, on_output);
     if let Some(writer) = writer {
         if writer.is_finished() {
             let _ = writer.join();
@@ -597,8 +715,8 @@ pub fn termination_message(termination: Termination, timeout: Option<Duration>) 
 #[cfg(test)]
 mod tests {
     use super::{
-        credential_env_keys, is_credential_env, run_bounded, scrub_credential_env,
-        termination_message, Termination,
+        credential_env_keys, is_credential_env, run_bounded, run_bounded_observed,
+        scrub_credential_env, termination_message, OutputPipe, Termination,
     };
     use std::ffi::OsStr;
     use std::process::Command;
@@ -657,6 +775,76 @@ mod tests {
             OsStr::new("SESSION_NAME"),
             OsStr::new("my-ses_name")
         ));
+    }
+
+    #[test]
+    fn detects_more_secret_names_and_provider_value_prefixes() {
+        for key in [
+            "DB_PASSWORD",
+            "POSTGRES_PASSWD",
+            "GOOGLE_CREDENTIALS",
+            "DJANGO_SECRET_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "SIGNING_PRIVATE_KEY",
+            "DATABASE_URL",
+            "AZURE_STORAGE_CONNECTION_STRING",
+        ] {
+            assert!(
+                is_credential_env(OsStr::new(key), OsStr::new("plain-value")),
+                "{key}"
+            );
+        }
+        for value in [
+            "sk-live-abc",
+            "ghp_abc",
+            "github_pat_abc",
+            "AKIAABCDEFG",
+            "xoxb-1-2",
+        ] {
+            assert!(
+                is_credential_env(OsStr::new("SOME_VAR"), OsStr::new(value)),
+                "{value}"
+            );
+        }
+        assert!(!is_credential_env(
+            OsStr::new("PASSWORD_POLICY"),
+            OsStr::new("strict")
+        ));
+    }
+
+    #[test]
+    fn detects_database_and_cluster_credentials_by_name() {
+        for key in [
+            "PGPASSWORD",
+            "MYSQL_PWD",
+            "MONGO_URI",
+            "SENTRY_DSN",
+            "REDIS_URL",
+            "KUBECONFIG",
+            "pgpassword",
+            "ANALYTICS_DSN",
+            "CACHE_URI",
+            "DSN",
+            "REDIS_URL",
+        ] {
+            assert!(
+                is_credential_env(OsStr::new(key), OsStr::new("plain-value")),
+                "{key}"
+            );
+        }
+        for key in [
+            "DSNAME",
+            "MYURI",
+            "PURI",
+            "CURL_CA_BUNDLE",
+            "REDIS_URL_FILE_NOT",
+        ] {
+            assert!(
+                !is_credential_env(OsStr::new(key), OsStr::new("plain-value")),
+                "{key}"
+            );
+        }
     }
 
     #[test]
@@ -721,6 +909,45 @@ mod tests {
         assert!(!stdout.contains("nzx_scrub_test_secret"), "{stdout}");
         assert!(!stdout.contains("sk-plain-provider-key"), "{stdout}");
         assert!(stdout.contains("keep=keep-me"), "{stdout}");
+    }
+
+    /// The observer hears each pipe's output before the run ends, and all of it
+    /// together is exactly what the result captured.
+    #[test]
+    fn observer_hears_both_pipes_while_the_child_runs() {
+        let script = if cfg!(windows) {
+            "echo first & echo oops 1>&2 & ping -n 2 127.0.0.1 >NUL & echo second"
+        } else {
+            "echo first; echo oops >&2; sleep 1; echo second"
+        };
+        let mut heard_stdout = Vec::new();
+        let mut heard_stderr = Vec::new();
+        let mut first_heard_at = None;
+        let started = Instant::now();
+        let output = run_bounded_observed(
+            &mut shell(script),
+            None,
+            Some(Duration::from_secs(20)),
+            &|| false,
+            &mut |pipe, bytes| {
+                first_heard_at.get_or_insert_with(|| started.elapsed());
+                match pipe {
+                    OutputPipe::Stdout => heard_stdout.extend_from_slice(bytes),
+                    OutputPipe::Stderr => heard_stderr.extend_from_slice(bytes),
+                }
+            },
+        )
+        .expect("child should run");
+        let total = started.elapsed();
+        assert_eq!(heard_stdout, output.stdout);
+        assert_eq!(heard_stderr, output.stderr);
+        assert!(String::from_utf8_lossy(&heard_stdout).contains("second"));
+        assert!(String::from_utf8_lossy(&heard_stderr).contains("oops"));
+        let first = first_heard_at.expect("output was heard");
+        assert!(
+            first + Duration::from_millis(500) < total,
+            "first output heard at {first:?}, run took {total:?}"
+        );
     }
 
     #[test]

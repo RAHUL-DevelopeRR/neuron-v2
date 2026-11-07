@@ -192,7 +192,10 @@ mod tests {
             .is_empty(),
             "a model the user picked is not second-guessed without toolCapableModels"
         );
-        assert!(tool_retry_models(&settings(), "openai/auto", None).is_empty());
+        assert_eq!(
+            tool_retry_models(&settings(), "openai/auto", None),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[test]
@@ -259,7 +262,7 @@ mod tests {
         let feature_config = RuntimeFeatureConfig::default();
         let routing = conversation_routing(&feature_config, "openai/auto", true, None);
         assert!(routing.agent_mode);
-        assert!(routing.fallbacks.is_empty());
+        assert_eq!(routing.fallbacks, [] as [std::string::String; 0]);
 
         let settings = ModelRoutingSettings {
             summary_model: Some("groq/openai/gpt-oss-20b".to_string()),

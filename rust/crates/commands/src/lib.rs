@@ -113,6 +113,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "artifacts",
+        aliases: &[],
+        summary: "List the files and large outputs saved for this session",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "cost",
         aliases: &[],
         summary: "Show cumulative token usage for this session",
@@ -185,15 +192,17 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "pr",
         aliases: &[],
-        summary: "Draft or create a pull request from the conversation",
-        argument_hint: Some("[context]"),
+        summary:
+            "Draft a pull request from the branch's commits; /pr create pushes and opens it with gh",
+        argument_hint: Some("[create [--draft]] [--base <branch>] [context]"),
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "issue",
         aliases: &[],
-        summary: "Draft or create a GitHub issue from the conversation",
-        argument_hint: Some("[context]"),
+        summary:
+            "Draft a GitHub issue from a title and the conversation; /issue create opens it with gh",
+        argument_hint: Some("[<title>|create]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -373,8 +382,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "hooks",
         aliases: &[],
-        summary: "List and manage lifecycle hooks",
-        argument_hint: Some("[list|run <hook>]"),
+        summary: "List configured hooks by event, with matcher and source",
+        argument_hint: Some("[event]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -737,8 +746,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "providers",
-        aliases: &[],
-        summary: "List available model providers",
+        aliases: &["auth"],
+        summary: "Show provider keys and the active provider (keys are never shown)",
         argument_hint: None,
         resume_supported: true,
     },
@@ -1092,6 +1101,7 @@ pub enum SlashCommand {
         confirm: bool,
     },
     Cost,
+    Artifacts,
     Resume {
         session_path: Option<String>,
     },
@@ -1124,6 +1134,8 @@ pub enum SlashCommand {
         args: Option<String>,
     },
     Doctor,
+    /// `/providers` (`/auth`): provider key status, never the keys.
+    Providers,
     Login,
     Logout,
     Vim,
@@ -1253,7 +1265,9 @@ impl SlashCommand {
             Self::Clear { .. } => "/clear",
             Self::Compact { .. } => "/compact",
             Self::Cost => "/cost",
+            Self::Artifacts => "/artifacts",
             Self::Doctor => "/doctor",
+            Self::Providers => "/providers",
             Self::Config { .. } => "/config",
             Self::Memory { .. } => "/memory",
             Self::History { .. } => "/history",
@@ -1389,6 +1403,10 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Cost
         }
+        "artifacts" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Artifacts
+        }
         "resume" => SlashCommand::Resume {
             session_path: Some(require_remainder(command, remainder, "<session-path>")?),
         },
@@ -1421,9 +1439,13 @@ pub fn validate_slash_command_input(
         "skills" | "skill" => SlashCommand::Skills {
             args: parse_skills_args(remainder.as_deref())?,
         },
-        "doctor" | "providers" => {
+        "doctor" => {
             validate_no_args(command, &args)?;
             SlashCommand::Doctor
+        }
+        "providers" | "auth" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Providers
         }
         "login" => {
             validate_no_args(command, &args)?;
@@ -2039,12 +2061,11 @@ pub fn resume_supported_slash_commands() -> Vec<&'static SlashCommandSpec> {
 
 fn slash_command_category(name: &str) -> &'static str {
     match name {
-        "help" | "status" | "cost" | "resume" | "session" | "version" | "usage" | "stats"
-        | "rename" | "clear" | "compact" | "history" | "tokens" | "cache" | "exit" | "summary"
-        | "tag" | "thinkback" | "copy" | "share" | "feedback" | "rewind" | "pin" | "unpin"
-        | "bookmarks" | "context" | "files" | "focus" | "unfocus" | "retry" | "stop" | "undo" => {
-            "Session"
-        }
+        "help" | "status" | "cost" | "artifacts" | "resume" | "session" | "version" | "usage"
+        | "stats" | "rename" | "clear" | "compact" | "history" | "tokens" | "cache" | "exit"
+        | "summary" | "tag" | "thinkback" | "copy" | "share" | "feedback" | "rewind" | "pin"
+        | "unpin" | "bookmarks" | "context" | "files" | "focus" | "unfocus" | "retry" | "stop"
+        | "undo" => "Session",
         "model" | "permissions" | "config" | "memory" | "theme" | "vim" | "voice" | "color"
         | "effort" | "fast" | "brief" | "output-style" | "keybindings" | "privacy-settings"
         | "stickers" | "language" | "profile" | "max-tokens" | "temperature" | "system-prompt"
@@ -5154,6 +5175,7 @@ pub fn handle_slash_command(
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost
+        | SlashCommand::Artifacts
         | SlashCommand::Resume { .. }
         | SlashCommand::Config { .. }
         | SlashCommand::Mcp { .. }
@@ -5167,6 +5189,7 @@ pub fn handle_slash_command(
         | SlashCommand::Agents { .. }
         | SlashCommand::Skills { .. }
         | SlashCommand::Doctor
+        | SlashCommand::Providers
         | SlashCommand::Login
         | SlashCommand::Logout
         | SlashCommand::Vim
@@ -5765,8 +5788,9 @@ mod tests {
         assert!(help.contains("/compact"));
         assert!(help.contains("/bughunter [scope]"));
         assert!(help.contains("/commit"));
-        assert!(help.contains("/pr [context]"));
-        assert!(help.contains("/issue [context]"));
+        assert!(help.contains("/pr [create [--draft]] [--base <branch>] [context]"));
+        assert!(help.contains("/pr create pushes and opens it with gh"));
+        assert!(help.contains("/issue [<title>|create]"));
         assert!(help.contains("/ultraplan [task]"));
         assert!(help.contains("/teleport <symbol-or-path>"));
         assert!(help.contains("/debug-tool-call"));
@@ -5796,7 +5820,7 @@ mod tests {
         assert!(help.contains("/login"));
         assert!(help.contains("/logout"));
         assert!(help.contains("Sign in to your Zero-X account in the browser"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert_eq!(slash_command_specs().len(), 142);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
@@ -7390,5 +7414,22 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
+    fn hooks_help_describes_listing_by_event() {
+        let spec = super::slash_command_specs()
+            .iter()
+            .find(|spec| spec.name == "hooks")
+            .expect("hooks command");
+        assert_eq!(spec.argument_hint, Some("[event]"));
+        assert!(spec.summary.contains("matcher"));
+        assert!(super::render_slash_command_help().contains("/hooks"));
+        assert_eq!(
+            super::SlashCommand::parse("/hooks Stop"),
+            Ok(Some(super::SlashCommand::Hooks {
+                args: Some("Stop".to_string())
+            }))
+        );
     }
 }

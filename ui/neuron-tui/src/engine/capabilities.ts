@@ -11,6 +11,8 @@
 import { logger } from '../utils/logger'
 import {
   CAPABILITY_GIT_VIEWS,
+  CAPABILITY_LIVE_OUTPUT,
+  CAPABILITY_HOOK_PROGRESS,
   CAPABILITY_QUESTIONS,
   CAPABILITY_LIVE_PROGRESS,
   CAPABILITY_REPORTS,
@@ -24,14 +26,18 @@ import type { NeuronEngineClient } from './neuron-engine-client'
  * Everything this UI handles: report panels for `/usage`, `/init`, `/memory`
  * and `/doctor` (reports), tool-input progress, output estimates and
  * per-request usage while a turn streams (live_progress), the changes, diff,
- * commit and checkpoint views (git_views), and the agent's questions as
- * `question` events, drawn in the turn and answered in the question form or
- * the input (questions; ./question-form.ts).
+ * commit and checkpoint views (git_views), a running shell command's output as
+ * it prints it (live_output), the hook command running now on the status line
+ * (hook_progress), and the agent's questions as `question` events, drawn in the
+ * turn and answered in the question form or the input (questions;
+ * ./question-form.ts).
  */
 export const UI_CAPABILITIES: readonly string[] = [
   CAPABILITY_REPORTS,
   CAPABILITY_LIVE_PROGRESS,
   CAPABILITY_GIT_VIEWS,
+  CAPABILITY_LIVE_OUTPUT,
+  CAPABILITY_HOOK_PROGRESS,
   CAPABILITY_QUESTIONS,
 ]
 

@@ -19,6 +19,12 @@ export const trustCopy = {
   access: 'Neuron will be able to open, change and run files in this folder.',
   turnsOnHeading: 'This project also wants to turn on:',
   turnsOnNothing: 'This project does not turn on any hooks, MCP servers or permission rules.',
+  /** Shown when the folder was trusted before and what it asks for changed. */
+  changed: 'Its hooks, MCP servers, permission rules or settings changed since you trusted this folder.',
+  /** Before the settings keys that changed (`env`, `model`, ...). */
+  changedKeys: 'Changed since you trusted it:',
+  /** Above the exact commands and rules the folder asks about. */
+  exactHeading: 'Exactly what it would run or allow:',
   caution: 'Continue only if you created this project or trust where it came from.',
   whyLabel: 'Why this matters:',
   /** `TRUST_DOCS_URL` as it is shown. */
@@ -108,6 +114,42 @@ export function trustPreviewLines(preview: TrustPreviewEvent): string[] {
   }
   if (preview.other_settings.length > 0) {
     lines.push(`Other settings: ${preview.other_settings.join(', ')}`)
+  }
+  return lines
+}
+
+/**
+ * The settings keys that changed since the folder was trusted, as one line
+ * (`Changed since you trusted it: env, model`); empty when the engine named none.
+ */
+export function trustChangedKeysLine(preview: Pick<TrustPreviewEvent, 'changed_since_trust' | 'changed_settings'>): string {
+  const keys = preview.changed_settings ?? []
+  if (!preview.changed_since_trust || keys.length === 0) return ''
+  return `${trustCopy.changedKeys} ${keys.join(', ')}`
+}
+
+/**
+ * What the folder would run or allow, one line each and in full: every hook
+ * command, MCP server command line and allow or ask rule, so Allow is not
+ * given blind. The text comes from the project's own files: a surface that
+ * draws it to a terminal cleans it of control characters first.
+ */
+export function trustDetailLines(
+  preview: TrustPreviewEvent,
+  options: { mcp?: boolean } = {},
+): string[] {
+  const lines: string[] = []
+  for (const hook of preview.hooks) {
+    const matcher = hook.matcher ? ` [${hook.matcher}]` : ''
+    lines.push(`hook ${hook.event}${matcher}: ${hook.command}`)
+  }
+  if (options.mcp !== false) {
+    for (const server of preview.mcp_servers) {
+      lines.push(`MCP server ${server.name}: ${server.command ?? server.target ?? ''}`)
+    }
+  }
+  for (const rule of preview.permission_rules) {
+    lines.push(`${rule.effect} rule: ${rule.rule}`)
   }
   return lines
 }

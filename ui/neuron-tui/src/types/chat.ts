@@ -62,6 +62,11 @@ export type ToolContentBlock = {
    * `input` is empty until the complete one arrives and replaces this.
    */
   liveInput?: ToolInputSoFar
+  /**
+   * What a running shell call printed so far (`tool_output_delta`), its tail
+   * only; the result replaces it.
+   */
+  liveOutput?: string
   /** An `Agent` call's sub-agent, as the engine reports it. */
   subagent?: SubagentState
   agentId?: string

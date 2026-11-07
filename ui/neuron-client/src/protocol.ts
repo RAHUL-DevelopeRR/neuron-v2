@@ -202,8 +202,11 @@ export interface ErrorDetail {
 /** A hook a workspace's settings would turn on. */
 export interface HookPreview {
   event: string
+  /** The command it runs, in full (cut only past a very long length). */
   command: string
   source: string
+  /** The tool name the hook is limited to; absent when it runs for every tool. */
+  matcher?: string
 }
 
 /** An MCP server a workspace's settings would start. */
@@ -503,6 +506,10 @@ export interface TrustPreviewEvent {
   /** Trust would last for this engine only (the home folder, or above it). */
   session_only: boolean
   trusted: boolean
+  /** Trusted before, but its hooks, MCP servers or allow rules changed since. */
+  changed_since_trust?: boolean
+  /** With `changed_since_trust`: the settings keys (`env`, `model`, `hooks`, ...) that differ from what was trusted. */
+  changed_settings?: string[]
   settings_files: string[]
   hooks: HookPreview[]
   mcp_servers: McpServerPreview[]

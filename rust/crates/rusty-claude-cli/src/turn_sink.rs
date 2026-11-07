@@ -21,9 +21,11 @@ use std::time::{Duration, Instant};
 static STDOUT_AFTER_TOOL_RESULT: AtomicBool = AtomicBool::new(false);
 
 use neuron_tui::protocol::{
-    TodoItem, TokenCounts, UiEvent, CAPABILITY_GIT_VIEWS, CAPABILITY_LIVE_PROGRESS,
+    OutputStream, TodoItem, TokenCounts, UiEvent, CAPABILITY_GIT_VIEWS, CAPABILITY_HOOK_PROGRESS,
+    CAPABILITY_LIVE_OUTPUT, CAPABILITY_LIVE_PROGRESS,
 };
 use runtime::context_manager::TextTokenEstimate;
+use runtime::tool_output::{OutputObserver, OutputPipe};
 use runtime::TokenUsage;
 use serde_json::Value;
 
@@ -104,6 +106,11 @@ pub(crate) trait TurnSink: Send {
     /// streaming, and the reply arrives all at once. Only the UI listens.
     fn reply_not_streamed(&mut self) -> io::Result<()> {
         Ok(())
+    }
+    /// Who hears the output of the call `id` while it runs (a shell command), if
+    /// anyone: only a UI that asked for it. The line terminal shows the result.
+    fn tool_output_observer(&self, _id: &str) -> Option<OutputObserver> {
+        None
     }
 }
 
@@ -186,6 +193,8 @@ impl fmt::Debug for ChangeListener {
 pub(crate) struct UiCapabilities {
     live_progress: AtomicBool,
     git_views: AtomicBool,
+    live_output: AtomicBool,
+    hook_progress: AtomicBool,
 }
 
 impl UiCapabilities {
@@ -196,6 +205,20 @@ impl UiCapabilities {
             .store(has(CAPABILITY_LIVE_PROGRESS), Ordering::SeqCst);
         self.git_views
             .store(has(CAPABILITY_GIT_VIEWS), Ordering::SeqCst);
+        self.live_output
+            .store(has(CAPABILITY_LIVE_OUTPUT), Ordering::SeqCst);
+        self.hook_progress
+            .store(has(CAPABILITY_HOOK_PROGRESS), Ordering::SeqCst);
+    }
+
+    /// A running shell command's output as it prints it.
+    pub(crate) fn live_output(&self) -> bool {
+        self.live_output.load(Ordering::SeqCst)
+    }
+
+    /// `hook_started` and `hook_finished` events.
+    pub(crate) fn hook_progress(&self) -> bool {
+        self.hook_progress.load(Ordering::SeqCst)
     }
 
     /// Tool-input progress, output estimates and per-request usage.
@@ -242,6 +265,21 @@ impl TurnOutput {
 
     pub(crate) fn is_visible(&self) -> bool {
         !matches!(self, Self::Silent)
+    }
+
+    /// Where hook progress goes: the UI's channel, the terminal (with `NEURON_DEBUG`),
+    /// or nowhere.
+    pub(crate) fn hook_reporter(&self) -> Option<Box<dyn runtime::HookProgressReporter>> {
+        match self {
+            Self::Silent => None,
+            Self::Channel(channel) => Some(Box::new(crate::hook_events::ChannelHookReporter::new(
+                Sender::clone(&channel.events),
+                Arc::clone(&channel.capabilities),
+            ))),
+            Self::Ansi => Some(Box::new(crate::progress::CliHookProgressReporter)),
+            #[cfg(test)]
+            Self::Captured(_) => Some(Box::new(crate::progress::CliHookProgressReporter)),
+        }
     }
 
     /// A sink for one model response. The terminal one renders through a synchronized
@@ -1004,6 +1042,28 @@ impl TurnSink for ChannelSink {
             kind: None,
         })
     }
+
+    /// [`UiEvent::ToolOutputDelta`]s for the call `id`, when the UI declared
+    /// `live_output`. The runtime coalesces and caps them
+    /// ([`runtime::tool_output::LiveOutput`]); a closed UI just stops hearing them.
+    fn tool_output_observer(&self, id: &str) -> Option<OutputObserver> {
+        if !self.capabilities.live_output() {
+            return None;
+        }
+        let events = Sender::clone(&self.events);
+        let tool_use_id = id.to_string();
+        Some(Arc::new(move |pipe, chunk: &str| {
+            let stream = match pipe {
+                OutputPipe::Stdout => OutputStream::Stdout,
+                OutputPipe::Stderr => OutputStream::Stderr,
+            };
+            let _ = events.send(UiEvent::ToolOutputDelta {
+                tool_use_id: tool_use_id.clone(),
+                stream,
+                chunk: chunk.to_string(),
+            });
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -1373,6 +1433,53 @@ mod tests {
 
     fn advance(now: &std::sync::Mutex<Instant>, millis: u64) {
         *now.lock().unwrap() += Duration::from_millis(millis);
+    }
+
+    /// A running command's output reaches only a UI that declared `live_output`, as
+    /// deltas of the call it belongs to; the line terminal hears none.
+    #[test]
+    fn live_output_goes_only_to_a_ui_that_asked_for_it() {
+        let (tx, rx) = mpsc::channel();
+        assert!(ChannelSink::with_capabilities(tx, live_capabilities())
+            .tool_output_observer("call_1")
+            .is_none());
+        assert!(rx.try_iter().next().is_none());
+        assert!(SilentSink.tool_output_observer("call_1").is_none());
+
+        let capabilities = Arc::new(UiCapabilities::default());
+        capabilities.set(&[CAPABILITY_LIVE_OUTPUT.to_string()]);
+        let (tx, rx) = mpsc::channel();
+        let sink = ChannelSink::with_capabilities(tx, capabilities);
+        let observer = sink.tool_output_observer("call_1").expect("declared");
+        observer(
+            OutputPipe::Stdout,
+            "building
+",
+        );
+        observer(
+            OutputPipe::Stderr,
+            "warning
+",
+        );
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                UiEvent::ToolOutputDelta {
+                    tool_use_id: "call_1".into(),
+                    stream: OutputStream::Stdout,
+                    chunk: "building
+"
+                    .into(),
+                },
+                UiEvent::ToolOutputDelta {
+                    tool_use_id: "call_1".into(),
+                    stream: OutputStream::Stderr,
+                    chunk: "warning
+"
+                    .into(),
+                },
+            ]
+        );
     }
 
     fn live_capabilities() -> Arc<UiCapabilities> {

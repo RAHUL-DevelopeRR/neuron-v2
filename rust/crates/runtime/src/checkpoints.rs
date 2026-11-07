@@ -1881,7 +1881,7 @@ fn hash_file(path: &Path) -> io::Result<String> {
     }
 }
 
-fn hex_digest(bytes: &[u8]) -> String {
+pub(crate) fn hex_digest(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes
         .iter()
@@ -2198,14 +2198,14 @@ fn is_strict_ancestor(dir: &str, key: &str) -> bool {
     key.len() > dir.len() && key.starts_with(dir) && key.as_bytes()[dir.len()] == b'/'
 }
 
-fn valid_hash(hash: &str) -> bool {
+pub(crate) fn valid_hash(hash: &str) -> bool {
     hash.len() == 64
         && hash
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn valid_session_id(id: &str) -> bool {
+pub(crate) fn valid_session_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id != "."
@@ -2225,7 +2225,7 @@ fn one_line_preview(text: &str, max_chars: usize) -> String {
     shortened
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| {
@@ -2237,7 +2237,7 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn temp_sibling(path: &Path) -> PathBuf {
+pub(crate) fn temp_sibling(path: &Path) -> PathBuf {
     let name = path.file_name().map_or_else(
         || "file".to_owned(),
         |name| name.to_string_lossy().into_owned(),

@@ -406,6 +406,7 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
         None => LiveCli::new(resolved_model, true, options.allowed_tools, permission_mode)?,
     };
     cli.set_reasoning_effort(options.reasoning_effort);
+    cli.run_session_start_hooks(if resumed { "resume" } else { "startup" });
     // The plan's token window, for `/status` and the guard before the first reply.
     crate::plan_window::read_on_gateway();
     let mut editor =
@@ -1414,10 +1415,13 @@ mod tests {
                     "written by hand
 "
                 );
-                assert!(cli.runtime.session().messages.is_empty());
+                assert_eq!(
+                    cli.runtime.session().messages,
+                    [] as [runtime::ConversationMessage; 0]
+                );
                 // The cut-back chat is what was saved.
                 let saved = runtime::Session::load_from_path(&cli.session.path).expect("saved");
-                assert!(saved.messages.is_empty());
+                assert_eq!(saved.messages, [] as [runtime::ConversationMessage; 0]);
             });
         });
         // As `launch` does when the REPL ends: no other test inherits its servers.

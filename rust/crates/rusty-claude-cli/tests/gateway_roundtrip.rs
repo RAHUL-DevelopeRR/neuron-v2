@@ -955,7 +955,7 @@ fn a_blurred_model_is_named_before_the_request_and_others_after_it_fails() {
     assert!(!output.status.success());
     let errors = stderr(&output);
     let warning = errors
-        .find("warning: gemini/gemini-2.5-flash is out of capacity until 2099-01-01 00:00 UTC")
+        .find("warning: Gemini 2.5 Flash is out of capacity until 2099-01-01 00:00 UTC")
         .unwrap_or_else(|| panic!("{errors}"));
     assert!(
         errors.contains("auto routes around it: --model auto."),

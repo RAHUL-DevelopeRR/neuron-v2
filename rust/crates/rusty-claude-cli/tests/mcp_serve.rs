@@ -175,6 +175,6 @@ fn serve_refuses_an_untrusted_folder() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("not trusted"), "{stderr}");
-    assert!(frames(&output.stdout).is_empty());
+    assert_eq!(frames(&output.stdout), [] as [serde_json::Value; 0]);
     let _ = fs::remove_dir_all(&root);
 }

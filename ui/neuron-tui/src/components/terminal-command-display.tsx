@@ -156,6 +156,8 @@ export const TerminalCommandDisplay = ({
         <text fg={theme.muted} style={{ wrapMode: 'word' }}>
           {displayOutput}
         </text>
+        {/* What it printed so far, while it still runs. */}
+        {isRunning && <text fg={theme.muted}>Running…</text>}
         {hasMoreLines && expandable && (
           <Button
             style={{ marginTop: 0 }}

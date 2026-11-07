@@ -32,6 +32,7 @@ import { cutToDisplayWidth } from '../utils/display-width'
 import { formatElapsedTime } from '../utils/format-elapsed-time'
 import { formatTokenCount } from '../utils/format-token-count'
 import { logger } from '../utils/logger'
+import { cleanModelName, distinctModelName, findCatalogModel } from '../utils/model-name'
 import { DEFAULT_REASONING_EFFORTS, effortLabel } from '../utils/status-bar-parts'
 import { BORDER_CHARS } from '../utils/ui-constants'
 
@@ -74,18 +75,19 @@ export function backInLabel(availableAgainAt: string | null | undefined, now: nu
  * The engine sends `current` as the wire model, which can carry the
  * provider's `openai/` prefix the catalog ids do not have.
  */
-const isCurrentModel = (id: string, current: string): boolean =>
-  id === current || current === `openai/${id}`
+const isCurrentModel = (models: ModelsEvent, id: string): boolean =>
+  findCatalogModel(models.models, models.current)?.id === id
 
 /**
  * The picker's rows: name, then context window, plans, the gateway's health,
- * or why it's unavailable. `now` dates a blurred model's return.
+ * or why it's unavailable. `now` dates a blurred model's return. Names leave
+ * out the route the gateway takes to a model (utils/model-name.ts), two that
+ * are then the same get a number, and the raw id is not shown: `/status` has it.
  */
 export function modelRows(models: ModelsEvent | null, now: number = Date.now()): ModelRow[] {
   if (!models) return []
   return models.models.map((model: ModelInfo) => {
     const details: string[] = []
-    if (model.display_name && model.display_name !== model.id) details.push(model.id)
     if (model.context_window) details.push(`${formatTokenCount(model.context_window)} context`)
     // Blurred until its time has come; without a time, until the next list says otherwise.
     const againAt = model.available_again_at ? Date.parse(model.available_again_at) : NaN
@@ -115,10 +117,14 @@ export function modelRows(models: ModelsEvent | null, now: number = Date.now()):
             : null
     return {
       id: model.id,
-      label: model.display_name ?? model.id,
+      label: distinctModelName(
+        models.models,
+        model.id,
+        cleanModelName(model.id, model.display_name, model.provider),
+      ),
       detail: details.join(' · '),
       available: model.available && !blurred,
-      current: isCurrentModel(model.id, models.current),
+      current: isCurrentModel(models, model.id),
       marker,
       unavailableReason,
       efforts,
@@ -216,8 +222,10 @@ export const ModelPicker = ({
   // Each open starts on the current model (the picker mounts per open).
   const [focus, setFocus] = useState(() => Math.max(0, currentIndex))
   // Why the model Enter was pressed on can't be picked, until the focus moves.
-  const [notice, setNotice] = useState<string | null>(null)
-  useEffect(() => setNotice(null), [focus])
+  // Kept with its row, not cleared by an effect on `focus`: that effect could
+  // run after a quick Enter on the new row and clear what Enter just said.
+  const [noticeFor, setNotice] = useState<{ focus: number; text: string } | null>(null)
+  const notice = noticeFor?.focus === focus ? noticeFor.text : null
 
   // Ask now and every 30 s; until the first reply the last list (if any) shows.
   useEffect(() => {
@@ -277,11 +285,11 @@ export const ModelPicker = ({
           const row = rows[focus]
           if (!row) return
           if (!row.available) {
-            setNotice(unavailableMessage(row))
+            setNotice({ focus, text: unavailableMessage(row) })
             return
           }
           if (!row.efforts) {
-            setNotice(`${row.label} has no thinking levels to pick.`)
+            setNotice({ focus, text: `${row.label} has no thinking levels to pick.` })
             return
           }
           const levels = reasoningLevels(row)
@@ -292,16 +300,18 @@ export const ModelPicker = ({
         }
         if (key.name === 'up') {
           key.preventDefault?.()
+          setNotice(null)
           setFocus((index) => Math.max(0, index - 1))
         } else if (key.name === 'down') {
           key.preventDefault?.()
+          setNotice(null)
           setFocus((index) => Math.min(rows.length - 1, index + 1))
         } else if (key.name === 'return' || key.name === 'enter') {
           key.preventDefault?.()
           const row = rows[focus]
           if (!row) return
           if (!row.available) {
-            setNotice(unavailableMessage(row))
+            setNotice({ focus, text: unavailableMessage(row) })
             return
           }
           if (!row.current) {

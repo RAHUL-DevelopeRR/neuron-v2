@@ -11,6 +11,7 @@
     clippy::unnecessary_wraps
 )]
 
+pub mod artifacts;
 mod bash;
 pub mod bash_validation;
 mod bootstrap;
@@ -27,9 +28,11 @@ pub mod default_skills;
 mod file_ops;
 mod git_context;
 pub mod green_contract;
+mod hook_matcher;
 mod hooks;
 mod json;
 mod lane_events;
+pub mod lifecycle_hooks;
 pub mod lsp_client;
 mod mcp;
 pub mod mcp_approvals;
@@ -73,6 +76,7 @@ mod session;
 pub mod session_control;
 pub use session_control::SessionStore;
 pub mod experience;
+pub mod parallel_tools;
 pub mod project_checks;
 mod sse;
 pub mod stale_base;
@@ -82,11 +86,13 @@ pub mod task_packet;
 pub mod task_registry;
 pub mod team_cron_registry;
 pub mod tool_input;
+pub mod tool_output;
 pub mod transcript;
 #[cfg(test)]
 mod trust_resolver;
 pub mod ui_hooks;
 mod usage;
+pub mod workdir;
 pub mod worker_boot;
 pub mod workspace_trust;
 
@@ -135,8 +141,10 @@ pub use file_ops::{
     StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
+pub use hook_matcher::{matcher_matches, validate_matcher, HookCommand, HookSource};
 pub use hooks::{
-    HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
+    HookAbortSignal, HookEvent, HookOutcome, HookProgressEvent, HookProgressReporter,
+    HookRunResult, HookRunner, LifecycleHookInput, ToolUseIdReporter,
 };
 pub use lane_events::{
     compute_event_fingerprint, dedupe_superseded_commit_events, dedupe_terminal_events,
@@ -215,6 +223,7 @@ pub use oauth::{
     OAuthCallbackParams, OAuthRefreshRequest, OAuthTokenExchangeRequest, OAuthTokenSet,
     PkceChallengeMethod, PkceCodePair,
 };
+pub use parallel_tools::ConcurrentToolCall;
 pub use permissions::{
     deny_for_session_label, non_interactive_hint, parse_permission_response, quote_allow_rules,
     render_permission_prompt, rule_covers_mcp_server, url_host, user_declined_message,

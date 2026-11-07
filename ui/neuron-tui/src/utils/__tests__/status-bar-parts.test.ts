@@ -6,8 +6,10 @@ import {
   STATUS_BAR_MODELS,
   STATUS_BAR_STATUS,
 } from '../../testing/status-bar-fixtures'
-import { inferProvider, providerBadge } from '../provider-badge'
+import { modelMaker } from '../model-name'
+import { providerBadge } from '../provider-badge'
 import {
+  catalogModel,
   effortLabel,
   folderName,
   lineWidth,
@@ -22,7 +24,7 @@ import {
 } from '../status-bar-parts'
 
 import type { GlyphMode } from '../glyphs'
-import type { AccountDetails, StatusEvent } from '../../engine/protocol'
+import type { AccountDetails, ModelsEvent, StatusEvent } from '../../engine/protocol'
 
 /** Three hours before the fixture's window resets (14:32 UTC). */
 const NOW = Date.parse('2026-11-03T11:22:00Z')
@@ -211,7 +213,85 @@ describe('segments', () => {
 
   test('a locked model says so', () => {
     const text = render(input({ model: 'glm-5.2', model_display_name: null, provider: null }), 200)
-    expect(text.startsWith('CF GLM 5.2 (locked) ▾')).toBe(true)
+    // Its maker's monogram (Zhipu's GLM), not the route's (Cloudflare).
+    expect(text.startsWith('Z GLM 5.2 (locked) ▾')).toBe(true)
+  })
+
+  test('names leave out the gateway’s route; auto names the model that answered', () => {
+    const routed = render(
+      input({
+        model: 'cohere/north-mini-code:free',
+        provider: 'openrouter',
+        model_display_name: 'North Mini Code (OpenRouter, free)',
+      }),
+      200,
+    )
+    expect(routed.startsWith('C North Mini Code ▾')).toBe(true)
+    expect(routed).not.toMatch(/openrouter|:free|cohere\//i)
+
+    // An older engine: the served model's catalog name, cleaned here.
+    const models = {
+      ...STATUS_BAR_MODELS,
+      models: [
+        ...STATUS_BAR_MODELS.models,
+        {
+          ...STATUS_BAR_MODELS.models[1]!,
+          id: 'groq/openai/gpt-oss-120b',
+          display_name: 'GPT-OSS 120B (Groq)',
+          provider: 'groq',
+        },
+      ],
+    }
+    const auto = render(
+      input(
+        { model: 'auto', provider: 'zero-x', model_display_name: 'Auto (best available model)', served_model: 'groq/openai/gpt-oss-120b' },
+        'unicode',
+        { models },
+      ),
+      200,
+    )
+    expect(auto.startsWith('◇ Auto → GPT-OSS 120B ▾')).toBe(true)
+    // A newer engine names it; without a catalog entry, the model part of the id.
+    const named = render(
+      input({ model: 'auto', served_model: 'x/glm-4.7-flash', served_model_display_name: 'GLM-4.7 Flash' }),
+      200,
+    )
+    expect(named.startsWith('◇ Auto → GLM-4.7 Flash ▾')).toBe(true)
+    const bare = render(input({ model: 'auto', served_model: 'cohere/north-mini-code:free' }), 200)
+    expect(bare.startsWith('◇ Auto → north-mini-code ▾')).toBe(true)
+  })
+
+  test('a model whose name another catalog model has is numbered as in the picker', () => {
+    const base = STATUS_BAR_MODELS.models[1]!
+    const models = {
+      ...STATUS_BAR_MODELS,
+      models: [
+        ...STATUS_BAR_MODELS.models,
+        { ...base, id: 'groq/openai/gpt-oss-20b', display_name: 'GPT-OSS 20B (Groq)', provider: 'groq' },
+        { ...base, id: 'nvidia/openai/gpt-oss-20b', display_name: 'GPT-OSS 20B (NVIDIA)', provider: 'nvidia' },
+      ],
+    }
+    const served = (id: string) =>
+      render(
+        input(
+          { model: 'auto', provider: 'zero-x', model_display_name: 'Auto', served_model: id, served_model_display_name: 'GPT-OSS 20B' },
+          'unicode',
+          { models },
+        ),
+        200,
+      )
+    expect(served('groq/openai/gpt-oss-20b').startsWith('◇ Auto → GPT-OSS 20B ▾')).toBe(true)
+    expect(served('nvidia/openai/gpt-oss-20b').startsWith('◇ Auto → GPT-OSS 20B (2) ▾')).toBe(true)
+    const picked = render(
+      input(
+        { model: 'nvidia/openai/gpt-oss-20b', provider: 'nvidia', model_display_name: 'GPT-OSS 20B' },
+        'unicode',
+        { models },
+      ),
+      200,
+    )
+    expect(picked).toContain('GPT-OSS 20B (2) ▾')
+    expect(picked).not.toMatch(/nvidia|groq/i)
   })
 
   test('no part names the provider, only its monogram', () => {
@@ -227,17 +307,27 @@ describe('segments', () => {
 })
 
 describe('helpers', () => {
-  test('monograms by provider, read from the model id when the engine does not say', () => {
-    expect(providerBadge('gemini', 'unicode')).toBe('G')
+  test('monograms by who made the model, never the route to it', () => {
+    expect(providerBadge('google', 'unicode')).toBe('G')
     expect(providerBadge('zero-x', 'unicode')).toBe('◇')
     expect(providerBadge('zero-x', 'console')).toBe('*')
     expect(providerBadge('someone', 'unicode')).toBe('•')
     expect(providerBadge(null, 'console')).toBe('.')
-    expect(inferProvider('auto')).toBe('zero-x')
-    expect(inferProvider('openai/gpt-5')).toBe('openai')
-    expect(inferProvider('claude-sonnet-4-6')).toBe('anthropic')
-    expect(inferProvider('@cf/meta/llama')).toBe('cloudflare')
-    expect(inferProvider('glm-5.2')).toBeNull()
+    // The routes that resell other makers' models have none.
+    for (const route of ['groq', 'openrouter', 'cloudflare', 'workers-ai', 'nim']) {
+      expect(providerBadge(route, 'unicode')).toBe('•')
+    }
+    expect(modelMaker('auto')).toBe('zero-x')
+    expect(modelMaker('openai/gpt-5')).toBe('openai')
+    expect(modelMaker('claude-sonnet-4-6')).toBe('anthropic')
+    expect(modelMaker('@cf/meta/llama-3.3-70b-instruct-fp8-fast', 'cloudflare')).toBe('meta')
+    expect(modelMaker('groq/openai/gpt-oss-120b', 'groq')).toBe('openai')
+    expect(modelMaker('nvidia/stepfun-ai/step-5-preview', 'nvidia')).toBe('stepfun')
+    expect(modelMaker('nvidia/nvidia/nemotron-3-ultra-550b-a55b', 'nvidia')).toBe('nvidia')
+    expect(modelMaker('cohere/north-mini-code:free', 'openrouter')).toBe('cohere')
+    expect(modelMaker('glm-5.2', 'cloudflare')).toBe('zhipu')
+    expect(modelMaker('mystery-model', 'openrouter')).toBeNull()
+    expect(modelMaker('mystery-model', 'acme')).toBe('acme')
   })
 
   test('thinking levels come from the status, then the catalog, then the default ladder', () => {
@@ -266,5 +356,54 @@ describe('helpers', () => {
     expect(folderName('C:\\RAHUL\\neuron-v2')).toBe('neuron-v2')
     expect(folderName('/home/dev/app/')).toBe('app')
     expect(folderName('')).toBeNull()
+  })
+})
+
+describe('the gateway lists model families; sessions may hold route ids', () => {
+  const family = (id: string, display_name: string) => ({
+    id,
+    display_name,
+    available: true,
+    unavailable_reason: null,
+    context_window: 131_072,
+    tiers: ['free'],
+    provider: id.split('/')[0],
+  })
+  const models: ModelsEvent = {
+    type: 'models',
+    current: 'auto',
+    models: [
+      family('openai/gpt-oss-120b', 'GPT-OSS 120B'),
+      family('nvidia/nemotron-3-ultra-550b', 'Nemotron 3 Ultra 550B'),
+      family('cohere/north-mini-code', 'North Mini Code'),
+    ],
+  }
+
+  test('a family id, its bare form and a route id find the same catalog entry', () => {
+    const wanted: Array<[string, string]> = [
+      ['openai/gpt-oss-120b', 'openai/gpt-oss-120b'],
+      ['gpt-oss-120b', 'openai/gpt-oss-120b'],
+      ['groq/openai/gpt-oss-120b', 'openai/gpt-oss-120b'],
+      ['nvidia/nvidia/nemotron-3-ultra-550b-a55b', 'nvidia/nemotron-3-ultra-550b'],
+      ['openrouter/cohere/north-mini-code:free', 'cohere/north-mini-code'],
+    ]
+    for (const [asked, id] of wanted) expect(catalogModel(models, asked)?.id).toBe(id)
+    for (const asked of ['acme/made-up', 'groq/openai/gpt-oss-1200b', 'nvidia/nemotron-3-ultra'])
+      expect(catalogModel(models, asked)).toBeNull()
+  })
+
+  test('the bar names a route id by the catalog name, not the id', () => {
+    for (const [asked, name] of [
+      ['groq/openai/gpt-oss-120b', 'GPT-OSS 120B'],
+      ['nvidia/nvidia/nemotron-3-ultra-550b-a55b', 'Nemotron 3 Ultra 550B'],
+    ]) {
+      const text = render(
+        input({ model: asked, model_display_name: null, provider: null }, 'unicode', { models }),
+        200,
+      )
+      expect(text).toContain(name)
+      expect(text).not.toContain('nvidia/nvidia')
+      expect(text).not.toContain('groq/')
+    }
   })
 })

@@ -126,6 +126,7 @@ class InstallShTests(unittest.TestCase):
         environment.update(
             HOME=shell_path(self.root / "home"),
             NEURON_DOWNLOAD_BASE=self.server.base_url,
+            NEURON_CHECKSUMS_BASE=self.server.base_url,
             NEURON_RELEASES_API=f"{self.server.base_url}/repos/neuron/releases/latest",
             NEURON_INSTALL_DIR=shell_path(self.install_dir),
             # The full-screen UI step has its own tests; NEURON_NO_TUI="" turns it on.
@@ -188,7 +189,7 @@ class InstallShTests(unittest.TestCase):
                 self.assertIn("is not on your PATH", result.stderr)
                 self.assertEqual(
                     self.server.paths(),
-                    [f"/v{VERSION}/neuron-linux-x64.sha256", f"/v{VERSION}/neuron-linux-x64"],
+                    [f"/v{VERSION}/SHA256SUMS", f"/v{VERSION}/neuron-linux-x64.sha256", f"/v{VERSION}/neuron-linux-x64"],
                 )
                 self.assertEqual(self.installed().read_bytes(), posix_dummy(VERSION))
                 self.assertIn(f"neuron-dummy {VERSION}", self.run_installed("--version"))
@@ -204,6 +205,7 @@ class InstallShTests(unittest.TestCase):
         self.assertEqual(
             self.server.paths(),
             [
+                f"/v{VERSION}/SHA256SUMS",
                 f"/v{VERSION}/neuron-linux-x64.sha256",
                 f"/v{VERSION}/neuron-linux-x64",
                 f"/v{VERSION}/neuron-tui-linux-x64.sha256",
@@ -295,6 +297,32 @@ class InstallShTests(unittest.TestCase):
         self.assertIn("Nothing was installed", result.stderr)
         self.assertEqual(self.installed().read_bytes(), b"previous neuron")
 
+    def test_release_sums_that_disagree_or_are_missing_fail_closed(self) -> None:
+        fake_release.write_executable(self.installed(), b"previous neuron")
+        fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", posix_dummy(VERSION))
+        sums = self.releases / f"v{VERSION}" / "SHA256SUMS"
+        sums.write_text(f"{'c' * 64}  neuron-linux-x64\n", encoding="ascii")
+        wrong = self.run_installer(NEURON_VERSION=VERSION)
+        self.assertEqual(wrong.returncode, 1)
+        self.assertIn("SHA256SUMS", wrong.stderr)
+        self.assertIn("Nothing was installed", wrong.stderr)
+        sums.write_text(f"{'c' * 64}  some-other-asset\n", encoding="ascii")
+        unlisted = self.run_installer(NEURON_VERSION=VERSION)
+        self.assertEqual(unlisted.returncode, 1)
+        sums.unlink()
+        missing = self.run_installer(NEURON_VERSION=VERSION)
+        self.assertEqual(missing.returncode, 1)
+        self.assertEqual(self.installed().read_bytes(), b"previous neuron")
+
+    def test_checksums_come_from_their_own_base_not_the_mirror(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", posix_dummy(VERSION))
+        result = self.run_installer(NEURON_VERSION=VERSION, NEURON_CHECKSUMS_BASE=fake_release.unused_loopback_url())
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(f"/v{VERSION}/SHA256SUMS", self.server.paths())
+        insecure = self.run_installer(NEURON_VERSION=VERSION, NEURON_CHECKSUMS_BASE="http://downloads.example.com")
+        self.assertEqual(insecure.returncode, 1)
+        self.assertIn("NEURON_CHECKSUMS_BASE must be an HTTPS URL", insecure.stderr)
+
     def test_malformed_checksum_file_is_rejected(self) -> None:
         fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", posix_dummy(VERSION), checksum="oops\n")
         result = self.run_installer(NEURON_VERSION=VERSION)
@@ -316,6 +344,18 @@ class InstallShTests(unittest.TestCase):
         self.assertIn("Next steps:", result.stderr)
         self.assertEqual(self.installed().read_bytes(), STDIN_READING_BINARY)
 
+    def test_every_curl_call_refuses_a_redirect_away_from_https(self) -> None:
+        # A mirror or release redirecting to plain HTTP must not be followed (--proto-redir
+        # only limits redirects; a loopback http base given on purpose still works).
+        calls = [
+            line.strip()
+            for line in INSTALL_SH.read_text(encoding="utf-8").splitlines()
+            if line.lstrip().startswith("curl ") and "--fail" in line
+        ]
+        self.assertGreaterEqual(len(calls), 2, calls)
+        for call in calls:
+            self.assertIn("--proto-redir =https", call)
+
     def test_unpublished_version_points_at_the_releases_page(self) -> None:
         result = self.run_installer(NEURON_VERSION="9.9.9")
         self.assertEqual(result.returncode, 1)
@@ -323,7 +363,7 @@ class InstallShTests(unittest.TestCase):
         self.assertIn("releases", result.stderr)
 
     def test_network_failure_is_not_reported_as_a_missing_release(self) -> None:
-        result = self.run_installer(NEURON_VERSION=VERSION, NEURON_DOWNLOAD_BASE=fake_release.unused_loopback_url())
+        result = self.run_installer(NEURON_VERSION=VERSION, NEURON_DOWNLOAD_BASE=fake_release.unused_loopback_url(), NEURON_CHECKSUMS_BASE=fake_release.unused_loopback_url())
         self.assertEqual(result.returncode, 1)
         self.assertIn("Check your network", result.stderr)
         self.assertNotIn("may not be published", result.stderr)
@@ -364,15 +404,16 @@ class InstallShTests(unittest.TestCase):
         self.assertIn("https://api.github.com/repos/RAHUL-DevelopeRR/neuron-v2/releases/latest", calls[0])
         self.assertNotIn(GITHUB_TOKEN, calls[0])
         self.assertEqual(stdin_log.read_text(encoding="utf-8"), f'header = "Authorization: Bearer {GITHUB_TOKEN}"\n')
-        self.assertEqual(self.server.paths(), [f"/v{VERSION}/neuron-linux-x64.sha256", f"/v{VERSION}/neuron-linux-x64"])
-        self.assertEqual(self.server.authorization, [None, None])
+        self.assertEqual(self.server.paths(), [f"/v{VERSION}/SHA256SUMS", f"/v{VERSION}/neuron-linux-x64.sha256", f"/v{VERSION}/neuron-linux-x64"])
+        self.assertEqual(self.server.authorization, [None, None, None])
 
     def test_github_token_is_not_sent_to_another_releases_api(self) -> None:
         fake_release.stage_release(self.releases, VERSION, "neuron-linux-x64", posix_dummy(VERSION))
         result = self.run_installer(GITHUB_TOKEN=GITHUB_TOKEN)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.server.paths()[0], "/repos/neuron/releases/latest")
-        self.assertEqual(self.server.authorization, [None, None, None])
+        # The releases lookup, then SHA256SUMS, the .sha256 file and the binary: none carries the token.
+        self.assertEqual(self.server.authorization, [None, None, None, None])
 
     def test_self_check_runs_the_binary_from_the_install_directory(self) -> None:
         # The temporary directory may be mounted noexec; the binary has to run from the install directory anyway.
@@ -470,6 +511,7 @@ class InstallPs1Tests(unittest.TestCase):
         environment = clean_environment()
         environment.update(
             NEURON_DOWNLOAD_BASE=self.server.base_url,
+            NEURON_CHECKSUMS_BASE=self.server.base_url,
             NEURON_RELEASES_API=f"{self.server.base_url}/repos/neuron/releases/latest",
             LOCALAPPDATA=str(self.root),
             # The full-screen UI step has its own tests; NEURON_NO_TUI="" turns it on.
@@ -517,7 +559,8 @@ class InstallPs1Tests(unittest.TestCase):
                 self.assertIn("auth login", result.stdout)
                 self.assertIn("is not on your PATH", result.stdout)
                 self.assertEqual(
-                    self.server.paths(), [f"/v{VERSION}/{self.ASSET}.sha256", f"/v{VERSION}/{self.ASSET}"]
+                    self.server.paths(),
+                    [f"/v{VERSION}/SHA256SUMS", f"/v{VERSION}/{self.ASSET}.sha256", f"/v{VERSION}/{self.ASSET}"],
                 )
                 output = subprocess.run([str(self.installed()), "--version"], capture_output=True, text=True, check=True)
                 self.assertIn(f"neuron-dummy {VERSION}", output.stdout)
@@ -557,6 +600,19 @@ class InstallPs1Tests(unittest.TestCase):
         self.assertEqual(pinned.returncode, 0, pinned.stdout + pinned.stderr)
         self.assertIn("Installing Neuron 6.3.0", pinned.stdout)
 
+    def test_release_sums_that_disagree_or_are_missing_fail_closed(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, self.ASSET)
+        sums = self.releases / f"v{VERSION}" / "SHA256SUMS"
+        sums.write_text(f"{'d' * 64}  {self.ASSET}\n", encoding="ascii")
+        wrong = self.run_installer("-Version", VERSION)
+        self.assertEqual(wrong.returncode, 1)
+        self.assertIn("SHA256SUMS", wrong.stdout + wrong.stderr)
+        self.assertFalse(self.installed().exists())
+        sums.unlink()
+        missing = self.run_installer("-Version", VERSION)
+        self.assertEqual(missing.returncode, 1)
+        self.assertFalse(self.installed().exists())
+
     def test_checksum_mismatch_installs_nothing(self) -> None:
         fake_release.stage_release(self.releases, VERSION, self.ASSET, checksum=f"{'b' * 64}  {self.ASSET}\n")
         result = self.run_installer("-Version", VERSION)
@@ -573,7 +629,7 @@ class InstallPs1Tests(unittest.TestCase):
         self.assertIn("must be an HTTPS URL", insecure.stdout)
 
     def test_network_failure_is_not_reported_as_a_missing_release(self) -> None:
-        result = self.run_installer("-Version", VERSION, NEURON_DOWNLOAD_BASE=fake_release.unused_loopback_url())
+        result = self.run_installer("-Version", VERSION, NEURON_DOWNLOAD_BASE=fake_release.unused_loopback_url(), NEURON_CHECKSUMS_BASE=fake_release.unused_loopback_url())
         self.assertEqual(result.returncode, 1)
         self.assertIn("Check your network", result.stdout)
         self.assertNotIn("may not be published", result.stdout)
@@ -591,7 +647,7 @@ class InstallPs1Tests(unittest.TestCase):
         result = self.run_installer(GITHUB_TOKEN=GITHUB_TOKEN)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.server.paths()[0], "/repos/neuron/releases/latest")
-        self.assertEqual(self.server.authorization, [None, None, None])
+        self.assertEqual(self.server.authorization, [None, None, None, None])
 
     def test_github_token_is_meant_only_for_the_github_api(self) -> None:
         cases = {
@@ -760,6 +816,7 @@ foreach ($name in @({quoted})) {{
         "Get-HttpStatus",
         "Get-NeuronDownload",
         "Get-NeuronSha256",
+        "Test-NeuronSums",
         "Get-PosixInstallCommand",
         "Assert-SupportedPlatform",
         "Resolve-NeuronVersion",

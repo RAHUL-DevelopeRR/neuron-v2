@@ -1989,20 +1989,49 @@ mod tests {
         std::env::temp_dir().join(format!("runtime-mcp-stdio-{nanos}-{unique_id}"))
     }
 
+    /// Interpreter used to run the fake MCP servers. On Windows the `py`
+    /// launcher is not always installed, so probe the usual candidates and use
+    /// the first one that really runs Python 3 (the `python3` `WindowsApps` stub
+    /// exits non-zero, which the probe rejects).
+    fn python_candidate() -> &'static (String, Vec<String>) {
+        static CANDIDATE: std::sync::OnceLock<(String, Vec<String>)> = std::sync::OnceLock::new();
+        CANDIDATE.get_or_init(|| {
+            if !cfg!(windows) {
+                return ("python3".to_string(), Vec::new());
+            }
+            let candidates: [(&str, &[&str]); 3] =
+                [("py", &["-3"]), ("python", &[]), ("python3", &[])];
+            for (program, prefix) in candidates {
+                let ok = std::process::Command::new(program)
+                    .args(prefix)
+                    .args([
+                        "-c",
+                        "import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)",
+                    ])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if ok {
+                    return (
+                        program.to_string(),
+                        prefix.iter().map(|arg| (*arg).to_string()).collect(),
+                    );
+                }
+            }
+            ("python".to_string(), Vec::new())
+        })
+    }
+
     fn python_command() -> String {
-        if cfg!(windows) {
-            "py".to_string()
-        } else {
-            "python3".to_string()
-        }
+        python_candidate().0.clone()
     }
 
     fn python_script_args(path: &Path) -> Vec<String> {
-        if cfg!(windows) {
-            vec!["-3".to_string(), path.to_string_lossy().into_owned()]
-        } else {
-            vec![path.to_string_lossy().into_owned()]
-        }
+        let mut args = python_candidate().1.clone();
+        args.push(path.to_string_lossy().into_owned());
+        args
     }
 
     #[cfg(unix)]

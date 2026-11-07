@@ -60,6 +60,37 @@ export function withCompleteToolInput(
   }))
 }
 
+/** How much of a running command's output a block keeps: its tail. */
+export const LIVE_OUTPUT_KEEP_CHARS = 16 * 1024
+
+/**
+ * More of what a running shell call printed, appended to what it printed
+ * before (stdout and stderr together, as a terminal shows them). Only the last
+ * {@link LIVE_OUTPUT_KEEP_CHARS} characters are kept. A call that has its
+ * result already is left alone: the result is the whole output.
+ */
+export function withToolOutputDelta(
+  blocks: ContentBlock[],
+  id: string,
+  chunk: string,
+): ContentBlock[] {
+  if (!chunk) return blocks
+  return updateToolBlock(blocks, id, (block) => {
+    if (block.output !== undefined) return block
+    const joined = (block.liveOutput ?? '') + chunk
+    const liveOutput =
+      joined.length > LIVE_OUTPUT_KEEP_CHARS ? joined.slice(-LIVE_OUTPUT_KEEP_CHARS) : joined
+    return { ...block, liveOutput }
+  })
+}
+
+/** The last `count` lines of a running command's output (no trailing blank line). */
+export function liveOutputTail(output: string, count: number): string | null {
+  const lines = output.replace(/\r\n/g, '\n').trimEnd().split('\n')
+  const tail = lines.slice(-count).join('\n')
+  return tail.trim() ? tail : null
+}
+
 /** The blocks without the calls of `ids` (input of an attempt that is retried). */
 export function withoutToolBlocks(
   blocks: ContentBlock[],

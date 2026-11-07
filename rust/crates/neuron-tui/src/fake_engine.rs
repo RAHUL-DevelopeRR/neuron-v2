@@ -341,6 +341,7 @@ pub mod samples {
             supports_images: Some(false),
             served_model: None,
             request_tokens_estimate: Some(6_200),
+            served_model_display_name: None,
             provider: Some("cloudflare".into()),
             model_display_name: Some("GLM 5.2".into()),
             reasoning_effort: Some("high".into()),
@@ -702,17 +703,21 @@ pub mod samples {
             is_git_root: true,
             session_only: false,
             trusted: false,
+            changed_since_trust: false,
+            changed_settings: Vec::new(),
             settings_files: vec![settings.clone()],
             hooks: vec![
                 HookPreview {
                     event: "PreToolUse".into(),
                     command: "./scripts/check-paths.sh".into(),
                     source: settings.clone(),
+                    matcher: None,
                 },
                 HookPreview {
                     event: "PostToolUse".into(),
                     command: "npm run lint --silent".into(),
                     source: settings.clone(),
+                    matcher: None,
                 },
             ],
             mcp_servers: vec![McpServerPreview {

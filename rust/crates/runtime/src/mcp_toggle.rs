@@ -187,7 +187,7 @@ mod tests {
 
         let outcome = set_mcp_server_enabled(&loader, "remote", true).unwrap();
         assert!(outcome.changed);
-        assert!(outcome.still_disabled_by.is_empty());
+        assert_eq!(outcome.still_disabled_by, [] as [std::path::PathBuf; 0]);
         let config = loader.load().unwrap();
         assert!(config.mcp().get("remote").is_some());
         assert!(config.mcp().disabled().is_empty());

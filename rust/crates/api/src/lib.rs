@@ -36,6 +36,7 @@ pub use providers::openai_compat::{
     OpenAiCompatEndpoint, QuotaRemaining, UsageObserver, DEFAULT_ZERO_X_BASE_URL,
     ZERO_X_PROVIDER_NAME,
 };
+pub use providers::user_keys::{clear_user_keys, has_user_key, install_user_key, user_key};
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
     model_token_limit, preflight_message_request, resolve_model_alias, ModelTokenLimit,

@@ -28,7 +28,7 @@
 //!   and, for a UI that declared `git_views`, the agent's changes ([`UiEvent::Changes`]);
 //! - `/diff [path]`, `/commit [message]`, [`EngineCommand::Commit`], `/rewind [id [mode]]`,
 //!   [`EngineCommand::Rewind`] and `/changes`: their events with `git_views`, else notices,
-//!   then `TurnFinished`. Each prompt gets a checkpoint ([`SessionCheckpoints`]) that
+//!   then `TurnFinished`. `/pr` and `/issue` answer with notices (`github_actions`). Each prompt gets a checkpoint ([`SessionCheckpoints`]) that
 //!   `/rewind` goes back to.
 //!
 //! When the engine stops, the event channel closes.
@@ -238,9 +238,15 @@ fn run_engine(
         return match started {
             Ok((mut engine, resumed)) => {
                 engine.announce();
+                let source = if resumed.is_some() {
+                    "resume"
+                } else {
+                    "startup"
+                };
                 if let Some(report) = resumed {
                     engine.notice(&report);
                 }
+                engine.cli.run_session_start_hooks(source);
                 let _ = ready.send(Ok(()));
                 let exit = engine.serve(queue);
                 engine.close();
@@ -294,6 +300,13 @@ fn run_engine(
                 }),
             }
         }
+        engine
+            .cli
+            .run_session_start_hooks(if signed_out.options.resume.is_some() {
+                "resume"
+            } else {
+                "startup"
+            });
         // The end of the `/login` that got here.
         engine.finish_turn();
         let exit = engine.serve(queue);
@@ -601,6 +614,9 @@ fn status_event(
 ) -> UiEvent {
     let cwd = env::current_dir().unwrap_or_default();
     let shown = shown_model(model);
+    let served = served_model
+        .map(shown_model)
+        .filter(|served| *served != shown);
     UiEvent::Status {
         model: shown.to_string(),
         permission_mode: permission_mode.as_str().to_string(),
@@ -614,10 +630,8 @@ fn status_event(
         sign_in_required,
         account: account.info.clone(),
         supports_images: crate::gateway_catalog::model_supports_images(model),
-        served_model: served_model
-            .map(shown_model)
-            .filter(|served| *served != shown)
-            .map(ToString::to_string),
+        served_model: served.map(ToString::to_string),
+        served_model_display_name: served.map(crate::gateway_catalog::model_name),
         request_tokens_estimate: request_tokens_estimate
             .map(|tokens| u64::try_from(tokens).unwrap_or(u64::MAX)),
         provider: bar.model.provider,
@@ -766,40 +780,9 @@ fn shorten_json_strings(input: &str, limit: usize) -> String {
     }
 }
 
-/// `TrustWorkspace`: records trust for the working directory's git root (the folder itself
-/// outside git) in the trust store; the home folder is trusted for this engine only. The
-/// workspace's own settings, hooks and MCP servers load when a session starts, so the UI
-/// restarts the engine to use them.
+/// `TrustWorkspace` for the working directory ([`engine_trust::trust_workspace_events`]).
 fn trust_workspace_events() -> Vec<UiEvent> {
-    let cwd = env::current_dir().unwrap_or_default();
-    match runtime::workspace_trust::trust_workspace_root(&cwd) {
-        Ok(trusted) => vec![
-            UiEvent::WorkspaceTrusted {
-                cwd: cwd.display().to_string(),
-                restart_required: true,
-                root: Some(trusted.root.display().to_string()),
-                session_only: trusted.session_only,
-            },
-            UiEvent::Notice {
-                message: if trusted.session_only {
-                    format!(
-                        "Trusted {} for this session only. Its settings, hooks and MCP servers load when the session restarts.",
-                        cwd.display()
-                    )
-                } else {
-                    format!(
-                        "Trusted {}. Its settings, hooks and MCP servers load when the session restarts.",
-                        trusted.root.display()
-                    )
-                },
-                kind: None,
-            },
-        ],
-        Err(error) => vec![UiEvent::error(format!(
-            "could not trust {}: {error}",
-            cwd.display()
-        ))],
-    }
+    engine_trust::trust_workspace_events(&env::current_dir().unwrap_or_default())
 }
 
 /// `ListExtensions`: the configured MCP servers with what each is doing now, the
@@ -1457,7 +1440,7 @@ fn models_event(current_model: &str) -> UiEvent {
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_else(crate::provider_auth::active_provider_model_infos);
     UiEvent::Models {
         current: shown_model(current_model).to_string(),
         models,
@@ -2227,6 +2210,12 @@ impl Engine {
             "commit" if args.is_empty() => self.propose_commit().map_err(Into::into),
             "commit" => self.commit(args).map_err(Into::into),
             "rewind" => self.rewind_command(args).map_err(Into::into),
+            "pr" => self
+                .github(crate::github_actions::GithubKind::PullRequest, args)
+                .map_err(Into::into),
+            "issue" => self
+                .github(crate::github_actions::GithubKind::Issue, args)
+                .map_err(Into::into),
             "changes" => {
                 self.show_changes();
                 Ok(())
@@ -2270,12 +2259,20 @@ impl Engine {
                 let usage = self.cli.runtime.usage().cumulative_usage();
                 self.notice(&format_cost_report(usage));
             }
+            SlashCommand::Artifacts => {
+                let report = crate::artifacts_view::artifacts_report(&self.cli.session.id);
+                self.notice(&report);
+            }
             SlashCommand::Stats => {
                 let usage =
                     UsageTracker::from_session(self.cli.runtime.session()).cumulative_usage();
                 self.notice(&format_cost_report(usage));
             }
             SlashCommand::Compact => self.compact()?,
+            SlashCommand::Hooks { args } => {
+                let report = self.cli.hooks_report(args.as_deref());
+                self.notice(&report);
+            }
             SlashCommand::Model { model: None } => self.model_report(),
             SlashCommand::Model { model: Some(model) } => {
                 self.switch_model(&model)?;
@@ -2295,6 +2292,7 @@ impl Engine {
                 self.resume(&reference)?;
                 self.persist();
                 self.send_transcript();
+                self.cli.run_session_start_hooks("resume");
             }
             SlashCommand::Plan { mode } => self.plan(mode.as_deref())?,
             SlashCommand::Login => self.login()?,
@@ -2320,6 +2318,7 @@ impl Engine {
                 let report = engine_reports::doctor(&render_doctor_report()?);
                 self.show_report(report);
             }
+            SlashCommand::Providers => self.notice(&crate::provider_auth::providers_report()),
             SlashCommand::Unknown(name) => return Err(format_unknown_slash_command(&name).into()),
             other => {
                 return Err(format!(
@@ -2563,6 +2562,7 @@ impl Engine {
     }
 
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.cli.run_manual_pre_compact_hooks();
         let result = self.cli.runtime.compact(CompactionConfig::default());
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
@@ -2570,6 +2570,9 @@ impl Engine {
         self.rebuild_runtime(result.compacted_session, &session_id)?;
         self.cli.persist_session()?;
         self.notice(&format_compact_report(removed, kept, removed == 0));
+        if removed > 0 {
+            self.cli.run_session_start_hooks("compact");
+        }
         Ok(())
     }
 
@@ -2593,6 +2596,7 @@ impl Engine {
         let report = self.cli.session_cleared_report(&previous);
         self.notice(&report);
         self.persist();
+        self.cli.run_session_start_hooks("clear");
         Ok(())
     }
 
@@ -2946,6 +2950,24 @@ impl Engine {
         Ok(())
     }
 
+    /// `/pr …` and `/issue …` (`github_actions`): a draft as a notice, or, on
+    /// `create` after a draft was shown, the pull request or issue opened with `gh`. An
+    /// interrupt stops the draft.
+    fn github(
+        &mut self,
+        kind: crate::github_actions::GithubKind,
+        args: &str,
+    ) -> Result<(), String> {
+        let cancel = CancellationToken::new();
+        let shared = Arc::clone(&self.shared);
+        let running = RunningTurn::start(&shared);
+        running.watch(cancel.clone(), HookAbortSignal::new());
+        let result = self.cli.github_command(kind, args, &cancel);
+        drop(running);
+        self.notice(&result?);
+        Ok(())
+    }
+
     fn repository(&self) -> Result<Repo, String> {
         let cwd = env::current_dir().map_err(|error| error.to_string())?;
         Repo::discover(&cwd)?.ok_or_else(|| {
@@ -3066,9 +3088,10 @@ mod tests {
     use super::{
         definitions, forward_commands, git_status, hosted_needs_connect, mcp_server_status,
         mcp_start_watch, mcp_tool_tiers, mcp_transport_id, plain_notice, question_notice, shorten,
-        shorten_json_strings, spawn, transcript_event, EngineExit, EngineHandle, EngineOptions,
-        McpRuntimeView, RunningTurn, Shared,
+        shorten_json_strings, spawn, status_event, transcript_event, AccountState, EngineExit,
+        EngineHandle, EngineOptions, McpRuntimeView, RunningTurn, Shared,
     };
+    use crate::engine_status_bar::StatusBarFields;
     use crate::repl_loop::InterruptPresses;
     use crate::tests::{env_lock, with_current_dir};
     use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
@@ -3289,6 +3312,53 @@ mod tests {
             }
         }
         contents
+    }
+
+    /// The status names the model that answered by name, never by the gateway's route to
+    /// it; the raw id stays beside it.
+    #[test]
+    fn the_status_names_the_served_model_without_its_route() {
+        let status = |served: Option<&str>| {
+            status_event(
+                "openai/auto",
+                PermissionMode::WorkspaceWrite,
+                "s",
+                false,
+                0,
+                &AccountState::default(),
+                false,
+                served,
+                None,
+                StatusBarFields::default(),
+            )
+        };
+        match status(Some("openai/unit-maker/unit-flash:free")) {
+            UiEvent::Status {
+                model,
+                served_model,
+                served_model_display_name,
+                ..
+            } => {
+                assert_eq!(model, "auto");
+                assert_eq!(served_model.as_deref(), Some("unit-maker/unit-flash:free"));
+                assert_eq!(served_model_display_name.as_deref(), Some("unit-flash"));
+            }
+            other => panic!("not a status: {other:?}"),
+        }
+        // Nothing to name when `auto` itself (or nothing yet) answered.
+        for served in [None, Some("openai/auto")] {
+            match status(served) {
+                UiEvent::Status {
+                    served_model,
+                    served_model_display_name,
+                    ..
+                } => {
+                    assert_eq!(served_model, None);
+                    assert_eq!(served_model_display_name, None);
+                }
+                other => panic!("not a status: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -3959,7 +4029,13 @@ mod tests {
         }
         fs::remove_file(&settings).expect("settings removed");
 
-        // Trust the workspace: recorded, and the footer says so; settings load on restart.
+        // Trust the workspace after its screen is drawn again from the files as they are now
+        // (what was shown is what is trusted): recorded, and the footer says so; settings
+        // load on restart.
+        engine.commands.send(EngineCommand::TrustPreview).unwrap();
+        events_until(&engine.events, |event| {
+            matches!(event, UiEvent::TrustPreview { .. })
+        });
         engine.commands.send(EngineCommand::TrustWorkspace).unwrap();
         let trusted = events_until(&engine.events, |event| {
             matches!(event, UiEvent::Status { .. })

@@ -62,6 +62,10 @@ export const FEATURE_CHECKPOINTS = 'checkpoints'
  * servers listed with status `disabled`.
  */
 export const FEATURE_MCP_TOGGLE = 'mcp_toggle'
+/** `tool_output_delta` events: a running shell command's output. */
+export const FEATURE_LIVE_OUTPUT = 'live_output'
+/** `hook_started` and `hook_finished` events while hook commands run. */
+export const FEATURE_HOOK_PROGRESS = 'hook_progress'
 /**
  * The connector catalog: the `list_connector_catalog` command (answered with a
  * `connector_catalog` event), `add_mcp_server`, `remove_mcp_server` and
@@ -106,6 +110,17 @@ export const CAPABILITY_LIVE_PROGRESS = 'live_progress'
  * `/rewind` with notices.
  */
 export const CAPABILITY_GIT_VIEWS = 'git_views'
+/**
+ * A UI capability: a running `bash` or `PowerShell` call's output as
+ * `tool_output_delta` events. Without it the output comes only with the result.
+ */
+export const CAPABILITY_LIVE_OUTPUT = 'live_output'
+
+/**
+ * A UI capability: `hook_started` and `hook_finished` events. Without it the
+ * engine sends neither.
+ */
+export const CAPABILITY_HOOK_PROGRESS = 'hook_progress'
 
 /** Token counts as the provider reported them (or estimated before it did). */
 export interface TokenCounts {
@@ -500,10 +515,12 @@ export interface ErrorDetail {
 export interface HookPreview {
   /** `PreToolUse`, `PostToolUse` or `PostToolUseFailure`. */
   event: string
-  /** The command it runs (shortened when long). */
+  /** The command it runs, in full (cut only past a very long length). */
   command: string
   /** The settings file it comes from. */
   source: string
+  /** The tool name the hook is limited to; absent when it runs for every tool. */
+  matcher?: string
 }
 
 /** An MCP server a workspace's settings would start. */
@@ -642,9 +659,18 @@ export interface StatusEvent {
    * is `AccountDetails.usage_window`.
    */
   request_tokens_estimate?: number | null
+  /**
+   * How a person reads `served_model`: its catalog name without the
+   * gateway's route to it (`GLM-4.7 Flash`, not `GLM-4.7 Flash (OpenRouter,
+   * free)` or the id). Sent with `served_model`; absent from older engines.
+   */
+  served_model_display_name?: string | null
   /** Who serves the model (feature `status_bar`), as on {@link ModelInfo}. */
   provider?: string | null
-  /** The catalog's name for the model (feature `status_bar`). */
+  /**
+   * The catalog's name for the model (feature `status_bar`), without the
+   * gateway's route to it from engines after 7.0.0-alpha.4.
+   */
   model_display_name?: string | null
   /** The thinking level the next turn asks for; `null` for the model's default. */
   reasoning_effort?: string | null
@@ -925,6 +951,17 @@ export interface TrustPreviewEvent {
   session_only: boolean
   /** The workspace is trusted already. */
   trusted: boolean
+  /**
+   * The workspace was trusted before, but its hooks, MCP servers or allow
+   * rules changed since: the screen says so and lists them again.
+   */
+  changed_since_trust?: boolean
+  /**
+   * With `changed_since_trust`: the settings keys (`env`, `model`, `hooks`, ...)
+   * that differ from what was trusted, sorted. Empty when there was nothing to
+   * compare. Engines before it leave it out.
+   */
+  changed_settings?: string[]
   /** The workspace's settings files. */
   settings_files: string[]
   hooks: HookPreview[]
@@ -976,6 +1013,49 @@ export interface OutputProgressEvent {
 export interface RequestUsageEvent {
   type: 'request_usage'
   usage: TokenCounts
+}
+
+/** Which stream of a command a `tool_output_delta` carries. */
+export type OutputStream = 'stdout' | 'stderr'
+
+/**
+ * More of what a running shell call printed: the text since the last delta of
+ * that stream, at most every 100 ms or so and at most 8 KB (the tail of what
+ * it printed meanwhile). The call's `tool_result` still has all of it.
+ */
+export interface ToolOutputDeltaEvent {
+  type: 'tool_output_delta'
+  tool_use_id: string
+  stream: OutputStream
+  chunk: string
+}
+
+/**
+ * A hook command started. `event` is its settings name (`PreToolUse`, `Stop`,
+ * ...); `command` is shortened, with anything that looks like a secret hidden;
+ * `tool_use_id` is the tool call it runs for.
+ */
+export interface HookStartedEvent {
+  type: 'hook_started'
+  event: string
+  matcher?: string | null
+  command: string
+  tool_use_id?: string | null
+}
+
+/** How a hook command ended. */
+export type HookOutcome = 'ok' | 'blocked' | 'error' | 'cancelled'
+
+/** A hook command ended; `message` is the start of what it said. */
+export interface HookFinishedEvent {
+  type: 'hook_finished'
+  event: string
+  matcher?: string | null
+  command: string
+  tool_use_id?: string | null
+  outcome: HookOutcome
+  duration_ms: number
+  message?: string | null
 }
 
 /**
@@ -1086,6 +1166,9 @@ export type UiEvent =
   | ToolInputProgressEvent
   | OutputProgressEvent
   | RequestUsageEvent
+  | ToolOutputDeltaEvent
+  | HookStartedEvent
+  | HookFinishedEvent
   | ChangesEvent
   | DiffEvent
   | CommitProposalEvent
@@ -1129,6 +1212,9 @@ export const UI_EVENT_TYPES: readonly UiEventType[] = [
   'tool_input_progress',
   'output_progress',
   'request_usage',
+  'tool_output_delta',
+  'hook_started',
+  'hook_finished',
   'changes',
   'diff',
   'commit_proposal',

@@ -258,6 +258,17 @@ export function reduceLiveTurn(
             : call,
         ),
       }
+    case 'hook_started':
+      return {
+        ...state,
+        hook: {
+          event: event.event,
+          command: event.command,
+          toolUseId: event.tool_use_id ?? null,
+        },
+      }
+    case 'hook_finished':
+      return { ...state, hook: null }
     case 'request_usage': {
       const { usage } = event
       return {
@@ -422,6 +433,11 @@ export function stalledFor(state: LiveTurnState, now: number): number | null {
  * What the status line says at `now`. A tool that runs and a permission
  * dialog are expected silences: only a streaming request reads as stalled.
  */
+/** The status line while a hook command runs: `Running Stop hook check.sh`. */
+export function hookActivity(hook: { event: string; command: string }): LiveActivity {
+  return { verb: `Running ${hook.event} hook`, target: hook.command || null, detail: null, stalled: false }
+}
+
 export function describeLiveActivity(
   state: LiveTurnState,
   options: { now: number; awaitingApproval: boolean },
@@ -436,6 +452,7 @@ export function describeLiveActivity(
       stalled: false,
     }
   }
+  if (state.hook) return hookActivity(state.hook)
   const silent = stalledFor(state, now)
   const stall: LiveActivity | null =
     silent === null
