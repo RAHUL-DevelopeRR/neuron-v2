@@ -147,10 +147,17 @@ jobs:
           root="$RUNNER_TEMP/releases"
           python tests/fake_release.py stage --root "$root" --version "$SMOKE_VERSION"
           cp install.sh "$root/"
-          python tests/fake_release.py serve --root "$root" --port-file "$RUNNER_TEMP/port" &
+          python tests/fake_release.py serve --root "$root" --port-file "$RUNNER_TEMP/port" >"$RUNNER_TEMP/server.log" 2>&1 &
           server=$!
           trap 'kill "$server"' EXIT
-          for _ in $(seq 100); do [ -s "$RUNNER_TEMP/port" ] && break; sleep 0.1; done
+          # Wait up to 60 s: a cold interpreter can be slow on a busy macOS runner.
+          for _ in $(seq 600); do [ -s "$RUNNER_TEMP/port" ] && break; sleep 0.1; done
+          if [ ! -s "$RUNNER_TEMP/port" ]; then
+            echo "fake release server wrote no port file; its log:" >&2
+            cat "$RUNNER_TEMP/server.log" >&2 || true
+            kill -0 "$server" 2>/dev/null && echo "server process is still running" >&2 || echo "server process has exited" >&2
+            exit 1
+          fi
           base="http://127.0.0.1:$(cat "$RUNNER_TEMP/port")"
           curl -fsSL "$base/install.sh" \
             | NEURON_DOWNLOAD_BASE="$base" NEURON_CHECKSUMS_BASE="$base" NEURON_RELEASES_API="$base/repos/neuron/releases/latest" \
