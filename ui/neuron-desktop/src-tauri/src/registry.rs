@@ -51,7 +51,10 @@ const SHUTDOWN_WAIT: Duration = if cfg!(test) {
     Duration::from_secs(3)
 };
 /// How long the app's shutdown then waits for starts under way to give up. The
-/// wait ends as soon as they have, so tests keep it as long.
+/// wait ends as soon as they have, so tests keep it as long. A spawn slower
+/// than this is not waited for: the engine's input ends when the app exits and
+/// the engine exits by itself, and on Windows the Job Object ends it with the
+/// app.
 const STARTS_WAIT: Duration = Duration::from_secs(3);
 
 /// Why a chat's engine ended, as the window is told.
@@ -887,8 +890,9 @@ impl EngineRegistry {
     /// The app is closing: no engine starts any more, every engine saves and
     /// stops (one already told to stop, too), and whatever is left after a
     /// short wait is ended with its children. A chat still starting is waited
-    /// for: its start gives up and ends any engine it brought up, so no engine
-    /// outlives the app.
+    /// for, up to `STARTS_WAIT`: its start gives up and ends any engine it
+    /// brought up. A start slower than that is left to the engine itself, which
+    /// exits when its input ends with the app.
     pub fn shutdown_all(&self) {
         let handles: Vec<_> = {
             let mut chats = lock(&self.chats);
