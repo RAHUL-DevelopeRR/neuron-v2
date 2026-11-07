@@ -43,6 +43,9 @@ import {
 import { ModelPicker } from './components/model-picker'
 import { PermissionPrompt } from './components/permission-prompt'
 import { RewindPicker } from './components/rewind-picker'
+import { McpPanel } from './components/mcp-panel'
+import { useMcpPanelStore } from './state/mcp-panel-store'
+import { openMcpPanel } from './engine/mcp-panel'
 import { SignInPanel } from './components/sign-in-panel'
 import { StatusBar } from './components/status-bar'
 import {
@@ -138,13 +141,20 @@ export const Chat = ({
   const [todoPanelOpen, setTodoPanelOpen] = useState(false)
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   // The status bar's other pickers and its context popover, in the same slot.
-  const [statusPanel, setStatusPanel] = useState<Exclude<StatusTarget, 'model' | 'account'> | null>(
-    null,
-  )
+  const [statusPanel, setStatusPanel] = useState<
+    Exclude<StatusTarget, 'model' | 'account' | 'connectors'> | null
+  >(null)
   const openStatusTarget = useCallback((target: StatusTarget) => {
     if (target === 'model') {
       setStatusPanel(null)
       setModelPickerOpen(true)
+      return
+    }
+    if (target === 'connectors') {
+      // The MCP panel, as /mcp opens it.
+      setStatusPanel(null)
+      setModelPickerOpen(false)
+      openMcpPanel()
       return
     }
     setModelPickerOpen(false)
@@ -312,7 +322,12 @@ export const Chat = ({
       deferred: state.deferred,
     })),
   )
-  const gitPanelOpen = isGitPanelOpen(gitViews)
+  // `/mcp`: the MCP servers and their switches (state/mcp-panel-store.ts). It
+  // takes the keyboard like a git panel.
+  const mcpPanel = useMcpPanelStore(
+    useShallow((state) => ({ open: state.open, servers: state.servers, pending: state.pending })),
+  )
+  const gitPanelOpen = isGitPanelOpen(gitViews) || mcpPanel.open
 
   // Get loaded skills for slash commands (and the git ones the engine has)
   const loadedSkills = useMemo(() => getLoadedSkills(), [])
@@ -1457,6 +1472,13 @@ export const Chat = ({
         ) : gitViews.changesPanelOpen && !askUserState ? (
           <ChangesPanel
             files={gitViews.changes}
+            width={separatorWidth}
+            maxVisibleRows={isCompactHeight ? 4 : 8}
+          />
+        ) : mcpPanel.open && !askUserState ? (
+          <McpPanel
+            servers={mcpPanel.servers}
+            pending={mcpPanel.pending}
             width={separatorWidth}
             maxVisibleRows={isCompactHeight ? 4 : 8}
           />

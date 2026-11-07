@@ -69,6 +69,17 @@ export interface LiveTurnState {
    * engines): one becomes the list only when its call worked.
    */
   pendingTodoWrites: { id: string; todos: TodoItem[] }[]
+  /** The hook command running now (`hook_progress`), for the status line. */
+  hook: LiveHook | null
+}
+
+/** A hook command that started and has not finished. */
+export interface LiveHook {
+  /** Its event's settings name (`PreToolUse`, `Stop`, ...). */
+  event: string
+  /** Shortened, secrets hidden. */
+  command: string
+  toolUseId: string | null
 }
 
 export const INITIAL_LIVE_TURN: LiveTurnState = {
@@ -86,6 +97,7 @@ export const INITIAL_LIVE_TURN: LiveTurnState = {
   todosThisTurn: false,
   todosFromEvents: false,
   pendingTodoWrites: [],
+  hook: null,
 }
 
 export const useLiveTurnStore = create<LiveTurnState>()(() => ({

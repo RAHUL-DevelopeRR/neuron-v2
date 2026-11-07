@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from 'bun:test'
 
 import {
   interruptAtPermission,
+  permissionHeadline,
   resolvePermissionKey,
   resolvePermissionNoteKey,
   summarizePermissionInput,
@@ -18,6 +19,8 @@ import {
   inUiWording,
   isRetryNotice,
   setEngineTurnActive,
+  showConversationOfResumedSession,
+  transcriptMessages,
 } from '../engine-session'
 
 import type { PermissionView, SignInCodeEvent, StatusEvent } from '../protocol'
@@ -54,6 +57,55 @@ beforeEach(() => {
   useEngineStore.getState().reset()
   useChatStore.getState().reset()
   setEngineTurnActive(false)
+})
+
+describe('a session resumed from the command line', () => {
+  const TRANSCRIPT = {
+    type: 'transcript' as const,
+    session_id: 'session-1',
+    truncated: true,
+    entries: [
+      { kind: 'user' as const, text: 'add a test' },
+      { kind: 'assistant' as const, text: 'Adding it.' },
+      { kind: 'tool_call' as const, id: 't1', name: 'write_file', input: '{}' },
+      { kind: 'tool_result' as const, id: 't1', name: 'write_file', output: 'ok', is_error: false },
+      { kind: 'assistant' as const, text: 'Done.' },
+    ],
+  }
+
+  test('its conversation is shown as prompts and answers, tools named', () => {
+    const messages = transcriptMessages(TRANSCRIPT)
+    expect(messages.map((m) => [m.variant, m.content])).toEqual([
+      ['ai', 'Earlier messages of this session are not shown.'],
+      ['user', 'add a test'],
+      ['ai', 'Adding it.\n\u2192 write_file'],
+      ['ai', 'Done.'],
+    ])
+    expect(new Set(messages.map((m) => m.id)).size).toBe(messages.length)
+  })
+
+  test('the first transcript fills the empty chat; later ones and other launches do not', () => {
+    // Without `--resume`, a transcript (after /clear, /resume) is not shown here.
+    handleEngineEvent(TRANSCRIPT)
+    expect(useChatStore.getState().messages).toEqual([])
+
+    showConversationOfResumedSession()
+    handleEngineEvent(TRANSCRIPT)
+    expect(useChatStore.getState().messages.map((m) => m.content)).toContain('add a test')
+
+    useChatStore.getState().reset()
+    handleEngineEvent(TRANSCRIPT)
+    expect(useChatStore.getState().messages).toEqual([])
+  })
+
+  test('a chat that already has messages keeps them', () => {
+    useChatStore.getState().setMessages([
+      { id: 'mine', variant: 'user', content: 'from --continue', timestamp: '' },
+    ])
+    showConversationOfResumedSession()
+    handleEngineEvent(TRANSCRIPT)
+    expect(useChatStore.getState().messages.map((m) => m.id)).toEqual(['mine'])
+  })
 })
 
 describe('handleEngineEvent', () => {
@@ -421,6 +473,46 @@ describe('permission prompt keys', () => {
     } finally {
       setNeuronEngineClientForTesting(null)
     }
+  })
+
+  test('d denies for the rest of the session; p always allows only when rules are offered', () => {
+    expect(resolvePermissionKey({ name: 'd', ctrl: false, meta: false }, armed)).toEqual({
+      type: 'decide',
+      decision: { kind: 'deny', note: null, session: true },
+    })
+    // Offered even when there is no prefix: the engine then refuses this exact call.
+    expect(
+      resolvePermissionKey(
+        { name: 'd', ctrl: false, meta: false },
+        { armed: true, canAllowForSession: false },
+      ),
+    ).toEqual({ type: 'decide', decision: { kind: 'deny', note: null, session: true } })
+    expect(
+      resolvePermissionKey(
+        { name: 'd', ctrl: false, meta: false },
+        { armed: false, canAllowForSession: true },
+      ).type,
+    ).toBe('none')
+    expect(resolvePermissionKey({ name: 'p', ctrl: false, meta: false }, armed).type).toBe('none')
+    expect(
+      resolvePermissionKey(
+        { name: 'p', ctrl: false, meta: false },
+        { armed: true, canAllowForSession: false, canAllowForProject: true },
+      ),
+    ).toEqual({ type: 'decide', decision: { kind: 'allow_for_project' } })
+  })
+
+  test('the headline says a shell command is outside the auto-allow list', () => {
+    expect(permissionHeadline(REQUEST)).toBe(
+      ' wants to run this command (outside the auto-allow list)',
+    )
+    expect(permissionHeadline(REQUEST)).not.toContain('danger-full-access')
+    expect(permissionHeadline({ ...REQUEST, current_mode: 'prompt' })).toBe(
+      ' wants to run this command (prompt mode asks every time)',
+    )
+    expect(permissionHeadline({ ...REQUEST, tool: 'write_file' })).toBe(
+      ' wants approval (workspace-write does not cover this call)',
+    )
   })
 
   test('keys are ignored until the guard passes, and a only when offered', () => {

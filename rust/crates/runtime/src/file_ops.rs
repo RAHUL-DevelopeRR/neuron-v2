@@ -54,7 +54,9 @@ fn is_binary_file(path: &Path) -> io::Result<bool> {
 /// the workspace boundary (e.g. via `../` traversal or symlink).
 #[allow(dead_code)]
 fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Result<()> {
-    if !path_starts_with_normalized(resolved, workspace_root) {
+    if !path_starts_with_normalized(resolved, workspace_root)
+        && !resolves_within(resolved, workspace_root)
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -67,6 +69,37 @@ fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Re
     Ok(())
 }
 
+/// Whether `resolved` names a location inside `workspace_root` once the
+/// filesystem resolves it. Windows accepts several spellings of one location
+/// that a lexical comparison treats as different (the `\\.\` device namespace,
+/// 8.3 short names). Only consulted after the lexical comparison fails, so it
+/// can accept such a spelling but never widens what already compared inside,
+/// and a path whose canonical form is outside stays rejected.
+///
+/// Ported from Claw Code (MIT), upstream commit dc34649.
+fn resolves_within(resolved: &Path, workspace_root: &Path) -> bool {
+    let Ok(canonical) = resolved.canonicalize() else {
+        return false;
+    };
+    let root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    path_starts_with_normalized(&canonical, &root)
+}
+
+/// The comparable spelling of a Windows path: the extended-length (`\\?\C:\`,
+/// `\\?\UNC\srv\share`) and device (`\\.\C:\`) prefixes dropped, so
+/// `\\?\UNC\srv\share` compares like `\\srv\share`. Ported from Claw Code
+/// (MIT), upstream commit 9e7fd60.
+#[cfg(any(windows, test))]
+fn comparable_windows_path(raw: &str) -> String {
+    let raw = raw.replace('/', "\\");
+    match raw.strip_prefix(r"\\.\") {
+        Some(device) => device.to_string(),
+        None => strip_verbatim_prefix(&raw),
+    }
+}
+
 fn path_starts_with_normalized(path: &Path, root: &Path) -> bool {
     if path.starts_with(root) {
         return true;
@@ -74,13 +107,8 @@ fn path_starts_with_normalized(path: &Path, root: &Path) -> bool {
 
     #[cfg(windows)]
     {
-        let normalize = |value: &Path| {
-            value
-                .to_string_lossy()
-                .trim_start_matches("\\\\?\\")
-                .replace('/', "\\")
-                .to_ascii_lowercase()
-        };
+        let normalize =
+            |value: &Path| comparable_windows_path(&value.to_string_lossy()).to_ascii_lowercase();
         let path = normalize(path);
         let mut root = normalize(root);
         if !root.ends_with('\\') {
@@ -1214,7 +1242,7 @@ pub fn is_blank_search_path(path: &str) -> bool {
 fn search_base(path: Option<&str>) -> io::Result<PathBuf> {
     match path.filter(|path| !is_blank_search_path(path)) {
         Some(path) => normalize_path(path),
-        None => std::env::current_dir(),
+        None => crate::workdir::current_dir(),
     }
 }
 
@@ -1222,10 +1250,10 @@ fn normalize_path(path: &str) -> io::Result<PathBuf> {
     let candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
-        std::env::current_dir()?.join(path)
+        crate::workdir::current_dir()?.join(path)
     };
     match candidate.canonicalize() {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => std::env::current_dir()
+        Err(error) if error.kind() == io::ErrorKind::NotFound => crate::workdir::current_dir()
             .ok()
             .and_then(|cwd| recover_mistyped_path(&candidate, &cwd))
             .ok_or(error),
@@ -1311,7 +1339,7 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
     let candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
-        std::env::current_dir()?.join(path)
+        crate::workdir::current_dir()?.join(path)
     };
 
     let mut ancestor = candidate.as_path();
@@ -2203,5 +2231,100 @@ mod tests {
         let named = grep(&dir.join(".env"));
         assert!(named.content.unwrap_or_default().contains("sk-grep-secret"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // Ported from Claw Code (MIT), upstream commit 9e7fd60.
+    #[test]
+    fn comparable_windows_path_drops_extended_and_device_prefixes() {
+        assert_eq!(
+            super::comparable_windows_path(r"\\?\C:\workspace\file.txt"),
+            r"C:\workspace\file.txt"
+        );
+        assert_eq!(
+            super::comparable_windows_path(r"\\?\UNC\server\share\workspace\file.txt"),
+            r"\\server\share\workspace\file.txt"
+        );
+        assert_eq!(
+            super::comparable_windows_path(r"\\.\C:\workspace\file.txt"),
+            r"C:\workspace\file.txt"
+        );
+        assert_eq!(
+            super::comparable_windows_path("C:/workspace/file.txt"),
+            r"C:\workspace\file.txt"
+        );
+    }
+
+    // Ported from Claw Code (MIT), upstream commit 9e7fd60.
+    #[test]
+    #[cfg(windows)]
+    fn accepts_equivalent_extended_and_unc_paths_at_the_workspace_boundary() {
+        use std::path::PathBuf;
+        super::validate_workspace_boundary(
+            &PathBuf::from(r"\\?\C:\workspace\src\main.rs"),
+            &PathBuf::from(r"C:\workspace"),
+        )
+        .expect("an extended DOS path inside the root should be accepted");
+        super::validate_workspace_boundary(
+            &PathBuf::from(r"\\?\UNC\server\share\repo\src\main.rs"),
+            &PathBuf::from(r"\\server\share\repo"),
+        )
+        .expect("an extended UNC path inside the root should be accepted");
+        super::validate_workspace_boundary(
+            &PathBuf::from(r"\\?\UNC\server\share\other\main.rs"),
+            &PathBuf::from(r"\\server\share\repo"),
+        )
+        .expect_err("a UNC path outside the root must stay rejected");
+    }
+
+    // Ported from Claw Code (MIT), upstream commit dc34649.
+    #[test]
+    #[cfg(windows)]
+    fn accepts_other_windows_spellings_of_a_workspace_path() {
+        use std::path::PathBuf;
+        let workspace = temp_path("Boundary-Case-Workspace");
+        std::fs::create_dir_all(workspace.join("src")).expect("workspace dir should be created");
+        let root = workspace
+            .canonicalize()
+            .expect("workspace should canonicalize");
+
+        let lower = PathBuf::from(workspace.join("src").to_string_lossy().to_lowercase());
+        super::validate_workspace_boundary(&lower, &root)
+            .expect("a lower-cased spelling of a workspace path should be accepted");
+
+        let device = PathBuf::from(format!(r"\\.\{}", workspace.join("src").display()));
+        super::validate_workspace_boundary(&device, &root)
+            .expect("a device-namespace spelling of a workspace path should be accepted");
+
+        let parent = workspace
+            .parent()
+            .expect("workspace has a parent")
+            .to_path_buf();
+        super::validate_workspace_boundary(&parent, &root)
+            .expect_err("the workspace's parent must stay rejected");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // Ported from Claw Code (MIT), upstream commit dc34649.
+    #[test]
+    #[cfg(unix)]
+    fn accepts_a_path_that_resolves_inside_the_workspace() {
+        let workspace = temp_path("boundary-alias-workspace");
+        let aliases = temp_path("boundary-alias-links");
+        std::fs::create_dir_all(workspace.join("src")).expect("workspace dir should be created");
+        std::fs::create_dir_all(&aliases).expect("alias dir should be created");
+        let alias = aliases.join("src");
+        std::os::unix::fs::symlink(workspace.join("src"), &alias).expect("symlink should create");
+        let root = workspace
+            .canonicalize()
+            .expect("workspace should canonicalize");
+
+        super::validate_workspace_boundary(&alias, &root)
+            .expect("a spelling that resolves inside the workspace should be accepted");
+        super::validate_workspace_boundary(&aliases, &root)
+            .expect_err("a path that resolves outside the workspace must stay rejected");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&aliases);
     }
 }

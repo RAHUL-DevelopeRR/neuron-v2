@@ -93,14 +93,19 @@ fn account_details(
         usage_updated_at: cache.fetched_at,
         usage_error: cache.error.clone(),
         usage_window: summary
-            .and_then(|summary| summary.usage_window.clone())
-            .map(|window| UsageWindow {
-                tokens: window.tokens,
-                limit_tokens: window.limit_tokens,
-                remaining_tokens: window.remaining_tokens,
-                resets_at: window.resets_at,
-                window_seconds: window.window_seconds,
-            }),
+            .and_then(AccountSummary::window)
+            .map(|window| usage_window(&window.as_of(crate::clock::now_unix()))),
+    }
+}
+
+/// The token window as the protocol carries it.
+fn usage_window(window: &crate::account::PlanWindow) -> UsageWindow {
+    UsageWindow {
+        tokens: window.used(),
+        limit_tokens: Some(window.limit_tokens),
+        remaining_tokens: window.remaining(),
+        resets_at: window.resets_at.clone(),
+        window_seconds: window.window_seconds,
     }
 }
 
@@ -251,9 +256,20 @@ fn apply_quota(cache: &mut AccountCache, quota: api::QuotaRemaining) -> bool {
         summary.requests_today = Some(limit.saturating_sub(left));
         changed = true;
     }
-    if let (Some(limit), Some(left)) = (summary.daily_tokens_limit, quota.tokens) {
-        summary.tokens_today = Some(limit.saturating_sub(left));
-        changed = true;
+    match (summary.window_tokens_limit, quota.tokens) {
+        // On a plan with a window the token header is what the window still allows.
+        (Some(limit), Some(left)) => {
+            summary.window_tokens_remaining = Some(left);
+            summary.window_tokens_used = Some(limit.saturating_sub(left));
+            changed = true;
+        }
+        (None, Some(left)) => {
+            if let Some(limit) = summary.daily_tokens_limit {
+                summary.tokens_today = Some(limit.saturating_sub(left));
+                changed = true;
+            }
+        }
+        (_, None) => {}
     }
     changed
 }
@@ -287,39 +303,9 @@ mod tests {
             "plan": {"id": "pro", "name": "Pro"},
             "limits": {"daily_requests": 2000, "daily_tokens": 10_000_000},
             "usage_today": {"requests": 37, "tokens": 120_431, "resets_at": "2026-10-24T00:00:00Z"},
-            "usage_window": {"tokens": 120_000, "limit_tokens": 1_000_000, "remaining_tokens": 880_000, "resets_at": "2026-10-23T14:32:00Z", "window_seconds": 18_000},
             "credits": {"balance_usd": 7.42},
             "flags": {"suspended": false}
         }))
-    }
-
-    #[test]
-    fn the_five_hour_window_reaches_the_ui_and_is_left_out_when_not_sent() {
-        let cache = AccountCache {
-            summary: Some(summary()),
-            fetched_at: Some(100),
-            ..AccountCache::default()
-        };
-        let details = account_details(&credential(), &cache, None);
-        assert_eq!(
-            details.usage_window,
-            Some(UsageWindow {
-                tokens: Some(120_000),
-                limit_tokens: Some(1_000_000),
-                remaining_tokens: Some(880_000),
-                resets_at: Some("2026-10-23T14:32:00Z".into()),
-                window_seconds: Some(18_000),
-            })
-        );
-        let without = crate::account::parse_account(&serde_json::json!({
-            "plan": {"id": "free"},
-            "usage_window": {}
-        }));
-        assert_eq!(without.usage_window, None);
-        let used = crate::account::parse_account(&serde_json::json!({
-            "usage_window": {"used_tokens": 5, "limit_tokens": 10}
-        }));
-        assert_eq!(used.usage_window.and_then(|window| window.tokens), Some(5));
     }
 
     #[test]
@@ -381,6 +367,37 @@ mod tests {
 
         let mut unread = AccountCache::default();
         assert!(!apply_quota(&mut unread, quota), "no limits to count from");
+    }
+
+    #[test]
+    fn on_a_plan_with_a_window_the_token_header_moves_the_window() {
+        let free = crate::account::parse_account(&serde_json::json!({
+            "plan": {"id": "free", "name": "Free"},
+            "limits": {"daily_requests": 100, "daily_tokens": 5_000_000, "window_tokens": 1_000_000, "window_seconds": 18_000},
+            "usage_today": {"requests": 3, "tokens": 30_000},
+            "usage_window": {"tokens": 30_000, "limit_tokens": 1_000_000, "remaining_tokens": 970_000}
+        }));
+        let mut cache = AccountCache {
+            summary: Some(free),
+            ..AccountCache::default()
+        };
+        let quota = api::QuotaRemaining {
+            requests: Some(96),
+            tokens: Some(360_000),
+        };
+        assert!(apply_quota(&mut cache, quota));
+        let summary = cache.summary.as_ref().expect("a summary");
+        assert_eq!(summary.window_tokens_used, Some(640_000));
+        assert_eq!(summary.window_tokens_remaining, Some(360_000));
+        assert_eq!(summary.tokens_today, Some(30_000), "not a daily figure");
+        assert_eq!(summary.requests_today, Some(4));
+
+        let details = account_details(&credential(), &cache, None);
+        let window = details.usage_window.expect("the window");
+        assert_eq!(window.limit_tokens, Some(1_000_000));
+        assert_eq!(window.tokens, Some(640_000));
+        assert_eq!(window.remaining_tokens, Some(360_000));
+        assert_eq!(window.window_seconds, Some(18_000));
     }
 
     #[test]

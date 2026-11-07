@@ -41,10 +41,16 @@ export interface EngineStoreState {
   /** Oldest first; the dialog shows the head. */
   permissionQueue: PermissionRequestedEvent[]
   /**
-   * The engine asked a question (a notice starting with "Question:") and
-   * takes the next submit as its answer, even while the turn runs.
+   * The engine asked a question (a notice starting with "Question:", or a
+   * `question` event with the `questions` capability) and takes the next
+   * submit as its answer, even while the turn runs.
    */
   pendingQuestion: string | null
+  /**
+   * The `question` event's id, answered with the `answer` command; `null` for
+   * a question that came as a notice (answered with a plain submit).
+   */
+  pendingQuestionId: number | null
   /**
    * Where that question is drawn: its block in the turn's message, which the
    * answer is written into. `null` when it is a chat line instead.
@@ -98,7 +104,7 @@ export interface EngineStoreState {
   resolvePermission: (id: number) => void
   clearPermissions: () => void
   /** Also forgets where the previous question was drawn. */
-  setPendingQuestion: (question: string | null) => void
+  setPendingQuestion: (question: string | null, id?: number | null) => void
   setPendingQuestionTarget: (target: QuestionTarget | null) => void
   setSignIn: (code: SignInCodeEvent | null, receivedAt?: number) => void
   setSignInProblem: (problem: string | null) => void
@@ -144,6 +150,7 @@ const initial = {
   usage: null,
   permissionQueue: [] as PermissionRequestedEvent[],
   pendingQuestion: null,
+  pendingQuestionId: null,
   pendingQuestionTarget: null,
   signIn: null,
   signInProblem: null,
@@ -168,6 +175,7 @@ export const useEngineStore = create<EngineStoreState>()(
         if (connection === 'exited') {
           state.permissionQueue = []
           state.pendingQuestion = null
+          state.pendingQuestionId = null
           state.pendingQuestionTarget = null
           state.signIn = null
           state.pendingPermission = null
@@ -213,9 +221,10 @@ export const useEngineStore = create<EngineStoreState>()(
       set((state) => {
         state.permissionQueue = []
       }),
-    setPendingQuestion: (question) =>
+    setPendingQuestion: (question, id = null) =>
       set((state) => {
         state.pendingQuestion = question
+        state.pendingQuestionId = question === null ? null : id
         state.pendingQuestionTarget = null
       }),
     setPendingQuestionTarget: (target) =>

@@ -219,6 +219,12 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     engineCommand: true,
     description: 'Show or change the permission mode',
   },
+  {
+    id: 'hooks',
+    label: 'hooks',
+    engineCommand: true,
+    description: 'List configured hooks by event, with matcher and source',
+  },
   ...MODE_COMMANDS,
   {
     id: 'upgrade',

@@ -26,8 +26,10 @@ pub fn format_unknown_slash_command_message(name: &str) -> String {
     message
 }
 
+/// `/model`'s report: the model by name, without the gateway's route to it (`/status`
+/// has the id).
 pub fn format_model_report(model: &str, message_count: usize, turns: u32) -> String {
-    let model = crate::provider::shown_model(model);
+    let model = crate::gateway_catalog::model_name(model);
     format!(
         "Model
   Current model    {model}
@@ -40,10 +42,12 @@ Usage
     )
 }
 
+/// `/model <id>`'s report: the models by name, without the gateway's route to them
+/// (`/status` has the id).
 pub fn format_model_switch_report(previous: &str, next: &str, message_count: usize) -> String {
     let (previous, next) = (
-        crate::provider::shown_model(previous),
-        crate::provider::shown_model(next),
+        crate::gateway_catalog::model_name(previous),
+        crate::gateway_catalog::model_name(next),
     );
     format!(
         "Model updated
@@ -180,27 +184,6 @@ pub fn format_ultraplan_report(task: Option<&str>) -> String {
   Action           break work into a multi-step execution plan
   Output           plan should cover goals, risks, sequencing, verification, and rollback",
         task.unwrap_or("the current repo work")
-    )
-}
-
-pub fn format_pr_report(branch: &str, context: Option<&str>) -> String {
-    format!(
-        "PR
-  Branch           {branch}
-  Context          {}
-  Action           draft or create a pull request for the current branch
-  Output           title and markdown body suitable for GitHub",
-        context.unwrap_or("none")
-    )
-}
-
-pub fn format_issue_report(context: Option<&str>) -> String {
-    format!(
-        "Issue
-  Context          {}
-  Action           draft or create a GitHub issue from the current context
-  Output           title and markdown body suitable for GitHub",
-        context.unwrap_or("none")
     )
 }
 

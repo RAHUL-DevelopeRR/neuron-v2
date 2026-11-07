@@ -205,27 +205,59 @@ impl PermissionEnforcer {
     }
 }
 
-/// Simple workspace boundary check via string prefix.
+/// Workspace boundary check.
+///
+/// Resolves `.` and `..` components lexically *before* comparing against the
+/// workspace root, so traversal such as `/workspace/../../etc` cannot pass a
+/// plain string-prefix match. Normalization is lexical (it does not touch the
+/// filesystem) because the target of a write may not exist yet.
+///
+/// Ported from Claw Code (MIT), upstream commit e8c8ef1.
 fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
-    let normalized = if path.starts_with('/') {
+    let combined = if path.starts_with('/') {
         path.to_owned()
     } else {
         format!("{workspace_root}/{path}")
     };
 
-    let root = if workspace_root.ends_with('/') {
-        workspace_root.to_owned()
+    let normalized = lexically_normalize(&combined);
+    let root = lexically_normalize(workspace_root);
+    let root_with_slash = if root.ends_with('/') {
+        root.clone()
     } else {
-        format!("{workspace_root}/")
+        format!("{root}/")
     };
 
-    normalized.starts_with(&root) || normalized == workspace_root.trim_end_matches('/')
+    normalized == root || normalized.starts_with(&root_with_slash)
+}
+
+/// Collapse `.` and `..` segments without consulting the filesystem. A `..`
+/// that would climb above an absolute root is clamped at `/`, so the result
+/// can never prefix-match a deeper workspace root.
+fn lexically_normalize(path: &str) -> String {
+    let is_absolute = path.starts_with('/');
+    let mut stack: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    let joined = stack.join("/");
+    if is_absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
 }
 
 /// Whether a bash command line is read-only, judged over every simple
 /// command in it (see [`classify_shell_command`]).
 fn is_read_only_command(command: &str) -> bool {
-    let workspace = std::env::current_dir().ok();
+    let workspace = crate::workdir::current_dir().ok();
     classify_shell_command(command, ShellDialect::host(), workspace.as_deref()).is_read_only()
 }
 
@@ -629,5 +661,91 @@ mod tests {
         assert!(!is_read_only_command("cat a.txt && rm b.txt"));
         assert!(!is_read_only_command("ls | sh"));
         assert!(!is_read_only_command("cargo build"));
+    }
+
+    // --- Ported from Claw Code (MIT), upstream commit e8c8ef1 ---
+
+    #[test]
+    fn workspace_rejects_parent_traversal() {
+        assert!(!is_within_workspace(
+            "/workspace/../etc/passwd",
+            "/workspace"
+        ));
+        assert!(!is_within_workspace(
+            "/workspace/../../etc/crontab",
+            "/workspace"
+        ));
+        assert!(!is_within_workspace("../etc/passwd", "/workspace"));
+        assert!(!is_within_workspace(
+            "/workspace/sub/../../outside",
+            "/workspace"
+        ));
+        // Legitimate paths still resolve inside.
+        assert!(is_within_workspace(
+            "/workspace/./src/main.rs",
+            "/workspace"
+        ));
+        assert!(is_within_workspace(
+            "/workspace/src/../src/main.rs",
+            "/workspace"
+        ));
+    }
+
+    #[test]
+    fn workspace_write_denies_traversal_escape() {
+        let enforcer = make_enforcer(PermissionMode::WorkspaceWrite);
+        let result = enforcer.check_file_write("/workspace/../../etc/crontab", "/workspace");
+        assert!(matches!(result, EnforcementResult::Denied { .. }));
+    }
+
+    /// The upstream cases are POSIX shell syntax (`;` and backticks mean
+    /// nothing to cmd.exe, which runs the bash tool on Windows), so they are
+    /// classified with the POSIX dialect on every platform.
+    #[test]
+    fn read_only_rejects_chaining_substitution_and_redirects() {
+        let posix_read_only = |command: &str| {
+            classify_shell_command(command, ShellDialect::Posix, None).is_read_only()
+        };
+        assert!(!posix_read_only("cat foo; rm -rf bar"));
+        assert!(!posix_read_only("cat foo && rm -rf bar"));
+        assert!(!posix_read_only("ls || rm bar"));
+        assert!(!posix_read_only("cat foo | sh"));
+        assert!(!posix_read_only("echo `rm bar`"));
+        assert!(!posix_read_only("echo $(rm bar)"));
+        assert!(!posix_read_only("echo x>file"));
+        // The host shell (cmd.exe on Windows) still rejects its own separators.
+        assert!(!is_read_only_command("cat foo && rm -rf bar"));
+        assert!(!is_read_only_command("cat foo | sh"));
+    }
+
+    #[test]
+    fn read_only_rejects_interpreters_and_build_drivers() {
+        assert!(!is_read_only_command(
+            "python3 -c \"import os; os.system('rm -rf .')\""
+        ));
+        assert!(!is_read_only_command("python script.py"));
+        assert!(!is_read_only_command("node app.js"));
+        assert!(!is_read_only_command("ruby x.rb"));
+        assert!(!is_read_only_command("cargo run"));
+        assert!(!is_read_only_command("rustc evil.rs"));
+    }
+
+    #[test]
+    fn read_only_gates_git_subcommands() {
+        assert!(is_read_only_command("git status"));
+        assert!(is_read_only_command("git diff HEAD~1"));
+        assert!(is_read_only_command("git show abc123"));
+        assert!(!is_read_only_command("git commit -m x"));
+        assert!(!is_read_only_command("git push origin main"));
+        assert!(!is_read_only_command("git reset --hard"));
+        assert!(!is_read_only_command("git clean -fd"));
+        assert!(!is_read_only_command("git config user.email a@b.c"));
+    }
+
+    #[test]
+    fn read_only_rejects_find_actions() {
+        assert!(is_read_only_command("find . -name Cargo.toml"));
+        assert!(!is_read_only_command("find . -delete"));
+        assert!(!is_read_only_command("find . -execdir rm rf"));
     }
 }

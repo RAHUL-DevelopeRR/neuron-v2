@@ -1,10 +1,13 @@
 //! A bare `neuron` on a terminal starts Neuron's full-screen UI, `neuron-tui`,
 //! when it is installed beside this binary (the npm and PyPI packages and the
-//! install scripts put it there). The UI runs this binary as its engine
+//! install scripts put it there), and so do `neuron "prompt"`, seeded with the
+//! prompt, and `neuron --resume SESSION`, continuing the session (`-p` and
+//! `neuron prompt` stay plain text for scripts). The UI runs this binary as its engine
 //! (`neuron engine --stdio`, found through `NEURON_BIN`). The line REPL stays
 //! one flag away: `--no-tui`, or `NEURON_NO_TUI=1`. Without the UI, or off a
 //! terminal, nothing changes. `--continue [chat-id]`, which the UI's exit hint
-//! names, is the UI's own flag: it is passed on to it.
+//! names, is the UI's own flag: it is passed on to it. A terminal smaller than the
+//! UI can draw in (60x16) keeps the line REPL, with a note saying so.
 
 use std::env;
 use std::ffi::OsString;
@@ -24,7 +27,8 @@ pub(crate) const CONTINUE_NEEDS_UI: &str = "--continue reopens a chat in the ful
 combined with a prompt, a subcommand or --no-tui. In the line REPL, use --resume instead; \
 from a script, send a saved session another prompt with `neuron --resume latest prompt \"...\"`.";
 
-/// What a REPL launch asked for, as the UI's flags can carry it.
+/// What a REPL launch, a bare prompt or an interactive `--resume` asked for, as the
+/// UI's flags can carry it.
 pub(crate) struct UiLaunch<'a> {
     /// `--model` as typed, when given.
     pub model: Option<String>,
@@ -35,6 +39,10 @@ pub(crate) struct UiLaunch<'a> {
     pub allow_broad_cwd: bool,
     pub base_commit: Option<&'a str>,
     pub continue_chat: Option<ContinueChat>,
+    /// `--resume SESSION`: the saved session the UI's engine continues.
+    pub resume: Option<String>,
+    /// `neuron "prompt"`: the prompt the UI sends first.
+    pub prompt: Option<String>,
 }
 
 /// `--continue`: the latest chat, or the one named.
@@ -123,9 +131,57 @@ pub(crate) fn locate_ui(explicit: Option<OsString>, exe: &Path) -> Option<PathBu
     sibling.is_file().then_some(sibling)
 }
 
-/// The UI to start instead of the line REPL, or `None`: turned off, not on a
-/// terminal, or not installed.
-pub(crate) fn ui_binary(no_tui_flag: bool) -> Option<PathBuf> {
+/// The fewest columns and rows the full-screen UI draws in (`MIN_TERMINAL_COLUMNS` and
+/// `MIN_TERMINAL_ROWS` in ui/neuron-tui/src/components/minimum-size-gate.tsx): below it
+/// the prompt, the status bar and the panels overlap.
+pub(crate) const MIN_UI_COLUMNS: u16 = 60;
+pub(crate) const MIN_UI_ROWS: u16 = 16;
+
+/// Whether a terminal of `size` (columns, rows) is big enough for the UI. An unknown
+/// size, or a zero one (some embedded panes report that before their first resize),
+/// counts as big enough: the UI checks again itself and says when it is too small.
+pub(crate) fn fits_full_screen(size: Option<(u16, u16)>) -> bool {
+    match size {
+        Some((columns, rows)) if columns > 0 && rows > 0 => {
+            columns >= MIN_UI_COLUMNS && rows >= MIN_UI_ROWS
+        }
+        _ => true,
+    }
+}
+
+/// What a caller of [`ui_binary`] does when the terminal is too small for the UI, so
+/// the note on stderr says what happens next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SmallTerminalFallback {
+    /// The line REPL runs (`neuron`, an interactive `--resume`).
+    LineRepl,
+    /// The prompt runs as plain text (`neuron "prompt"`).
+    PlainText,
+    /// Nothing can run without the UI (`--continue`).
+    None,
+}
+
+/// Why the UI does not start in a small terminal, and what happens instead.
+fn too_small_note(columns: u16, rows: u16, fallback: SmallTerminalFallback) -> String {
+    let size = format!(
+        "The terminal is {columns}x{rows}; the full-screen UI needs {MIN_UI_COLUMNS}x{MIN_UI_ROWS}"
+    );
+    match fallback {
+        SmallTerminalFallback::LineRepl => format!(
+            "{size}, so the line REPL runs. Make the window bigger and start neuron again to use the UI."
+        ),
+        SmallTerminalFallback::PlainText => format!(
+            "{size}, so the prompt runs here as plain text. Make the window bigger to use the UI."
+        ),
+        SmallTerminalFallback::None => {
+            format!("{size}. Make the window bigger and run the command again.")
+        }
+    }
+}
+
+/// The UI to start, or `None`: turned off, not on a terminal, a terminal too small for
+/// it (with a note on stderr saying what runs instead, `fallback`), or not installed.
+pub(crate) fn ui_binary(no_tui_flag: bool, fallback: SmallTerminalFallback) -> Option<PathBuf> {
     if no_tui_flag || env_truthy("NEURON_NO_TUI") {
         return None;
     }
@@ -133,7 +189,15 @@ pub(crate) fn ui_binary(no_tui_flag: bool) -> Option<PathBuf> {
         return None;
     }
     let exe = env::current_exe().ok()?;
-    locate_ui(env::var_os("NEURON_TUI_BIN"), &exe)
+    let ui = locate_ui(env::var_os("NEURON_TUI_BIN"), &exe)?;
+    let size = crossterm::terminal::size().ok();
+    if !fits_full_screen(size) {
+        if let Some((columns, rows)) = size {
+            eprintln!("{}", too_small_note(columns, rows, fallback));
+        }
+        return None;
+    }
+    Some(ui)
 }
 
 /// The UI's arguments for a REPL launch, or `None` when it can't carry one of
@@ -168,6 +232,17 @@ pub(crate) fn ui_args(launch: &UiLaunch<'_>) -> Option<Vec<String>> {
         if let ContinueChat::Chat(id) = chat {
             args.push(id.clone());
         }
+    }
+    if let Some(session) = &launch.resume {
+        args.extend(["--resume".to_string(), session.clone()]);
+    }
+    // After `--`, so a prompt that starts with `-` is not read as an option.
+    if let Some(prompt) = launch
+        .prompt
+        .as_ref()
+        .filter(|prompt| !prompt.trim().is_empty())
+    {
+        args.extend(["--".to_string(), prompt.clone()]);
     }
     Some(args)
 }
@@ -394,6 +469,8 @@ mod tests {
             allow_broad_cwd: true,
             base_commit: None,
             continue_chat: Some(ContinueChat::Chat("chat-42".to_string())),
+            resume: None,
+            prompt: None,
         };
         assert_eq!(
             ui_args(&launch),
@@ -449,8 +526,76 @@ mod tests {
             allow_broad_cwd: false,
             base_commit: Some("HEAD~1"),
             continue_chat: None,
+            resume: None,
+            prompt: None,
         };
         assert_eq!(ui_args(&launch), None);
+    }
+
+    /// `neuron --resume SESSION` and `neuron "prompt"` on a terminal: the UI continues
+    /// the session, and sends the prompt first, even one that looks like an option.
+    #[test]
+    fn ui_args_carry_a_session_to_resume_and_a_first_prompt() {
+        let launch = UiLaunch {
+            model: None,
+            provider: None,
+            permission_mode: PermissionMode::WorkspaceWrite,
+            allowed_tools: None,
+            reasoning_effort: None,
+            allow_broad_cwd: false,
+            base_commit: None,
+            continue_chat: None,
+            resume: Some("/work/.neuron/sessions/abc/session-1.jsonl".to_string()),
+            prompt: Some("--explain the build".to_string()),
+        };
+        assert_eq!(
+            ui_args(&launch),
+            Some(strings(&[
+                "--permission-mode",
+                "workspace-write",
+                "--resume",
+                "/work/.neuron/sessions/abc/session-1.jsonl",
+                "--",
+                "--explain the build",
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_terminal_smaller_than_the_ui_needs_keeps_the_line_repl() {
+        assert!(fits_full_screen(Some((MIN_UI_COLUMNS, MIN_UI_ROWS))));
+        assert!(fits_full_screen(Some((200, 50))));
+        assert!(!fits_full_screen(Some((MIN_UI_COLUMNS - 1, 50))));
+        assert!(!fits_full_screen(Some((200, MIN_UI_ROWS - 1))));
+        // Unknown, or reported as zero before the first resize: the UI checks itself.
+        assert!(fits_full_screen(None));
+        assert!(fits_full_screen(Some((0, 0))));
+        let note = too_small_note(40, 10, SmallTerminalFallback::LineRepl);
+        assert!(note.contains("40x10"), "{note}");
+        assert!(note.contains("60x16"), "{note}");
+        assert!(note.contains("line REPL runs"), "{note}");
+        assert!(!note.to_ascii_lowercase().contains("claude"), "{note}");
+    }
+
+    /// The note says what each caller does next: `neuron "prompt"` answers as plain
+    /// text, and `--continue` has nothing to fall back to.
+    #[test]
+    fn the_too_small_note_says_what_runs_instead() {
+        let prompt = too_small_note(40, 10, SmallTerminalFallback::PlainText);
+        assert!(prompt.contains("plain text"), "{prompt}");
+        assert!(!prompt.contains("REPL"), "{prompt}");
+        let resume = too_small_note(40, 10, SmallTerminalFallback::None);
+        assert!(
+            resume.contains("Make the window bigger and run the command again"),
+            "{resume}"
+        );
+        assert!(
+            !resume.contains("REPL") && !resume.contains("plain text"),
+            "{resume}"
+        );
+        for note in [prompt, resume] {
+            assert!(note.contains("40x10") && note.contains("60x16"), "{note}");
+        }
     }
 
     #[test]

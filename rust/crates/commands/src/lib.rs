@@ -2,14 +2,18 @@
 
 use std::collections::BTreeMap;
 use std::env;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginSummary};
+use runtime::mcp_sandbox::{
+    describe_mcp_sandbox, mcp_program_roots, mcp_sandbox_enforcement, resolve_mcp_sandbox,
+    McpSandboxOrigin,
+};
 use runtime::{
-    compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
-    ScopedMcpServerConfig, Session,
+    compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig,
+    McpSandboxNetwork, McpServerConfig, ScopedMcpServerConfig, Session,
 };
 use serde_json::{json, Value};
 
@@ -109,6 +113,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "artifacts",
+        aliases: &[],
+        summary: "List the files and large outputs saved for this session",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "cost",
         aliases: &[],
         summary: "Show cumulative token usage for this session",
@@ -132,8 +143,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "mcp",
         aliases: &[],
-        summary: "Inspect configured MCP servers",
-        argument_hint: Some("[list|show <server>|help]"),
+        summary: "Inspect configured MCP servers, add one from the catalog, or turn one on or off",
+        argument_hint: Some(MCP_SLASH_ARGUMENTS),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -181,15 +192,17 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "pr",
         aliases: &[],
-        summary: "Draft or create a pull request from the conversation",
-        argument_hint: Some("[context]"),
+        summary:
+            "Draft a pull request from the branch's commits; /pr create pushes and opens it with gh",
+        argument_hint: Some("[create [--draft]] [--base <branch>] [context]"),
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "issue",
         aliases: &[],
-        summary: "Draft or create a GitHub issue from the conversation",
-        argument_hint: Some("[context]"),
+        summary:
+            "Draft a GitHub issue from a title and the conversation; /issue create opens it with gh",
+        argument_hint: Some("[<title>|create]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -369,8 +382,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "hooks",
         aliases: &[],
-        summary: "List and manage lifecycle hooks",
-        argument_hint: Some("[list|run <hook>]"),
+        summary: "List configured hooks by event, with matcher and source",
+        argument_hint: Some("[event]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -426,8 +439,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "rewind",
         aliases: &[],
-        summary: "Rewind the conversation to a previous state",
-        argument_hint: Some("[steps]"),
+        summary: "List checkpoints, or go back to one: the files, the chat or both",
+        argument_hint: Some("[id [code|chat|both]]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -733,8 +746,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "providers",
-        aliases: &[],
-        summary: "List available model providers",
+        aliases: &["auth"],
+        summary: "Show provider keys and the active provider (keys are never shown)",
         argument_hint: None,
         resume_supported: true,
     },
@@ -1088,6 +1101,7 @@ pub enum SlashCommand {
         confirm: bool,
     },
     Cost,
+    Artifacts,
     Resume {
         session_path: Option<String>,
     },
@@ -1120,6 +1134,8 @@ pub enum SlashCommand {
         args: Option<String>,
     },
     Doctor,
+    /// `/providers` (`/auth`): provider key status, never the keys.
+    Providers,
     Login,
     Logout,
     Vim,
@@ -1249,7 +1265,9 @@ impl SlashCommand {
             Self::Clear { .. } => "/clear",
             Self::Compact { .. } => "/compact",
             Self::Cost => "/cost",
+            Self::Artifacts => "/artifacts",
             Self::Doctor => "/doctor",
+            Self::Providers => "/providers",
             Self::Config { .. } => "/config",
             Self::Memory { .. } => "/memory",
             Self::History { .. } => "/history",
@@ -1385,6 +1403,10 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Cost
         }
+        "artifacts" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Artifacts
+        }
         "resume" => SlashCommand::Resume {
             session_path: Some(require_remainder(command, remainder, "<session-path>")?),
         },
@@ -1417,9 +1439,13 @@ pub fn validate_slash_command_input(
         "skills" | "skill" => SlashCommand::Skills {
             args: parse_skills_args(remainder.as_deref())?,
         },
-        "doctor" | "providers" => {
+        "doctor" => {
             validate_no_args(command, &args)?;
             SlashCommand::Doctor
+        }
+        "providers" | "auth" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Providers
         }
         "login" => {
             validate_no_args(command, &args)?;
@@ -1683,6 +1709,74 @@ fn parse_session_command(args: &[&str]) -> Result<SlashCommand, SlashCommandPars
     }
 }
 
+/// The arguments `/mcp` takes.
+const MCP_SLASH_ARGUMENTS: &str = "[list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|help]";
+
+/// The arguments `neuron mcp` takes.
+const MCP_CLI_ARGUMENTS: &str = "[list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|login <server>|logout <server>|serve|help]";
+
+/// `add <id> [--scope user|project|local] [--name <name>]`, parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpAddArgs {
+    pub id: String,
+    pub name: Option<String>,
+    pub scope: Option<runtime::McpInstallScope>,
+}
+
+/// The words after `add`: one catalog id, `--scope`, `--name` (also as `--flag=value`).
+pub fn parse_mcp_add_args(words: &[&str]) -> Result<McpAddArgs, String> {
+    let mut id = None;
+    let mut name = None;
+    let mut scope = None;
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        let (flag, inline) = match word.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
+            _ => (*word, None),
+        };
+        match flag {
+            "--scope" | "--name" => {
+                let value = if let Some(value) = inline {
+                    value
+                } else {
+                    index += 1;
+                    words
+                        .get(index)
+                        .copied()
+                        .ok_or_else(|| format!("{flag} needs a value"))?
+                };
+                if flag == "--scope" {
+                    scope = Some(runtime::McpInstallScope::parse(value)?);
+                } else {
+                    name = Some(value.to_string());
+                }
+            }
+            other if other.starts_with('-') => return Err(format!("unknown option {other}")),
+            other if id.is_none() => id = Some(other.to_string()),
+            other => return Err(format!("unexpected `{other}`: add one connector at a time")),
+        }
+        index += 1;
+    }
+    let id = id.ok_or_else(|| "name a connector from the catalog (/mcp catalog)".to_string())?;
+    Ok(McpAddArgs { id, name, scope })
+}
+
+/// The words after `remove`: the server, and optionally `--scope`.
+pub fn parse_mcp_remove_args(
+    words: &[&str],
+) -> Result<(String, Option<runtime::McpInstallScope>), String> {
+    let parsed = parse_mcp_add_args(words).map_err(|error| {
+        error.replace(
+            "name a connector from the catalog (/mcp catalog)",
+            "name the server to remove",
+        )
+    })?;
+    if parsed.name.is_some() {
+        return Err("remove takes the server's name, not --name".to_string());
+    }
+    Ok((parsed.id, parsed.scope))
+}
+
 fn parse_mcp_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseError> {
     match args {
         [] => Ok(SlashCommand::Mcp {
@@ -1708,10 +1802,62 @@ fn parse_mcp_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseErr
             action: Some("help".to_string()),
             target: None,
         }),
-        [action, ..] => Err(command_error(
-            &format!("Unknown /mcp action '{action}'. Use list, show <server>, or help."),
+        ["catalog"] => Ok(SlashCommand::Mcp {
+            action: Some("catalog".to_string()),
+            target: None,
+        }),
+        ["catalog", query @ ..] => Ok(SlashCommand::Mcp {
+            action: Some("catalog".to_string()),
+            target: Some(query.join(" ")),
+        }),
+        ["add"] => Err(usage_error(
+            "mcp add",
+            "<id> [--scope user|project|local] [--name <name>]",
+        )),
+        ["add", rest @ ..] => match parse_mcp_add_args(rest) {
+            Ok(_) => Ok(SlashCommand::Mcp {
+                action: Some("add".to_string()),
+                target: Some(rest.join(" ")),
+            }),
+            Err(error) => Err(command_error(
+                &format!("Cannot add: {error}."),
+                "mcp",
+                "/mcp add <id> [--scope user|project|local] [--name <name>]",
+            )),
+        },
+        ["remove"] => Err(usage_error(
+            "mcp remove",
+            "<server> [--scope user|project|local]",
+        )),
+        ["remove", rest @ ..] => match parse_mcp_remove_args(rest) {
+            Ok(_) => Ok(SlashCommand::Mcp {
+                action: Some("remove".to_string()),
+                target: Some(rest.join(" ")),
+            }),
+            Err(error) => Err(command_error(
+                &format!("Cannot remove: {error}."),
+                "mcp",
+                "/mcp remove <server> [--scope user|project|local]",
+            )),
+        },
+        [action @ ("enable" | "disable" | "approve" | "pin" | "connect")] => {
+            Err(usage_error(&format!("mcp {action}"), "<server>"))
+        }
+        [action @ ("enable" | "disable" | "approve" | "pin" | "connect"), target] => Ok(SlashCommand::Mcp {
+            action: Some((*action).to_string()),
+            target: Some((*target).to_string()),
+        }),
+        [action @ ("enable" | "disable" | "approve" | "pin" | "connect"), ..] => Err(command_error(
+            &format!("Unexpected arguments for /mcp {action}."),
             "mcp",
-            "/mcp [list|show <server>|help]",
+            &format!("/mcp {action} <server>"),
+        )),
+        [action, ..] => Err(command_error(
+            &format!(
+                "Unknown /mcp action '{action}'. Use list, show <server>, catalog [query], add <id>, remove <server>, enable <server>, disable <server>, approve <server>, pin <server>, connect <server>, or help."
+            ),
+            "mcp",
+            &format!("/mcp {MCP_SLASH_ARGUMENTS}"),
         )),
     }
 }
@@ -1915,12 +2061,11 @@ pub fn resume_supported_slash_commands() -> Vec<&'static SlashCommandSpec> {
 
 fn slash_command_category(name: &str) -> &'static str {
     match name {
-        "help" | "status" | "cost" | "resume" | "session" | "version" | "usage" | "stats"
-        | "rename" | "clear" | "compact" | "history" | "tokens" | "cache" | "exit" | "summary"
-        | "tag" | "thinkback" | "copy" | "share" | "feedback" | "rewind" | "pin" | "unpin"
-        | "bookmarks" | "context" | "files" | "focus" | "unfocus" | "retry" | "stop" | "undo" => {
-            "Session"
-        }
+        "help" | "status" | "cost" | "artifacts" | "resume" | "session" | "version" | "usage"
+        | "stats" | "rename" | "clear" | "compact" | "history" | "tokens" | "cache" | "exit"
+        | "summary" | "tag" | "thinkback" | "copy" | "share" | "feedback" | "rewind" | "pin"
+        | "unpin" | "bookmarks" | "context" | "files" | "focus" | "unfocus" | "retry" | "stop"
+        | "undo" => "Session",
         "model" | "permissions" | "config" | "memory" | "theme" | "vim" | "voice" | "color"
         | "effort" | "fast" | "brief" | "output-style" | "keybindings" | "privacy-settings"
         | "stickers" | "language" | "profile" | "max-tokens" | "temperature" | "system-prompt"
@@ -2396,6 +2541,56 @@ pub fn handle_mcp_slash_command_json(
     render_mcp_report_json_for(&loader, cwd, args)
 }
 
+/// `/mcp` as text and as JSON from a single run, so `/mcp add` adds once and
+/// `/mcp remove` does not fail on the server it just removed.
+pub fn handle_mcp_slash_command_with_json(
+    args: Option<&str>,
+    cwd: &Path,
+) -> Result<(String, Value), runtime::ConfigError> {
+    let loader = ConfigLoader::default_for(cwd);
+    render_mcp_report_with_json_for(&loader, cwd, args)
+}
+
+fn render_mcp_report_with_json_for(
+    loader: &ConfigLoader,
+    cwd: &Path,
+    args: Option<&str>,
+) -> Result<(String, Value), runtime::ConfigError> {
+    if let Some(args) = normalize_optional_args(args)
+        .filter(|args| help_path_from_args(args).is_none() && !is_help_arg(args))
+    {
+        if let Some((name, enabled)) = mcp_toggle_args(args) {
+            let outcome = runtime::set_mcp_server_enabled(loader, name, enabled);
+            return Ok((
+                render_mcp_toggle(&outcome, name, enabled),
+                render_mcp_toggle_json(&outcome, name, enabled),
+            ));
+        }
+        if let Some(name) = mcp_approve_arg(args) {
+            let outcome = runtime::approve_mcp_server(loader, name);
+            return Ok((
+                render_mcp_approval(&outcome, name),
+                render_mcp_approval_json(&outcome, name),
+            ));
+        }
+        if let Some(name) = mcp_connect_arg(args) {
+            let outcome = mcp_hosted_connect_url(loader, name);
+            return Ok((
+                render_mcp_connect(&outcome, name),
+                render_mcp_connect_json(&outcome, name),
+            ));
+        }
+        if let Some(change) = McpChange::run(loader, args) {
+            return Ok((change.render(), change.render_json()));
+        }
+    }
+    // Everything else only reads the settings.
+    Ok((
+        render_mcp_report_for(loader, cwd, args)?,
+        render_mcp_report_json_for(loader, cwd, args)?,
+    ))
+}
+
 /// What a local `/skills` command did, before it is shown as text or JSON.
 enum SkillsCommandOutcome {
     /// Usage, naming the unexpected argument if there was one.
@@ -2611,14 +2806,89 @@ fn render_mcp_report_for(
     match normalize_optional_args(args) {
         None | Some("list") => {
             let runtime_config = loader.load()?;
-            Ok(render_mcp_summary_report(
-                cwd,
-                runtime_config.mcp().servers(),
-            ))
+            let mut report = render_mcp_summary_report(cwd, runtime_config.mcp().servers());
+            for name in runtime_config.mcp().disabled().keys() {
+                let _ = write!(report, "\n  {name:<16} disabled");
+            }
+            for (name, server) in runtime_config.mcp().needs_approval() {
+                let _ = write!(
+                    report,
+                    "\n  {name:<16} needs approval ({} server, not started): /mcp approve {name}",
+                    config_source_label(server.scope)
+                );
+            }
+            for (name, blocked) in runtime_config.mcp().blocked() {
+                if blocked.policy.is_some() {
+                    let _ = write!(report, "\n  {name:<16} blocked: {}", blocked.reason);
+                } else {
+                    let _ = write!(
+                        report,
+                        "\n  {name:<16} blocked by permissions.deny rule '{}'",
+                        blocked.rule
+                    );
+                }
+            }
+            for (name, required) in runtime_config.mcp().required() {
+                let _ = write!(
+                    report,
+                    "\n  {name:<16} required by {} (cannot be turned off)",
+                    required.by.describe()
+                );
+            }
+            for name in hosted_needing_connect(runtime_config.mcp()) {
+                let _ = write!(
+                    report,
+                    "\n  {name:<16} needs connect (not linked to your Zero-X account): /mcp connect {name}"
+                );
+            }
+            let store = runtime::McpInstallStore::in_config_home(loader.config_home());
+            for name in runtime::mcp_unpinned_servers(&store, runtime_config.mcp(), loader.cwd()) {
+                let _ = write!(
+                    report,
+                    "\n  {name:<16} unpinned (not a catalog connector; /mcp pin {name} records its version and hash)"
+                );
+            }
+            if let Some(line) = mcp_policy_line(runtime_config.mcp().policy()) {
+                let _ = write!(report, "\n\n  {line}");
+            }
+            Ok(report)
         }
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage(None)),
-        Some("show") => Ok(render_mcp_usage(Some("show"))),
-        Some(args) if args.split_whitespace().next() == Some("show") => {
+        Some(args) if mcp_toggle_args(args).is_some() => {
+            let (name, enabled) = mcp_toggle_args(args).unwrap_or_default();
+            let outcome = runtime::set_mcp_server_enabled(loader, name, enabled);
+            Ok(render_mcp_toggle(&outcome, name, enabled))
+        }
+        Some(args) if mcp_approve_arg(args).is_some() => {
+            let name = mcp_approve_arg(args).unwrap_or_default();
+            Ok(render_mcp_approval(
+                &runtime::approve_mcp_server(loader, name),
+                name,
+            ))
+        }
+        Some(args) if mcp_connect_arg(args).is_some() => {
+            let name = mcp_connect_arg(args).unwrap_or_default();
+            Ok(render_mcp_connect(
+                &mcp_hosted_connect_url(loader, name),
+                name,
+            ))
+        }
+        Some(args) => match McpChange::run(loader, args) {
+            Some(change) => Ok(change.render()),
+            None => render_mcp_view(loader, cwd, args),
+        },
+    }
+}
+
+/// `show <server>` and usage for what no other `/mcp` action takes.
+fn render_mcp_view(
+    loader: &ConfigLoader,
+    cwd: &Path,
+    args: &str,
+) -> Result<String, runtime::ConfigError> {
+    match args {
+        "show" => Ok(render_mcp_usage(Some("show"))),
+        args if args.split_whitespace().next() == Some("show") => {
             let mut parts = args.split_whitespace();
             let _ = parts.next();
             let Some(server_name) = parts.next() else {
@@ -2634,7 +2904,7 @@ fn render_mcp_report_for(
                 runtime_config.mcp().get(server_name),
             ))
         }
-        Some(args) => Ok(render_mcp_usage(Some(args))),
+        args => Ok(render_mcp_usage(Some(args))),
     }
 }
 
@@ -2656,14 +2926,86 @@ fn render_mcp_report_json_for(
     match normalize_optional_args(args) {
         None | Some("list") => {
             let runtime_config = loader.load()?;
-            Ok(render_mcp_summary_report_json(
-                cwd,
-                runtime_config.mcp().servers(),
-            ))
+            let mut report = render_mcp_summary_report_json(cwd, runtime_config.mcp().servers());
+            report["disabled_servers"] =
+                json!(runtime_config.mcp().disabled().keys().collect::<Vec<_>>());
+            report["needs_approval_servers"] = json!(runtime_config
+                .mcp()
+                .needs_approval()
+                .keys()
+                .collect::<Vec<_>>());
+            report["blocked_servers"] = json!(runtime_config
+                .mcp()
+                .blocked()
+                .iter()
+                .map(|(name, blocked)| {
+                    json!({
+                        "name": name,
+                        "rule": blocked.rule,
+                        "reason": blocked.reason,
+                        "policy": blocked.policy.map(mcp_policy_source_id),
+                    })
+                })
+                .collect::<Vec<_>>());
+            report["required_servers"] = json!(runtime_config
+                .mcp()
+                .required()
+                .iter()
+                .map(|(name, required)| {
+                    json!({
+                        "name": name,
+                        "by": mcp_policy_source_id(required.by),
+                        "catalog": required.catalog_id,
+                    })
+                })
+                .collect::<Vec<_>>());
+            report["unpinned_servers"] = json!(runtime::mcp_unpinned_servers(
+                &runtime::McpInstallStore::in_config_home(loader.config_home()),
+                runtime_config.mcp(),
+                loader.cwd()
+            ));
+            let policy = runtime_config.mcp().policy();
+            report["policy"] = json!({
+                "managed_settings": policy.managed.as_ref().map(|path| path.display().to_string()),
+                "gateway": match policy.gateway {
+                    runtime::McpGatewayPolicyStatus::None => "none",
+                    runtime::McpGatewayPolicyStatus::Current => "current",
+                    runtime::McpGatewayPolicyStatus::Stale => "stale",
+                    runtime::McpGatewayPolicyStatus::Unreadable => "unreadable",
+                },
+                "closed": policy.closed,
+            });
+            Ok(report)
         }
         Some(args) if is_help_arg(args) => Ok(render_mcp_usage_json(None)),
-        Some("show") => Ok(render_mcp_usage_json(Some("show"))),
-        Some(args) if args.split_whitespace().next() == Some("show") => {
+        Some(args) if mcp_toggle_args(args).is_some() => {
+            let (name, enabled) = mcp_toggle_args(args).unwrap_or_default();
+            let outcome = runtime::set_mcp_server_enabled(loader, name, enabled);
+            Ok(render_mcp_toggle_json(&outcome, name, enabled))
+        }
+        Some(args) if mcp_approve_arg(args).is_some() => {
+            let name = mcp_approve_arg(args).unwrap_or_default();
+            Ok(render_mcp_approval_json(
+                &runtime::approve_mcp_server(loader, name),
+                name,
+            ))
+        }
+        Some(args) => match McpChange::run(loader, args) {
+            Some(change) => Ok(change.render_json()),
+            None => render_mcp_view_json(loader, cwd, args),
+        },
+    }
+}
+
+/// [`render_mcp_view`] as JSON.
+fn render_mcp_view_json(
+    loader: &ConfigLoader,
+    cwd: &Path,
+    args: &str,
+) -> Result<Value, runtime::ConfigError> {
+    match args {
+        "show" => Ok(render_mcp_usage_json(Some("show"))),
+        args if args.split_whitespace().next() == Some("show") => {
             let mut parts = args.split_whitespace();
             let _ = parts.next();
             let Some(server_name) = parts.next() else {
@@ -2679,7 +3021,7 @@ fn render_mcp_report_json_for(
                 runtime_config.mcp().get(server_name),
             ))
         }
-        Some(args) => Ok(render_mcp_usage_json(Some(args))),
+        args => Ok(render_mcp_usage_json(Some(args))),
     }
 }
 
@@ -3703,6 +4045,30 @@ fn render_mcp_server_report(
                     .tool_call_timeout_ms
                     .map_or_else(|| "<default>".to_string(), |value| format!("{value} ms"))
             ));
+            let (profile, origin) =
+                resolve_mcp_sandbox(server_name, Some(server.scope), &server.config);
+            lines.push(format!(
+                "  Sandbox           {} ({})",
+                describe_mcp_sandbox(&profile),
+                origin.label()
+            ));
+            if !profile.off {
+                let program = mcp_program_roots(&config.command, &config.args);
+                if !program.is_empty() {
+                    lines.push(format!(
+                        "  Program roots     {} (readable: the server's program)",
+                        program
+                            .iter()
+                            .map(|root| root.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
+            lines.push(format!(
+                "  Enforcement       {}",
+                mcp_sandbox_enforcement(&profile)
+            ));
         }
         McpServerConfig::Sse(config) | McpServerConfig::Http(config) => {
             lines.push(format!("  URL               {}", config.url));
@@ -3734,8 +4100,14 @@ fn render_mcp_server_report(
             lines.push(format!("  SDK name          {}", config.name));
         }
         McpServerConfig::ManagedProxy(config) => {
-            lines.push(format!("  URL               {}", config.url));
-            lines.push(format!("  Proxy id          {}", config.id));
+            lines.push(format!(
+                "  Connector         {} (hosted by Zero-X)",
+                config.id
+            ));
+            lines.push(format!("  URL               {}", config.endpoint()));
+            if let Some(url) = runtime::zerox_needs_connect(server_name) {
+                lines.push(format!("  Connect           not linked yet: {url}"));
+            }
         }
     }
 
@@ -3851,12 +4223,599 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
     })
 }
 
+/// `enable <server>` / `disable <server>`: the server and whether to turn it on.
+fn mcp_toggle_args(args: &str) -> Option<(&str, bool)> {
+    match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["enable", name] => Some((name, true)),
+        ["disable", name] => Some((name, false)),
+        _ => None,
+    }
+}
+
+/// `approve <server>`: the workspace server to approve.
+fn mcp_approve_arg(args: &str) -> Option<&str> {
+    match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["approve", name] => Some(name),
+        _ => None,
+    }
+}
+
+/// `connect <server>`: the hosted connector to link on the Zero-X dashboard.
+fn mcp_connect_arg(args: &str) -> Option<&str> {
+    match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+        ["connect", name] => Some(name),
+        _ => None,
+    }
+}
+
+/// The page where the user links the hosted connector `name` (a `zerox` server) to
+/// their Zero-X account: the one the gateway named when it said the connector is not
+/// linked, else the dashboard's connectors page.
+pub fn mcp_hosted_connect_url(loader: &ConfigLoader, name: &str) -> Result<String, String> {
+    let config = loader.load().map_err(|error| error.to_string())?;
+    let mcp = config.mcp();
+    let server = mcp
+        .get(name)
+        .or_else(|| mcp.disabled().get(name))
+        .or_else(|| mcp.blocked().get(name).map(|blocked| &blocked.server));
+    match server.map(|server| &server.config) {
+        Some(McpServerConfig::ManagedProxy(_)) => match runtime::zerox_needs_connect(name) {
+            Some(url) => Ok(url),
+            None => runtime::zerox_origin().map(|origin| runtime::zerox_connect_url(&origin)),
+        },
+        Some(_) => Err(format!(
+            "{name} is not a hosted connector; only zerox servers are linked on the Zero-X dashboard"
+        )),
+        None => Err(format!("no MCP server named {name}")),
+    }
+}
+
+/// The hosted connectors the gateway said are not linked to the account.
+fn hosted_needing_connect(mcp: &runtime::McpConfigCollection) -> Vec<String> {
+    mcp.servers()
+        .iter()
+        .filter(|(_, server)| matches!(server.config, McpServerConfig::ManagedProxy(_)))
+        .filter(|(name, _)| runtime::zerox_needs_connect(name).is_some())
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+fn render_mcp_connect(outcome: &Result<String, String>, name: &str) -> String {
+    match outcome {
+        Err(error) => format!("MCP\n  Error            {error}"),
+        Ok(url) => [
+            "MCP".to_string(),
+            format!("  Connect          {name} (hosted by Zero-X)"),
+            format!("  Page             {url}"),
+            "  Next             link it there; it is ready from the next turn".to_string(),
+        ]
+        .join("\n"),
+    }
+}
+
+fn render_mcp_connect_json(outcome: &Result<String, String>, name: &str) -> Value {
+    match outcome {
+        Ok(url) => json!({"kind": "mcp", "action": "connect", "server": name, "url": url}),
+        Err(error) => json!({"kind": "mcp", "action": "connect", "server": name, "error": error}),
+    }
+}
+
+/// What `/mcp catalog`, `/mcp add` and `/mcp remove` did, before it is shown as text or
+/// JSON.
+enum McpChange {
+    Catalog {
+        query: String,
+        version: String,
+        /// Each matching entry with the names of the servers added from it.
+        entries: Vec<(&'static runtime::McpCatalogEntry, Vec<String>)>,
+    },
+    Added {
+        id: String,
+        outcome: Result<runtime::McpInstallOutcome, String>,
+    },
+    Removed {
+        name: String,
+        outcome: Result<runtime::McpRemoveOutcome, String>,
+    },
+    Pinned {
+        name: String,
+        outcome: Result<runtime::McpPinOutcome, String>,
+    },
+}
+
+impl McpChange {
+    /// Runs `catalog [query]`, `add ...` or `remove ...`; `None` for other arguments.
+    fn run(loader: &ConfigLoader, args: &str) -> Option<Self> {
+        let words = args.split_whitespace().collect::<Vec<_>>();
+        let (action, rest) = words.split_first()?;
+        match *action {
+            "catalog" => {
+                let query = rest.join(" ");
+                let added = loader
+                    .load()
+                    .map(|config| runtime::mcp_catalog_servers(config.mcp()))
+                    .unwrap_or_default();
+                let catalog = runtime::McpCatalog::builtin();
+                Some(Self::Catalog {
+                    version: catalog.version.clone(),
+                    entries: catalog
+                        .search(&query)
+                        .into_iter()
+                        .map(|entry| (entry, added.get(&entry.id).cloned().unwrap_or_default()))
+                        .collect(),
+                    query,
+                })
+            }
+            "add" => {
+                let id = rest.first().copied().unwrap_or_default().to_string();
+                Some(Self::Added {
+                    id,
+                    outcome: mcp_add_from_environment(loader, rest),
+                })
+            }
+            "remove" => {
+                let parsed = parse_mcp_remove_args(rest);
+                let name = parsed
+                    .as_ref()
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_default();
+                Some(Self::Removed {
+                    name,
+                    outcome: parsed
+                        .and_then(|(name, scope)| runtime::remove_mcp_server(loader, &name, scope)),
+                })
+            }
+            "pin" => match rest {
+                [name] => Some(Self::Pinned {
+                    name: (*name).to_string(),
+                    outcome: runtime::pin_mcp_server(loader, name),
+                }),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::Catalog {
+                query,
+                version,
+                entries,
+            } => render_mcp_catalog(query, version, entries),
+            Self::Added { outcome, .. } => render_mcp_add_outcome(outcome),
+            Self::Removed {
+                outcome: Err(error),
+                ..
+            }
+            | Self::Pinned {
+                outcome: Err(error),
+                ..
+            } => format!("MCP\n  Error            {error}"),
+            Self::Removed {
+                outcome: Ok(outcome),
+                ..
+            } => {
+                let mut lines = vec![
+                    "MCP".to_string(),
+                    format!("  Removed          {}", outcome.name),
+                    format!("  Settings         {}", outcome.settings_path.display()),
+                ];
+                if !outcome.secrets_deleted.is_empty() {
+                    lines.push(format!(
+                        "  Secrets          {} deleted from the OS keychain",
+                        outcome.secrets_deleted.join(", ")
+                    ));
+                }
+                if outcome.signed_out {
+                    lines.push("  Signed out       its sign-in was forgotten".to_string());
+                }
+                if let Some(scope) = outcome.still_used_by {
+                    lines.push(format!(
+                        "  Kept             the secrets and sign-in the {} server of that name still uses",
+                        scope.as_str()
+                    ));
+                }
+                lines.push("  Takes effect     from the next turn".to_string());
+                lines.join("\n")
+            }
+            Self::Pinned {
+                outcome: Ok(outcome),
+                ..
+            } => {
+                let mut lines = vec![
+                    "MCP".to_string(),
+                    format!(
+                        "  {:<16} {}",
+                        if outcome.already {
+                            "Pinned already"
+                        } else {
+                            "Pinned"
+                        },
+                        outcome.name
+                    ),
+                    format!("  Runs             {}", outcome.pin.label()),
+                ];
+                match &outcome.installed {
+                    Some(dir) => lines.push(format!(
+                        "  Installed        {} (verified; starts from here, offline)",
+                        dir.display()
+                    )),
+                    None => lines.push(
+                        "  Checked          on every start; a changed file stops it until you pin it again"
+                            .to_string(),
+                    ),
+                }
+                lines.push(format!(
+                    "  Pins             {}",
+                    outcome.pins_path.display()
+                ));
+                lines.push("  Takes effect     the next time it starts".to_string());
+                lines.join("\n")
+            }
+        }
+    }
+
+    fn render_json(&self) -> Value {
+        match self {
+            Self::Catalog {
+                query,
+                version,
+                entries,
+            } => json!({
+                "kind": "mcp",
+                "action": "catalog",
+                "version": version,
+                "query": query,
+                "connectors": entries
+                    .iter()
+                    .map(|(entry, added)| mcp_catalog_entry_json(entry, added))
+                    .collect::<Vec<_>>(),
+            }),
+            Self::Added { id, outcome } => match outcome {
+                Err(error) => json!({
+                    "kind": "mcp",
+                    "action": "add",
+                    "id": id,
+                    "ok": false,
+                    "error": error,
+                }),
+                Ok(outcome) => json!({
+                    "kind": "mcp",
+                    "action": "add",
+                    "id": outcome.id,
+                    "server": outcome.name,
+                    "ok": true,
+                    "already": outcome.already,
+                    "scope": outcome.scope.as_str(),
+                    "settings_path": outcome.settings_path.display().to_string(),
+                    "secrets_stored": outcome.secrets_stored,
+                    "approved": outcome.approved,
+                    "needs_login": outcome.needs_login,
+                    "pinned": outcome.pinned,
+                }),
+            },
+            Self::Pinned { name, outcome } => match outcome {
+                Err(error) => json!({
+                    "kind": "mcp",
+                    "action": "pin",
+                    "server": name,
+                    "ok": false,
+                    "error": error,
+                }),
+                Ok(outcome) => json!({
+                    "kind": "mcp",
+                    "action": "pin",
+                    "server": outcome.name,
+                    "ok": true,
+                    "already": outcome.already,
+                    "pin": outcome.pin,
+                    "installed": outcome.installed.as_ref().map(|dir| dir.display().to_string()),
+                    "pins_path": outcome.pins_path.display().to_string(),
+                }),
+            },
+            Self::Removed { name, outcome } => match outcome {
+                Err(error) => json!({
+                    "kind": "mcp",
+                    "action": "remove",
+                    "server": name,
+                    "ok": false,
+                    "error": error,
+                }),
+                Ok(outcome) => json!({
+                    "kind": "mcp",
+                    "action": "remove",
+                    "server": outcome.name,
+                    "ok": true,
+                    "settings_path": outcome.settings_path.display().to_string(),
+                    "secrets_deleted": outcome.secrets_deleted,
+                    "signed_out": outcome.signed_out,
+                    "still_used_by": outcome.still_used_by.map(runtime::McpInstallScope::as_str),
+                }),
+            },
+        }
+    }
+}
+
+/// What adding a connector did, as `/mcp add` and `neuron mcp add` show it.
+#[must_use]
+pub fn render_mcp_add_outcome(outcome: &Result<runtime::McpInstallOutcome, String>) -> String {
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => return format!("MCP\n  Error            {error}"),
+    };
+    let mut lines = vec![
+        "MCP".to_string(),
+        if outcome.already {
+            format!(
+                "  {} was already added; its secrets were stored again",
+                outcome.name
+            )
+        } else {
+            format!("  Added            {} ({})", outcome.name, outcome.pinned)
+        },
+        format!("  Scope            {}", outcome.scope.as_str()),
+        format!("  Settings         {}", outcome.settings_path.display()),
+    ];
+    if !outcome.secrets_stored.is_empty() {
+        lines.push(format!(
+            "  Secrets          {} in the OS keychain; the settings hold ${{secret:NAME}}",
+            outcome.secrets_stored.join(", ")
+        ));
+    }
+    if outcome.approved {
+        lines.push("  Approved         for this workspace as written".to_string());
+    }
+    if outcome.needs_login {
+        lines.push(format!(
+            "  Sign in          neuron mcp login {}",
+            outcome.name
+        ));
+    }
+    lines.push("  Takes effect     from the next turn".to_string());
+    lines.join("\n")
+}
+
+/// `add <id> ...` from a slash command: the variables come from the environment
+/// (variables of the same name), since a slash command cannot ask for hidden input.
+fn mcp_add_from_environment(
+    loader: &ConfigLoader,
+    words: &[&str],
+) -> Result<runtime::McpInstallOutcome, String> {
+    let args = parse_mcp_add_args(words)?;
+    let mut values = BTreeMap::new();
+    if let Some(entry) = runtime::McpCatalog::builtin().get(&args.id) {
+        for variable in &entry.env {
+            if let Some(value) = std::env::var(&variable.name)
+                .ok()
+                .filter(|value| !value.is_empty())
+            {
+                values.insert(variable.name.clone(), value);
+            }
+        }
+        let missing = runtime::missing_mcp_variables(entry, &values);
+        if !missing.is_empty() {
+            let names = missing
+                .iter()
+                .map(|variable| variable.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let labels = missing
+                .iter()
+                .map(|variable| format!("{} ({})", variable.label, variable.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "`{id}` needs {labels}. Run `neuron mcp add {id}` in a terminal to type it (the input stays hidden), or set {names} in the environment and add it again",
+                id = args.id,
+            ));
+        }
+    }
+    runtime::install_mcp_server(
+        loader,
+        &runtime::McpInstallRequest {
+            id: args.id,
+            name: args.name,
+            scope: args.scope,
+            values,
+        },
+    )
+}
+
+fn render_mcp_catalog(
+    query: &str,
+    version: &str,
+    entries: &[(&runtime::McpCatalogEntry, Vec<String>)],
+) -> String {
+    let mut lines = vec![format!("Connector catalog ({version})")];
+    if entries.is_empty() {
+        lines.push(format!("  Nothing matches `{query}`."));
+    }
+    for (entry, added) in entries {
+        let transport = if entry.is_remote() { "remote" } else { "local" };
+        let mut needs = entry
+            .env
+            .iter()
+            .filter(|variable| variable.required)
+            .map(|variable| variable.name.clone())
+            .collect::<Vec<_>>();
+        if entry.install.oauth {
+            needs.push("sign-in".to_string());
+        }
+        let mut line = format!(
+            "  {id:<16} {name} · {publisher} · {transport}",
+            id = entry.id,
+            name = entry.name,
+            publisher = entry.publisher,
+        );
+        if !needs.is_empty() {
+            let _ = write!(line, " · needs {}", needs.join(", "));
+        }
+        if !added.is_empty() {
+            let _ = write!(line, " · added as {}", added.join(", "));
+        }
+        lines.push(line);
+        lines.push(format!("  {:<16} {}", "", entry.description));
+    }
+    lines.push(
+        "  Add one          /mcp add <id> [--scope user|project|local] [--name <name>]".to_string(),
+    );
+    lines.join("\n")
+}
+
+fn mcp_catalog_entry_json(entry: &runtime::McpCatalogEntry, added: &[String]) -> Value {
+    json!({
+        "id": entry.id,
+        "name": entry.name,
+        "description": entry.description,
+        "publisher": entry.publisher,
+        "official": entry.official,
+        "licence": entry.licence,
+        "source": entry.source,
+        "transport": if entry.is_remote() { "http" } else { "stdio" },
+        "pinned": entry.pinned_label(),
+        "oauth": entry.install.oauth,
+        "default_scope": entry.default_scope,
+        "variables": entry.env.iter().map(|variable| json!({
+            "name": variable.name,
+            "label": variable.label,
+            "secret": variable.secret,
+            "required": variable.required,
+            "default": variable.default,
+            "help_url": variable.help_url,
+        })).collect::<Vec<_>>(),
+        "added": added,
+    })
+}
+
+fn render_mcp_approval(
+    outcome: &Result<runtime::McpApprovalOutcome, String>,
+    name: &str,
+) -> String {
+    match outcome {
+        Err(error) => format!("MCP\n  Error            {error}"),
+        Ok(outcome) => {
+            let mut lines = vec![
+                "MCP".to_string(),
+                if outcome.already {
+                    format!("  {name} was already approved for this workspace")
+                } else {
+                    format!("  {name} is approved for this workspace as it is configured now")
+                },
+                format!("  Workspace        {}", outcome.workspace.display()),
+                format!("  Approvals        {}", outcome.approvals_path.display()),
+            ];
+            if outcome.disabled {
+                lines.push(format!(
+                    "  Disabled         it starts once enabled: /mcp enable {name}"
+                ));
+            } else {
+                lines.push("  Takes effect     from the next turn".to_string());
+            }
+            lines.push(
+                "  Asks again       when its command, arguments, environment, headers or URL change"
+                    .to_string(),
+            );
+            lines.join("\n")
+        }
+    }
+}
+
+fn render_mcp_approval_json(
+    outcome: &Result<runtime::McpApprovalOutcome, String>,
+    name: &str,
+) -> Value {
+    match outcome {
+        Err(error) => json!({
+            "kind": "mcp",
+            "action": "approve",
+            "server": name,
+            "ok": false,
+            "error": error,
+        }),
+        Ok(outcome) => json!({
+            "kind": "mcp",
+            "action": "approve",
+            "server": name,
+            "ok": true,
+            "already": outcome.already,
+            "disabled": outcome.disabled,
+            "workspace": outcome.workspace.display().to_string(),
+            "approvals_path": outcome.approvals_path.display().to_string(),
+        }),
+    }
+}
+
+fn render_mcp_toggle(
+    outcome: &Result<runtime::McpToggleOutcome, String>,
+    name: &str,
+    enabled: bool,
+) -> String {
+    let state = if enabled { "enabled" } else { "disabled" };
+    match outcome {
+        Err(error) => format!("MCP\n  Error            {error}"),
+        Ok(outcome) => {
+            let mut lines = vec![
+                "MCP".to_string(),
+                if outcome.changed {
+                    format!("  {name} is now {state}")
+                } else {
+                    format!("  {name} was already {state} in the user settings")
+                },
+                format!("  Settings         {}", outcome.settings_path.display()),
+            ];
+            for path in &outcome.still_disabled_by {
+                lines.push(format!("  Still disabled by {}", path.display()));
+            }
+            lines.push("  Takes effect     from the next turn".to_string());
+            lines.join("\n")
+        }
+    }
+}
+
+fn render_mcp_toggle_json(
+    outcome: &Result<runtime::McpToggleOutcome, String>,
+    name: &str,
+    enabled: bool,
+) -> Value {
+    let action = if enabled { "enable" } else { "disable" };
+    match outcome {
+        Err(error) => json!({
+            "kind": "mcp",
+            "action": action,
+            "server": name,
+            "ok": false,
+            "error": error,
+        }),
+        Ok(outcome) => json!({
+            "kind": "mcp",
+            "action": action,
+            "server": name,
+            "ok": true,
+            "enabled": enabled && outcome.still_disabled_by.is_empty(),
+            "changed": outcome.changed,
+            "settings_path": outcome.settings_path.display().to_string(),
+            "still_disabled_by": outcome
+                .still_disabled_by
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+        }),
+    }
+}
+
 fn render_mcp_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "MCP".to_string(),
-        "  Usage            /mcp [list|show <server>|help]".to_string(),
-        "  Direct CLI       neuron mcp [list|show <server>|help]".to_string(),
-        "  Sources          .claw/settings.json, .claw/settings.local.json".to_string(),
+        format!("  Usage            /mcp {MCP_SLASH_ARGUMENTS}"),
+        format!("  Direct CLI       neuron mcp {MCP_CLI_ARGUMENTS}"),
+        "  Catalog          catalog lists vetted connectors; add <id> [--scope user|project|local] [--name <name>] adds one"
+            .to_string(),
+        "  Secrets          kept in the OS keychain; settings hold ${secret:NAME}".to_string(),
+        "  Switches         enable/disable edit disabledMcpServers in the user settings".to_string(),
+        "  Approval         approve starts a workspace server (project or local) as configured now".to_string(),
+        "  Pinning          pin records what an unpinned stdio server runs (npm or Python package version and hashes, else its files' sha256)".to_string(),
+        "  Sources          .neuron/settings.json, .neuron/settings.local.json, .mcp.json".to_string(),
     ];
     if let Some(args) = unexpected {
         lines.push(format!("  Unexpected       {args}"));
@@ -3869,12 +4828,47 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         "kind": "mcp",
         "action": "help",
         "usage": {
-            "slash_command": "/mcp [list|show <server>|help]",
-            "direct_cli": "neuron mcp [list|show <server>|help]",
-            "sources": [".claw/settings.json", ".claw/settings.local.json"],
+            "slash_command": format!("/mcp {MCP_SLASH_ARGUMENTS}"),
+            "direct_cli": format!("neuron mcp {MCP_CLI_ARGUMENTS}"),
+            "sources": [".neuron/settings.json", ".neuron/settings.local.json", ".mcp.json"],
         },
         "unexpected": unexpected,
     })
+}
+
+/// `managed` or `gateway`.
+fn mcp_policy_source_id(source: runtime::McpPolicySource) -> &'static str {
+    match source {
+        runtime::McpPolicySource::Managed => "managed",
+        runtime::McpPolicySource::Gateway => "gateway",
+    }
+}
+
+/// `Connector policy: managed settings (<path>); your Zero-X plan`, when any policy
+/// applies.
+fn mcp_policy_line(policy: &runtime::McpPolicyStatus) -> Option<String> {
+    if !policy.is_active() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Some(path) = &policy.managed {
+        parts.push(format!("managed settings ({})", path.display()));
+    }
+    match policy.gateway {
+        runtime::McpGatewayPolicyStatus::None => {}
+        runtime::McpGatewayPolicyStatus::Current => parts.push("your Zero-X plan".to_string()),
+        runtime::McpGatewayPolicyStatus::Stale => parts.push(
+            "your Zero-X plan (out of date: Neuron could not read it in the last day)".to_string(),
+        ),
+        runtime::McpGatewayPolicyStatus::Unreadable => {
+            parts.push("your Zero-X plan (its cache cannot be read)".to_string());
+        }
+    }
+    let mut line = format!("Connector policy: {}", parts.join("; "));
+    if policy.closed.is_some() {
+        line.push_str(". The managed settings fail closed: only the servers they configure or require start until the plan's policy is read again.");
+    }
+    Some(line)
 }
 
 fn config_source_label(source: ConfigSource) -> &'static str {
@@ -3883,6 +4877,7 @@ fn config_source_label(source: ConfigSource) -> &'static str {
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
+        ConfigSource::Managed => "managed",
     }
 }
 
@@ -3893,7 +4888,7 @@ fn mcp_transport_label(config: &McpServerConfig) -> &'static str {
         McpServerConfig::Http(_) => "http",
         McpServerConfig::Ws(_) => "ws",
         McpServerConfig::Sdk(_) => "sdk",
-        McpServerConfig::ManagedProxy(_) => "managed-proxy",
+        McpServerConfig::ManagedProxy(_) => "zerox",
     }
 }
 
@@ -3909,7 +4904,7 @@ fn mcp_server_summary(config: &McpServerConfig) -> String {
         McpServerConfig::Sse(config) | McpServerConfig::Http(config) => config.url.clone(),
         McpServerConfig::Ws(config) => config.url.clone(),
         McpServerConfig::Sdk(config) => config.name.clone(),
-        McpServerConfig::ManagedProxy(config) => format!("{} ({})", config.id, config.url),
+        McpServerConfig::ManagedProxy(config) => format!("{} (hosted by Zero-X)", config.id),
     }
 }
 
@@ -4019,6 +5014,7 @@ fn config_source_id(source: ConfigSource) -> &'static str {
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
+        ConfigSource::Managed => "managed",
     }
 }
 
@@ -4072,19 +5068,59 @@ fn mcp_server_details_json(config: &McpServerConfig) -> Value {
             "name": &config.name,
         }),
         McpServerConfig::ManagedProxy(config) => json!({
-            "url": &config.url,
+            "url": config.endpoint(),
             "id": &config.id,
+            "hosted": true,
         }),
     }
 }
 
+/// A stdio server's sandbox profile, where it came from and what this platform enforces.
+fn mcp_sandbox_json(name: &str, server: &ScopedMcpServerConfig) -> Value {
+    let (profile, origin) = resolve_mcp_sandbox(name, Some(server.scope), &server.config);
+    let (origin_id, catalog_id) = match &origin {
+        McpSandboxOrigin::Settings => ("settings", None),
+        McpSandboxOrigin::Catalog(id) => ("catalog", Some(id.clone())),
+        McpSandboxOrigin::Unvetted => ("unvetted", None),
+    };
+    let network = match &profile.network {
+        McpSandboxNetwork::None => json!("none"),
+        McpSandboxNetwork::Any => json!("any"),
+        McpSandboxNetwork::Hosts(hosts) => json!(hosts),
+    };
+    let program_roots = match &server.config {
+        McpServerConfig::Stdio(stdio) if !profile.off => {
+            mcp_program_roots(&stdio.command, &stdio.args)
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+        }
+        _ => Vec::new(),
+    };
+    json!({
+        "origin": origin_id,
+        "catalog_id": catalog_id,
+        "off": profile.off,
+        "fs_read": &profile.fs_read,
+        "fs_write": &profile.fs_write,
+        "network": network,
+        "env_allow": &profile.env_allow,
+        "program_roots": program_roots,
+        "enforcement": mcp_sandbox_enforcement(&profile),
+    })
+}
+
 fn mcp_server_json(name: &str, server: &ScopedMcpServerConfig) -> Value {
+    let mut details = mcp_server_details_json(&server.config);
+    if matches!(server.config, McpServerConfig::Stdio(_)) {
+        details["sandbox"] = mcp_sandbox_json(name, server);
+    }
     json!({
         "name": name,
         "scope": config_source_json(server.scope),
         "transport": mcp_transport_json(&server.config),
         "summary": mcp_server_summary(&server.config),
-        "details": mcp_server_details_json(&server.config),
+        "details": details,
     })
 }
 
@@ -4139,6 +5175,7 @@ pub fn handle_slash_command(
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost
+        | SlashCommand::Artifacts
         | SlashCommand::Resume { .. }
         | SlashCommand::Config { .. }
         | SlashCommand::Mcp { .. }
@@ -4152,6 +5189,7 @@ pub fn handle_slash_command(
         | SlashCommand::Agents { .. }
         | SlashCommand::Skills { .. }
         | SlashCommand::Doctor
+        | SlashCommand::Providers
         | SlashCommand::Login
         | SlashCommand::Logout
         | SlashCommand::Vim
@@ -4465,6 +5503,39 @@ mod tests {
             }))
         );
         assert_eq!(
+            SlashCommand::parse("/mcp disable remote"),
+            Ok(Some(SlashCommand::Mcp {
+                action: Some("disable".to_string()),
+                target: Some("remote".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/mcp enable remote"),
+            Ok(Some(SlashCommand::Mcp {
+                action: Some("enable".to_string()),
+                target: Some("remote".to_string())
+            }))
+        );
+        assert!(SlashCommand::parse("/mcp enable").is_err());
+        assert!(SlashCommand::parse("/mcp disable a b").is_err());
+        assert_eq!(
+            SlashCommand::parse("/mcp approve docs"),
+            Ok(Some(SlashCommand::Mcp {
+                action: Some("approve".to_string()),
+                target: Some("docs".to_string())
+            }))
+        );
+        assert!(SlashCommand::parse("/mcp approve").is_err());
+        assert_eq!(
+            SlashCommand::parse("/mcp pin notes"),
+            Ok(Some(SlashCommand::Mcp {
+                action: Some("pin".to_string()),
+                target: Some("notes".to_string())
+            }))
+        );
+        assert!(SlashCommand::parse("/mcp pin").is_err());
+        assert!(SlashCommand::parse("/mcp pin a b").is_err());
+        assert_eq!(
             SlashCommand::parse("/memory"),
             Ok(Some(SlashCommand::Memory))
         );
@@ -4677,8 +5748,10 @@ mod tests {
 
         let action_error = parse_error_message("/mcp inspect alpha");
         assert!(action_error
-            .contains("Unknown /mcp action 'inspect'. Use list, show <server>, or help."));
-        assert!(action_error.contains("  Usage            /mcp [list|show <server>|help]"));
+            .contains("Unknown /mcp action 'inspect'. Use list, show <server>, catalog [query], add <id>, remove <server>, enable <server>, disable <server>, approve <server>, pin <server>, connect <server>, or help."));
+        assert!(action_error.contains(
+            "  Usage            /mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|help]"
+        ));
     }
 
     #[test]
@@ -4715,8 +5788,9 @@ mod tests {
         assert!(help.contains("/compact"));
         assert!(help.contains("/bughunter [scope]"));
         assert!(help.contains("/commit"));
-        assert!(help.contains("/pr [context]"));
-        assert!(help.contains("/issue [context]"));
+        assert!(help.contains("/pr [create [--draft]] [--base <branch>] [context]"));
+        assert!(help.contains("/pr create pushes and opens it with gh"));
+        assert!(help.contains("/issue [<title>|create]"));
         assert!(help.contains("/ultraplan [task]"));
         assert!(help.contains("/teleport <symbol-or-path>"));
         assert!(help.contains("/debug-tool-call"));
@@ -4726,7 +5800,9 @@ mod tests {
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
-        assert!(help.contains("/mcp [list|show <server>|help]"));
+        assert!(help.contains(
+            "/mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|help]"
+        ));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
@@ -4744,7 +5820,7 @@ mod tests {
         assert!(help.contains("/login"));
         assert!(help.contains("/logout"));
         assert!(help.contains("Sign in to your Zero-X account in the browser"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert_eq!(slash_command_specs().len(), 142);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
@@ -5428,8 +6504,12 @@ mod tests {
         let cwd = temp_dir("mcp-usage");
 
         let help = super::handle_mcp_slash_command(Some("help"), &cwd).expect("mcp help");
-        assert!(help.contains("Usage            /mcp [list|show <server>|help]"));
-        assert!(help.contains("Direct CLI       neuron mcp [list|show <server>|help]"));
+        assert!(help.contains(
+            "Usage            /mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|help]"
+        ));
+        assert!(help.contains(
+            "Direct CLI       neuron mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|login <server>|logout <server>|serve|help]"
+        ));
 
         let unexpected =
             super::handle_mcp_slash_command(Some("show alpha beta"), &cwd).expect("mcp usage");
@@ -5437,12 +6517,16 @@ mod tests {
 
         let nested_help =
             super::handle_mcp_slash_command(Some("show --help"), &cwd).expect("mcp help");
-        assert!(nested_help.contains("Usage            /mcp [list|show <server>|help]"));
+        assert!(nested_help.contains(
+            "Usage            /mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|help]"
+        ));
         assert!(nested_help.contains("Unexpected       show"));
 
         let unknown_help =
             super::handle_mcp_slash_command(Some("inspect --help"), &cwd).expect("mcp usage");
-        assert!(unknown_help.contains("Usage            /mcp [list|show <server>|help]"));
+        assert!(unknown_help.contains(
+            "Usage            /mcp [list|show <server>|catalog|add <id>|remove <server>|enable <server>|disable <server>|approve <server>|pin <server>|connect <server>|help]"
+        ));
         assert!(unknown_help.contains("Unexpected       inspect"));
 
         let _ = fs::remove_dir_all(cwd);
@@ -5543,6 +6627,13 @@ mod tests {
         assert!(show.contains("Args              alpha-server"));
         assert!(show.contains("Env keys          ALPHA_TOKEN"));
         assert!(show.contains("Tool timeout      1200 ms"));
+        assert!(
+            show.contains(
+                "Sandbox           read .; write nothing; network none (unvetted default)"
+            ),
+            "{show}"
+        );
+        assert!(show.contains("Enforcement       "), "{show}");
 
         let remote = super::render_mcp_report_for(&loader, &workspace, Some("show remote"))
             .expect("mcp show remote report should render");
@@ -5552,6 +6643,498 @@ mod tests {
         let missing = super::render_mcp_report_for(&loader, &workspace, Some("show missing"))
             .expect("missing report should render");
         assert!(missing.contains("server `missing` is not configured"));
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn mcp_show_lists_the_program_roots_a_sandboxed_server_can_read() {
+        let workspace = temp_dir("mcp-program-workspace");
+        let config_home = temp_dir("mcp-program-home");
+        let package = workspace.join("node_modules").join("notes-mcp");
+        fs::create_dir_all(&package).expect("package folder");
+        fs::create_dir_all(&config_home).expect("config home");
+        let script = package.join("index.js");
+        fs::write(&script, "").expect("script");
+        let settings = serde_json::json!({
+            "mcpServers": {
+                "notes": {
+                    "command": "node",
+                    "args": [script.to_string_lossy(), workspace.to_string_lossy()]
+                }
+            }
+        });
+        fs::write(config_home.join("settings.json"), settings.to_string()).expect("settings");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let show = super::render_mcp_report_for(&loader, &workspace, Some("show notes"))
+            .expect("mcp show report should render");
+        let line = show
+            .lines()
+            .find(|line| line.trim_start().starts_with("Program roots"))
+            .unwrap_or_else(|| panic!("no program roots: {show}"));
+        assert!(line.contains("node_modules"), "{line}");
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    /// The secret store the CLI installs (the OS keychain), in memory.
+    #[derive(Default)]
+    struct MemorySecrets(Mutex<std::collections::BTreeMap<String, String>>);
+
+    impl runtime::McpTokenStore for MemorySecrets {
+        fn load(&self, key: &str) -> Result<Option<String>, String> {
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+        fn save(&self, key: &str, value: &str) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+        fn delete(&self, key: &str) -> Result<(), String> {
+            self.0.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mcp_catalog_add_and_remove_keep_the_secret_out_of_settings() {
+        static STORE: OnceLock<()> = OnceLock::new();
+        STORE.get_or_init(|| {
+            runtime::set_mcp_token_store(Some(std::sync::Arc::new(MemorySecrets::default())));
+        });
+        let workspace = temp_dir("mcp-add-workspace");
+        let config_home = temp_dir("mcp-add-home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false}"#,
+        )
+        .expect("user settings");
+        let loader = ConfigLoader::new(&workspace, &config_home)
+            .with_project_trust(runtime::ProjectTrust::Trusted)
+            .with_mcp_approvals(true);
+        let sentinel = "c7_SENTINEL_commands_test";
+        std::env::set_var("CONTEXT7_API_KEY", sentinel);
+
+        let catalog =
+            super::render_mcp_report_for(&loader, &workspace, Some("catalog")).expect("catalog");
+        assert!(catalog.contains("Connector catalog ("), "{catalog}");
+        assert!(
+            catalog.contains(
+                "github           GitHub · GitHub · remote · needs GITHUB_PERSONAL_ACCESS_TOKEN"
+            ),
+            "{catalog}"
+        );
+        let docs = super::render_mcp_report_for(&loader, &workspace, Some("catalog docs"))
+            .expect("catalog docs");
+        assert!(
+            docs.contains("cloudflare-docs") && !docs.contains("  github "),
+            "{docs}"
+        );
+
+        let added =
+            super::render_mcp_report_for(&loader, &workspace, Some("add context7")).expect("add");
+        assert!(
+            added.contains("Added            context7 (https://mcp.context7.com/mcp)"),
+            "{added}"
+        );
+        assert!(
+            added.contains("CONTEXT7_API_KEY in the OS keychain"),
+            "{added}"
+        );
+        let settings = fs::read_to_string(config_home.join("settings.json")).expect("settings");
+        assert!(!settings.contains(sentinel), "{settings}");
+        assert!(
+            settings.contains("${secret:CONTEXT7_API_KEY}"),
+            "{settings}"
+        );
+        assert_eq!(
+            runtime::load_mcp_secret("context7", "CONTEXT7_API_KEY").unwrap(),
+            Some(sentinel.to_string())
+        );
+        let list = super::render_mcp_report_for(&loader, &workspace, None).expect("list");
+        assert!(list.contains("context7"), "{list}");
+        let json = super::render_mcp_report_json_for(&loader, &workspace, Some("catalog context7"))
+            .expect("catalog json");
+        assert_eq!(json["connectors"][0]["id"], "context7");
+        assert_eq!(
+            json["connectors"][0]["added"],
+            serde_json::json!(["context7"])
+        );
+
+        // A project server in a folder that is not trusted would never load.
+        let untrusted = ConfigLoader::new(&workspace, &config_home)
+            .with_project_trust(runtime::ProjectTrust::Untrusted);
+        let refused = super::render_mcp_report_json_for(
+            &untrusted,
+            &workspace,
+            Some("add fetch --scope project"),
+        )
+        .expect("refused");
+        assert_eq!(refused["ok"], false);
+        assert!(refused["error"].as_str().unwrap().contains("not trusted"));
+
+        if std::env::var_os("GITHUB_PERSONAL_ACCESS_TOKEN").is_none() {
+            let missing = super::render_mcp_report_for(&loader, &workspace, Some("add github"))
+                .expect("missing secret");
+            assert!(
+                missing.contains("Run `neuron mcp add github` in a terminal"),
+                "{missing}"
+            );
+        }
+
+        // `/mcp add github --scope user` with the token in the environment, then
+        // `/mcp list`: github is configured and ready (a user server waits for no
+        // approval), and the settings hold only the reference.
+        let earlier_token = std::env::var_os("GITHUB_PERSONAL_ACCESS_TOKEN");
+        let github_sentinel = "ghp_SENTINEL_commands_list";
+        std::env::set_var("GITHUB_PERSONAL_ACCESS_TOKEN", github_sentinel);
+        let added =
+            super::render_mcp_report_for(&loader, &workspace, Some("add github --scope user"))
+                .expect("add github");
+        match earlier_token {
+            Some(token) => std::env::set_var("GITHUB_PERSONAL_ACCESS_TOKEN", token),
+            None => std::env::remove_var("GITHUB_PERSONAL_ACCESS_TOKEN"),
+        }
+        assert!(
+            added.contains("Added            github (https://api.githubcopilot.com/mcp/)"),
+            "{added}"
+        );
+        let settings = fs::read_to_string(config_home.join("settings.json")).expect("settings");
+        assert!(!settings.contains(github_sentinel), "{settings}");
+        let list = super::render_mcp_report_for(&loader, &workspace, Some("list")).expect("list");
+        assert!(
+            list.lines()
+                .any(|line| line.trim_start().starts_with("github ")
+                    && line.contains("https://api.githubcopilot.com/mcp/")),
+            "{list}"
+        );
+        assert!(!list.contains("needs approval"), "{list}");
+        let list_json =
+            super::render_mcp_report_json_for(&loader, &workspace, None).expect("list json");
+        assert!(
+            list_json["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|server| server["name"] == "github"),
+            "{list_json}"
+        );
+        assert_eq!(list_json["needs_approval_servers"], serde_json::json!([]));
+        assert_eq!(
+            runtime::load_mcp_secret("github", "GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(),
+            Some(github_sentinel.to_string())
+        );
+        super::render_mcp_report_for(&loader, &workspace, Some("remove github"))
+            .expect("remove github");
+
+        let removed =
+            super::render_mcp_report_json_for(&loader, &workspace, Some("remove context7"))
+                .expect("remove");
+        assert_eq!(removed["ok"], true, "{removed}");
+        assert_eq!(
+            removed["secrets_deleted"],
+            serde_json::json!(["CONTEXT7_API_KEY"])
+        );
+        assert_eq!(
+            runtime::load_mcp_secret("context7", "CONTEXT7_API_KEY").unwrap(),
+            None
+        );
+        std::env::remove_var("CONTEXT7_API_KEY");
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    /// A resumed `/mcp` shows one run as text and as JSON: `add` adds once (the JSON
+    /// does not see it "already" added) and `remove` reports the removal it made.
+    #[test]
+    fn mcp_changes_run_once_for_both_outputs() {
+        let workspace = temp_dir("mcp-once-workspace");
+        let config_home = temp_dir("mcp-once-home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&config_home).expect("config home");
+        let loader = ConfigLoader::new(&workspace, &config_home)
+            .with_project_trust(runtime::ProjectTrust::Trusted)
+            .with_mcp_approvals(true);
+
+        let (text, json) = super::render_mcp_report_with_json_for(
+            &loader,
+            &workspace,
+            Some("add fetch --scope user"),
+        )
+        .expect("add");
+        assert!(text.contains("Added            fetch"), "{text}");
+        assert_eq!(json["ok"], true, "{json}");
+        assert_eq!(json["already"], false, "{json}");
+
+        let (text, json) =
+            super::render_mcp_report_with_json_for(&loader, &workspace, Some("disable fetch"))
+                .expect("disable");
+        assert!(text.contains("fetch is now disabled"), "{text}");
+        assert_eq!(json["changed"], true, "{json}");
+
+        let (text, json) =
+            super::render_mcp_report_with_json_for(&loader, &workspace, Some("remove fetch"))
+                .expect("remove");
+        assert!(text.contains("Removed          fetch"), "{text}");
+        assert_eq!(json["ok"], true, "{json}");
+        assert_eq!(json["server"], "fetch");
+
+        let (text, json) =
+            super::render_mcp_report_with_json_for(&loader, &workspace, None).expect("list");
+        assert!(text.contains("Configured servers"), "{text}");
+        assert_eq!(json["action"], "list");
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn mcp_add_and_remove_arguments_are_checked_when_parsed() {
+        assert_eq!(
+            SlashCommand::parse("/mcp add github --scope project --name gh"),
+            Ok(Some(SlashCommand::Mcp {
+                action: Some("add".to_string()),
+                target: Some("github --scope project --name gh".to_string()),
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/mcp catalog web docs"),
+            Ok(Some(SlashCommand::Mcp {
+                action: Some("catalog".to_string()),
+                target: Some("web docs".to_string()),
+            }))
+        );
+        assert!(parse_error_message("/mcp add").contains("/mcp add <id>"));
+        assert!(parse_error_message("/mcp add github fetch").contains("one connector at a time"));
+        assert!(parse_error_message("/mcp add github --scope team").contains("unknown scope"));
+        assert!(parse_error_message("/mcp add github --scope").contains("--scope needs a value"));
+        assert!(parse_error_message("/mcp remove").contains("/mcp remove <server>"));
+        assert!(parse_error_message("/mcp remove gh --name x").contains("not --name"));
+        let parsed = super::parse_mcp_add_args(&["github", "--scope=local", "--name=gh"]).unwrap();
+        assert_eq!(parsed.scope, Some(runtime::McpInstallScope::Local));
+        assert_eq!(parsed.name.as_deref(), Some("gh"));
+    }
+
+    #[test]
+    fn mcp_list_shows_the_connector_policy_and_disable_refuses_a_required_server() {
+        let workspace = temp_dir("mcp-policy-workspace");
+        let config_home = temp_dir("mcp-policy-home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"mcpServers":{"slack":{"command":"slack-mcp"}}}"#,
+        )
+        .expect("user settings");
+        let managed = config_home.join("managed-settings.json");
+        fs::write(
+            &managed,
+            r#"{"mcpPolicy":{"deny":["slack"],"required":["codebase-memory"]}}"#,
+        )
+        .expect("managed settings");
+        let loader =
+            ConfigLoader::new(&workspace, &config_home).with_managed_settings(Some(managed));
+
+        let list = super::render_mcp_report_for(&loader, &workspace, None).expect("list");
+        assert!(
+            list.contains(
+                "slack            blocked: refused by managed settings: mcpPolicy.deny lists \"slack\""
+            ),
+            "{list}"
+        );
+        assert!(
+            list.contains("codebase-memory  required by managed settings (cannot be turned off)"),
+            "{list}"
+        );
+        assert!(
+            list.contains("Connector policy: managed settings ("),
+            "{list}"
+        );
+        let json = super::render_mcp_report_json_for(&loader, &workspace, None).expect("json");
+        assert_eq!(json["blocked_servers"][0]["policy"], "managed");
+        assert_eq!(json["required_servers"][0]["name"], "codebase-memory");
+        assert_eq!(json["required_servers"][0]["by"], "managed");
+        assert_eq!(json["policy"]["gateway"], "none");
+
+        let refused =
+            super::render_mcp_report_for(&loader, &workspace, Some("disable codebase-memory"))
+                .expect("disable");
+        assert!(
+            refused.contains("required by managed settings"),
+            "{refused}"
+        );
+        let config = loader.load().expect("config");
+        assert!(config.mcp().get("codebase-memory").is_some(), "still on");
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn mcp_connect_names_the_page_that_links_a_hosted_connector() {
+        let workspace = temp_dir("mcp-connect-workspace");
+        let config_home = temp_dir("mcp-connect-home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"mcpServers":{"gh":{"type":"zerox","id":"github"},"notes":{"command":"notes-mcp"}}}"#,
+        )
+        .expect("user settings");
+        let loader = ConfigLoader::new(&workspace, &config_home);
+
+        assert_eq!(
+            SlashCommand::parse("/mcp connect gh"),
+            Ok(Some(SlashCommand::Mcp {
+                action: Some("connect".to_string()),
+                target: Some("gh".to_string()),
+            }))
+        );
+        let (text, json) =
+            super::render_mcp_report_with_json_for(&loader, &workspace, Some("connect gh"))
+                .expect("connect");
+        assert!(
+            text.contains("Connect          gh (hosted by Zero-X)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Page             https://zero-x.live/dashboard#connectors"),
+            "{text}"
+        );
+        assert_eq!(json["url"], "https://zero-x.live/dashboard#connectors");
+
+        let refused = super::render_mcp_report_for(&loader, &workspace, Some("connect notes"))
+            .expect("connect");
+        assert!(
+            refused.contains("notes is not a hosted connector"),
+            "{refused}"
+        );
+
+        let list = super::render_mcp_report_for(&loader, &workspace, None).expect("list");
+        assert!(list.contains("zerox"), "{list}");
+        assert!(list.contains("github (hosted by Zero-X)"), "{list}");
+        assert!(!list.contains("claudeai"), "{list}");
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn mcp_approve_starts_a_waiting_workspace_server() {
+        let workspace = temp_dir("mcp-approve-workspace");
+        let config_home = temp_dir("mcp-approve-home");
+        fs::create_dir_all(workspace.join(".neuron")).expect("workspace config dir");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"permissions":{"deny":["mcp__gone"]},"mcpServers":{"gone":{"command":"node"}}}"#,
+        )
+        .expect("user settings");
+        fs::write(
+            workspace.join(".neuron").join("settings.json"),
+            r#"{"mcpServers":{"docs":{"command":"npx","args":["docs-server"]},"off":{"command":"node"}},"disabledMcpServers":["off"]}"#,
+        )
+        .expect("project settings");
+        let loader = ConfigLoader::new(&workspace, &config_home).with_mcp_approvals(true);
+
+        let list = super::render_mcp_report_for(&loader, &workspace, None).expect("list");
+        assert!(list.contains("Configured servers 0"), "{list}");
+        assert!(
+            list.contains(
+                "docs             needs approval (project server, not started): /mcp approve docs"
+            ),
+            "{list}"
+        );
+        assert!(
+            list.contains("gone             blocked by permissions.deny rule 'mcp__gone'"),
+            "{list}"
+        );
+        let json = super::render_mcp_report_json_for(&loader, &workspace, None).expect("json");
+        assert_eq!(json["needs_approval_servers"], serde_json::json!(["docs"]));
+        assert_eq!(json["blocked_servers"][0]["rule"], "mcp__gone");
+
+        let approved = super::render_mcp_report_for(&loader, &workspace, Some("approve docs"))
+            .expect("approve");
+        assert!(
+            approved.contains("docs is approved for this workspace"),
+            "{approved}"
+        );
+        let list = super::render_mcp_report_for(&loader, &workspace, None).expect("list");
+        assert!(list.contains("Configured servers 1"), "{list}");
+        let refused = super::render_mcp_report_json_for(&loader, &workspace, Some("approve gone"))
+            .expect("approve json");
+        assert_eq!(refused["ok"], false);
+
+        // A disabled workspace server is approved for when it is enabled, not
+        // reported as approved already.
+        let off = super::render_mcp_report_for(&loader, &workspace, Some("approve off"))
+            .expect("approve off");
+        assert!(off.contains("off is approved for this workspace"), "{off}");
+        assert!(off.contains("/mcp enable off"), "{off}");
+        let again = super::render_mcp_report_json_for(&loader, &workspace, Some("approve off"))
+            .expect("approve off json");
+        assert_eq!(again["already"], true);
+        assert_eq!(again["disabled"], true);
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn mcp_list_marks_unpinned_servers_and_pin_records_a_program() {
+        let workspace = temp_dir("mcp-pin-workspace");
+        let config_home = temp_dir("mcp-pin-home");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&config_home).expect("config home");
+        let program = workspace.join("notes-server");
+        fs::write(&program, "#!/bin/sh\n").expect("program");
+        fs::write(
+            config_home.join("settings.json"),
+            serde_json::json!({
+                "defaultMcpServers": false,
+                "mcpServers": {
+                    "notes": {"command": program.to_string_lossy()},
+                    "remote": {"type": "http", "url": "https://remote.example/mcp"},
+                    "fs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem@2.1.0", "."]}
+                }
+            })
+            .to_string(),
+        )
+        .expect("user settings");
+        let loader = ConfigLoader::new(&workspace, &config_home);
+
+        let list = super::render_mcp_report_for(&loader, &workspace, None).expect("list");
+        assert!(
+            list.contains("notes            unpinned (not a catalog connector; /mcp pin notes records its version and hash)"),
+            "{list}"
+        );
+        // A remote server and a catalog connector are not unpinned.
+        assert!(!list.contains("remote           unpinned"), "{list}");
+        assert!(!list.contains("fs               unpinned"), "{list}");
+        let json = super::render_mcp_report_json_for(&loader, &workspace, None).expect("json");
+        assert_eq!(json["unpinned_servers"], serde_json::json!(["notes"]));
+
+        let (pinned, pinned_json) =
+            super::render_mcp_report_with_json_for(&loader, &workspace, Some("pin notes"))
+                .expect("pin");
+        assert!(pinned.contains("Pinned           notes"), "{pinned}");
+        assert!(pinned.contains("a changed file stops it"), "{pinned}");
+        assert_eq!(pinned_json["ok"], true);
+        assert_eq!(pinned_json["pin"]["kind"], "program");
+        let json = super::render_mcp_report_json_for(&loader, &workspace, None).expect("json");
+        assert_eq!(json["unpinned_servers"], serde_json::json!([]));
+
+        let refused = super::render_mcp_report_json_for(&loader, &workspace, Some("pin remote"))
+            .expect("pin");
+        assert_eq!(refused["ok"], false);
+        assert!(refused["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nothing to pin"));
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);
@@ -5627,6 +7210,17 @@ mod tests {
         assert_eq!(show["server"]["name"], "alpha");
         assert_eq!(show["server"]["details"]["env_keys"][0], "ALPHA_TOKEN");
         assert_eq!(show["server"]["details"]["tool_call_timeout_ms"], 1200);
+        assert_eq!(show["server"]["details"]["sandbox"]["origin"], "unvetted");
+        assert_eq!(show["server"]["details"]["sandbox"]["network"], "none");
+        assert_eq!(show["server"]["details"]["sandbox"]["fs_read"][0], ".");
+        let bundled = render_mcp_report_json_for(&loader, &workspace, Some("show playwright"))
+            .expect("mcp show playwright json render");
+        assert_eq!(bundled["server"]["details"]["sandbox"]["origin"], "catalog");
+        assert_eq!(
+            bundled["server"]["details"]["sandbox"]["catalog_id"],
+            "playwright"
+        );
+        assert_eq!(bundled["server"]["details"]["sandbox"]["network"], "any");
 
         let missing = render_mcp_report_json_for(&loader, &workspace, Some("show missing"))
             .expect("mcp missing json render");
@@ -5636,7 +7230,7 @@ mod tests {
         let help =
             render_mcp_report_json_for(&loader, &workspace, Some("help")).expect("mcp help json");
         assert_eq!(help["action"], "help");
-        assert_eq!(help["usage"]["sources"][0], ".claw/settings.json");
+        assert_eq!(help["usage"]["sources"][0], ".neuron/settings.json");
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(config_home);
@@ -5820,5 +7414,22 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
+    fn hooks_help_describes_listing_by_event() {
+        let spec = super::slash_command_specs()
+            .iter()
+            .find(|spec| spec.name == "hooks")
+            .expect("hooks command");
+        assert_eq!(spec.argument_hint, Some("[event]"));
+        assert!(spec.summary.contains("matcher"));
+        assert!(super::render_slash_command_help().contains("/hooks"));
+        assert_eq!(
+            super::SlashCommand::parse("/hooks Stop"),
+            Ok(Some(super::SlashCommand::Hooks {
+                args: Some("Stop".to_string())
+            }))
+        );
     }
 }

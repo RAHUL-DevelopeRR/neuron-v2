@@ -7,7 +7,7 @@
 /**
  * The line under the input:
  *
- *   G Gemini 2.5 Flash ▾ │ ◑ think high │ ⌂ neuron-v2 ⎇ main +1 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx     Free · 5h 12% · 37/100 req
+ *   G Gemini 2.5 Flash ▾ │ ◑ think high │ ⌂ neuron-v2 ⎇ main +1 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx     Free · 5h 640K/1M · resets 14:20 · 37/100 req
  *
  * Each segment opens its picker when clicked (`onActivate`); the same pickers
  * have keys (Alt+M/T/W/P/C, Shift+Tab for the permission mode) and slash
@@ -16,12 +16,14 @@
  */
 
 import { TextAttributes } from '@opentui/core'
-import React, { useState } from 'react'
+import React, { memo, useEffect, useMemo, useState } from 'react'
 
 import { Button } from './button'
 import { useTheme } from '../hooks/use-theme'
 import { useEngineStore } from '../state/engine-store'
+import { connectorsChip, useMcpPanelStore } from '../state/mcp-panel-store'
 import { getGlyphMode, type GlyphMode } from '../utils/glyphs'
+import { renderProbe } from '../utils/render-probe'
 import {
   RIGHT_GAP,
   SEGMENT_SEPARATOR,
@@ -64,25 +66,61 @@ const Segment = ({
   )
 }
 
-export const PromptStatusBar = ({
+/** How often the bar looks whether the token window's reset time has passed. */
+const RESET_CHECK_MS = 60_000
+
+/**
+ * Drawn again when what it shows changes (the engine's status, account,
+ * models, connectors, the clock minute or a pending permission choice) or its
+ * width does: not for each streamed update of the chat around it.
+ */
+export const PromptStatusBar = memo(function PromptStatusBar({
   width,
   onActivate,
   glyphMode = getGlyphMode(),
+  now: fixedNow,
+  timeZone,
 }: {
   /** The columns the bar may use, padding included. */
   width: number
   onActivate?: (target: StatusTarget) => void
   /** The terminal's glyph set (tests draw both). */
   glyphMode?: GlyphMode
-}) => {
+  /** A fixed now (ms) for tests; the clock, checked each minute, otherwise. */
+  now?: number
+  /** The time zone of the reset time (tests); the system's when unset. */
+  timeZone?: string
+}) {
+  renderProbe.onRender?.('PromptStatusBar')
   const theme = useTheme()
+  const [clock, setClock] = useState(() => Date.now())
+  useEffect(() => {
+    if (fixedNow !== undefined) return
+    const timer = setInterval(() => setClock(Date.now()), RESET_CHECK_MS)
+    return () => clearInterval(timer)
+  }, [fixedNow])
   const status = useEngineStore((state) => state.status)
   const account = useEngineStore((state) => state.account)
   const models = useEngineStore((state) => state.models)
   const pendingPermission = useEngineStore((state) => state.pendingPermission)
-  const line = statusBarLine(
-    { status, account, models, mode: glyphMode, pendingPermission },
-    Math.max(0, width - 2),
+  const mcpServers = useMcpPanelStore((state) => state.known)
+  const effectiveNow = fixedNow ?? clock
+  const line = useMemo(
+    () =>
+      statusBarLine(
+        {
+          status,
+          account,
+          models,
+          mode: glyphMode,
+          pendingPermission,
+          now: effectiveNow,
+          timeZone,
+          connectors: connectorsChip(mcpServers),
+        },
+        Math.max(0, width - 2),
+      ),
+    [status, account, models, glyphMode, pendingPermission, effectiveNow, timeZone, mcpServers, width],
   )
   if (!line || line.left.length === 0) return null
 
@@ -117,4 +155,4 @@ export const PromptStatusBar = ({
       ) : null}
     </box>
   )
-}
+})

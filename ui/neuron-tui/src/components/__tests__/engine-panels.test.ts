@@ -126,7 +126,7 @@ describe('model picker', () => {
       {
         id: 'zx-fast',
         label: 'Fast',
-        detail: 'zx-fast · 131.1K context · free',
+        detail: '131.1K context · free',
         available: true,
         current: true,
         marker: null,
@@ -136,7 +136,7 @@ describe('model picker', () => {
       {
         id: 'zx-big',
         label: 'Big',
-        detail: 'zx-big · 262.1K context · Pro plan only',
+        detail: '262.1K context · Pro plan only',
         available: false,
         current: false,
         marker: null,
@@ -166,18 +166,18 @@ describe('model picker', () => {
 
   test('long rows end in an ellipsis: the detail gives way first, then the name', () => {
     const [fast] = modelRows(MODELS)
-    // "Fast  (current)  zx-fast · 131.1K context · free" is 49 columns.
+    // "Fast  (current)  131.1K context · free" is 38 columns.
     expect(fitModelRow(fast!, 60)).toEqual({
       label: 'Fast',
       current: '  (current)',
       marker: '',
-      detail: '  zx-fast · 131.1K context · free',
+      detail: '  131.1K context · free',
     })
     expect(fitModelRow(fast!, 30)).toEqual({
       label: 'Fast',
       current: '  (current)',
       marker: '',
-      detail: '  zx-fast · 13…',
+      detail: '  131.1K conte…',
     })
     const long = { ...fast!, label: 'A very long model display name indeed' }
     expect(fitModelRow(long, 20)).toEqual({
@@ -188,6 +188,53 @@ describe('model picker', () => {
     })
     expect(truncateToWidth('abcdef', 4)).toBe('abc…')
     expect(truncateToWidth('abc', 4)).toBe('abc')
+  })
+
+  test('rows name models without the gateway’s route to them, and no raw ids', () => {
+    const rows = modelRows({
+      ...MODELS,
+      models: [
+        { ...MODELS.models[0]!, id: 'cohere/north-mini-code:free', display_name: 'North Mini Code (OpenRouter, free)', provider: 'openrouter' },
+        { ...MODELS.models[0]!, id: 'groq/openai/gpt-oss-120b', display_name: 'GPT-OSS 120B (Groq)', provider: 'groq' },
+        { ...MODELS.models[0]!, id: 'auto', display_name: 'Auto (best available model)', provider: 'zero-x' },
+        { ...MODELS.models[0]!, id: 'nvidia/stepfun-ai/step-5-preview', display_name: null, provider: 'nvidia' },
+      ],
+    })
+    expect(rows.map((row) => row.label)).toEqual(['North Mini Code', 'GPT-OSS 120B', 'Auto', 'step-5-preview'])
+    for (const row of rows) {
+      expect(`${row.label} ${row.detail}`).not.toMatch(/openrouter|groq|nvidia|:free|\//i)
+    }
+    // The id is still what a pick switches to.
+    expect(rows[0]!.id).toBe('cohere/north-mini-code:free')
+  })
+
+  test('two models with the same name once the route is left out are told apart by a number', () => {
+    const base = MODELS.models[0]!
+    const rows = modelRows({
+      ...MODELS,
+      current: 'nvidia/openai/gpt-oss-20b',
+      models: [
+        { ...base, id: 'groq/openai/gpt-oss-20b', display_name: 'GPT-OSS 20B (Groq)', provider: 'groq' },
+        { ...base, id: 'nvidia/openai/gpt-oss-20b', display_name: 'GPT-OSS 20B (NVIDIA)', provider: 'nvidia' },
+        { ...base, id: 'groq/openai/gpt-oss-120b', display_name: 'GPT-OSS 120B (Groq)', provider: 'groq' },
+        { ...base, id: '@cf/openai/gpt-oss-120b', display_name: 'GPT-OSS 120B (Workers AI)', provider: 'cloudflare' },
+        { ...base, id: 'x/gpt-oss-120b', display_name: 'gpt-oss 120b (NVIDIA NIM)', provider: 'nvidia' },
+      ],
+    })
+    expect(rows.map((row) => row.label)).toEqual([
+      'GPT-OSS 20B',
+      'GPT-OSS 20B (2)',
+      'GPT-OSS 120B',
+      'GPT-OSS 120B (2)',
+      'gpt-oss 120b (3)',
+    ])
+    expect(new Set(rows.map((row) => row.label)).size).toBe(rows.length)
+    for (const row of rows) expect(row.label).not.toMatch(/groq|nvidia|workers|cloudflare|\//i)
+    // The number stays with the model, in what Enter says and as the current one.
+    expect(rows[1]!.current).toBe(true)
+    expect(unavailableMessage({ ...rows[1]!, unavailableReason: 'needs a plan upgrade' })).toBe(
+      "GPT-OSS 20B (2) can't be picked: needs a plan upgrade.",
+    )
   })
 
   test('the current model matches with the engine’s openai/ wire prefix too', () => {
@@ -223,20 +270,20 @@ describe('model picker', () => {
     test('a blurred model is greyed until it is back, with the time left', () => {
       const [row] = modelRows(withStatus('blurred', '2026-10-21T13:20:00Z'), NOW)
       expect(row!.available).toBe(false)
-      expect(row!.detail).toBe('zx-fast · 131.1K context · back in 3h 20m')
+      expect(row!.detail).toBe('131.1K context · back in 3h 20m')
       expect(row!.marker).toBeNull()
     })
 
     test('a blurred model without a return time is just unavailable', () => {
       const [row] = modelRows(withStatus('blurred'), NOW)
       expect(row!.available).toBe(false)
-      expect(row!.detail).toBe('zx-fast · 131.1K context · temporarily unavailable')
+      expect(row!.detail).toBe('131.1K context · temporarily unavailable')
     })
 
     test('a blurred model whose time has passed can be picked again', () => {
       const [row] = modelRows(withStatus('blurred', '2026-10-21T09:59:00Z'), NOW)
       expect(row!.available).toBe(true)
-      expect(row!.detail).toBe('zx-fast · 131.1K context · free')
+      expect(row!.detail).toBe('131.1K context · free')
     })
 
     test('degraded and busy are marked but stay selectable', () => {

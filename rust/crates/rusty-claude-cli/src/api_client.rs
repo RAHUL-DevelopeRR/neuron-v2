@@ -337,6 +337,10 @@ pub(crate) fn fatal_api_error(
     crate::error_detail::record_model_call_failure(error);
     let kind = if error.is_context_window_failure() {
         RuntimeErrorKind::ContextWindowExceeded
+    } else if error.is_retryable() {
+        // Still failing after the provider client's own retries (capacity,
+        // overload, 5xx): another model of `providerFallbacks` may serve it.
+        RuntimeErrorKind::ProviderUnavailable
     } else {
         RuntimeErrorKind::Other
     };
@@ -466,6 +470,12 @@ pub(crate) struct AnthropicRuntimeClient {
     /// The turn (by the index of its prompt) whose request was too large with the
     /// deferred MCP tool definitions: its later requests leave them out at once.
     oversized_with_deferred_tools: Option<usize>,
+    /// The session's model and client while a turn runs on another model (see
+    /// `ApiClient::set_model_override`).
+    overridden: Option<(String, ApiProviderClient)>,
+    /// The model short drafting requests go to (`summaryModel`); the session's
+    /// model when unset.
+    summary_model: Option<String>,
 }
 
 /// The notice shown when a request that was too large is sent again without the
@@ -513,13 +523,29 @@ pub(crate) fn build_provider_client(
         // `OpenAiCompatClient::from_env` with the matching config (openai /
         // xai / dashscope), covering OpenAI, OpenRouter, xAI, DashScope,
         // Ollama and the Zero-X gateway.
+        // Requests of one session share the upstream prompt cache where the gateway's
+        // provider has one; the key is a hash, never the session id itself.
         ProviderKind::Xai | ProviderKind::OpenAi => {
             ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+                .with_prompt_cache_key(session_id.map(prompt_cache_key))
         }
     })
 }
 
+/// The `prompt_cache_key` of a session: a SHA-256 of its id (32 hex characters), so
+/// the gateway and its providers never see the id.
+pub(crate) fn prompt_cache_key(session_id: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(format!("neuron-prompt-cache:{session_id}").as_bytes());
+    hex::encode(&digest[..16])
+}
+
 impl AnthropicRuntimeClient {
+    /// The requests go to the Zero-X gateway.
+    pub(crate) fn uses_gateway(&self) -> bool {
+        is_gateway_client(&self.client)
+    }
+
     pub fn new(
         session_id: &str,
         model: String,
@@ -545,7 +571,14 @@ impl AnthropicRuntimeClient {
             timeouts,
             retry_backoff: StreamRetryBackoff::default(),
             oversized_with_deferred_tools: None,
+            overridden: None,
+            summary_model: None,
         })
+    }
+
+    /// Sends [`Self::complete_text`] requests to `model` (`summaryModel`).
+    pub(crate) fn set_summary_model(&mut self, model: Option<String>) {
+        self.summary_model = model;
     }
 
     pub fn set_reasoning_effort(&mut self, effort: Option<String>) {
@@ -592,8 +625,20 @@ impl AnthropicRuntimeClient {
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<String, String> {
+        let summary_client = match self.summary_model.as_deref() {
+            Some(model) if model != self.model => Some((
+                model.to_string(),
+                build_provider_client(model, None).map_err(|error| error.to_string())?,
+            )),
+            _ => None,
+        };
+        let (model, client) = summary_client
+            .as_ref()
+            .map_or((self.model.as_str(), &self.client), |(model, client)| {
+                (model.as_str(), client)
+            });
         let request = MessageRequest {
-            model: self.model.clone(),
+            model: model.to_string(),
             max_tokens,
             messages: vec![InputMessage::user_text(prompt)],
             system: Some(instructions.to_string()),
@@ -602,8 +647,7 @@ impl AnthropicRuntimeClient {
         };
         self.runtime.block_on(async {
             let reply = async {
-                let mut stream = self
-                    .client
+                let mut stream = client
                     .stream_message(&request)
                     .await
                     .map_err(|error| error.to_string())?;
@@ -675,6 +719,26 @@ pub(crate) fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiEr
 impl ApiClient for AnthropicRuntimeClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         self.stream_with_cancellation(request, &CancellationToken::new())
+    }
+
+    fn set_model_override(&mut self, model: Option<&str>) -> bool {
+        let Some(model) = model else {
+            if let Some((model, client)) = self.overridden.take() {
+                self.model = model;
+                self.client = client;
+            }
+            return true;
+        };
+        let Ok(client) = build_provider_client(model, Some(&self.session_id)) else {
+            return false;
+        };
+        let previous_client = std::mem::replace(&mut self.client, client);
+        let previous_model = std::mem::replace(&mut self.model, model.to_string());
+        // Keep the session's own model, not one an earlier switch put in.
+        if self.overridden.is_none() {
+            self.overridden = Some((previous_model, previous_client));
+        }
+        true
     }
 
     fn stream_with_cancellation(
@@ -1130,9 +1194,10 @@ pub(crate) fn format_context_window_blocked_error(
             estimated_total_tokens,
             context_window_tokens,
         } => {
+            // The model's name, not the gateway's route to it (`cohere/north-mini-code:free`).
             lines.push(format!(
                 "  Model            {}",
-                crate::provider::shown_model(model)
+                crate::gateway_catalog::model_name(model)
             ));
             lines.push(format!(
                 "  Input estimate   ~{estimated_input_tokens} tokens (heuristic)"
@@ -1322,7 +1387,6 @@ pub(crate) const STUB_COMMANDS: &[&str] = &[
     "color",
     "effort",
     "branch",
-    "rewind",
     "ide",
     "tag",
     "output-style",
@@ -2052,6 +2116,8 @@ mod stream_resilience_tests {
             timeouts,
             retry_backoff: fast_backoff(),
             oversized_with_deferred_tools: None,
+            overridden: None,
+            summary_model: None,
         }
     }
 
@@ -2254,8 +2320,11 @@ mod stream_resilience_tests {
             .expect("the second request answers");
 
         let gaps = gateway.gaps();
-        // The 300 ms first-token deadline, then the wait.
-        assert!(gaps[0] >= Duration::from_millis(700), "{gaps:?}");
+        // The 300 ms first-token deadline, then the 400 ms wait. Gaps are measured
+        // between accepted connections and Windows timers are coarse (observed
+        // 688 ms), so the lower bound leaves slack while still proving the wait
+        // ran: the deadline alone would be about 300 ms.
+        assert!(gaps[0] >= Duration::from_millis(600), "{gaps:?}");
         assert!(gaps[0] < Duration::from_secs(10), "{gaps:?}");
     }
 
@@ -3289,6 +3358,31 @@ mod switch_model_hint_tests {
         ))
     }
 
+    /// Transient provider failures that outlived the client's retries are typed so
+    /// the runtime can move to the next `providerFallbacks` model; final ones are not.
+    #[test]
+    fn transient_failures_are_typed_as_provider_unavailable() {
+        for (code, expected) in [
+            (
+                "capacity_exhausted",
+                runtime::RuntimeErrorKind::ProviderUnavailable,
+            ),
+            (
+                "upstream_error",
+                runtime::RuntimeErrorKind::ProviderUnavailable,
+            ),
+            ("insufficient_quota", runtime::RuntimeErrorKind::Other),
+            ("invalid_request", runtime::RuntimeErrorKind::Other),
+        ] {
+            let StreamFailure::Fatal(error) =
+                fatal_api_error("session-1", "openai/auto", &gateway_error(code))
+            else {
+                panic!("a fatal error");
+            };
+            assert_eq!(error.kind(), expected, "{code}");
+        }
+    }
+
     /// The gateway tells everyone to upgrade, max-plan users included; switching
     /// models is what they can do now.
     #[test]
@@ -3381,5 +3475,20 @@ mod switch_model_hint_tests {
             })
             .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod prompt_cache_key_tests {
+    use super::prompt_cache_key;
+
+    #[test]
+    fn the_prompt_cache_key_is_a_stable_hash_that_hides_the_session_id() {
+        let key = prompt_cache_key("session-1792800000000-0");
+        assert_eq!(key.len(), 32, "{key}");
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()), "{key}");
+        assert!(!key.contains("1792800000000"), "{key}");
+        assert_eq!(key, prompt_cache_key("session-1792800000000-0"), "stable");
+        assert_ne!(key, prompt_cache_key("session-1792800000000-1"));
     }
 }

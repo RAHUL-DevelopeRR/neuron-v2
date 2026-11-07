@@ -22,8 +22,8 @@ website the same way; we route them to the gateway maintainers.
 
 | Version | Supported |
 | --- | --- |
-| 7.0.0-alpha.4 (the latest alpha) | Yes |
-| Earlier than 7.0.0-alpha.4 | No; this includes 7.0.0-alpha.1 to 7.0.0-alpha.3 and the npm 6.2.0 and PyPI 6.2.4 (and earlier) packages, which were built outside the release pipeline |
+| 7.0.0-alpha.5 (the latest alpha) | Yes |
+| Earlier than 7.0.0-alpha.5 | No; this includes 7.0.0-alpha.1 to 7.0.0-alpha.4 and the npm 6.2.0 and PyPI 6.2.4 (and earlier) packages, which were built outside the release pipeline |
 
 During the alpha, security fixes ship as the next prerelease (for example
 7.0.0-alpha.5); upgrade to get them.

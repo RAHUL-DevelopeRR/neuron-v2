@@ -153,7 +153,7 @@ jobs:
             asset: neuron-linux-arm64
             ui_asset: neuron-tui-linux-arm64
           - name: macos-arm64
-            runner: macos-14
+            runner: macos-15
             target: aarch64-apple-darwin
             bin: neuron
             asset: neuron-macos-arm64
@@ -478,8 +478,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macos-14 installs the arm64 assets and macos-15-intel the x64 ones.
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-15-intel, windows-2022]
+        # macos-15 installs the arm64 assets and macos-15-intel the x64 ones.
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2022]
     env:
       TAG: ${{ needs.metadata.outputs.tag }}
       VERSION: ${{ needs.metadata.outputs.version }}

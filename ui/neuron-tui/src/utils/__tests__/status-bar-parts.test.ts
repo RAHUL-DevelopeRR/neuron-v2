@@ -6,8 +6,10 @@ import {
   STATUS_BAR_MODELS,
   STATUS_BAR_STATUS,
 } from '../../testing/status-bar-fixtures'
-import { inferProvider, providerBadge } from '../provider-badge'
+import { modelMaker } from '../model-name'
+import { providerBadge } from '../provider-badge'
 import {
+  catalogModel,
   effortLabel,
   folderName,
   lineWidth,
@@ -15,12 +17,17 @@ import {
   statusBarLine,
   statusLineText,
   usageWindowPercent,
+  usageWindowText,
+  windowResetClock,
   type StatusBarInput,
   type StatusLine,
 } from '../status-bar-parts'
 
 import type { GlyphMode } from '../glyphs'
-import type { StatusEvent } from '../../engine/protocol'
+import type { AccountDetails, ModelsEvent, StatusEvent } from '../../engine/protocol'
+
+/** Three hours before the fixture's window resets (14:32 UTC). */
+const NOW = Date.parse('2026-11-03T11:22:00Z')
 
 const input = (
   overrides: Partial<StatusEvent> = {},
@@ -31,6 +38,8 @@ const input = (
   account: STATUS_BAR_ACCOUNT,
   models: STATUS_BAR_MODELS,
   mode,
+  now: NOW,
+  timeZone: 'UTC',
   ...rest,
 })
 
@@ -48,9 +57,11 @@ describe('the status bar at each width', () => {
       expect(text.startsWith(
         'G Gemini 2.5 Flash ▾ │ ● think high │ ⌂ neuron-v2 ⎇ feat/tui-status-bar +1 ~2 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx',
       )).toBe(true)
-      expect(text.endsWith('Free · 5h 12% · 37/100 req')).toBe(true)
       expect(stringWidth(text)).toBe(width)
     }
+    // The Free token window as used/limit with its reset time, then today's requests.
+    expect(render(input(), 200).endsWith('Free · 5h 120K/1M · resets 14:32 · 37/100 req')).toBe(true)
+    expect(render(input(), 160).endsWith('   120K/1M · resets 14:32')).toBe(true)
   })
 
   test('120 columns drop the labels and shorten the account group', () => {
@@ -58,13 +69,14 @@ describe('the status bar at each width', () => {
     expect(text.startsWith(
       'G Gemini 2.5 Flash │ ● high │ ⌂ neuron-v2 ⎇ feat/tui-status-bar +1 ~2 │ ✎ Edit │ ●●●◑○○○○○○ 35%',
     )).toBe(true)
-    expect(text.endsWith('5h 12%')).toBe(true)
+    expect(text.endsWith('120K/1M · resets 14:32')).toBe(true)
     expect(stringWidth(text)).toBe(120)
   })
 
   test('80 columns drop the folder and git counts and halve the meter', () => {
+    // The token window stays: the branch gives up a column for it.
     expect(render(input(), 80)).toBe(
-      'G Gemini 2.5 Flash │ ● high │ ⎇ feat/tui-status-bar │ ✎ Edit │ ●◕○○○ 35%  5h 12%',
+      'G Gemini 2.5 Flash │ ● high │ ⎇ feat/tui-status-b… │ ✎ Edit │ ●◕○○○ 35%  120K/1M',
     )
   })
 
@@ -90,6 +102,53 @@ describe('the status bar at each width', () => {
     const text = render(input({}, 'console'), 160)
     expect(text).toContain('G Gemini 2.5 Flash ▼ │ ● think high │ ⌂ neuron-v2 ± feat/tui-status-bar +1 ~2 │ + Edit workspace │ ●●●●○○○○○○ 35% ctx')
     expect(text).not.toMatch(/[◔◑◕⎇✎◌▾]/)
+  })
+})
+
+describe('the token window', () => {
+  const account = (window: Partial<NonNullable<AccountDetails['usage_window']>>): AccountDetails => ({
+    ...STATUS_BAR_ACCOUNT,
+    usage_window: { ...STATUS_BAR_ACCOUNT.usage_window!, ...window },
+  })
+  const right = (value: StatusBarInput) =>
+    line(value, 200).right.flatMap((segment) => segment.spans)
+
+  test('used/limit is toned by how full it is', () => {
+    expect(usageWindowText(STATUS_BAR_ACCOUNT, NOW)).toBe('120K/1M')
+    const full = right(input({}, 'unicode', { account: account({ tokens: 640_000, remaining_tokens: 360_000 }) }))
+    expect(full.find((span) => span.text === '5h 640K/1M')).toEqual({ text: '5h 640K/1M', tone: 'muted' })
+    const near = right(input({}, 'unicode', { account: account({ tokens: 850_000 }) }))
+    expect(near.find((span) => span.text === '5h 850K/1M')!.tone).toBe('warning')
+    const spent = right(input({}, 'unicode', { account: account({ tokens: 990_000 }) }))
+    expect(spent.find((span) => span.text === '5h 990K/1M')!.tone).toBe('error')
+  })
+
+  test('the used tokens come from the remaining ones when only those are sent', () => {
+    expect(usageWindowText(account({ tokens: null, remaining_tokens: 360_000 }), NOW)).toBe('640K/1M')
+    expect(usageWindowText(account({ tokens: null, remaining_tokens: null }), NOW)).toBeNull()
+    expect(usageWindowText(account({ limit_tokens: null }), NOW)).toBeNull()
+    expect(usageWindowText(null, NOW)).toBeNull()
+  })
+
+  test('past its reset the figures are stale: the plan and requests show instead', () => {
+    const later = Date.parse('2026-11-03T15:00:00Z')
+    expect(usageWindowText(STATUS_BAR_ACCOUNT, later)).toBeNull()
+    expect(render(input({}, 'unicode', { now: later }), 200).endsWith('Free · 37/100 req')).toBe(true)
+  })
+
+  test('the reset is a time within a day and a date after', () => {
+    expect(windowResetClock('2026-11-03T14:32:00Z', NOW, 'UTC')).toBe('14:32')
+    expect(windowResetClock('2026-11-03T14:32:00Z', NOW, 'Asia/Kolkata')).toBe('20:02')
+    expect(windowResetClock('2026-11-05T09:00:00Z', NOW, 'UTC')).toBe('Nov 5')
+    expect(windowResetClock('2026-11-03T10:00:00Z', NOW, 'UTC')).toBeNull()
+    expect(windowResetClock(null, NOW, 'UTC')).toBeNull()
+    expect(windowResetClock('not a date', NOW, 'UTC')).toBeNull()
+  })
+
+  test('without a reset time the window shows alone', () => {
+    expect(render(input({}, 'unicode', { account: account({ resets_at: null }) }), 200)).toMatch(
+      /Free · 5h 120K\/1M · 37\/100 req$/,
+    )
   })
 })
 
@@ -154,7 +213,85 @@ describe('segments', () => {
 
   test('a locked model says so', () => {
     const text = render(input({ model: 'glm-5.2', model_display_name: null, provider: null }), 200)
-    expect(text.startsWith('CF GLM 5.2 (locked) ▾')).toBe(true)
+    // Its maker's monogram (Zhipu's GLM), not the route's (Cloudflare).
+    expect(text.startsWith('Z GLM 5.2 (locked) ▾')).toBe(true)
+  })
+
+  test('names leave out the gateway’s route; auto names the model that answered', () => {
+    const routed = render(
+      input({
+        model: 'cohere/north-mini-code:free',
+        provider: 'openrouter',
+        model_display_name: 'North Mini Code (OpenRouter, free)',
+      }),
+      200,
+    )
+    expect(routed.startsWith('C North Mini Code ▾')).toBe(true)
+    expect(routed).not.toMatch(/openrouter|:free|cohere\//i)
+
+    // An older engine: the served model's catalog name, cleaned here.
+    const models = {
+      ...STATUS_BAR_MODELS,
+      models: [
+        ...STATUS_BAR_MODELS.models,
+        {
+          ...STATUS_BAR_MODELS.models[1]!,
+          id: 'groq/openai/gpt-oss-120b',
+          display_name: 'GPT-OSS 120B (Groq)',
+          provider: 'groq',
+        },
+      ],
+    }
+    const auto = render(
+      input(
+        { model: 'auto', provider: 'zero-x', model_display_name: 'Auto (best available model)', served_model: 'groq/openai/gpt-oss-120b' },
+        'unicode',
+        { models },
+      ),
+      200,
+    )
+    expect(auto.startsWith('◇ Auto → GPT-OSS 120B ▾')).toBe(true)
+    // A newer engine names it; without a catalog entry, the model part of the id.
+    const named = render(
+      input({ model: 'auto', served_model: 'x/glm-4.7-flash', served_model_display_name: 'GLM-4.7 Flash' }),
+      200,
+    )
+    expect(named.startsWith('◇ Auto → GLM-4.7 Flash ▾')).toBe(true)
+    const bare = render(input({ model: 'auto', served_model: 'cohere/north-mini-code:free' }), 200)
+    expect(bare.startsWith('◇ Auto → north-mini-code ▾')).toBe(true)
+  })
+
+  test('a model whose name another catalog model has is numbered as in the picker', () => {
+    const base = STATUS_BAR_MODELS.models[1]!
+    const models = {
+      ...STATUS_BAR_MODELS,
+      models: [
+        ...STATUS_BAR_MODELS.models,
+        { ...base, id: 'groq/openai/gpt-oss-20b', display_name: 'GPT-OSS 20B (Groq)', provider: 'groq' },
+        { ...base, id: 'nvidia/openai/gpt-oss-20b', display_name: 'GPT-OSS 20B (NVIDIA)', provider: 'nvidia' },
+      ],
+    }
+    const served = (id: string) =>
+      render(
+        input(
+          { model: 'auto', provider: 'zero-x', model_display_name: 'Auto', served_model: id, served_model_display_name: 'GPT-OSS 20B' },
+          'unicode',
+          { models },
+        ),
+        200,
+      )
+    expect(served('groq/openai/gpt-oss-20b').startsWith('◇ Auto → GPT-OSS 20B ▾')).toBe(true)
+    expect(served('nvidia/openai/gpt-oss-20b').startsWith('◇ Auto → GPT-OSS 20B (2) ▾')).toBe(true)
+    const picked = render(
+      input(
+        { model: 'nvidia/openai/gpt-oss-20b', provider: 'nvidia', model_display_name: 'GPT-OSS 20B' },
+        'unicode',
+        { models },
+      ),
+      200,
+    )
+    expect(picked).toContain('GPT-OSS 20B (2) ▾')
+    expect(picked).not.toMatch(/nvidia|groq/i)
   })
 
   test('no part names the provider, only its monogram', () => {
@@ -170,17 +307,27 @@ describe('segments', () => {
 })
 
 describe('helpers', () => {
-  test('monograms by provider, read from the model id when the engine does not say', () => {
-    expect(providerBadge('gemini', 'unicode')).toBe('G')
+  test('monograms by who made the model, never the route to it', () => {
+    expect(providerBadge('google', 'unicode')).toBe('G')
     expect(providerBadge('zero-x', 'unicode')).toBe('◇')
     expect(providerBadge('zero-x', 'console')).toBe('*')
     expect(providerBadge('someone', 'unicode')).toBe('•')
     expect(providerBadge(null, 'console')).toBe('.')
-    expect(inferProvider('auto')).toBe('zero-x')
-    expect(inferProvider('openai/gpt-5')).toBe('openai')
-    expect(inferProvider('claude-sonnet-4-6')).toBe('anthropic')
-    expect(inferProvider('@cf/meta/llama')).toBe('cloudflare')
-    expect(inferProvider('glm-5.2')).toBeNull()
+    // The routes that resell other makers' models have none.
+    for (const route of ['groq', 'openrouter', 'cloudflare', 'workers-ai', 'nim']) {
+      expect(providerBadge(route, 'unicode')).toBe('•')
+    }
+    expect(modelMaker('auto')).toBe('zero-x')
+    expect(modelMaker('openai/gpt-5')).toBe('openai')
+    expect(modelMaker('claude-sonnet-4-6')).toBe('anthropic')
+    expect(modelMaker('@cf/meta/llama-3.3-70b-instruct-fp8-fast', 'cloudflare')).toBe('meta')
+    expect(modelMaker('groq/openai/gpt-oss-120b', 'groq')).toBe('openai')
+    expect(modelMaker('nvidia/stepfun-ai/step-5-preview', 'nvidia')).toBe('stepfun')
+    expect(modelMaker('nvidia/nvidia/nemotron-3-ultra-550b-a55b', 'nvidia')).toBe('nvidia')
+    expect(modelMaker('cohere/north-mini-code:free', 'openrouter')).toBe('cohere')
+    expect(modelMaker('glm-5.2', 'cloudflare')).toBe('zhipu')
+    expect(modelMaker('mystery-model', 'openrouter')).toBeNull()
+    expect(modelMaker('mystery-model', 'acme')).toBe('acme')
   })
 
   test('thinking levels come from the status, then the catalog, then the default ladder', () => {
@@ -209,5 +356,54 @@ describe('helpers', () => {
     expect(folderName('C:\\RAHUL\\neuron-v2')).toBe('neuron-v2')
     expect(folderName('/home/dev/app/')).toBe('app')
     expect(folderName('')).toBeNull()
+  })
+})
+
+describe('the gateway lists model families; sessions may hold route ids', () => {
+  const family = (id: string, display_name: string) => ({
+    id,
+    display_name,
+    available: true,
+    unavailable_reason: null,
+    context_window: 131_072,
+    tiers: ['free'],
+    provider: id.split('/')[0],
+  })
+  const models: ModelsEvent = {
+    type: 'models',
+    current: 'auto',
+    models: [
+      family('openai/gpt-oss-120b', 'GPT-OSS 120B'),
+      family('nvidia/nemotron-3-ultra-550b', 'Nemotron 3 Ultra 550B'),
+      family('cohere/north-mini-code', 'North Mini Code'),
+    ],
+  }
+
+  test('a family id, its bare form and a route id find the same catalog entry', () => {
+    const wanted: Array<[string, string]> = [
+      ['openai/gpt-oss-120b', 'openai/gpt-oss-120b'],
+      ['gpt-oss-120b', 'openai/gpt-oss-120b'],
+      ['groq/openai/gpt-oss-120b', 'openai/gpt-oss-120b'],
+      ['nvidia/nvidia/nemotron-3-ultra-550b-a55b', 'nvidia/nemotron-3-ultra-550b'],
+      ['openrouter/cohere/north-mini-code:free', 'cohere/north-mini-code'],
+    ]
+    for (const [asked, id] of wanted) expect(catalogModel(models, asked)?.id).toBe(id)
+    for (const asked of ['acme/made-up', 'groq/openai/gpt-oss-1200b', 'nvidia/nemotron-3-ultra'])
+      expect(catalogModel(models, asked)).toBeNull()
+  })
+
+  test('the bar names a route id by the catalog name, not the id', () => {
+    for (const [asked, name] of [
+      ['groq/openai/gpt-oss-120b', 'GPT-OSS 120B'],
+      ['nvidia/nvidia/nemotron-3-ultra-550b-a55b', 'Nemotron 3 Ultra 550B'],
+    ]) {
+      const text = render(
+        input({ model: asked, model_display_name: null, provider: null }, 'unicode', { models }),
+        200,
+      )
+      expect(text).toContain(name)
+      expect(text).not.toContain('nvidia/nvidia')
+      expect(text).not.toContain('groq/')
+    }
   })
 })

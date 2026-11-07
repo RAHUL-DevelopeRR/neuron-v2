@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {chmodSync, existsSync, readdirSync, readFileSync} from 'node:fs';
+import {chmodSync, existsSync, readdirSync, readFileSync, utimesSync, writeFileSync} from 'node:fs';
 import path from 'node:path';
 import {test} from 'node:test';
 import {
@@ -36,7 +36,7 @@ function setup(t) {
 }
 
 function environment(context, base, extra = {}) {
-  return cleanEnv({NEURON_DOWNLOAD_BASE: base, NEURON_CACHE_DIR: context.cache, ...extra});
+  return cleanEnv({NEURON_DOWNLOAD_BASE: base, NEURON_CHECKSUMS_BASE: base, NEURON_CACHE_DIR: context.cache, ...extra});
 }
 
 function assertNoStack(stderr) {
@@ -51,10 +51,10 @@ test('first run without postinstall downloads, verifies and runs the binary', {s
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, new RegExp(`neuron-dummy ${VERSION}`));
   assert.match(result.stderr, /Downloading Neuron/);
-  assert.deepEqual(server.requests, [`/v${VERSION}/${asset}.sha256`, `/v${VERSION}/${asset}`]);
+  assert.deepEqual(server.requests, [`/v${VERSION}/SHA256SUMS`, `/v${VERSION}/${asset}.sha256`, `/v${VERSION}/${asset}`]);
   const binary = nativeBinaryPath(context.packageRoot);
   assert.equal(readFileSync(`${binary}.sha256`, 'ascii'), `${sha256(data)}  ${asset}\n`);
-  assert.deepEqual(readdirSync(path.dirname(binary)).sort(), [path.basename(binary), `${path.basename(binary)}.sha256`]);
+  assert.deepEqual(readdirSync(path.dirname(binary)).sort(), [path.basename(binary), `${path.basename(binary)}.sha256`, `${path.basename(binary)}.verified`]);
 
   const offline = await runNode(context.launcher, ['--version'], {env: environment(context, await unusedUrl())});
   assert.equal(offline.code, 0, offline.stderr);
@@ -80,6 +80,90 @@ test('a checksum mismatch installs nothing', {skip}, async (t) => {
   assertNoStack(result.stderr);
   const native = path.dirname(nativeBinaryPath(context.packageRoot));
   assert.deepEqual(existsSync(native) ? readdirSync(native) : [], []);
+});
+
+test('the release SHA256SUMS must agree, even when the mirror serves a matching binary and sidecar', {skip}, async (t) => {
+  const data = dummyBinary();
+  const cases = {
+    'an empty SHA256SUMS': '',
+    'a SHA256SUMS without the asset': `${sha256(data)}  something-else\n`,
+    'a SHA256SUMS with another hash': `${'1'.repeat(64)}  ${asset}\n`,
+  };
+  for (const [name, sums] of Object.entries(cases)) {
+    const context = setup(t);
+    const server = await startServer(t, releaseRoutes({asset, data, sums}));
+    const result = await runNode(context.launcher, ['--version'], {env: environment(context, server.url)});
+    assert.equal(result.code, 1, name);
+    assert.match(result.stderr, /SHA256SUMS/, name);
+    assertNoStack(result.stderr);
+    const native = path.dirname(nativeBinaryPath(context.packageRoot));
+    assert.deepEqual(existsSync(native) ? readdirSync(native) : [], [], name);
+    assert.ok(!existsSync(path.join(context.cache, VERSION)), name);
+  }
+  // No SHA256SUMS at all (HTTP 404) and an unreachable checksums server fail closed too.
+  const missing = setup(t);
+  const routes = releaseRoutes({asset, data});
+  routes.delete(`/v${VERSION}/SHA256SUMS`);
+  const server = await startServer(t, routes);
+  const absent = await runNode(missing.launcher, ['--version'], {env: environment(missing, server.url)});
+  assert.equal(absent.code, 1);
+  assert.match(absent.stderr, /SHA256SUMS/);
+  const down = setup(t);
+  const unreachable = await runNode(down.launcher, ['--version'], {
+    env: environment(down, server.url, {NEURON_CHECKSUMS_BASE: await unusedUrl()}),
+  });
+  assert.equal(unreachable.code, 1);
+  assert.match(unreachable.stderr, /SHA256SUMS/);
+  assert.ok(!existsSync(nativeBinaryPath(down.packageRoot)));
+});
+
+test('SHA256SUMS is not taken from the mirror that serves the binary', {skip}, async (t) => {
+  const context = setup(t);
+  const server = await startServer(t, releaseRoutes({asset, data: dummyBinary()}));
+  // No NEURON_CHECKSUMS_BASE: the checksums URL is GitHub's (made unreachable by a dead proxy).
+  const env = environment(context, server.url, {HTTPS_PROXY: 'http://127.0.0.1:9', NODE_USE_ENV_PROXY: '1'});
+  delete env.NEURON_CHECKSUMS_BASE;
+  const result = await runNode(context.launcher, ['--version'], {env});
+  assert.equal(result.code, 1);
+  assert.ok(!server.requests.includes(`/v${VERSION}/SHA256SUMS`), server.requests.join(', '));
+  assert.ok(!existsSync(nativeBinaryPath(context.packageRoot)));
+});
+
+test('a cached binary that changed after it was verified is refused', {skip}, async (t) => {
+  const context = setup(t);
+  const server = await startServer(t, releaseRoutes({asset, data: dummyBinary()}));
+  const first = await runNode(context.launcher, ['--version'], {env: environment(context, server.url)});
+  assert.equal(first.code, 0, first.stderr);
+  const binary = nativeBinaryPath(context.packageRoot);
+  const offline = environment(context, await unusedUrl());
+
+  // Unchanged: runs, with a stamp of the verified size and mtime beside the sidecar.
+  assert.ok(existsSync(`${binary}.verified`));
+  const warm = await runNode(context.launcher, ['--version'], {env: offline});
+  assert.equal(warm.code, 0, warm.stderr);
+
+  // Same size, different bytes, new mtime: refused (the size check alone would miss it).
+  const original = readFileSync(binary);
+  const tampered = Buffer.from(original);
+  tampered[tampered.length - 2] ^= 0x01;
+  writeFileSync(binary, tampered);
+  const later = new Date(Date.now() + 5000);
+  utimesSync(binary, later, later);
+  const refused = await runNode(context.launcher, ['--version'], {env: offline});
+  assert.equal(refused.code, 1);
+  assert.match(refused.stderr, /does not match its recorded SHA-256/);
+  assert.doesNotMatch(refused.stdout, /neuron-dummy/);
+  assertNoStack(refused.stderr);
+
+  // A forged or stale stamp does not excuse a changed file.
+  writeFileSync(`${binary}.verified`, 'garbage\n');
+  const stale = await runNode(context.launcher, ['--version'], {env: offline});
+  assert.equal(stale.code, 1);
+
+  // Restoring the verified bytes makes it run again.
+  writeFileSync(binary, original);
+  const restored = await runNode(context.launcher, ['--version'], {env: offline});
+  assert.equal(restored.code, 0, restored.stderr);
 });
 
 test('an offline first run explains how to recover', async (t) => {
@@ -136,7 +220,7 @@ test('postinstall also installs the full-screen UI, and nothing about it fails t
   const both = setup(t);
   const cli = dummyBinary();
   const ui = Buffer.from('a stand-in for neuron-tui');
-  const server = await startServer(t, new Map([...releaseRoutes({asset, data: cli}), ...releaseRoutes({asset: uiAsset, data: ui})]));
+  const server = await startServer(t, releaseRoutes({asset, data: cli, also: [{asset: uiAsset, data: ui}]}));
   const installed = await runNode(both.postinstall, [], {env: environment(both, server.url)});
   assert.equal(installed.code, 0, installed.stderr);
   const native = path.dirname(nativeBinaryPath(both.packageRoot));
@@ -154,7 +238,7 @@ test('postinstall also installs the full-screen UI, and nothing about it fails t
 
   // NEURON_NO_TUI=1 does not fetch it at all.
   const off = setup(t);
-  const watched = await startServer(t, new Map([...releaseRoutes({asset, data: cli}), ...releaseRoutes({asset: uiAsset, data: ui})]));
+  const watched = await startServer(t, releaseRoutes({asset, data: cli, also: [{asset: uiAsset, data: ui}]}));
   const skipped = await runNode(off.postinstall, [], {env: environment(off, watched.url, {NEURON_NO_TUI: '1'})});
   assert.equal(skipped.code, 0, skipped.stderr);
   assert.ok(!watched.requests.some((url) => url.includes('neuron-tui')), watched.requests.join(', '));

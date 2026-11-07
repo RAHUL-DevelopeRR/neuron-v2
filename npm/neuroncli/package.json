@@ -1,6 +1,6 @@
 {
   "name": "@zero-x.live/neuron",
-  "version": "7.0.0-alpha.4",
+  "version": "7.0.0-alpha.5",
   "description": "Neuron coding agent for the terminal, powered by the Zero-X gateway",
   "keywords": [
     "ai",
@@ -39,10 +39,6 @@
     "x64",
     "arm64"
   ],
-  "dependencies": {
-    "codebase-memory-mcp": "0.11.0",
-    "@playwright/mcp": "0.0.83"
-  },
   "repository": {
     "type": "git",
     "url": "https://github.com/RAHUL-DevelopeRR/neuron-v2.git"

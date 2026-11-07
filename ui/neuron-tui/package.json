@@ -10,8 +10,10 @@
     "start": "bun run src/entry.ts",
     "dev:mock": "bun run scripts/dev-against-mock.ts",
     "build:binary": "bun run scripts/build-binary.ts",
+    "bench:streaming": "bun run scripts/bench-streaming.ts",
     "check:console": "bun run scripts/windows-console-check.ts",
     "test": "bun run scripts/run-tests.ts",
+    "eval:ui": "bun test ./evals/ui-flow.test.tsx",
     "typecheck": "tsc --noEmit -p ."
   },
   "sideEffects": false,

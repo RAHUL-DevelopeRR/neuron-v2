@@ -1,12 +1,14 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the
-// renderers hear whether their call is still running. See
-// ui/neuron-tui/PORTING.md.
+// renderers hear whether their call is still running, and an MCP call's
+// title names its connector and tool tier. See ui/neuron-tui/PORTING.md.
 import { sanitizeTerminalOutput } from '@neuron-tui/common/util/terminal-safe-text'
 import { TextAttributes } from '@opentui/core'
 import { memo, useCallback } from 'react'
 
 import { useTheme } from '../../hooks/use-theme'
 import { useChatStore } from '../../state/chat-store'
+import { useMcpPanelStore } from '../../state/mcp-panel-store'
+import { mcpToolCallLabel, mcpToolTitle } from '../../utils/mcp-tool-label'
 import { getToolDisplayInfo } from '../../utils/tool-display'
 import { shouldCollapseToolByDefault } from '../../utils/constants'
 import { renderCodeText } from '../../utils/markdown-renderer'
@@ -39,6 +41,8 @@ export const ToolBranch = memo(
     const theme = useTheme()
     // Derive streaming boolean for this specific tool to avoid re-renders when other tools/agents change
     const isStreaming = useChatStore((state) => state.streamingAgents.has(toolBlock.toolCallId))
+    // An MCP call names its connector and the tool's tier (utils/mcp-tool-label.ts).
+    const mcpServers = useMcpPanelStore((state) => state.known)
 
     const sanitizePreview = (value: string): string =>
       value.replace(/[#*_`~\[\]()]/g, '').trim()
@@ -165,7 +169,9 @@ export const ToolBranch = memo(
         </text>
       )
 
-    const headerName = displayInfo.name
+    const mcpCall = mcpToolCallLabel(toolBlock.toolName, toolBlock.input, mcpServers)
+    const headerName = mcpCall ? mcpToolTitle(mcpCall) : displayInfo.name
+    const titleSuffix = mcpCall?.tier ? `[${mcpCall.tier}]` : undefined
 
     const handleToggle = useCallback(() => {
       onToggleCollapsed(toolBlock.toolCallId)
@@ -185,7 +191,7 @@ export const ToolBranch = memo(
               streamingPreview={streamingPreview}
               finishedPreview={finishedPreview}
               onToggle={handleToggle}
-              titleSuffix={undefined}
+              titleSuffix={titleSuffix}
             />
           )}
         </ToolFailureContext.Provider>

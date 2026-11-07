@@ -3,29 +3,41 @@
  * tones, and how it gives way in a narrow terminal. Pure, so it is tested
  * without a renderer (components/prompt-status-bar.tsx draws it).
  *
- *   G Gemini 2.5 Flash ▾ │ ◑ think high │ ⌂ neuron-v2 ⎇ main +1 ~2 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx      Free · 5h 12% · 37/100 req
+ *   G Gemini 2.5 Flash ▾ │ ◑ think high │ ⌂ neuron-v2 ⎇ main +1 ~2 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx      Free · 5h 640K/1M · resets 14:20 · 37/100 req
  *
- * Segments, left to right: the model (provider monogram and name), the
- * thinking level, the workspace folder and git branch, the permission mode
- * and the context meter; on the right, the Zero-X plan and its usage. Each
- * segment opens its picker when clicked (`target`).
+ * Segments, left to right: the model (its maker's monogram and its name,
+ * never the route the gateway takes to it: utils/model-name.ts), the
+ * thinking level, the workspace folder and git branch, the permission mode,
+ * the MCP connectors (`⧉ 5/6`: up of turned on, amber when one needs the
+ * user, a lock when the connector policy requires one) and the context meter;
+ * on the right, the Zero-X plan and its usage: the plan's rolling token window
+ * (Free: 1M tokens per 5 hours) as used/limit with the time it resets, and
+ * today's requests. Each segment opens its picker when clicked (`target`).
  *
  * When the line is too wide it gives way one step at a time
- * ({@link COLLAPSE_STEPS}): the account group shortens, labels go, then the
- * git counts, the folder name, half the meter's circles, the account group,
- * then the branch is cut, the thinking level and the circles go, and last the
- * model name is cut. The provider monogram, the permission mode and the
+ * ({@link COLLAPSE_STEPS}): the account group shortens to the window, labels
+ * go, then the window's reset time, the git counts, the folder name, half
+ * the meter's circles and the connectors chip; then the branch is cut, the account group goes, the
+ * thinking level and the circles go, and last the model name is cut. The provider monogram, the permission mode and the
  * context percentage are never dropped.
  */
-
-import stringWidth from 'string-width'
 
 import { meterCells, meterTone, displayPercent } from '../components/context-meter'
 import { needsSignIn } from '../state/engine-store'
 import { contextUsage } from './context-breakdown'
-import { inferProvider, providerBadge } from './provider-badge'
+import { formatTokenCount } from './format-token-count'
+import { cutToDisplayWidth, displayWidth as stringWidth } from './display-width'
+import {
+  cleanModelName,
+  distinctModelName,
+  findCatalogModel,
+  isAutoModel,
+  modelMaker,
+} from './model-name'
+import { providerBadge } from './provider-badge'
 
 import type { GlyphMode } from './glyphs'
+import type { ConnectorsChip } from '../state/mcp-panel-store'
 import type {
   AccountDetails,
   ModelInfo,
@@ -50,6 +62,7 @@ export type StatusTarget =
   | 'branch'
   | 'permission'
   | 'context'
+  | 'connectors'
   | 'account'
 
 export interface StatusSpan {
@@ -79,7 +92,6 @@ export const RIGHT_GAP = 2
 /** A branch name is not cut below this, nor a model name below {@link MODEL_MIN_COLUMNS}. */
 export const BRANCH_MIN_COLUMNS = 8
 export const MODEL_MIN_COLUMNS = 12
-const ELLIPSIS = '…'
 
 /** Levels the engine accepts from engines that report none per model. */
 export const DEFAULT_REASONING_EFFORTS = ['low', 'medium', 'high'] as const
@@ -103,6 +115,9 @@ interface Glyphs {
   thinkDefault: string
   /** Between the permission mode and the one coming next. */
   arrow: string
+  /** The MCP connectors chip, and its mark for a server the connector policy requires. */
+  connectors: string
+  lock: string
 }
 
 const UNICODE: Glyphs = {
@@ -118,6 +133,8 @@ const UNICODE: Glyphs = {
   thinkLevels: ['◔', '◑', '◕', '●'],
   thinkDefault: '◑',
   arrow: '→',
+  connectors: '⧉',
+  lock: '🔒',
 }
 
 /** What the classic console fonts (WGL4/CP437) can draw. */
@@ -134,6 +151,8 @@ const CONSOLE: Glyphs = {
   thinkLevels: ['●', '●', '●', '●'],
   thinkDefault: '●',
   arrow: '>',
+  connectors: '≡',
+  lock: '§',
 }
 
 export function statusGlyphs(mode: GlyphMode): Glyphs {
@@ -149,6 +168,12 @@ export interface StatusBarInput {
   mode: GlyphMode
   /** A permission choice sent that no status shows yet (engine-store's `pendingPermission`). */
   pendingPermission?: string | null
+  /** Now (ms), for the token window's reset time; tests pass a fixed one. */
+  now?: number
+  /** The time zone the reset time is shown in; the system's when unset. */
+  timeZone?: string
+  /** The MCP servers' chip (state/mcp-panel-store.ts `connectorsChip`); none before they are known. */
+  connectors?: ConnectorsChip | null
 }
 
 /** One segment's possible texts, before they are fitted. */
@@ -173,22 +198,31 @@ export interface StatusView {
   /** The permission choice coming next (sent, not in effect yet): `✎ Edit → ◇ Plan`. */
   permissionNext: StatusView['permission'] | null
   context: { percent: number; estimated: boolean; thresholdPercent: number } | null
+  connectors: ConnectorsChip | null
   account:
-    | { kind: 'usage'; plan: string; window: number | null; requests: string | null }
+    | {
+        kind: 'usage'
+        plan: string
+        /** The token window's used share (0–100), for its tone. */
+        window: number | null
+        /** "640K/1M": tokens used in the window and its limit. */
+        windowUsage: string | null
+        /** "14:20" today or within a day, else "Nov 4"; `null` once it has passed. */
+        windowResets: string | null
+        requests: string | null
+      }
     | { kind: 'signed-out' }
     | null
   glyphs: Glyphs
   mode: GlyphMode
 }
 
-/** The engine names the model with the provider's `openai/` prefix the catalog lacks. */
-function isCurrentModel(id: string, current: string): boolean {
-  return id === current || current === `openai/${id}` || `openai/${current}` === id
-}
-
+/**
+ * The catalog entry for the engine's model id: the family the gateway lists, found
+ * from its bare form (`openai/` stripped by the engine) or a route id.
+ */
 export function catalogModel(models: ModelsEvent | null, id: string): ModelInfo | null {
-  if (!models) return null
-  return models.models.find((model) => isCurrentModel(model.id, id)) ?? null
+  return findCatalogModel(models?.models, id)
 }
 
 /** "free" → "Free". */
@@ -283,6 +317,49 @@ export function usageWindowPercent(account: AccountDetails | null): number | nul
   return Math.max(0, Math.min(100, (used / limit) * 100))
 }
 
+/**
+ * When the token window frees up, short: "14:20" within a day (24-hour clock),
+ * else "Nov 4". `null` without a time, and once it has passed: the window's
+ * figures are not known again until the account is read.
+ */
+export function windowResetClock(
+  iso: string | null | undefined,
+  now: number,
+  timeZone?: string,
+): string | null {
+  if (!iso) return null
+  const at = Date.parse(iso)
+  if (Number.isNaN(at) || at <= now) return null
+  const date = new Date(at)
+  if (at - now < 24 * 3_600_000) {
+    return date.toLocaleTimeString('en-US', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+      timeZone,
+    })
+  }
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone })
+}
+
+/**
+ * "640K/1M": the token window's used tokens and limit, when both are known
+ * and the window has not reset since (its figures are stale after `resets_at`).
+ */
+export function usageWindowText(account: AccountDetails | null, now: number): string | null {
+  const window = account?.usage_window
+  if (!window?.limit_tokens || window.limit_tokens <= 0) return null
+  const resetsAt = window.resets_at ? Date.parse(window.resets_at) : Number.NaN
+  if (!Number.isNaN(resetsAt) && resetsAt <= now) return null
+  const used =
+    window.tokens ??
+    (window.remaining_tokens !== null && window.remaining_tokens !== undefined
+      ? window.limit_tokens - window.remaining_tokens
+      : null)
+  if (used === null || !Number.isFinite(used)) return null
+  return `${formatTokenCount(Math.max(0, used))}/${formatTokenCount(window.limit_tokens)}`
+}
+
 /** A usable Zero-X login: signed in, and the engine does not wait for a sign-in. */
 export function hasUsableZeroXLogin(status: StatusEvent): boolean {
   return status.signed_in === true && !needsSignIn(status)
@@ -295,17 +372,36 @@ export function statusView({
   models,
   mode,
   pendingPermission = null,
+  now = Date.now(),
+  timeZone,
+  connectors = null,
 }: StatusBarInput): StatusView | null {
   if (!status) return null
   const glyphs = statusGlyphs(mode)
   const model = catalogModel(models, status.model)
-  const provider = status.provider ?? model?.provider ?? inferProvider(status.model)
-  const name = status.model_display_name ?? model?.display_name ?? status.model
+  const provider = status.provider ?? model?.provider ?? null
+  // Numbered as in the picker when another catalog model has the same name.
+  const name = distinctModelName(
+    models?.models,
+    model?.id,
+    cleanModelName(status.model, status.model_display_name ?? model?.display_name, provider),
+  )
   const served = status.served_model
+  const servedModel = served ? catalogModel(models, served) : null
   const servedName =
     served && served !== status.model
-      ? (catalogModel(models, served)?.display_name ?? served)
+      ? distinctModelName(
+          models?.models,
+          servedModel?.id,
+          cleanModelName(
+            served,
+            status.served_model_display_name ?? servedModel?.display_name,
+            servedModel?.provider,
+          ),
+        )
       : null
+  // `auto` is Zero-X's router: its mark, whichever model answered.
+  const maker = isAutoModel(status.model) ? 'zero-x' : modelMaker(status.model, provider)
   const health = model?.status
   const efforts = reasoningEffortsOf(status, model)
   const usage = contextUsage(status)
@@ -316,10 +412,13 @@ export function statusView({
     const plan = account?.plan_name ?? (planId ? titleCase(planId) : 'Zero-X')
     const used = account?.usage_today?.requests
     const limit = account?.limits?.requests
+    const windowUsage = usageWindowText(account, now)
     accountView = {
       kind: 'usage',
       plan,
-      window: usageWindowPercent(account),
+      window: windowUsage ? usageWindowPercent(account) : null,
+      windowUsage,
+      windowResets: windowUsage ? windowResetClock(account?.usage_window?.resets_at, now, timeZone) : null,
       requests:
         limit !== null && limit !== undefined && limit > 0
           ? `${used ?? 0}/${limit} req`
@@ -331,7 +430,7 @@ export function statusView({
 
   return {
     model: {
-      badge: providerBadge(provider, mode),
+      badge: providerBadge(maker, mode),
       badgeTone: health === 'degraded' || health === 'busy' ? 'warning' : 'primary',
       name: servedName ? `${name} → ${servedName}` : name,
       pickable: (models?.models.length ?? 0) > 0,
@@ -358,6 +457,7 @@ export function statusView({
     context: usage
       ? { percent: usage.percent, estimated: usage.estimated, thresholdPercent: usage.thresholdPercent }
       : null,
+    connectors,
     account: accountView,
     glyphs,
     mode,
@@ -369,6 +469,8 @@ export function statusView({
 /** How far the line has given way. */
 export interface Compaction {
   accountShort: boolean
+  /** The token window's reset time. */
+  accountResets: boolean
   accountShown: boolean
   /** The signed-out warning stays longer than the usage. */
   warningShown: boolean
@@ -376,6 +478,8 @@ export interface Compaction {
   gitCounts: boolean
   folder: boolean
   cells: 0 | 5 | 10
+  /** The MCP connectors chip. */
+  connectors: boolean
   think: boolean
   /** The branch cut to this many columns, with "…". */
   branchMax: number | null
@@ -388,12 +492,14 @@ export interface Compaction {
 
 export const FULL: Compaction = {
   accountShort: false,
+  accountResets: true,
   accountShown: true,
   warningShown: true,
   labels: true,
   gitCounts: true,
   folder: true,
   cells: 10,
+  connectors: true,
   think: true,
   branchMax: null,
   modelMax: null,
@@ -407,11 +513,14 @@ type Step = Partial<Compaction> | 'cut-branch' | 'cut-model'
 export const COLLAPSE_STEPS: readonly Step[] = [
   { accountShort: true },
   { labels: false },
+  { accountResets: false },
   { gitCounts: false },
   { folder: false },
   { cells: 5 },
-  { accountShown: false },
+  { connectors: false },
+  // The token window stays before a whole branch name (it is what refuses requests).
   'cut-branch',
+  { accountShown: false },
   { think: false },
   { cells: 0, warningShown: false },
   'cut-model',
@@ -420,16 +529,7 @@ export const COLLAPSE_STEPS: readonly Step[] = [
 ]
 
 /** `text` in `columns` columns, ending in "…" when it was cut. */
-export function cutToWidth(text: string, columns: number): string {
-  if (columns <= 0) return ''
-  if (stringWidth(text) <= columns) return text
-  let kept = ''
-  for (const char of text) {
-    if (stringWidth(kept + char) > columns - 1) break
-    kept += char
-  }
-  return kept + ELLIPSIS
-}
+export const cutToWidth = cutToDisplayWidth
 
 /** The segments for `view` at compaction `c`. */
 export function buildLine(view: StatusView, c: Compaction): StatusLine {
@@ -496,6 +596,17 @@ export function buildLine(view: StatusView, c: Compaction): StatusLine {
   }
   left.push({ target: 'permission', spans: permissionSpans })
 
+  const chip = view.connectors
+  if (chip && c.connectors) {
+    // `⧉ 5/6`: servers up of those turned on, amber when one needs the user.
+    const spans: StatusSpan[] = [
+      { text: `${glyphs.connectors} ${chip.ready}/${chip.total}`, tone: chip.warning ? 'warning' : 'muted' },
+    ]
+    if (chip.locked) spans.push({ text: ` ${glyphs.lock}`, tone: 'muted' })
+    if (c.labels) spans.push({ text: ' mcp', tone: 'muted' })
+    left.push({ target: 'connectors', spans })
+  }
+
   if (view.context) {
     const ctx = view.context
     const tone = meterTone(ctx.percent)
@@ -512,18 +623,23 @@ export function buildLine(view: StatusView, c: Compaction): StatusLine {
   if (account?.kind === 'signed-out' && c.warningShown) {
     right.push({ target: 'account', spans: [{ text: 'Signed out: /login', tone: 'warning' }] })
   } else if (account?.kind === 'usage' && c.accountShown) {
-    const windowSpan: StatusSpan | null =
-      account.window !== null
-        ? { text: `5h ${displayPercent(account.window)}%`, tone: windowTone(account.window) }
+    const tone = account.window !== null ? windowTone(account.window) : 'muted'
+    const windowSpan: StatusSpan | null = account.windowUsage
+      ? { text: c.accountShort ? account.windowUsage : `5h ${account.windowUsage}`, tone }
+      : null
+    const resetsSpan: StatusSpan | null =
+      windowSpan && account.windowResets && c.accountResets
+        ? { text: ` · resets ${account.windowResets}`, tone: 'muted' }
         : null
     const spans: StatusSpan[] = []
     if (c.accountShort) {
-      if (windowSpan) spans.push(windowSpan)
+      if (windowSpan) spans.push(windowSpan, ...(resetsSpan ? [resetsSpan] : []))
       else if (account.requests) spans.push({ text: account.requests, tone: 'muted' })
       else spans.push({ text: account.plan, tone: 'muted' })
     } else {
       spans.push({ text: account.plan, tone: 'muted' })
       if (windowSpan) spans.push({ text: ' · ', tone: 'muted' }, windowSpan)
+      if (resetsSpan) spans.push(resetsSpan)
       if (account.requests) spans.push({ text: ` · ${account.requests}`, tone: 'muted' })
     }
     right.push({ target: 'account', spans })
@@ -540,7 +656,7 @@ function windowTone(percent: number): StatusTone {
 function segmentsWidth(segments: StatusSegment[]): number {
   let width = 0
   segments.forEach((segment, index) => {
-    if (index > 0) width += segment.glue ? 1 : SEGMENT_SEPARATOR.length
+    if (index > 0) width += segment.glue ? 1 : stringWidth(SEGMENT_SEPARATOR)
     for (const span of segment.spans) width += stringWidth(span.text)
   })
   return width

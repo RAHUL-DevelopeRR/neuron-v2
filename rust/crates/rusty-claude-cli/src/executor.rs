@@ -76,7 +76,9 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 }
 
 /// Writes the approval question for `request` to `out` and reads the answer from
-/// `input`: `y` or `yes` approves the call once, anything else denies it.
+/// `input`: `y` approves the call once, `a` for the session and `p` always in this
+/// project (each when offered), `d` denies it for the rest of the session, anything
+/// else denies it.
 fn ask_for_approval(
     out: &mut dyn Write,
     input: &mut dyn io::BufRead,
@@ -92,28 +94,36 @@ fn ask_for_approval(
     if let Some(reason) = &request.reason {
         question.push_str(&format!("  Reason           {reason}\n"));
     }
+    question.push_str(&format!("  Input            {}\n", request.input));
+    let mut choices = String::from("y");
+    question.push_str("  [y] allow once\n");
+    if !request.session_prefixes.is_empty() {
+        let scope = request
+            .session_prefixes
+            .iter()
+            .map(|prefix| format!("`{prefix}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        question.push_str(&format!("  [a] allow {scope} for this session\n"));
+        choices.push_str("/a");
+    }
+    if !request.project_rules.is_empty() {
+        question.push_str(&format!(
+            "  [p] always allow in this project (saves {} to .neuron/settings.local.json)\n",
+            runtime::quote_allow_rules(&request.project_rules)
+        ));
+        choices.push_str("/p");
+    }
     question.push_str(&format!(
-        "  Input            {}\nApprove this tool call? [y/N]: ",
-        request.input
+        "  [n] deny\n  [d] {}\nApprove this tool call? [{choices}/d/N]: ",
+        runtime::deny_for_session_label(request)
     ));
     let _ = out.write_all(question.as_bytes());
     let _ = out.flush();
 
     let mut response = String::new();
     match input.read_line(&mut response) {
-        Ok(_) => {
-            let normalized = response.trim().to_ascii_lowercase();
-            if matches!(normalized.as_str(), "y" | "yes") {
-                runtime::PermissionPromptDecision::Allow
-            } else {
-                runtime::PermissionPromptDecision::Deny {
-                    reason: format!(
-                        "tool '{}' denied by user approval prompt",
-                        request.tool_name
-                    ),
-                }
-            }
-        }
+        Ok(_) => runtime::parse_permission_response(&response, request),
         Err(error) => runtime::PermissionPromptDecision::Deny {
             reason: format!("permission approval failed: {error}"),
         },
@@ -179,6 +189,7 @@ impl runtime::PermissionPrompter for ChannelPermissionPrompter<'_> {
                 reason: request.reason.clone(),
                 input: request.input.clone(),
                 session_prefixes: request.session_prefixes.clone(),
+                project_rules: request.project_rules.clone(),
             },
         });
         if asked.is_err() {
@@ -200,21 +211,26 @@ impl runtime::PermissionPrompter for ChannelPermissionPrompter<'_> {
                         {
                             runtime::PermissionPromptDecision::AllowForSession
                         }
-                        // Nothing to remember for the session: approve this call only.
-                        PermissionDecision::AllowForSession => {
+                        PermissionDecision::AllowForProject
+                            if !request.project_rules.is_empty() =>
+                        {
+                            runtime::PermissionPromptDecision::AllowForProject
+                        }
+                        // Nothing to remember for the session, or no rule to save for
+                        // the project: approve this call only.
+                        PermissionDecision::AllowForSession
+                        | PermissionDecision::AllowForProject => {
                             runtime::PermissionPromptDecision::Allow
                         }
-                        PermissionDecision::Deny { note } => deny(match note {
-                            Some(note) if !note.trim().is_empty() => format!(
-                                "tool '{}' denied by the user: {}",
-                                request.tool_name,
-                                note.trim()
-                            ),
-                            _ => format!(
-                                "tool '{}' denied by user approval prompt",
-                                request.tool_name
-                            ),
-                        }),
+                        PermissionDecision::Deny { note, session } => {
+                            let reason =
+                                runtime::user_declined_message(request, note.as_deref(), session);
+                            if session {
+                                runtime::PermissionPromptDecision::DenyForSession { reason }
+                            } else {
+                                deny(reason)
+                            }
+                        }
                     };
                 }
                 // An answer to an earlier request the turn already gave up on.
@@ -236,6 +252,18 @@ impl runtime::PermissionPrompter for ChannelPermissionPrompter<'_> {
 // -- API client (extracted to api_client.rs) --
 pub(crate) struct CliToolExecutor {
     output: Box<dyn TurnSink>,
+    dispatch: ToolDispatch,
+    /// The id of the call [`ToolExecutor::tool_started`] announced, until it runs: a
+    /// UI may want its output while it runs.
+    starting_call: Option<String>,
+    /// The user approved the call about to run in the permission prompt (taken by
+    /// the next execute call): a hosted connector is told so.
+    user_approved: bool,
+}
+
+/// What runs a tool call, apart from where its output goes: shared by the calls of a
+/// read-only batch, which run on threads of their own.
+struct ToolDispatch {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -250,10 +278,87 @@ impl CliToolExecutor {
     ) -> Self {
         Self {
             output: output.into().tool_sink(),
-            allowed_tools,
-            tool_registry,
-            mcp_state,
+            dispatch: ToolDispatch {
+                allowed_tools,
+                tool_registry,
+                mcp_state,
+            },
+            starting_call: None,
+            user_approved: false,
         }
+    }
+
+    /// Shows a call's result on the line terminal (the UI hears it from
+    /// [`ToolExecutor::tool_call_finished`]).
+    fn report_result(
+        &mut self,
+        tool_name: &str,
+        result: &Result<String, ToolError>,
+    ) -> Result<(), ToolError> {
+        let (text, is_error) = match result {
+            Ok(output) => (output.clone(), false),
+            Err(error) => (error.to_string(), true),
+        };
+        self.output
+            .tool_result(tool_name, &text, is_error)
+            .map_err(|error| ToolError::new(error.to_string()))
+    }
+}
+
+impl ToolDispatch {
+    /// Runs one call: the `--allowedTools` check, argument parsing (and repair), then
+    /// the tool. `approved`: the user approved this call in the permission prompt.
+    fn run(
+        &self,
+        tool_name: &str,
+        input: &str,
+        approved: bool,
+        cancel: &runtime::CancellationToken,
+    ) -> Result<String, ToolError> {
+        if self
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(tool_name))
+        {
+            return Err(ToolError::new(format!(
+                "tool `{tool_name}` is not enabled by the current --allowedTools setting"
+            )));
+        }
+        let parsed = runtime::tool_input::parse_tool_input(input).map_err(ToolError::new)?;
+        let repaired = parsed.repaired;
+        let value = parsed.value;
+        // `MCPTool` runs the tool it names: --allowedTools has to list that one too.
+        if let Some(inner) = (tool_name == "MCPTool")
+            .then(|| mcp_tool_target(&value))
+            .flatten()
+            .filter(|inner| {
+                self.allowed_tools
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(inner.as_str()))
+            })
+        {
+            return Err(ToolError::new(format!(
+                "tool `{inner}` (called through MCPTool) is not enabled by the current --allowedTools setting"
+            )));
+        }
+        let result = if tool_name == "ToolSearch" {
+            self.execute_search_tool(value)
+        } else if self.tool_registry.has_runtime_tool(tool_name) {
+            self.execute_runtime_tool(tool_name, value, approved, cancel)
+        } else {
+            self.tool_registry
+                .execute_with_cancel(tool_name, &value, cancel)
+                .map_err(ToolError::new)
+        };
+        // Arguments that needed repair: say so, so the model sends valid JSON next time.
+        result.map(|output| match &repaired {
+            Some(fixes) => format!(
+                "{output}
+
+[note: the arguments were not valid JSON; Neuron {fixes}. Send them as valid JSON next time.]"
+            ),
+            None => output,
+        })
     }
 
     pub fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -304,10 +409,12 @@ impl CliToolExecutor {
     }
 
     /// Runs an MCP tool or wrapper; `cancel` abandons a tool call that is still running.
+    /// `approved`: the user approved this call in the permission prompt.
     pub fn execute_runtime_tool(
         &self,
         tool_name: &str,
         value: serde_json::Value,
+        approved: bool,
         cancel: &runtime::CancellationToken,
     ) -> Result<String, ToolError> {
         let Some(mcp_state) = &self.mcp_state else {
@@ -321,16 +428,16 @@ impl CliToolExecutor {
 
         match tool_name {
             "MCPTool" => {
+                // Resolved as the permission check resolved it, so the call runs the
+                // tool that was decided on.
+                let qualified_name = mcp_tool_target(&value)
+                    .ok_or_else(|| ToolError::new("missing required field `qualifiedName`"))?;
                 let input: McpToolRequest = serde_json::from_value(value)
                     .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-                let qualified_name = input
-                    .qualified_name
-                    .or(input.tool)
-                    .ok_or_else(|| ToolError::new("missing required field `qualifiedName`"))?;
                 // Models send the object as JSON text too; servers want the object.
                 let arguments = tools::mcp_call_arguments(input.arguments)
                     .map_err(|error| ToolError::new(format!("invalid MCPTool input: {error}")))?;
-                mcp_state.call_tool(&qualified_name, arguments, cancel)
+                mcp_state.call_tool(&qualified_name, arguments, approved, cancel)
             }
             "ListMcpResourcesTool" => {
                 let input: ListMcpResourcesRequest = serde_json::from_value(value)
@@ -345,7 +452,7 @@ impl CliToolExecutor {
                     .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
                 mcp_state.read_resource(&input.server, &input.uri)
             }
-            _ => mcp_state.call_tool(tool_name, Some(value), cancel),
+            _ => mcp_state.call_tool(tool_name, Some(value), approved, cancel),
         }
     }
 }
@@ -363,49 +470,66 @@ impl ToolExecutor for CliToolExecutor {
         input: &str,
         cancel: &runtime::CancellationToken,
     ) -> Result<String, ToolError> {
-        if self
-            .allowed_tools
-            .as_ref()
-            .is_some_and(|allowed| !allowed.contains(tool_name))
-        {
-            return Err(ToolError::new(format!(
-                "tool `{tool_name}` is not enabled by the current --allowedTools setting"
-            )));
-        }
-        let parsed = runtime::tool_input::parse_tool_input(input).map_err(ToolError::new)?;
-        let repaired = parsed.repaired;
-        let value = parsed.value;
-        let result = if tool_name == "ToolSearch" {
-            self.execute_search_tool(value)
-        } else if self.tool_registry.has_runtime_tool(tool_name) {
-            self.execute_runtime_tool(tool_name, value, cancel)
-        } else {
-            self.tool_registry
-                .execute_with_cancel(tool_name, &value, cancel)
-                .map_err(ToolError::new)
+        let approved = std::mem::take(&mut self.user_approved);
+        // A UI that asked for it hears a shell command's output while it runs.
+        let observer = self
+            .starting_call
+            .take()
+            .and_then(|id| self.output.tool_output_observer(&id));
+        let dispatch = &self.dispatch;
+        let result = match observer {
+            Some(observer) => runtime::tool_output::with_output_observer(observer, || {
+                dispatch.run(tool_name, input, approved, cancel)
+            }),
+            None => dispatch.run(tool_name, input, approved, cancel),
         };
-        // Arguments that needed repair: say so, so the model sends valid JSON next time.
-        let result = result.map(|output| match &repaired {
-            Some(fixes) => format!("{output}\n\n[note: the arguments were not valid JSON; Neuron {fixes}. Send them as valid JSON next time.]"),
-            None => output,
-        });
-        match result {
-            Ok(output) => {
-                self.output
-                    .tool_result(tool_name, &output, false)
-                    .map_err(|error| ToolError::new(error.to_string()))?;
-                Ok(output)
-            }
-            Err(error) => {
-                self.output
-                    .tool_result(tool_name, &error.to_string(), true)
-                    .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
-                Err(error)
-            }
-        }
+        self.report_result(tool_name, &result)?;
+        result
+    }
+
+    /// Read-only calls run on scoped threads, at most
+    /// [`runtime::parallel_tools::MAX_CONCURRENT_TOOL_CALLS`] at once; the terminal
+    /// shows their results in the order of the calls.
+    fn supports_concurrent_calls(&self) -> bool {
+        true
+    }
+
+    fn execute_concurrently(
+        &mut self,
+        calls: &[runtime::ConcurrentToolCall],
+        cancel: &runtime::CancellationToken,
+    ) -> Vec<Result<String, ToolError>> {
+        self.starting_call = None;
+        // Only built-in reads run in a batch: none of them asks the user.
+        self.user_approved = false;
+        let dispatch = &self.dispatch;
+        let results = runtime::parallel_tools::run_concurrently(
+            calls,
+            runtime::parallel_tools::MAX_CONCURRENT_TOOL_CALLS,
+            |call| dispatch.run(&call.tool_name, &call.input, false, cancel),
+        );
+        results
+            .into_iter()
+            .zip(calls)
+            .map(
+                |(result, call)| match self.report_result(&call.tool_name, &result) {
+                    Ok(()) => result,
+                    Err(error) => Err(error),
+                },
+            )
+            .collect()
+    }
+
+    fn tool_permission_decided(
+        &mut self,
+        _tool_name: &str,
+        decided_by: runtime::PermissionDecider,
+    ) {
+        self.user_approved = decided_by == runtime::PermissionDecider::User;
     }
 
     fn tool_started(&mut self, id: &str, name: &str, input: &str) {
+        self.starting_call = Some(id.to_string());
         let _ = self.output.tool_started(id, name, input);
     }
 
@@ -413,6 +537,18 @@ impl ToolExecutor for CliToolExecutor {
         // A closed UI also fails the turn's next stream write, which ends the turn.
         let _ = self.output.tool_call_finished(id, name, output, is_error);
     }
+}
+
+/// The MCP tool an `MCPTool` call names (`qualifiedName`, or `tool`).
+fn mcp_tool_target(input: &serde_json::Value) -> Option<String> {
+    ["qualifiedName", "tool"].iter().find_map(|key| {
+        input
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 pub(crate) fn permission_policy(
@@ -524,7 +660,10 @@ pub(crate) fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  neuron [--model MODEL] [--output-format text|json] TEXT"
     )?;
-    writeln!(out, "      Shorthand non-interactive prompt mode")?;
+    writeln!(
+        out,
+        "      On a terminal, the full-screen UI sending TEXT first; otherwise the same as `prompt TEXT`"
+    )?;
     writeln!(out, "  neuron [FLAGS] -p TEXT")?;
     writeln!(
         out,
@@ -775,6 +914,8 @@ mod cli_prompter_tests {
             reason: Some("Run `mkdir out`?".to_string()),
             session_prefixes: Vec::new(),
             remedy: runtime::PermissionRemedy::default(),
+            project_rules: Vec::new(),
+            deny_prefixes: Vec::new(),
         }
     }
 
@@ -800,7 +941,11 @@ mod cli_prompter_tests {
             "{shown}"
         );
         assert!(
-            shown.ends_with("Approve this tool call? [y/N]: "),
+            shown.contains("  [d] deny this call for the rest of the session\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.ends_with("Approve this tool call? [y/d/N]: "),
             "{shown}"
         );
 
@@ -811,9 +956,63 @@ mod cli_prompter_tests {
             PermissionMode::WorkspaceWrite,
         );
         assert!(
-            matches!(decision, PermissionPromptDecision::Deny { ref reason } if reason == "tool 'bash' denied by user approval prompt"),
+            matches!(decision, PermissionPromptDecision::Deny { ref reason } if reason == "The user declined `mkdir out`. Do not retry it or a variant; choose another approach or ask the user."),
             "{decision:?}"
         );
+    }
+
+    /// The line REPL offers the session and project choices when the request has them,
+    /// and `d` denies for the rest of the session.
+    #[test]
+    fn the_line_prompt_offers_session_project_and_deny_for_session() {
+        let request = PermissionRequest {
+            input: r#"{"command":"npm install better-sqlite3"}"#.to_string(),
+            session_prefixes: vec!["npm install".to_string()],
+            project_rules: vec!["bash(npm install:*)".to_string()],
+            deny_prefixes: vec!["npm install".to_string()],
+            ..request()
+        };
+        let mut out = Vec::new();
+        let decision = ask_for_approval(
+            &mut out,
+            &mut Cursor::new("d\n"),
+            &request,
+            PermissionMode::Prompt,
+        );
+        assert_eq!(
+            decision,
+            PermissionPromptDecision::DenyForSession {
+                reason: "The user declined `npm install better-sqlite3` in this session. Do not retry it or a variant; choose another approach or ask the user.".to_string()
+            }
+        );
+        let shown = String::from_utf8(out).expect("utf-8");
+        assert!(
+            shown.contains("  [a] allow `npm install` for this session\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("  [p] always allow in this project (saves \"bash(npm install:*)\" to .neuron/settings.local.json)\n"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("  [d] deny `npm install` for the rest of the session\n"),
+            "{shown}"
+        );
+        assert!(shown.ends_with("[y/a/p/d/N]: "), "{shown}");
+
+        for (answer, expected) in [
+            ("a\n", PermissionPromptDecision::AllowForSession),
+            ("p\n", PermissionPromptDecision::AllowForProject),
+            ("yes\n", PermissionPromptDecision::Allow),
+        ] {
+            let decision = ask_for_approval(
+                &mut Vec::new(),
+                &mut Cursor::new(answer),
+                &request,
+                PermissionMode::Prompt,
+            );
+            assert_eq!(decision, expected, "{answer}");
+        }
     }
 }
 
@@ -837,6 +1036,12 @@ mod channel_prompter_tests {
             reason: None,
             session_prefixes: session_prefixes.iter().map(ToString::to_string).collect(),
             remedy: runtime::PermissionRemedy::default(),
+            project_rules: if session_prefixes.is_empty() {
+                Vec::new()
+            } else {
+                vec!["bash(cargo test:*)".to_string()]
+            },
+            deny_prefixes: session_prefixes.iter().map(ToString::to_string).collect(),
         }
     }
 
@@ -914,6 +1119,7 @@ mod channel_prompter_tests {
                     id,
                     decision: PermissionDecision::Deny {
                         note: Some("use --dry-run first".into()),
+                        session: false,
                     },
                 })
                 .unwrap();
@@ -922,6 +1128,44 @@ mod channel_prompter_tests {
             panic!("denied");
         };
         assert!(reason.contains("use --dry-run first"), "{reason}");
+
+        let denied_for_session = decide_with(&["cargo test"], &cancel, |id, replies| {
+            replies
+                .send(PermissionReply {
+                    id,
+                    decision: PermissionDecision::Deny {
+                        note: None,
+                        session: true,
+                    },
+                })
+                .unwrap();
+        });
+        assert_eq!(
+            denied_for_session,
+            PermissionPromptDecision::DenyForSession {
+                reason: "The user declined `cargo test` in this session. Do not retry it or a variant; choose another approach or ask the user.".to_string()
+            }
+        );
+
+        let for_project = decide_with(&["cargo test"], &cancel, |id, replies| {
+            replies
+                .send(PermissionReply {
+                    id,
+                    decision: PermissionDecision::AllowForProject,
+                })
+                .unwrap();
+        });
+        assert_eq!(for_project, PermissionPromptDecision::AllowForProject);
+        // No rule was offered: approve this call only.
+        let nothing_to_save = decide_with(&[], &cancel, |id, replies| {
+            replies
+                .send(PermissionReply {
+                    id,
+                    decision: PermissionDecision::AllowForProject,
+                })
+                .unwrap();
+        });
+        assert_eq!(nothing_to_save, PermissionPromptDecision::Allow);
     }
 
     #[test]
@@ -1207,10 +1451,7 @@ while True:
                     .to_string(),
             )
             .expect("the call runs");
-        assert!(
-            from_text.contains(r#"dict:{\"text\": \"hi\"}"#),
-            "{from_text}"
-        );
+        assert!(from_text.contains(r#"dict:{"text": "hi"}"#), "{from_text}");
         let from_object = executor
             .execute(
                 "MCPTool",

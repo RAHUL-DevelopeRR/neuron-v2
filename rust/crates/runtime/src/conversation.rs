@@ -17,10 +17,17 @@ use crate::context_manager::{
     ContextBudget, ContextManager, ContextPolicy, ContextPreparation, ContextSnapshot,
 };
 use crate::experience::{self, ExperienceStore, HarnessStats};
-use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
+use crate::hooks::{
+    HookAbortSignal, HookEvent, HookProgressReporter, HookRunResult, HookRunner,
+    LifecycleHookInput, ToolUseIdReporter,
+};
+use crate::mcp_audit::{McpAuditCall, McpAuditLog};
 use crate::model_registry;
+use crate::model_routing::{self, ModelRouting};
+use crate::parallel_tools::ConcurrentToolCall;
 use crate::permissions::{
-    PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
+    PermissionContext, PermissionDecider, PermissionMode, PermissionOutcome, PermissionPolicy,
+    PermissionPrompter,
 };
 use crate::project_checks::{detect_checks, ProjectCheck};
 use crate::refusal::neutral_refusal_note;
@@ -28,8 +35,13 @@ use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::transcript::{normalize_messages, normalized_messages};
 use crate::usage::{TokenUsage, UsageTracker};
 
+mod tool_batch;
+
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
-const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+/// Environment variable setting the automatic compaction threshold.
+const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "NEURON_AUTO_COMPACT_INPUT_TOKENS";
+/// The name claw-code gave it, still read when the new one is unset.
+const LEGACY_AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 /// Default cap on model calls per turn.
 pub const DEFAULT_MAX_ITERATIONS: usize = 50;
 /// Environment variable overriding the per-turn model-call cap.
@@ -162,7 +174,7 @@ impl HarnessConfig {
             completion_check: enabled(COMPLETION_CHECK_ENV_VAR),
             auto_checks: enabled(AUTO_CHECKS_ENV_VAR),
             action_nudge: true,
-            workspace_root: std::env::current_dir().ok(),
+            workspace_root: crate::workdir::current_dir().ok(),
             model: None,
             experience: ExperienceStore::from_env(),
         }
@@ -256,6 +268,13 @@ pub trait ApiClient {
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
         self.stream(request)
     }
+
+    /// Sends the requests that follow to `model` instead of the session's model;
+    /// `None` returns to the session's model. Returns whether the client now sends
+    /// to the model asked for. The default cannot switch models.
+    fn set_model_override(&mut self, _model: Option<&str>) -> bool {
+        false
+    }
 }
 
 /// Trait implemented by tool dispatchers that execute model-requested tools.
@@ -279,6 +298,12 @@ pub trait ToolExecutor {
     /// nothing.
     fn tool_started(&mut self, _tool_use_id: &str, _tool_name: &str, _input: &str) {}
 
+    /// Who allowed the tool call about to run (`decided_by`), just before
+    /// [`Self::tool_started`]; it holds for the next execute call only. An executor
+    /// tells a hosted connector when the user approved the call in the prompt
+    /// ([`PermissionDecider::User`]). The default does nothing.
+    fn tool_permission_decided(&mut self, _tool_name: &str, _decided_by: PermissionDecider) {}
+
     /// Every tool call's final result, as the model will see it: one that ran, one that
     /// was denied or blocked by a hook, and one that never started (interrupted, cut off
     /// at the output limit, stopped by the loop guard). The default does nothing.
@@ -289,6 +314,26 @@ pub trait ToolExecutor {
         _output: &str,
         _is_error: bool,
     ) {
+    }
+
+    /// Whether [`Self::execute_concurrently`] really runs calls at the same time. Only
+    /// then does the runtime batch read-only calls (`crate::parallel_tools`).
+    fn supports_concurrent_calls(&self) -> bool {
+        false
+    }
+
+    /// Runs read-only calls that were all allowed already ([`Self::tool_started`] was
+    /// called for each, in order) and returns their results in the order of `calls`.
+    /// The default runs them one after another.
+    fn execute_concurrently(
+        &mut self,
+        calls: &[ConcurrentToolCall],
+        cancel: &CancellationToken,
+    ) -> Vec<Result<String, ToolError>> {
+        calls
+            .iter()
+            .map(|call| self.execute_with_cancellation(&call.tool_name, &call.input, cancel))
+            .collect()
     }
 }
 
@@ -335,6 +380,12 @@ pub enum RuntimeErrorKind {
     /// model's context window. The runtime shrinks the context and retries
     /// once before reporting it.
     ContextWindowExceeded,
+    /// The provider could not serve the model right now even after the client's
+    /// own retries (capacity, overload, 5xx): another model may (see
+    /// [`crate::model_routing`]).
+    ProviderUnavailable,
+    /// A `UserPromptSubmit` hook blocked the prompt; it was not sent.
+    BlockedByHook,
 }
 
 /// Error returned when a conversation turn cannot be completed.
@@ -431,7 +482,43 @@ pub enum TurnOutcome {
         note: Option<String>,
         skipped_tool_calls: usize,
     },
+    /// The [`RequestGuard`] stopped the turn before a model request of about
+    /// `estimated_tokens` input tokens (the plan's token window would not cover
+    /// it, and the user chose to stop). Nothing was sent.
+    BudgetStopped { estimated_tokens: usize },
 }
+
+/// A model request about to be sent, as a [`RequestGuard`] sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestEstimate {
+    /// Estimated input tokens: the system prompt, the tool definitions and the
+    /// conversation.
+    pub input_tokens: usize,
+    /// Output tokens the request asks for (`max_tokens`).
+    pub output_reserve: usize,
+    /// The request's step in the turn, from 1.
+    pub iteration: usize,
+}
+
+/// Looks at every model request before it is sent: the plan's token allowance as
+/// the conversation sees it. A plan with a small rolling token window (Free) keeps
+/// a smaller working set ([`ContextPolicy::working_set_tokens`]) and is asked
+/// before a request would spend more than the window has left.
+pub trait RequestGuard: Send {
+    /// The transcript budget the plan calls for now, in place of the model's own
+    /// when smaller; `None` for the model's own.
+    fn working_set_tokens(&self) -> Option<usize> {
+        None
+    }
+
+    /// Whether to send `request`; `false` stops the turn with
+    /// [`TurnOutcome::BudgetStopped`]. The guard may ask the user first.
+    fn allow_request(&mut self, request: &RequestEstimate) -> bool;
+}
+
+/// The assistant note that closes a turn the [`RequestGuard`] stopped.
+pub const BUDGET_STOPPED_NOTE: &str =
+    "[Stopped before the next model request: it would have needed more tokens than the plan's token window had left, and the user chose to stop.]";
 
 /// Summary of one completed runtime turn, including tool results and usage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -475,6 +562,16 @@ struct TurnProgress {
     edited_paths: Vec<String>,
     completion_checked: bool,
     action_nudged: bool,
+    /// The chat-only nudge was sent, and the request was retried on a model that
+    /// calls tools (see [`crate::model_routing`]).
+    chat_only_nudged: bool,
+    tool_retried: bool,
+    /// Models the turn fell over to after provider failures, in order.
+    fallen_over_to: Vec<String>,
+    /// How often a Stop hook kept this turn going.
+    stop_hook_continuations: usize,
+    /// Whether `PreCompact` hooks ran for automatic compaction this turn.
+    pre_compact_hooks_ran: bool,
     /// Harness events this turn, for the experience library.
     stats: HarnessStats,
 }
@@ -500,6 +597,17 @@ pub struct ConversationRuntime<C, T> {
     reviewer: Option<Box<dyn ChangeReviewer + Send>>,
     /// The user's message that started the current turn.
     turn_request: String,
+    routing: ModelRouting,
+    /// A model the client was switched to for the current turn.
+    model_override: Option<String>,
+    /// Where tool outputs too large for the conversation are kept whole.
+    artifacts: Option<crate::artifacts::ArtifactStore>,
+    /// What `SessionStart` hooks printed, added to the next prompt.
+    pending_hook_context: Vec<String>,
+    /// Looks at each model request before it is sent (see [`RequestGuard`]).
+    request_guard: Option<Box<dyn RequestGuard>>,
+    /// Records every MCP call, refused ones too (see [`crate::mcp_audit`]).
+    mcp_audit: Option<McpAuditLog>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -536,6 +644,8 @@ where
         feature_config: &RuntimeFeatureConfig,
     ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
+        let mut hook_runner = HookRunner::from_feature_config(feature_config);
+        hook_runner.set_session_id(session.session_id.clone());
         let mut context_manager =
             ContextManager::new(ContextBudget::default(), ContextPolicy::from_env());
         context_manager.set_threshold_override(
@@ -549,7 +659,7 @@ where
             system_prompt,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             usage_tracker,
-            hook_runner: HookRunner::from_feature_config(feature_config),
+            hook_runner,
             context_manager,
             cancel: CancellationToken::new(),
             hook_abort_signal: HookAbortSignal::default(),
@@ -560,7 +670,65 @@ where
             check_counter: 0,
             reviewer: None,
             turn_request: String::new(),
+            routing: ModelRouting::default(),
+            model_override: None,
+            artifacts: None,
+            pending_hook_context: Vec::new(),
+            request_guard: None,
+            mcp_audit: None,
         }
+    }
+
+    /// Records every MCP tool call this runtime decides in `audit`.
+    #[must_use]
+    pub fn with_mcp_audit(mut self, audit: McpAuditLog) -> Self {
+        self.mcp_audit = Some(audit);
+        self
+    }
+
+    /// Has `guard` look at every model request before it is sent (see
+    /// [`RequestGuard`]).
+    #[must_use]
+    pub fn with_request_guard(mut self, guard: Box<dyn RequestGuard>) -> Self {
+        self.request_guard = Some(guard);
+        self
+    }
+
+    pub fn set_request_guard(&mut self, guard: Option<Box<dyn RequestGuard>>) {
+        self.request_guard = guard;
+    }
+
+    /// Estimated input tokens of the next model request: the system prompt, the
+    /// tool definitions and the conversation.
+    #[must_use]
+    pub fn request_tokens_estimate(&self) -> usize {
+        self.context_snapshot().request_input_tokens()
+    }
+
+    /// How the conversation may move between models within a turn (see
+    /// [`ModelRouting`]).
+    #[must_use]
+    pub fn with_model_routing(mut self, routing: ModelRouting) -> Self {
+        self.routing = routing;
+        self
+    }
+
+    #[must_use]
+    pub fn model_routing(&self) -> &ModelRouting {
+        &self.routing
+    }
+
+    /// Keeps tool outputs longer than the tool-result cap whole in `store`; the model
+    /// gets the capped preview and the artifact's id (see [`crate::artifacts`]).
+    #[must_use]
+    pub fn with_artifact_store(mut self, store: crate::artifacts::ArtifactStore) -> Self {
+        self.artifacts = Some(store);
+        self
+    }
+
+    #[must_use]
+    pub fn artifact_store(&self) -> Option<&crate::artifacts::ArtifactStore> {
+        self.artifacts.as_ref()
     }
 
     /// Has the completion check ask `reviewer` for a second opinion on the turn's
@@ -700,78 +868,146 @@ where
         }
     }
 
-    fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
+    fn run_pre_tool_use_hook(
+        &mut self,
+        tool_use_id: Option<&str>,
+        tool_name: &str,
+        input: &str,
+    ) -> HookRunResult {
         self.sync_hook_abort();
-        if let Some(reporter) = self.hook_progress_reporter.as_mut() {
-            self.hook_runner.run_pre_tool_use_with_context(
+        let runner = &self.hook_runner;
+        let abort = Some(&self.hook_abort_signal);
+        match self.hook_progress_reporter.as_mut() {
+            Some(reporter) => runner.run_pre_tool_use_with_context(
                 tool_name,
                 input,
-                Some(&self.hook_abort_signal),
-                Some(reporter.as_mut()),
-            )
-        } else {
-            self.hook_runner.run_pre_tool_use_with_context(
-                tool_name,
-                input,
-                Some(&self.hook_abort_signal),
-                None,
-            )
+                abort,
+                Some(&mut ToolUseIdReporter::new(reporter.as_mut(), tool_use_id)),
+            ),
+            None => runner.run_pre_tool_use_with_context(tool_name, input, abort, None),
         }
     }
 
     fn run_post_tool_use_hook(
         &mut self,
+        tool_use_id: &str,
         tool_name: &str,
         input: &str,
         output: &str,
         is_error: bool,
     ) -> HookRunResult {
         self.sync_hook_abort();
-        if let Some(reporter) = self.hook_progress_reporter.as_mut() {
-            self.hook_runner.run_post_tool_use_with_context(
+        let runner = &self.hook_runner;
+        let abort = Some(&self.hook_abort_signal);
+        match self.hook_progress_reporter.as_mut() {
+            Some(reporter) => runner.run_post_tool_use_with_context(
                 tool_name,
                 input,
                 output,
                 is_error,
-                Some(&self.hook_abort_signal),
-                Some(reporter.as_mut()),
-            )
-        } else {
-            self.hook_runner.run_post_tool_use_with_context(
-                tool_name,
-                input,
-                output,
-                is_error,
-                Some(&self.hook_abort_signal),
-                None,
-            )
+                abort,
+                Some(&mut ToolUseIdReporter::new(
+                    reporter.as_mut(),
+                    Some(tool_use_id),
+                )),
+            ),
+            None => runner
+                .run_post_tool_use_with_context(tool_name, input, output, is_error, abort, None),
         }
     }
 
     fn run_post_tool_use_failure_hook(
         &mut self,
+        tool_use_id: &str,
         tool_name: &str,
         input: &str,
         output: &str,
     ) -> HookRunResult {
         self.sync_hook_abort();
-        if let Some(reporter) = self.hook_progress_reporter.as_mut() {
-            self.hook_runner.run_post_tool_use_failure_with_context(
+        let runner = &self.hook_runner;
+        let abort = Some(&self.hook_abort_signal);
+        match self.hook_progress_reporter.as_mut() {
+            Some(reporter) => runner.run_post_tool_use_failure_with_context(
                 tool_name,
                 input,
                 output,
-                Some(&self.hook_abort_signal),
-                Some(reporter.as_mut()),
-            )
-        } else {
-            self.hook_runner.run_post_tool_use_failure_with_context(
-                tool_name,
-                input,
-                output,
-                Some(&self.hook_abort_signal),
-                None,
-            )
+                abort,
+                Some(&mut ToolUseIdReporter::new(
+                    reporter.as_mut(),
+                    Some(tool_use_id),
+                )),
+            ),
+            None => {
+                runner.run_post_tool_use_failure_with_context(tool_name, input, output, abort, None)
+            }
         }
+    }
+
+    /// Runs a lifecycle event's hooks, reporting their progress.
+    fn run_lifecycle_hook(&mut self, event: HookEvent, input: LifecycleHookInput) -> HookRunResult {
+        if !self.hook_runner.has_hooks(event) {
+            return HookRunResult::allow(Vec::new());
+        }
+        self.sync_hook_abort();
+        let runner = &self.hook_runner;
+        let abort = Some(&self.hook_abort_signal);
+        match self.hook_progress_reporter.as_mut() {
+            Some(reporter) => runner.run_lifecycle(event, input, abort, Some(reporter.as_mut())),
+            None => runner.run_lifecycle(event, input, abort, None),
+        }
+    }
+
+    /// The hooks this runtime runs, for `/hooks`.
+    #[must_use]
+    pub fn hook_config(&self) -> &crate::config::RuntimeHookConfig {
+        self.hook_runner.config()
+    }
+
+    /// Runs the `SessionStart` hooks (`source`: `startup`, `resume`, `clear` or
+    /// `compact`). What they print is added to the next prompt as context; the
+    /// result is returned for the caller to show.
+    pub fn run_session_start_hooks(&mut self, source: &str) -> HookRunResult {
+        // `/clear` and `/resume` begin another session: what an earlier start left
+        // unsent (and a rebuild carried over) belongs to the old one.
+        if matches!(source, "clear" | "resume") {
+            self.pending_hook_context.clear();
+        }
+        self.hook_runner
+            .set_session_id(self.session.session_id.clone());
+        let result = self.run_lifecycle_hook(
+            HookEvent::SessionStart,
+            LifecycleHookInput::session_start(source),
+        );
+        if !result.is_failed() && !result.is_cancelled() {
+            self.pending_hook_context
+                .extend(result.messages().iter().cloned());
+        }
+        result
+    }
+
+    /// Takes what `SessionStart` hooks printed and no turn has sent yet. A caller
+    /// that replaces this runtime with a rebuilt one hands it on through
+    /// [`Self::set_pending_hook_context`], so the rebuild does not lose it.
+    #[must_use]
+    pub fn take_pending_hook_context(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_hook_context)
+    }
+
+    /// Sets the hook context the next turn sends (see
+    /// [`Self::take_pending_hook_context`]); what is already pending stays after it.
+    pub fn set_pending_hook_context(&mut self, mut context: Vec<String>) {
+        context.append(&mut self.pending_hook_context);
+        self.pending_hook_context = context;
+    }
+
+    /// Runs the `PreCompact` hooks before `/compact` (`trigger` `manual`) or automatic
+    /// compaction (`auto`). They cannot stop compaction; the result is returned for
+    /// the caller to show.
+    pub fn run_pre_compact_hooks(&mut self, trigger: &str) -> HookRunResult {
+        self.run_lifecycle_hook(
+            HookEvent::PreCompact,
+            LifecycleHookInput::pre_compact(trigger),
+        )
     }
 
     /// Runs one user turn: model call, tool execution, repeat until the model
@@ -799,17 +1035,36 @@ where
             self.session.persist_snapshot().map_err(session_error)?;
         }
 
+        let prompt_hooks = self.run_lifecycle_hook(
+            HookEvent::UserPromptSubmit,
+            LifecycleHookInput::user_prompt_submit(&user_input),
+        );
+        if prompt_hooks.is_denied() {
+            // The prompt never reaches the session or the model.
+            return Err(RuntimeError::with_kind(
+                RuntimeErrorKind::BlockedByHook,
+                crate::lifecycle_hooks::blocked_prompt_message(prompt_hooks.messages()),
+            ));
+        }
+        let mut context = std::mem::take(&mut self.pending_hook_context);
+        if !prompt_hooks.is_failed() && !prompt_hooks.is_cancelled() {
+            context.extend(prompt_hooks.messages().iter().cloned());
+        }
+
         self.record_turn_started(&user_input);
         self.turn_request.clone_from(&user_input);
         self.refresh_model_notes();
         self.session
-            .push_user_text(user_input)
+            .push_user_text(crate::lifecycle_hooks::with_hook_context(
+                user_input, &context,
+            ))
             .map_err(session_error)?;
 
         let result = self.run_turn_loop(prompter);
         if let Err(error) = &result {
             self.close_failed_turn(error);
         }
+        self.clear_model_override();
         result
     }
 
@@ -846,6 +1101,12 @@ where
             }
 
             self.prepare_context(&mut progress)?;
+            if let Some(estimated_tokens) = self.guard_stops_request(progress.iterations) {
+                return Ok(
+                    self.finish_turn(progress, TurnOutcome::BudgetStopped { estimated_tokens })
+                );
+            }
+            self.record_model_request_started(progress.iterations);
 
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
@@ -889,6 +1150,9 @@ where
                     return Err(error);
                 }
                 Err(error) => {
+                    if self.fall_over(&mut progress, &error) {
+                        continue;
+                    }
                     self.record_turn_failed(progress.iterations, &error);
                     return Err(error);
                 }
@@ -1002,7 +1266,12 @@ where
                 return Ok(self.finish_turn(progress, outcome));
             }
 
+            // Calls up to here already ran together with an earlier one.
+            let mut batched_until = 0;
             for (index, (tool_use_id, tool_name, input)) in pending_tool_uses.iter().enumerate() {
+                if index < batched_until {
+                    continue;
+                }
                 if self.cancel.is_cancelled() {
                     let interrupted = self.push_synthetic_results(
                         progress.iterations,
@@ -1034,6 +1303,17 @@ where
                         true,
                     );
                     self.record_tool_result(progress.iterations, result, &mut progress)?;
+                    continue;
+                }
+
+                // A run of read-only calls that need nobody's approval runs at once.
+                let batched = self.run_read_only_batch(
+                    &pending_tool_uses[index..],
+                    &mut loop_guard,
+                    &mut progress,
+                )?;
+                if batched > 0 {
+                    batched_until = index + batched;
                     continue;
                 }
 
@@ -1133,6 +1413,7 @@ where
     /// The pre-hook and the permission prompt can block for a while, so the
     /// cancellation token is checked again once they return: a call the user
     /// interrupted meanwhile is never started.
+    #[allow(clippy::too_many_lines)]
     fn execute_tool_use(
         &mut self,
         iteration: usize,
@@ -1141,7 +1422,7 @@ where
         input: &str,
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> ExecutedToolCall {
-        let pre_hook_result = self.run_pre_tool_use_hook(tool_name, input);
+        let pre_hook_result = self.run_pre_tool_use_hook(Some(tool_use_id), tool_name, input);
         let effective_input = pre_hook_result
             .updated_input()
             .map_or_else(|| input.to_string(), ToOwned::to_owned);
@@ -1150,80 +1431,99 @@ where
             pre_hook_result.permission_reason().map(ToOwned::to_owned),
         );
 
-        let permission_outcome = if pre_hook_result.is_cancelled() {
-            PermissionOutcome::Deny {
-                reason: format_hook_message(
-                    &pre_hook_result,
-                    &format!("PreToolUse hook cancelled tool `{tool_name}`"),
-                ),
-            }
+        let hook_refusal = if pre_hook_result.is_cancelled() {
+            Some(format!("PreToolUse hook cancelled tool `{tool_name}`"))
         } else if pre_hook_result.is_failed() {
-            PermissionOutcome::Deny {
-                reason: format_hook_message(
-                    &pre_hook_result,
-                    &format!("PreToolUse hook failed for tool `{tool_name}`"),
-                ),
-            }
+            Some(format!("PreToolUse hook failed for tool `{tool_name}`"))
         } else if pre_hook_result.is_denied() {
-            PermissionOutcome::Deny {
-                reason: format_hook_message(
-                    &pre_hook_result,
-                    &format!("PreToolUse hook denied tool `{tool_name}`"),
-                ),
-            }
+            Some(format!("PreToolUse hook denied tool `{tool_name}`"))
         } else {
-            self.permission_policy.authorize_with_context(
+            None
+        };
+        let (permission_outcome, decided_by) = match hook_refusal {
+            Some(fallback) => (
+                PermissionOutcome::Deny {
+                    reason: format_hook_message(&pre_hook_result, &fallback),
+                },
+                PermissionDecider::Hook,
+            ),
+            None => self.permission_policy.authorize_with_context_decided(
                 tool_name,
                 &effective_input,
                 &permission_context,
                 prompter,
-            )
+            ),
         };
 
         let interrupted = self.cancel.is_cancelled();
+        let allowed = permission_outcome == PermissionOutcome::Allow;
+        let started = Instant::now();
         let (output, is_error) = match permission_outcome {
             PermissionOutcome::Allow if interrupted => (INTERRUPTED_TOOL_RESULT.to_string(), true),
             PermissionOutcome::Allow => {
                 self.record_tool_started(iteration, tool_name);
                 self.tool_executor
+                    .tool_permission_decided(tool_name, decided_by);
+                self.tool_executor
                     .tool_started(tool_use_id, tool_name, &effective_input);
-                let (mut output, mut is_error) = match self.tool_executor.execute_with_cancellation(
+                let result = self.tool_executor.execute_with_cancellation(
                     tool_name,
                     &effective_input,
                     &self.cancel,
-                ) {
-                    Ok(output) => (output, false),
-                    Err(error) => (error.to_string(), true),
-                };
-                output = merge_hook_feedback(pre_hook_result.messages(), output, false);
-
-                let post_hook_result = if is_error {
-                    self.run_post_tool_use_failure_hook(tool_name, &effective_input, &output)
-                } else {
-                    self.run_post_tool_use_hook(tool_name, &effective_input, &output, false)
-                };
-                let post_hook_blocked = post_hook_result.is_denied()
-                    || post_hook_result.is_failed()
-                    || post_hook_result.is_cancelled();
-                if post_hook_blocked {
-                    is_error = true;
-                }
-                output =
-                    merge_hook_feedback(post_hook_result.messages(), output, post_hook_blocked);
-                (output, is_error)
+                );
+                self.after_tool_ran(
+                    tool_use_id,
+                    tool_name,
+                    &effective_input,
+                    pre_hook_result.messages(),
+                    result,
+                )
             }
             PermissionOutcome::Deny { reason } => (
                 merge_hook_feedback(pre_hook_result.messages(), reason, true),
                 true,
             ),
         };
-        ExecutedToolCall {
-            message: ConversationMessage::tool_result(
-                tool_use_id,
+        if let Some(audit) = &self.mcp_audit {
+            let error_class = if !allowed {
+                Some("denied")
+            } else if interrupted {
+                Some("interrupted")
+            } else if is_error {
+                Some("tool_error")
+            } else {
+                None
+            };
+            let recorded = audit.record(&McpAuditCall {
                 tool_name,
-                self.context_manager.cap_tool_result(output),
-                is_error,
-            ),
+                input: &effective_input,
+                allowed,
+                decided_by,
+                duration: if allowed && !interrupted {
+                    started.elapsed()
+                } else {
+                    std::time::Duration::ZERO
+                },
+                output_bytes: output.len(),
+                error_class,
+            });
+            if let Err(error) = recorded {
+                crate::ui_hooks::notice(&format!(
+                    "warning: could not write the MCP audit log: {error}"
+                ));
+            }
+        }
+        let limit = self.context_manager.policy().max_tool_result_chars;
+        let context_manager = &self.context_manager;
+        let output = crate::artifacts::offload_tool_result(
+            self.artifacts.as_mut(),
+            tool_name,
+            output,
+            limit,
+            |output| context_manager.cap_tool_result(output),
+        );
+        ExecutedToolCall {
+            message: ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error),
             interrupted,
         }
     }
@@ -1234,6 +1534,8 @@ where
         result_message: ConversationMessage,
         progress: &mut TurnProgress,
     ) -> Result<(), RuntimeError> {
+        // One redaction for every consumer: session file, model, UI events.
+        let result_message = crate::redaction::redact_tool_result(result_message);
         self.session
             .push_message(result_message.clone())
             .map_err(session_error)?;
@@ -1316,8 +1618,21 @@ where
     }
 
     /// Checks the context budget before a model call and prunes or compacts
-    /// the session when needed.
+    /// the session when needed. The [`RequestGuard`]'s working set applies.
     fn prepare_context(&mut self, progress: &mut TurnProgress) -> Result<(), RuntimeError> {
+        if let Some(guard) = &self.request_guard {
+            self.context_manager
+                .set_working_set_tokens(guard.working_set_tokens());
+        }
+        if !progress.pre_compact_hooks_ran && self.hook_runner.has_hooks(HookEvent::PreCompact) {
+            let snapshot = self
+                .context_manager
+                .snapshot(&self.session.messages, &self.system_prompt);
+            if snapshot.estimated_tokens >= snapshot.threshold_tokens {
+                progress.pre_compact_hooks_ran = true;
+                let _ = self.run_pre_compact_hooks("auto");
+            }
+        }
         let preparation = self
             .context_manager
             .prepare_session(&mut self.session, &self.system_prompt);
@@ -1329,6 +1644,20 @@ where
         progress.compacted_messages += preparation.compacted_messages;
         self.record_context_prepared(progress.iterations, &preparation);
         self.session.persist_snapshot().map_err(session_error)
+    }
+
+    /// Asks the [`RequestGuard`] about the request step `iteration` is about to
+    /// send; `Some` with its estimated input tokens when the guard stops it.
+    fn guard_stops_request(&mut self, iteration: usize) -> Option<usize> {
+        self.request_guard.as_ref()?;
+        let snapshot = self.context_snapshot();
+        let request = RequestEstimate {
+            input_tokens: snapshot.request_input_tokens(),
+            output_reserve: snapshot.budget.output_reserve,
+            iteration,
+        };
+        let guard = self.request_guard.as_mut()?;
+        (!guard.allow_request(&request)).then_some(request.input_tokens)
     }
 
     /// Shrinks the session after the provider reported a context overflow.
@@ -1396,6 +1725,9 @@ where
         if self.cancel.is_cancelled() {
             return None;
         }
+        if let Some(note) = self.chat_only_note(progress) {
+            return Some(note);
+        }
         if self.harness.action_nudge && !progress.action_nudged && announces_next_step(final_text) {
             progress.action_nudged = true;
             progress.stats.nudges += 1;
@@ -1411,7 +1743,109 @@ where
                 self.completion_check_message(&progress.edited_paths, &mut progress.stats),
             );
         }
+        if progress.stop_hook_continuations < crate::lifecycle_hooks::MAX_STOP_HOOK_CONTINUATIONS {
+            let stop = self.run_lifecycle_hook(
+                HookEvent::Stop,
+                LifecycleHookInput::stop(progress.stop_hook_continuations > 0, final_text),
+            );
+            if stop.is_denied() && !self.cancel.is_cancelled() {
+                progress.stop_hook_continuations += 1;
+                return Some(crate::lifecycle_hooks::stop_continuation_message(
+                    stop.messages(),
+                ));
+            }
+        }
         None
+    }
+
+    /// For a request to change files answered in chat, with no tool call this turn:
+    /// the nudge, then once the request again on a model that calls tools (see
+    /// [`crate::model_routing`]). Nudging first keeps the model the user chose when
+    /// a reminder is enough; the retry costs a second answer.
+    fn chat_only_note(&mut self, progress: &mut TurnProgress) -> Option<String> {
+        if !self.harness.action_nudge
+            || !self.routing.agent_mode
+            || !progress.tool_results.is_empty()
+            || self.permission_policy.active_mode() == PermissionMode::ReadOnly
+            || !model_routing::asks_for_file_changes(&self.turn_request)
+        {
+            return None;
+        }
+        if !progress.chat_only_nudged {
+            progress.chat_only_nudged = true;
+            // One nudge per turn, whichever rule sends it.
+            progress.action_nudged = true;
+            progress.stats.nudges += 1;
+            progress.stats.chat_only_answers += 1;
+            return Some(model_routing::CHAT_ONLY_NUDGE_MESSAGE.to_string());
+        }
+        if progress.tool_retried {
+            return None;
+        }
+        progress.tool_retried = true;
+        let from = self.current_model_label();
+        let answered = [
+            self.harness.model.as_deref(),
+            self.served_model.as_deref(),
+            self.model_override.as_deref(),
+        ];
+        let answered = answered.into_iter().flatten().collect::<Vec<_>>();
+        let target = self.routing.tool_retry_model(&answered)?.to_string();
+        if !self.switch_model(&target) {
+            return None;
+        }
+        progress.stats.tool_model_retries += 1;
+        let shown = target.strip_prefix("openai/").unwrap_or(&target);
+        crate::ui_hooks::notice(&model_routing::tool_retry_notice(&from, shown));
+        Some(model_routing::tool_retry_message(shown))
+    }
+
+    /// Moves the turn to the next model of the fallback chain after a provider
+    /// failure another model may not have; `false` when there is none to try.
+    fn fall_over(&mut self, progress: &mut TurnProgress, error: &RuntimeError) -> bool {
+        if self.cancel.is_cancelled() || !model_routing::is_provider_unavailable(error) {
+            return false;
+        }
+        let mut tried = progress.fallen_over_to.clone();
+        tried.extend(self.harness.model.clone());
+        let Some(next) = self.routing.next_fallback(&tried).map(str::to_string) else {
+            return false;
+        };
+        progress.fallen_over_to.push(next.clone());
+        let from = self.current_model_label();
+        if !self.switch_model(&next) {
+            return false;
+        }
+        progress.stats.provider_fallovers += 1;
+        let shown = next.strip_prefix("openai/").unwrap_or(&next);
+        crate::ui_hooks::notice(&model_routing::fallover_notice(&from, shown, error));
+        true
+    }
+
+    /// The model requests go to now, as people see it.
+    fn current_model_label(&self) -> String {
+        let model = self
+            .model_override
+            .as_deref()
+            .or(self.served_model.as_deref())
+            .or(self.harness.model.as_deref())
+            .unwrap_or("the model");
+        model.strip_prefix("openai/").unwrap_or(model).to_string()
+    }
+
+    fn switch_model(&mut self, model: &str) -> bool {
+        if !self.api_client.set_model_override(Some(model)) {
+            return false;
+        }
+        self.model_override = Some(model.to_string());
+        true
+    }
+
+    /// Returns the client to the session's model after a turn that switched it.
+    fn clear_model_override(&mut self) {
+        if self.model_override.take().is_some() {
+            self.api_client.set_model_override(None);
+        }
     }
 
     /// The completion check: the request reminder, the changed files and the project
@@ -1422,7 +1856,7 @@ where
             .harness
             .workspace_root
             .clone()
-            .or_else(|| std::env::current_dir().ok());
+            .or_else(|| crate::workdir::current_dir().ok());
         let checks = root
             .as_deref()
             .map(|root| detect_checks(root, edited))
@@ -1545,7 +1979,7 @@ where
         // Same gates as a model's bash call, minus the prompt: hooks that block or
         // rewrite the call, or a policy (or hook override) that would ask, leave the
         // check to the model.
-        let hook = self.run_pre_tool_use_hook("bash", &input);
+        let hook = self.run_pre_tool_use_hook(None, "bash", &input);
         if hook.is_denied()
             || hook.is_failed()
             || hook.is_cancelled()
@@ -1587,8 +2021,14 @@ where
             // Best effort: a read-only or full disk must not fail the turn.
             let _ = store.record(&model, &progress.stats);
         }
-        if matches!(outcome, TurnOutcome::Cancelled { .. }) {
-            self.close_turn_with_note(INTERRUPTED_RESPONSE_NOTE.to_string(), None);
+        match outcome {
+            TurnOutcome::Cancelled { .. } => {
+                self.close_turn_with_note(INTERRUPTED_RESPONSE_NOTE.to_string(), None);
+            }
+            TurnOutcome::BudgetStopped { .. } => {
+                self.close_turn_with_note(BUDGET_STOPPED_NOTE.to_string(), None);
+            }
+            _ => {}
         }
         let summary = TurnSummary {
             assistant_messages: progress.assistant_messages,
@@ -1788,7 +2228,32 @@ where
             "pending_tool_use_count".to_string(),
             Value::from(pending_tool_use_count as u64),
         );
+        if let Some(usage) = assistant_message.usage {
+            for (key, tokens) in [
+                ("input_tokens", usage.input_tokens),
+                ("output_tokens", usage.output_tokens),
+                ("cache_read_input_tokens", usage.cache_read_input_tokens),
+                (
+                    "cache_creation_input_tokens",
+                    usage.cache_creation_input_tokens,
+                ),
+            ] {
+                attributes.insert(key.to_string(), Value::from(tokens));
+            }
+        }
+        if let Some(model) = &self.served_model {
+            attributes.insert("served_model".to_string(), Value::String(model.clone()));
+        }
         session_tracer.record("assistant_iteration_completed", attributes);
+    }
+
+    fn record_model_request_started(&self, iteration: usize) {
+        let Some(session_tracer) = &self.session_tracer else {
+            return;
+        };
+        let mut attributes = Map::new();
+        attributes.insert("iteration".to_string(), Value::from(iteration as u64));
+        session_tracer.record("model_request_started", attributes);
     }
 
     fn record_tool_started(&self, iteration: usize, tool_name: &str) {
@@ -1910,21 +2375,24 @@ fn parse_max_iterations(env_value: Option<&str>, configured: Option<usize>) -> u
 #[must_use]
 pub fn auto_compaction_threshold_from_env() -> u32 {
     parse_auto_compaction_threshold(
-        std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR)
-            .ok()
-            .as_deref(),
+        auto_compaction_threshold_env(|name| std::env::var(name).ok()).as_deref(),
     )
 }
 
 /// Explicit compaction threshold (estimated context tokens) from
-/// `CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS`, or `None` when unset or invalid so
+/// `NEURON_AUTO_COMPACT_INPUT_TOKENS`, or `None` when unset or invalid so
 /// the model-aware budget applies.
 #[must_use]
 pub fn auto_compaction_threshold_override_from_env() -> Option<u32> {
-    std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR)
-        .ok()
+    auto_compaction_threshold_env(|name| std::env::var(name).ok())
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|threshold| *threshold > 0)
+}
+
+/// The compaction threshold variable `var` gives: [`AUTO_COMPACTION_THRESHOLD_ENV_VAR`],
+/// else the legacy name, which is kept as a silent alias.
+fn auto_compaction_threshold_env(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    var(AUTO_COMPACTION_THRESHOLD_ENV_VAR).or_else(|| var(LEGACY_AUTO_COMPACTION_THRESHOLD_ENV_VAR))
 }
 
 #[must_use]
@@ -1957,11 +2425,12 @@ pub fn is_refusal_stop_reason(stop_reason: Option<&str>) -> bool {
     })
 }
 
-/// Whether `text` is a note the runtime wrote to close an interrupted or failed
-/// turn, not model output.
+/// Whether `text` is a note the runtime wrote to close an interrupted, stopped or
+/// failed turn, not model output.
 #[must_use]
 pub fn is_turn_end_note(text: &str) -> bool {
     text == INTERRUPTED_RESPONSE_NOTE
+        || text == BUDGET_STOPPED_NOTE
         || (text.starts_with(FAILED_RESPONSE_NOTE_PREFIX) && text.ends_with(']'))
 }
 
@@ -2151,6 +2620,7 @@ fn append_to_tool_result(message: &mut ConversationMessage, note: &str) {
 
 /// Signature-based detector for a model calling the same tool with the same
 /// arguments over and over.
+#[derive(Clone)]
 struct LoopGuard {
     threshold: usize,
     last_signature: Option<String>,
@@ -2565,9 +3035,10 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        auto_compaction_threshold_env, build_assistant_message, parse_auto_compaction_threshold,
+        ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime,
+        PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -2710,6 +3181,44 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A secret a tool printed is redacted before the session, the model's
+    /// next request and the session file see it.
+    #[test]
+    fn tool_output_secrets_are_redacted_before_the_session_and_model() {
+        let path = std::env::temp_dir().join(format!(
+            "runtime-redact-session-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        let mut runtime = ConversationRuntime::new(
+            Session::new().with_persistence_path(&path),
+            ScriptedApiClient { call_count: 0 },
+            StaticToolExecutor::new().register("add", |_input| {
+                Ok("4 GITHUB_TOKEN=ghp_0123456789abcdefABCDEF0123456789abcd".to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+        let summary = runtime
+            .run_turn("what is 2 + 2?", Some(&mut PromptAllowOnce))
+            .expect("turn");
+        let ContentBlock::ToolResult { output, .. } = &summary.tool_results[0].blocks[0] else {
+            panic!("tool result");
+        };
+        assert_eq!(output, "4 GITHUB_TOKEN=[REDACTED:github-token]");
+        let ContentBlock::ToolResult { output, .. } = &runtime.session().messages[2].blocks[0]
+        else {
+            panic!("tool result in session");
+        };
+        assert!(!output.contains("ghp_"), "{output}");
+        let persisted = std::fs::read_to_string(&path).expect("session file");
+        let _ = std::fs::remove_file(&path);
+        assert!(!persisted.contains("ghp_0123"), "{persisted}");
+        assert!(persisted.contains("[REDACTED:github-token]"));
     }
 
     #[test]
@@ -3255,6 +3764,134 @@ mod tests {
         script.to_string()
     }
 
+    /// An API client that records the text of every user message it is sent.
+    struct RecordingApiClient {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ApiClient for RecordingApiClient {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            let mut seen = self.seen.lock().expect("seen lock");
+            for message in &request.messages {
+                for block in &message.blocks {
+                    if let (MessageRole::User, ContentBlock::Text { text }) = (&message.role, block)
+                    {
+                        seen.push(text.clone());
+                    }
+                }
+            }
+            Ok(vec![
+                AssistantEvent::TextDelta("ok".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    fn recording_runtime(
+        hooks: RuntimeHookConfig,
+    ) -> (
+        ConversationRuntime<RecordingApiClient, StaticToolExecutor>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            RecordingApiClient {
+                seen: Arc::clone(&seen),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            &RuntimeFeatureConfig::default().with_hooks(hooks),
+        );
+        (runtime, seen)
+    }
+
+    #[test]
+    fn session_start_context_survives_a_runtime_rebuild() {
+        use crate::hook_matcher::{HookCommand, HookSource};
+        use crate::hooks::HookEvent;
+        let hooks = RuntimeHookConfig::default().with(
+            HookEvent::SessionStart,
+            HookCommand::new("echo release-codename-marker", HookSource::Project),
+        );
+        let (mut first, _) = recording_runtime(hooks);
+        let result = first.run_session_start_hooks("startup");
+        assert!(!result.is_failed(), "{result:?}");
+
+        // The CLI rebuilds the runtime before the first turn: the new one starts
+        // empty, so the context is handed across.
+        let (mut rebuilt, seen) = recording_runtime(RuntimeHookConfig::default());
+        let context = first.take_pending_hook_context();
+        assert!(first.take_pending_hook_context().is_empty(), "taken once");
+        rebuilt.set_pending_hook_context(context);
+        rebuilt
+            .run_turn("what is the codename?", None)
+            .expect("turn");
+
+        let seen = seen.lock().expect("seen lock");
+        let prompt = seen.last().expect("a user message");
+        assert!(prompt.starts_with("what is the codename?"), "{prompt}");
+        assert!(prompt.contains("[Context from hooks]"), "{prompt}");
+        assert!(prompt.contains("release-codename-marker"), "{prompt}");
+    }
+
+    #[test]
+    fn rebuilt_runtime_without_the_handover_loses_session_start_context() {
+        // Documents the bug the handover fixes: nothing carries over by itself.
+        use crate::hook_matcher::{HookCommand, HookSource};
+        use crate::hooks::HookEvent;
+        let hooks = RuntimeHookConfig::default().with(
+            HookEvent::SessionStart,
+            HookCommand::new("echo release-codename-marker", HookSource::Project),
+        );
+        let (mut first, _) = recording_runtime(hooks);
+        first.run_session_start_hooks("startup");
+        let (mut rebuilt, seen) = recording_runtime(RuntimeHookConfig::default());
+        rebuilt.run_turn("hello", None).expect("turn");
+        let seen = seen.lock().expect("seen lock");
+        assert_eq!(seen.last().map(String::as_str), Some("hello"));
+    }
+
+    #[test]
+    fn clear_and_resume_drop_context_left_by_an_earlier_session() {
+        for source in ["clear", "resume"] {
+            let (mut runtime, _) = recording_runtime(RuntimeHookConfig::default());
+            runtime.set_pending_hook_context(vec!["old-session".to_string()]);
+            runtime.run_session_start_hooks(source);
+            assert!(runtime.take_pending_hook_context().is_empty(), "{source}");
+        }
+        for source in ["startup", "compact"] {
+            let (mut runtime, _) = recording_runtime(RuntimeHookConfig::default());
+            runtime.set_pending_hook_context(vec!["kept".to_string()]);
+            runtime.run_session_start_hooks(source);
+            assert_eq!(runtime.take_pending_hook_context(), ["kept"], "{source}");
+        }
+    }
+
+    #[test]
+    fn handed_over_context_comes_before_user_prompt_submit_context() {
+        use crate::hook_matcher::{HookCommand, HookSource};
+        use crate::hooks::HookEvent;
+        let hooks = RuntimeHookConfig::default().with(
+            HookEvent::UserPromptSubmit,
+            HookCommand::new("echo prompt-marker", HookSource::Project),
+        );
+        let (mut runtime, seen) = recording_runtime(hooks);
+        runtime.set_pending_hook_context(vec!["start-marker".to_string()]);
+        runtime.run_turn("go", None).expect("turn");
+        let seen = seen.lock().expect("seen lock");
+        let prompt = seen.last().expect("a user message");
+        let start = prompt.find("start-marker").expect("start context");
+        let submit = prompt.find("prompt-marker").expect("prompt context");
+        assert!(start < submit, "{prompt}");
+        // Consumed by the turn: the next one does not repeat it.
+        assert_eq!(
+            runtime.take_pending_hook_context(),
+            [] as [std::string::String; 0]
+        );
+    }
+
     #[test]
     fn does_not_auto_compact_on_cumulative_billed_tokens() {
         // Billed input tokens accumulate across calls; they say nothing about
@@ -3427,6 +4064,38 @@ mod tests {
             parse_auto_compaction_threshold(Some("not-a-number")),
             DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
         );
+    }
+
+    #[test]
+    fn auto_compaction_threshold_reads_the_neuron_name_then_the_old_one() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+            }
+        };
+        assert_eq!(
+            auto_compaction_threshold_env(env(&[("NEURON_AUTO_COMPACT_INPUT_TOKENS", "4000")])),
+            Some("4000".to_string())
+        );
+        // The inherited name still works on its own...
+        assert_eq!(
+            auto_compaction_threshold_env(env(&[(
+                "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS",
+                "5000"
+            )])),
+            Some("5000".to_string())
+        );
+        // ...and the new one wins over it.
+        assert_eq!(
+            auto_compaction_threshold_env(env(&[
+                ("CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS", "5000"),
+                ("NEURON_AUTO_COMPACT_INPUT_TOKENS", "4000"),
+            ])),
+            Some("4000".to_string())
+        );
+        assert_eq!(auto_compaction_threshold_env(env(&[])), None);
     }
 
     #[test]
@@ -3629,10 +4298,10 @@ mod tests {
 mod resilience_tests {
     use super::{
         is_turn_end_note, parse_max_iterations, ApiClient, ApiRequest, AssistantEvent,
-        AutoCompactionEvent, ConversationRuntime, RuntimeError, RuntimeErrorKind,
-        StaticToolExecutor, ToolExecutor, TurnOutcome, DEFAULT_MAX_ITERATIONS,
-        FAILED_RESPONSE_NOTE_PREFIX, INTERRUPTED_RESPONSE_NOTE, INTERRUPTED_TOOL_RESULT,
-        MAX_ITERATIONS_ENV_VAR, REFUSAL_STOP_REASON,
+        AutoCompactionEvent, ConversationRuntime, RequestEstimate, RequestGuard, RuntimeError,
+        RuntimeErrorKind, StaticToolExecutor, ToolExecutor, TurnOutcome, BUDGET_STOPPED_NOTE,
+        DEFAULT_MAX_ITERATIONS, FAILED_RESPONSE_NOTE_PREFIX, INTERRUPTED_RESPONSE_NOTE,
+        INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR, REFUSAL_STOP_REASON,
     };
     use crate::cancel::CancellationToken;
     use crate::compact::AUTO_CONTINUE_PREFIX;
@@ -3677,6 +4346,98 @@ mod resilience_tests {
             assert!(!self.responses.is_empty(), "unexpected extra model call");
             self.responses.remove(0)
         }
+    }
+
+    #[test]
+    fn every_mcp_call_is_audited_refused_ones_too_without_its_arguments() {
+        let root = std::env::temp_dir().join(format!(
+            "neuron-conversation-audit-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = root.join("home");
+        std::fs::create_dir_all(root.join("repo")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"mcpServers":{"alpha":{"command":"alpha-mcp"}},"permissions":{"deny":["mcp__alpha__delete"]}}"#,
+        )
+        .unwrap();
+        let config = crate::ConfigLoader::new(root.join("repo"), &home)
+            .load()
+            .unwrap();
+        let sentinel = "SENTINEL-conversation-audit-91c3";
+        let input = format!(r#"{{"text":"{sentinel}"}}"#);
+        let wrapped = format!(
+            r#"{{"qualifiedName":"mcp__alpha__delete","arguments":{{"id":"{sentinel}"}}}}"#
+        );
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("a", "mcp__alpha__echo", &input),
+                tool_call("b", "mcp__alpha__delete", &input),
+                tool_call("c", "MCPTool", &wrapped),
+                tool_call("d", "read_file", &input),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("done"), AssistantEvent::MessageStop]),
+        ]);
+        let tools = StaticToolExecutor::new()
+            .register("mcp__alpha__echo", |_| Ok(format!("echo {}", "x")))
+            .register("mcp__alpha__delete", |_| {
+                panic!("a denied call must not run")
+            })
+            .register("MCPTool", |_| panic!("a denied call must not run"))
+            .register("read_file", |_| Ok("file".to_string()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            tools,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess)
+                .with_permission_rules(config.permission_rules()),
+            vec!["system".to_string()],
+        )
+        .with_mcp_audit(crate::McpAuditLog::new(&home, "s-audit", config.mcp()));
+
+        runtime.run_turn("go", None).expect("turn runs");
+
+        let audit = home.join("audit");
+        let text = std::fs::read_dir(&audit)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert!(!text.contains(sentinel), "{text}");
+        let lines = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        // The three MCP calls, the refused ones included; not the built-in tool.
+        assert_eq!(lines.len(), 3, "{text}");
+        let summary = lines
+            .iter()
+            .map(|line| {
+                (
+                    line["tool"].as_str().unwrap().to_string(),
+                    line["decision"].as_str().unwrap().to_string(),
+                    line["decided_by"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summary,
+            [
+                ("echo".to_string(), "allow".to_string(), "mode".to_string()),
+                ("delete".to_string(), "deny".to_string(), "rule".to_string()),
+                ("delete".to_string(), "deny".to_string(), "rule".to_string()),
+            ]
+        );
+        assert!(lines.iter().all(|line| line["session"] == "s-audit"));
+        assert!(lines.iter().all(|line| line["server"] == "alpha"));
+        assert!(lines[0]["error_class"].is_null());
+        assert_eq!(lines[1]["error_class"], "denied");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn tool_call(id: &str, name: &str, input: &str) -> AssistantEvent {
@@ -3883,6 +4644,212 @@ mod resilience_tests {
                 ("3".to_string(), "stops".to_string())
             ]
         );
+    }
+
+    /// A hosted connector is told only of calls the user approved in the prompt: the
+    /// executor hears who allowed each call that runs, and nothing for a denied one.
+    #[test]
+    fn the_executor_hears_who_allowed_each_call() {
+        type Decided = Rc<RefCell<Vec<(String, crate::permissions::PermissionDecider)>>>;
+        struct Recording {
+            inner: StaticToolExecutor,
+            decided: Decided,
+        }
+        impl ToolExecutor for Recording {
+            fn execute(
+                &mut self,
+                tool_name: &str,
+                input: &str,
+            ) -> Result<String, super::ToolError> {
+                self.inner.execute(tool_name, input)
+            }
+            fn tool_permission_decided(
+                &mut self,
+                tool_name: &str,
+                decided_by: crate::permissions::PermissionDecider,
+            ) {
+                self.decided
+                    .borrow_mut()
+                    .push((tool_name.to_string(), decided_by));
+            }
+        }
+        struct AllowAsked;
+        impl PermissionPrompter for AllowAsked {
+            fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
+                if request.tool_name == "refused" {
+                    PermissionPromptDecision::Deny {
+                        reason: "no".to_string(),
+                    }
+                } else {
+                    PermissionPromptDecision::Allow
+                }
+            }
+        }
+
+        let api = ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("1", "read", "{}"),
+                tool_call("2", "delete", "{}"),
+                tool_call("3", "refused", "{}"),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("done"), AssistantEvent::MessageStop]),
+        ]);
+        let decided = Decided::default();
+        let tools = Recording {
+            inner: StaticToolExecutor::new()
+                .register("read", |_| Ok("read".to_string()))
+                .register("delete", |_| Ok("deleted".to_string()))
+                .register("refused", |_| panic!("a denied call must not run")),
+            decided: Rc::clone(&decided),
+        };
+        let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("read", PermissionMode::ReadOnly)
+            .with_tool_requirement("delete", PermissionMode::DangerFullAccess)
+            .with_tool_requirement("refused", PermissionMode::DangerFullAccess);
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            tools,
+            policy,
+            vec!["system".to_string()],
+        );
+
+        runtime
+            .run_turn("go", Some(&mut AllowAsked))
+            .expect("turn runs");
+
+        assert_eq!(
+            *decided.borrow(),
+            vec![
+                (
+                    "read".to_string(),
+                    crate::permissions::PermissionDecider::Mode
+                ),
+                (
+                    "delete".to_string(),
+                    crate::permissions::PermissionDecider::User
+                ),
+            ]
+        );
+    }
+
+    /// A hosted connector's destructive tool runs only on the user's approval of that
+    /// call, which is what the gateway is told: full access, an allow rule and an
+    /// "allow for this session" answer all still ask, and with nobody to ask the call is
+    /// refused.
+    #[test]
+    fn a_confirmed_tool_asks_for_every_call_whatever_would_allow_it() {
+        type Decided = Rc<RefCell<Vec<crate::permissions::PermissionDecider>>>;
+        struct Recording {
+            inner: StaticToolExecutor,
+            decided: Decided,
+        }
+        impl ToolExecutor for Recording {
+            fn execute(
+                &mut self,
+                tool_name: &str,
+                input: &str,
+            ) -> Result<String, super::ToolError> {
+                self.inner.execute(tool_name, input)
+            }
+            fn tool_permission_decided(
+                &mut self,
+                _tool_name: &str,
+                decided_by: crate::permissions::PermissionDecider,
+            ) {
+                self.decided.borrow_mut().push(decided_by);
+            }
+        }
+        /// Allows every call for the session; counts the questions.
+        struct AllowForSession(usize);
+        impl PermissionPrompter for AllowForSession {
+            fn decide(&mut self, _request: &PermissionRequest) -> PermissionPromptDecision {
+                self.0 += 1;
+                PermissionPromptDecision::AllowForSession
+            }
+        }
+
+        const TOOL: &str = "mcp__github__delete_repository";
+        let run = |policy: PermissionPolicy, prompter: Option<&mut AllowForSession>| {
+            let api = ScriptedApi::new(vec![
+                Ok(vec![
+                    tool_call("1", TOOL, "{}"),
+                    tool_call("2", TOOL, "{}"),
+                    AssistantEvent::MessageStop,
+                ]),
+                Ok(vec![text("done"), AssistantEvent::MessageStop]),
+            ]);
+            let decided = Decided::default();
+            let ran = Rc::new(RefCell::new(0));
+            let counter = Rc::clone(&ran);
+            let tools = Recording {
+                inner: StaticToolExecutor::new().register(TOOL, move |_| {
+                    *counter.borrow_mut() += 1;
+                    Ok("deleted".to_string())
+                }),
+                decided: Rc::clone(&decided),
+            };
+            let policy = policy
+                .with_tool_requirement(TOOL, PermissionMode::DangerFullAccess)
+                .with_confirmed_tools([TOOL.to_string()])
+                .with_session_approvals(crate::permissions::SessionApprovals::isolated());
+            let mut runtime = ConversationRuntime::new(
+                Session::new(),
+                api,
+                tools,
+                policy,
+                vec!["system".to_string()],
+            );
+            let prompter = prompter.map(|prompter| prompter as &mut dyn PermissionPrompter);
+            runtime.run_turn("go", prompter).expect("turn runs");
+            (decided.take(), ran.take())
+        };
+        let user = crate::permissions::PermissionDecider::User;
+
+        // Full access would run it unasked.
+        let mut prompter = AllowForSession(0);
+        let (decided, ran) = run(
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            Some(&mut prompter),
+        );
+        assert_eq!((prompter.0, ran), (2, 2), "asked for each call");
+        assert_eq!(decided, vec![user, user]);
+
+        // So would an allow rule.
+        let mut prompter = AllowForSession(0);
+        let rules = crate::config::RuntimePermissionRuleConfig::new(
+            vec![TOOL.to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+        let (decided, ran) = run(
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite).with_permission_rules(&rules),
+            Some(&mut prompter),
+        );
+        assert_eq!((prompter.0, ran), (2, 2));
+        assert_eq!(decided, vec![user, user]);
+
+        // Nobody to ask: refused, even in full access.
+        let (decided, ran) = run(
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            None,
+        );
+        assert_eq!(ran, 0);
+        assert_eq!(decided, [] as [crate::permissions::PermissionDecider; 0]);
+
+        // A deny rule still refuses without asking.
+        let mut prompter = AllowForSession(0);
+        let rules = crate::config::RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            vec![TOOL.to_string()],
+            Vec::new(),
+        );
+        let (_, ran) = run(
+            PermissionPolicy::new(PermissionMode::DangerFullAccess).with_permission_rules(&rules),
+            Some(&mut prompter),
+        );
+        assert_eq!((prompter.0, ran), (0, 0));
     }
 
     #[test]
@@ -5161,6 +6128,137 @@ mod resilience_tests {
         assert!(output.chars().count() <= 40_000);
         assert!(output.starts_with("start") && output.ends_with("end"));
         assert!(output.contains("chars omitted"));
+    }
+
+    /// A [`RequestGuard`] for tests: a fixed working set, and the requests it saw;
+    /// it stops the request of step `stop_at`.
+    struct TestGuard {
+        working_set: Option<usize>,
+        stop_at: Option<usize>,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<RequestEstimate>>>,
+    }
+
+    impl RequestGuard for TestGuard {
+        fn working_set_tokens(&self) -> Option<usize> {
+            self.working_set
+        }
+
+        fn allow_request(&mut self, request: &RequestEstimate) -> bool {
+            self.seen.lock().expect("seen").push(*request);
+            self.stop_at != Some(request.iteration)
+        }
+    }
+
+    fn read_twice_then_answer() -> ScriptedApi {
+        ScriptedApi::new(vec![
+            Ok(vec![
+                tool_call("a", "read_file", r#"{"path":"a"}"#),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![
+                tool_call("b", "read_file", r#"{"path":"b"}"#),
+                AssistantEvent::MessageStop,
+            ]),
+            Ok(vec![text("done"), AssistantEvent::MessageStop]),
+        ])
+    }
+
+    #[test]
+    fn a_guard_working_set_stubs_older_tool_results_early() {
+        let tools = StaticToolExecutor::new().register("read_file", |_| Ok("z".repeat(3_000)));
+        let manager = ContextManager::new(
+            ContextBudget::default(),
+            ContextPolicy {
+                keep_recent_tool_results: 1,
+                ..ContextPolicy::default()
+            },
+        );
+        let seen = std::sync::Arc::default();
+        let mut runtime = runtime_with(Session::new(), read_twice_then_answer(), tools)
+            .with_context_manager(manager)
+            .with_request_guard(Box::new(TestGuard {
+                working_set: Some(2_000),
+                stop_at: None,
+                seen: std::sync::Arc::clone(&seen),
+            }));
+
+        let summary = runtime.run_turn("read both", None).expect("turn completes");
+
+        assert_eq!(summary.outcome, TurnOutcome::Completed);
+        assert_eq!(summary.pruned_tool_results, 1);
+        assert_eq!(summary.auto_compaction, None::<AutoCompactionEvent>);
+        let outputs = runtime.api_client().requests[2]
+            .messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            outputs[0]
+                .starts_with("[Earlier output of read_file removed to save tokens (3000 chars)"),
+            "{}",
+            outputs[0]
+        );
+        assert_eq!(
+            outputs[1].len(),
+            3_000,
+            "the most recent result stays whole"
+        );
+        // Without the working set the model budget (100K+) would leave both alone.
+        assert_eq!(
+            runtime.context_manager().policy().working_set_tokens,
+            Some(2_000)
+        );
+        assert!(runtime.context_snapshot().input_budget <= 2_000);
+        let seen = seen.lock().expect("seen");
+        assert_eq!(
+            seen.iter()
+                .map(|request| request.iteration)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(seen[1].input_tokens > seen[0].input_tokens);
+    }
+
+    #[test]
+    fn a_guard_that_stops_a_request_ends_the_turn_before_it_is_sent() {
+        let tools = StaticToolExecutor::new().register("read_file", |_| Ok("z".repeat(3_000)));
+        let seen = std::sync::Arc::default();
+        let mut runtime = runtime_with(Session::new(), read_twice_then_answer(), tools)
+            .with_request_guard(Box::new(TestGuard {
+                working_set: None,
+                stop_at: Some(2),
+                seen: std::sync::Arc::clone(&seen),
+            }));
+
+        let summary = runtime
+            .run_turn("read both", None)
+            .expect("a stop is no error");
+
+        let TurnOutcome::BudgetStopped { estimated_tokens } = summary.outcome else {
+            panic!("stopped by the guard, got {:?}", summary.outcome);
+        };
+        assert_eq!(estimated_tokens, seen.lock().expect("seen")[1].input_tokens);
+        assert!(estimated_tokens > 1_000, "the read result counts");
+        assert_eq!(
+            runtime.api_client().requests.len(),
+            1,
+            "nothing more was sent"
+        );
+        let last = runtime.session().messages.last().expect("a message");
+        assert_eq!(last.role, MessageRole::Assistant);
+        assert!(matches!(
+            &last.blocks[..],
+            [ContentBlock::Text { text }] if text == BUDGET_STOPPED_NOTE
+        ));
+        assert!(is_turn_end_note(BUDGET_STOPPED_NOTE));
+        assert_eq!(
+            runtime.request_tokens_estimate(),
+            runtime.context_snapshot().request_input_tokens()
+        );
     }
 
     #[test]

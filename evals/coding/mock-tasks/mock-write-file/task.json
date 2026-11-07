@@ -1,0 +1,10 @@
+{
+  "id": "mock-write-file",
+  "summary": "The mock provider's scripted write_file turn: checks the eval pipeline end to end, no model.",
+  "tags": ["mock", "smoke"],
+  "prompt": "PARITY_SCENARIO:write_file_allowed",
+  "allow": [],
+  "grader": {"from": "grader", "to": "_grader"},
+  "check": "python _grader/check_output.py",
+  "protected": ["README.md"]
+}

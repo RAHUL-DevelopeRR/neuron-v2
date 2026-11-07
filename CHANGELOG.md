@@ -3,6 +3,258 @@
 Notable changes to Neuron. Versions follow [semantic versioning](https://semver.org/).
 The release workflow copies a version's section into its GitHub release notes.
 
+## 7.0.0-alpha.5 (2026-11-07)
+
+- Trust hardening: the npm and PyPI launchers now check the downloaded binary against the
+  release `SHA256SUMS` (from the GitHub release even when `NEURON_DOWNLOAD_BASE` is a
+  mirror; `NEURON_CHECKSUMS_BASE` overrides, HTTPS or loopback only) and fail closed when it
+  is missing, empty, does not list the file or disagrees. A cached binary whose size or
+  modification time changed since it was verified is hashed again and not run on a mismatch.
+  `install.sh` refuses redirects away from HTTPS.
+- Trust hardening: folder trust now covers every project setting that applies once trusted
+  (`env`, `model`, plugins, `apiKeyHelper`, a non-restrictive permission mode, ...), not only
+  hooks, MCP servers and allow rules. Changing one asks again, and the trust screen names the
+  keys that changed; settings that only restrict do not ask. What is trusted is what the
+  screen showed: files changed while it was open are not trusted, and it is shown again. A
+  command longer than 2000 characters is cut with a note giving its length and the file that
+  holds all of it. Folders trusted before this release ask once more.
+- Trust hardening: a session approval of `pwsh`, `powershell` or `cmd` no longer covers other
+  calls (`-Command`, `-EncodedCommand`, `/c` and `/k` ask every time; `-File x.ps1` covers
+  that script), the same for `pypy`, `npx`, `bunx`, `uv run` and `npm exec`;
+  `jq -n -- env` is not read-only; the plugin and MCP child environment drops `PGPASSWORD`,
+  `MYSQL_PWD`, `REDIS_URL`, `KUBECONFIG` and names ending in `_DSN` or `_URI`.
+- `WebSearch` goes through the Zero-X gateway (`POST /v1/search`) when you are signed in,
+  with the same sign-in as chat, and shows how many of the day's searches are left. It
+  takes an optional `freshness` (`day`, `week`, `month`, `year`) and still honours
+  `allowed_domains` and `blocked_domains`. When the gateway answers 503, cannot be
+  reached, rejects the sign-in, or you are signed out, it falls back to the local
+  DuckDuckGo search and marks the answer "local fallback" (that search cannot filter by
+  date). When the day's quota is used up it says so and does not scrape instead.
+  Approval is the same as before.
+- Trust screen, MCP: each project server shows what it runs (command line or URL,
+  secret-looking values redacted) before you tick it, and the approval is bound to
+  what was shown: `trust_preview` servers carry `command` and `fingerprint`, and
+  `approve_mcp_server` takes the `fingerprint` back and is refused if the config
+  changed since. Ticked servers are approved only by an engine in the folder they were
+  shown for; a failed restart or a switch to another folder drops them, and an engine
+  that cannot approve them says they still wait.
+- Full-screen UI: in a terminal too small for it, the note on stderr says what runs
+  instead (the line REPL, or a plain-text answer for `neuron "prompt"`), and for
+  `--continue` asks for a bigger window. While "Terminal too small" shows, keys and
+  pastes are dropped (Ctrl+C still works), so a hidden permission prompt or the
+  composer is never answered unseen.
+- Full-screen UI: in a terminal that draws East Asian ambiguous-width characters two
+  columns wide (a Chinese, Japanese or Korean locale, or `NEURON_AMBIGUOUS_WIDE=1`),
+  the status bar measures its `│ ● ○ ◑` glyphs as two columns, so it still fits its row.
+- Full-screen UI, MCP panel: a server that waits for you carries a badge after its
+  name (`[blocked]`, `[needs approval]`, `[needs connect]`, `[unpinned]`), and its
+  summary no longer repeats it.
+- Full-screen UI, MCP: a connectors chip in the status bar (`⧉ 5/6`, amber when a
+  server needs you, a lock for a policy-required one; click opens the panel). The MCP
+  panel gains an Installed tab (approve, connect, sign in, remove) and an Add tab
+  (search the catalog, masked secret fields, user/project/local scope). The trust
+  screen lists the project's MCP servers to approve at once. MCP tool calls name their
+  connector and the tool's catalog tier. The engine sends the servers again once its
+  background start finishes, and `McpServerInfo.tool_tiers` carries the tiers.
+- Full-screen UI: the agent's questions open a question form (pick a choice with ↑/↓
+  and Enter, or write your own answer) instead of a plain notice. The UI declares the
+  `questions` capability and answers with the `answer` command; Esc leaves the question
+  to the input, as before.
+- Full-screen UI: the status bar shows the Free token window as used/limit with its
+  reset time (`Free · 5h 640K/1M · resets 14:20 · 37/100 req`; `640K/1M` when narrow),
+  amber from 80% and red from 95%. Past its reset time the stale figures are left out.
+- Full-screen UI: a terminal smaller than 60x16 gets a "Terminal too small" screen
+  (the chat stays open underneath), and `neuron` starts the line REPL in one with a
+  note. The status bar, the MCP panel and the model picker measure text in terminal
+  columns, so wide characters in a branch, email or model name no longer push the line
+  onto the next row.
+- Hosted connectors (off until `NEURON_HOSTED_CONNECTORS=1`): `"type": "zerox"` MCP
+  servers reach a connector linked on the Zero-X dashboard through the gateway's
+  `/mcp/<id>` with your Zero-X sign-in, and each hosted connector the plan's policy
+  lists appears as a `managed` server. One that is not linked yet shows
+  `needs_connect` (`McpServerInfo.connect_url`, engine feature `mcp_hosted`);
+  `/mcp connect <server>` and `c` in the MCP panel open the page that links it; once
+  linked, it joins the next turn (or the MCP panel when it opens) without a restart.
+  Neuron asks you about every call of a hosted connector's destructive tool, even in
+  full access or with an allow rule, and tells the gateway only about the call you
+  approved (`-p` in a script does not run them). Older settings for these servers keep working;
+  `/mcp` and the protocol call the transport `zerox`.
+- MCP supply chain: catalog connectors and the default MCP servers no longer start
+  through `npx -y` or `uvx`. The catalog (`2026-11-05.3`) pins each local entry's whole
+  npm dependency tree with `sha512` integrity, its Python requirements with wheel
+  hashes, or its release binary's `sha256`; the first start installs into
+  `~/.neuron/mcp/<id>/<version>` and checks every hash (npm packages are unpacked by
+  Neuron, so no install script runs; Python installs are wheels only with
+  `--require-hashes`), later starts are offline, and a changed installed file or cached
+  tarball stops the start with an integrity error. Codebase memory runs its
+  hash-checked release binary; the npm package no longer installs `codebase-memory-mcp`,
+  whose install script downloaded that binary without a pinned hash. `/mcp list`, its
+  JSON and the MCP panel mark other stdio servers `unpinned` (`McpServerInfo.unpinned`),
+  and `/mcp pin <server>` records their version and hashes.
+- Verified MCP installs take a lock file per server folder, so a second session that
+  starts the same server waits for the first install instead of deleting a Python
+  virtual environment that is still being built.
+- A verified Python MCP install now records every file of its virtual environment, so a
+  changed module stops the start with an integrity error, as a changed npm file does.
+- `/mcp pin` of a program (not `npx` or `uvx`) holds only for the files it was pinned
+  with: the same relative launch (`node server.js`) in another workspace is unpinned
+  there, instead of borrowing the first workspace's pin.
+- npm package: `@zero-x.live/neuron` no longer depends on `@playwright/mcp`. npm does
+  not hold a published package to its `package-lock.json`, so that tree was whatever
+  npm resolved and Neuron never checked it; Playwright now starts from its verified
+  install for npm users too, with the launcher's Node.js, and
+  `NEURON_PLAYWRIGHT_MCP_ENTRY` is ignored.
+- Memory connector: its graph is kept in `~/.neuron/mcp-data/memory/memory.jsonl`
+  (catalog `2026-11-05.4`), which its sandbox may write, instead of its package folder,
+  where a reinstall would delete it and the sandbox did not let it write.
+
+- MCP sandbox: every stdio MCP server runs with a sandbox profile from its
+  `mcpServers.<name>.sandbox` setting (`fsRead`, `fsWrite`, `network`, `envAllow`), its
+  catalog entry, or the default for unvetted servers (the workspace read-only, no
+  network). Its environment is an allowlist that never passes Zero-X or provider
+  credentials, and its network goes through a local proxy for its own host list. On
+  Windows a kill-on-close job object ends the server's whole process tree with it, so no
+  `node.exe` is left behind; macOS enforces the profile with `sandbox-exec` and Linux
+  with bubblewrap when installed. Workspace settings cannot turn the sandbox off, a
+  changed `sandbox` setting needs approval again, and `/mcp show` prints the profile.
+- MCP sandbox fixes: on Linux a server is no longer killed when the thread that
+  started it ends (bubblewrap's `--die-with-parent` is gone), gets a private `/tmp`,
+  and no longer sees `/run/user`, `/run/dbus` or `XDG_RUNTIME_DIR`; the shared npm and
+  uv caches are writable only by a server that may reach that registry, others get a
+  cache of their own; only a server's command and the script its interpreter runs are
+  readable beyond its profile (listed in `/mcp show`), not every path in its
+  arguments; Codebase memory may write its package's `bin` folder (catalog
+  `2026-11-05.2`); Node servers follow the sandbox proxy in `fetch`
+  (`NODE_USE_ENV_PROXY`); on Windows a server that could not be put in its job object
+  is stopped with `taskkill /T`; and the managed settings' `mcpPolicy.requireSandbox`
+  ignores `"sandbox": false` outside them.
+- Connector policy: machine-wide managed settings (`managed-settings.json` in
+  `C:\Program Files\Neuron`, `/Library/Application Support/Neuron` or `/etc/neuron`,
+  read only when no one but an administrator can have written the file or its folders)
+  load last and cannot be overridden; their `mcpPolicy` allows, denies and requires MCP
+  servers, limits stdio servers, unvetted servers and remote hosts, adds tool rules
+  (deny always wins) and can fail closed. The Zero-X plan's `policy.connectors` from
+  `/api/account` (contract v1.3) is cached in `~/.neuron/policy-cache.json` and applies
+  after a restart and offline. Refused servers show as `blocked` with the reason;
+  required ones cannot be turned off or removed. Every MCP call, refused ones too, is
+  logged metadata-only to `~/.neuron/audit/mcp-YYYY-MM-DD.jsonl`. The engine protocol
+  adds the `managed` scope and `McpServerInfo.required` (feature `mcp_policy`).
+- Connector policy fixes: a deny rule in user or workspace settings no longer blocks a
+  required server (only the managed settings' own rules do); deny lists also match a
+  connector's package at another version and its remote host; a cached plan policy is
+  never current for more than a day after it was read; MCP resource list and read
+  requests are audited too.
+- Connector catalog: `/mcp catalog`, `/mcp add <id> [--scope user|project|local]` and
+  `/mcp remove <server>` (and `neuron mcp catalog|add|remove`) list and add vetted MCP
+  servers (GitHub, Filesystem, Git, Fetch, Memory, Playwright, Codebase memory,
+  Supabase, Context7, Cloudflare docs, AWS documentation) at pinned versions.
+  `neuron mcp add` asks for secrets with the input hidden; secrets go to the OS
+  keychain and settings hold `${secret:NAME}`. Catalog connectors get the permission
+  tier their entry pins per tool. The engine protocol adds `list_connector_catalog`,
+  `add_mcp_server`, `remove_mcp_server`, `approve_mcp_server` and the
+  `connector_catalog` event (feature `mcp_catalog`).
+- Connector catalog fixes: a resumed `/mcp add` or `/mcp remove` runs once for its text
+  and JSON; a server name can be added in one settings scope only, and removing one
+  keeps the secrets and sign-in another scope's server of that name uses; Memory and
+  Codebase memory writes need full access (they write outside the workspace); a stdio
+  secret is bound to the server's environment too; an OAuth connector added through
+  the engine signs in from there; a signed catalog update must be newer than the
+  catalog in use; Filesystem and Memory are listed as `Apache-2.0 AND MIT`.
+- MCP hardening: a call through `MCPTool` is checked as the tool it names, so a deny
+  or ask rule on `mcp__<server>__<tool>` can no longer be stepped around, and rules can
+  name a whole server (`mcp__<server>`, `mcp__<server>__*`); a server a deny rule
+  refuses whole shows as `blocked` and does not start. Servers other than the bundled
+  ones cannot mark their own tools read-only. A workspace's servers, including those in
+  a project `.mcp.json`, wait at `needs approval` until `/mcp approve <server>`, and
+  again when their launch spec changes. MCP output reaches the model enveloped as
+  external content, cleaned of control characters, redacted and capped at 25,000
+  characters with the rest in a spill file. `neuron mcp serve` checks every call
+  against your permission rules (read-only unless `--permission-mode` is given),
+  annotates its tools, and refuses an untrusted folder.
+- MCP hardening follow-ups: near-JSON `MCPTool` calls and `MCPTool` calls that name the
+  tool with `tool` or carry extra keys meet the named tool's rules; an approval also
+  covers environment and header values and the `oauth` block (existing approvals are
+  asked again once); approving a disabled workspace server records it; a server can
+  no longer fake the end of its external-content block; spill files go to
+  `~/.neuron/mcp-output` inside the envelope; and the tool descriptions and schemas of
+  servers Neuron does not ship are cleaned and capped.
+- Remote MCP servers: a server with a `url` is reached over Streamable HTTP (or SSE
+  with `"type": "sse"`), and `neuron mcp login <server>` signs in to one that needs
+  OAuth; the token is kept in the OS keychain, or in an owner-only file when no
+  keychain is available. `neuron mcp enable|disable <server>` and `/mcp enable|disable`
+  turn servers on and off, and the full-screen UI has an MCP panel.
+- A request to create or change files that a model answers in chat, without tools, is
+  nudged once and then retried on a tool-capable model; a provider that stays down
+  moves the turn to the next `providerFallbacks` model. `toolCapableModels`,
+  `autoToolModel`, `subagentModel`, `summaryModel` and `reviewerModel` pick models for
+  particular jobs.
+- Token-shaped secrets in tool output, the session file and telemetry are replaced
+  with `[REDACTED:<kind>]` (`"redactSecrets": false` turns it off).
+- Sandbox: on Windows, shell commands run in a job object that kills what they start
+  when they end, with `sandbox.maxProcesses` and `sandbox.memoryLimitMb` limits; the
+  macOS sandbox uses a seatbelt profile that keeps writes inside the workspace and
+  temporary folders; `sandbox.network.allow`
+  limits the hosts `WebFetch` and shell commands may reach.
+- A nightly eval workflow gates on the coding-task pass rate and drives the
+  full-screen UI through a scripted prompt, tool call, approval and answer.
+- Two runs started in the same millisecond no longer get the same session and refuse
+  each other: session ids are `session-<millis>-<pid>-<rand>`, and a new session that
+  finds its id taken picks another.
+- `--resume <file>` no longer leaves a `<file>.lock` beside the file: session locks are
+  kept in `~/.neuroncli/locks` (under `NEURON_HOME` if set), and a file that is not a
+  session is refused before it is locked. A `.jsonl.lock` an older release is holding
+  is still honoured for this release.
+- `--output-format json` for `--resume <session> -p` reports that run's `usage` and
+  `estimated_cost` instead of the session's totals, which are in a new `session_usage`.
+- `echo /status | neuron --resume latest -p` runs the piped slash commands as
+  `--resume latest /status` does instead of sending them to the model, and
+  `echo /status | neuron -p` is refused as piped slash commands are for `neuron`.
+- `NEURON_AUTO_COMPACT_INPUT_TOKENS` sets the automatic compaction threshold; the
+  inherited variable name it replaces still works.
+- A `.clawd-todos.json` an earlier release left in the workspace is removed once the
+  task list is saved in Neuron's home, unless git tracks it or fails to say inside a
+  repository (a corrupt index, a folder refused for dubious ownership).
+- `/rewind` works in the line REPL (`--no-tui`) as in the full-screen UI: a checkpoint
+  is saved with each prompt, and `/rewind <id> [code|chat|both]` goes back to one.
+  `/help` and Tab completion list it, and `neuron /rewind` says to run it in a session.
+- On a terminal, `neuron "prompt"` (without `-p`) opens the full-screen UI and sends the
+  prompt first, and `neuron --resume SESSION` opens it on that session, showing its
+  conversation (from the home folder or a drive root without `--allow-broad-cwd`, the
+  line REPL continues it, asking first as before); `-p` and `neuron prompt` stay plain
+  text for scripts. A `-p` run on a terminal starts with one line on stderr (model,
+  permission mode, plan) instead of the boxed banner, and no longer walks the
+  workspace to draw it.
+- In `workspace-write` mode, build, test, run and package-install commands that stay
+  in the workspace (`npm install`, `npm run dev`, `npx`, `node`, `cargo build`/`test`,
+  `python -m`, `pip`/`uv` installs, `go build`/`test`, `make`, ...) run without asking,
+  each part of a `&&`/`|` line judged on its own; sudo, global installs, `curl | sh`,
+  paths or writes outside the workspace and `git push` still ask, and so do inline
+  code (`node -e`, `python -c`, `echo ... | node`), wrappers that start a program off
+  the list (`uv run git push`, `pnpm exec ...`) and writes into `.git`, Neuron settings
+  or package-manager configuration such as `.npmrc`. The approval says a command is
+  outside the auto-allow list instead of asking for full access.
+- Permission prompts offer "always allow in this project" (`p`), which saves a rule as
+  wide as the session choice (`bash(cargo install:*)`) to `.neuron/settings.local.json`
+  and is not offered for `sudo`, `... | sh` or a `cd` out of the workspace, and "deny
+  for this session" (`d`), after which commands that would ask and start with the same
+  prefix are refused without asking. A denied model is told plainly not to retry the
+  command or a variant.
+- The Free plan's rolling 5-hour token window is shown in `/usage`, `neuron usage` and
+  a new `Plan` section of `/status` (`Free 640K/1M, resets 14:20 UTC`), kept current
+  from each reply's quota headers, and Neuron warns once at 90% of it; the near-limit
+  upgrade hint follows the window instead of the daily tokens, which it does not refuse.
+  Past the window's reset time the old figures count as unknown until the account is
+  read again. The full-screen UI protocol gains the window
+  (`AccountDetails.usage_window`, every part optional) and an estimate of each
+  request's size (`Status.request_tokens_estimate`).
+- On a plan with a token window, Neuron keeps a working set of about 40,000 tokens
+  (`workingSetTokens`, `NEURON_WORKING_SET_TOKENS`): older tool results become short
+  stubs from half of it, and it asks before a request would need more tokens than the
+  window has left (a script is warned instead; a sub-agent stops). `neuron prompt`
+  reads the window too. On the gateway, requests carry a `prompt_cache_key` (a hash of the
+  session id), and `auto` requests that attach tools carry `x-neuron-route: agentic`
+  so the gateway picks a model that calls tools well.
+
 ## 7.0.0-alpha.4 (2026-11-03)
 
 The fourth Neuron alpha. In the full-screen UI, the line under the input is now a

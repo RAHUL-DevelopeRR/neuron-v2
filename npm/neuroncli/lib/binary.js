@@ -8,10 +8,13 @@
 //   <cache>/neuroncli/<version>/<asset> (+ .sha256)      fallback when the package
 //                                                         directory is read-only
 // A binary counts as installed only when its .sha256 sidecar exists; the
-// sidecar is written after the download passed its SHA-256 check.
+// sidecar is written after the download passed its SHA-256 check against both
+// the per-file checksum and the release's SHA256SUMS. A `.verified` stamp
+// ("<size> <mtime ns>") records which file that was; when the binary's size or
+// mtime no longer matches the stamp it is hashed again before it may run.
 
 import {createHash} from 'node:crypto';
-import {chmodSync, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync} from 'node:fs';
+import {chmodSync, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {Readable, Transform} from 'node:stream';
@@ -96,17 +99,29 @@ export function assetFor(
   return asset;
 }
 
-export function downloadBase(env = process.env) {
-  const base = (env.NEURON_DOWNLOAD_BASE || DEFAULT_DOWNLOAD_BASE).replace(/\/+$/, '');
+function checkedBase(name, value) {
+  const base = value.replace(/\/+$/, '');
   let url;
   try {
     url = new URL(base);
   } catch {
-    throw new LauncherError(`NEURON_DOWNLOAD_BASE is not a valid URL: ${base}`);
+    throw new LauncherError(`${name} is not a valid URL: ${base}`);
   }
   const loopback = ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
   if (url.protocol === 'https:' || (url.protocol === 'http:' && loopback)) return base;
-  throw new LauncherError(`NEURON_DOWNLOAD_BASE must be an HTTPS URL (or loopback HTTP): ${base}`);
+  throw new LauncherError(`${name} must be an HTTPS URL (or loopback HTTP): ${base}`);
+}
+
+export function downloadBase(env = process.env) {
+  return checkedBase('NEURON_DOWNLOAD_BASE', env.NEURON_DOWNLOAD_BASE || DEFAULT_DOWNLOAD_BASE);
+}
+
+/**
+ * Where SHA256SUMS comes from: the GitHub release by default, even when
+ * NEURON_DOWNLOAD_BASE points at a mirror, so a mirror cannot vouch for itself.
+ */
+export function checksumsBase(env = process.env) {
+  return checkedBase('NEURON_CHECKSUMS_BASE', env.NEURON_CHECKSUMS_BASE || DEFAULT_DOWNLOAD_BASE);
 }
 
 export function cacheRoot(env = process.env, platform = process.platform) {
@@ -137,13 +152,78 @@ export function parseChecksum(text) {
   return match ? match[1].toLowerCase() : null;
 }
 
-export function isVerified(binary) {
-  if (!existsSync(binary)) return false;
-  try {
-    return parseChecksum(readFileSync(`${binary}.sha256`, 'ascii')) !== null;
-  } catch {
-    return false;
+/** The hash of `asset` in a SHA256SUMS listing ("<hash>  <name>" or "<hash> *<name>"), or null. */
+export function parseSums(text, asset) {
+  for (const line of text.split(/\r?\n/)) {
+    const match = /^\s*([0-9a-fA-F]{64})\s+\*?(.+?)\s*$/.exec(line);
+    if (match && match[2] === asset) return match[1].toLowerCase();
   }
+  return null;
+}
+
+function recordedChecksum(binary) {
+  try {
+    return parseChecksum(readFileSync(`${binary}.sha256`, 'ascii'));
+  } catch {
+    return null;
+  }
+}
+
+function stampOf(binary) {
+  const {size, mtimeNs} = statSync(binary, {bigint: true});
+  return `${size} ${mtimeNs}\n`;
+}
+
+function writeStamp(binary, stamp = stampOf(binary)) {
+  try {
+    writeFileSync(`${binary}.verified`, stamp);
+  } catch {
+    // A read-only location only costs a re-hash on the next launch.
+  }
+}
+
+/**
+ * 'missing' (no binary or no sidecar), 'ok', or 'changed' (its size or mtime differs from
+ * when it was verified and its hash no longer matches the sidecar). A changed file whose hash
+ * still matches is stamped again, so the next launch skips the hashing.
+ */
+export function installedState(binary) {
+  if (!existsSync(binary)) return 'missing';
+  const expected = recordedChecksum(binary);
+  if (expected === null) return 'missing';
+  try {
+    const stamp = stampOf(binary);
+    try {
+      if (readFileSync(`${binary}.verified`, 'ascii') === stamp) return 'ok';
+    } catch {
+      // No stamp yet: hash below.
+    }
+    if (createHash('sha256').update(readFileSync(binary)).digest('hex') !== expected) return 'changed';
+    writeStamp(binary, stamp);
+    return 'ok';
+  } catch {
+    return 'changed';
+  }
+}
+
+export function isVerified(binary) {
+  return installedState(binary) === 'ok';
+}
+
+/** The first location holding a verified binary, null if none; throws when one changed after verification. */
+function findInstalled(locations, label = 'Neuron') {
+  for (const location of locations) {
+    const state = installedState(location);
+    if (state === 'changed') {
+      throw new LauncherError(
+        `${label} at ${location} does not match its recorded SHA-256 (${location}.sha256), so it was not run. ` +
+          `Delete ${location}, ${location}.sha256 and ${location}.verified to download a fresh, verified copy.`,
+        {kind: 'integrity'},
+      );
+    }
+    if (state === 'ok') return location;
+  }
+  return null;
 }
 
 function describeFailure(error) {
@@ -206,12 +286,12 @@ function replace(temporary, destination) {
   }
 }
 
-async function fetchChecksum(url, version, idleTimeoutMs) {
+async function fetchText(url, version, idleTimeoutMs) {
   const idle = idleTimeout(idleTimeoutMs);
   try {
     const response = await request(url, version, idle);
     try {
-      return parseChecksum(await response.text());
+      return await response.text();
     } catch (error) {
       throw new LauncherError(`Downloading ${url} was interrupted: ${describeFailure(error)}. Try again.`, {
         cause: error,
@@ -224,12 +304,14 @@ async function fetchChecksum(url, version, idleTimeoutMs) {
 }
 
 /**
- * Downloads `url` to `destination` after checking it against `url.sha256`.
+ * Downloads `url` to `destination` after checking it against `url.sha256` and against the
+ * release's SHA256SUMS at `sumsUrl` (required; every failure to get or match it is fatal).
  * `idleTimeoutMs` bounds each wait for data, not the whole transfer.
  */
 export async function downloadBinary({
   destination,
   url,
+  sumsUrl,
   version,
   asset,
   platform = process.platform,
@@ -237,9 +319,16 @@ export async function downloadBinary({
   idleTimeoutMs = IDLE_TIMEOUT_MS,
   label = 'Neuron',
 }) {
+  if (!sumsUrl) throw new LauncherError(`No SHA256SUMS location for ${asset}; refusing to install it unchecked.`, {kind: 'integrity'});
   mkdirSync(path.dirname(destination), {recursive: true});
   log(`Downloading ${label} ${version} (${asset}) to ${path.dirname(destination)} ...`);
-  const expected = await fetchChecksum(`${url}.sha256`, version, idleTimeoutMs);
+  const listed = parseSums(await fetchText(sumsUrl, version, idleTimeoutMs), asset);
+  if (!listed) {
+    throw new LauncherError(`The release SHA256SUMS (${sumsUrl}) is empty or does not list ${asset}. Nothing was installed.`, {
+      kind: 'integrity',
+    });
+  }
+  const expected = parseChecksum(await fetchText(`${url}.sha256`, version, idleTimeoutMs));
   if (!expected) throw new LauncherError(`${url}.sha256 does not contain a SHA-256 checksum.`, {kind: 'integrity'});
 
   const temporary = `${destination}.${process.pid}.${Date.now()}.tmp`;
@@ -272,10 +361,18 @@ export async function downloadBinary({
         {kind: 'integrity'},
       );
     }
+    if (actual !== listed) {
+      throw new LauncherError(
+        `Neuron ${version} (${asset}) is not what the release SHA256SUMS (${sumsUrl}) lists: it lists ${listed}, got ${actual}. ` +
+          'The download was discarded; nothing was installed.',
+        {kind: 'integrity'},
+      );
+    }
     if (platform !== 'win32') chmodSync(temporary, 0o755);
     replace(temporary, destination);
     writeFileSync(sidecarTemporary, `${expected}  ${asset}\n`);
     replace(sidecarTemporary, `${destination}.sha256`);
+    writeStamp(destination);
     return destination;
   } finally {
     idle.clear();
@@ -298,7 +395,7 @@ export function installedBinary({
 } = {}) {
   const version = packageVersion(root);
   const asset = assetFor(platform, arch, {component: componentName});
-  return binaryLocations({root, version, asset, env, platform, component: componentName}).find(isVerified) ?? null;
+  return findInstalled(binaryLocations({root, version, asset, env, platform, component: componentName}));
 }
 
 /**
@@ -317,15 +414,16 @@ export async function ensureBinary({
   const version = packageVersion(root);
   const asset = assetFor(platform, arch, {component: componentName});
   const locations = binaryLocations({root, version, asset, env, platform, component: componentName});
-  const installed = locations.find(isVerified);
+  const installed = findInstalled(locations, component(componentName).label);
   if (installed) return installed;
 
   const {label} = component(componentName);
   const url = `${downloadBase(env)}/v${version}/${asset}`;
+  const sumsUrl = `${checksumsBase(env)}/v${version}/SHA256SUMS`;
   let permissionError;
   for (const destination of locations) {
     try {
-      return await downloadBinary({destination, url, version, asset, platform, log, label});
+      return await downloadBinary({destination, url, sumsUrl, version, asset, platform, log, label});
     } catch (error) {
       if (!isPermissionError(error)) throw error;
       permissionError = error;

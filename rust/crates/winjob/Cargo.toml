@@ -1,0 +1,32 @@
+[package]
+name = "winjob"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Windows Job Objects for sandboxed shell commands. One of the two crates in the
+# workspace allowed `unsafe` (with `winsec`): Win32 calls need FFI. The unsafe surface is a
+# single module (`imp`) of thin wrappers; everything it exports is safe. On
+# other platforms the crate is empty.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+# The workspace lints, except that `unsafe_code` is `deny` (not `forbid`) so
+# the FFI module alone can opt in.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_panics_doc = "allow"
+missing_errors_doc = "allow"

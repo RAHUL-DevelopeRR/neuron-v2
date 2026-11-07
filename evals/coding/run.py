@@ -9,6 +9,13 @@ A variant is `NAME=PATH[,KEY=VALUE...]`: the binary to run and extra environment
 variables (for example `review=neuron.exe,NEURON_REVIEW=1`). Results go to
 `evals/coding/results/<time>/`: `results.jsonl` (one line per run) and `summary.md`.
 
+With `--gate` (reads `evals/coding/gate.json`) or `--min-pass-rate 0.75` the run fails
+(exit 1) when any variant/model's pass rate is below the threshold, and
+`--json-out FILE` writes the totals, per-task counts and the gate's verdict as JSON
+(for CI). `--provider mock --base-url URL --tasks-dir evals/coding/mock-tasks` runs the
+deterministic tasks against the scripted mock provider (`mock-anthropic-service`),
+with no key.
+
 Each run gets a fresh copy of the task's `workspace/` as its own git repository,
 project settings that allow only the task's test commands (the rest of the
 permission model is Neuron's default `workspace-write`), and its own Neuron home
@@ -31,6 +38,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 TASKS = ROOT / "tasks"
+MOCK_TASKS = ROOT / "mock-tasks"
+GATE_FILE = ROOT / "gate.json"
 CHECK_TIMEOUT_S = 300
 # Always allowed: the project checks Neuron's completion check may propose, and the
 # snippet runners models use to try things (no more powerful than the test commands,
@@ -52,6 +61,9 @@ PROVIDERS = {
     },
     # The Zero-X gateway: NEURON_TOKEN, or the stored login (keeps your Neuron home).
     "zero-x": {"NEURON_PROVIDER": "zero-x"},
+    # The scripted mock provider (rust/crates/mock-anthropic-service) at --base-url:
+    # deterministic, no key. Only the PARITY_SCENARIO prompts in mock-tasks/ work there.
+    "mock": {"ANTHROPIC_API_KEY": "mock-eval-key"},
 }
 # Variables that would otherwise pick a provider or change the run.
 SCRUBBED_ENV = (
@@ -63,9 +75,9 @@ SCRUBBED_ENV = (
 )
 
 
-def load_tasks(selected):
+def load_tasks(selected, tasks_dir=TASKS):
     tasks = []
-    for task_dir in sorted(path for path in TASKS.iterdir() if (path / "task.json").is_file()):
+    for task_dir in sorted(path for path in Path(tasks_dir).iterdir() if (path / "task.json").is_file()):
         task = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
         task["dir"] = task_dir
         if selected and task["id"] not in selected:
@@ -166,6 +178,11 @@ def build_env(args, variant, run_home):
             if not value:
                 sys.exit(f"--provider {args.provider} needs {PROVIDERS[args.provider][key][1:]} in the environment")
         env[key] = value
+    if args.provider == "mock":
+        base_url = getattr(args, "base_url", None) or os.environ.get("NEURON_EVAL_MOCK_BASE_URL", "")
+        if not base_url:
+            sys.exit("--provider mock needs --base-url (or NEURON_EVAL_MOCK_BASE_URL)")
+        env["ANTHROPIC_BASE_URL"] = base_url
     if args.provider == "zero-x" and os.environ.get("NEURON_TOKEN"):
         env["NEURON_TOKEN"] = os.environ["NEURON_TOKEN"]
     if args.provider != "zero-x":
@@ -282,6 +299,90 @@ def summarize(rows):
     return "\n".join(lines) + "\n"
 
 
+def group_stats(rows):
+    """Per (variant, model): runs, runs the provider did not end ("valid"), passes, and
+    the pass rate over the valid runs (None when every run was a provider error)."""
+    groups = {}
+    for row in rows:
+        groups.setdefault((row["variant"], row["model"]), []).append(row)
+    stats = []
+    for (variant, model), runs in sorted(groups.items()):
+        valid = [row for row in runs if not row.get("infra_error")]
+        passed = sum(1 for row in valid if row["passed"])
+        stats.append({
+            "variant": variant,
+            "model": model,
+            "runs": len(runs),
+            "valid": len(valid),
+            "passed": passed,
+            "provider_errors": len(runs) - len(valid),
+            "pass_rate": passed / len(valid) if valid else None,
+        })
+    return stats
+
+
+def check_rate(rate, label="--min-pass-rate"):
+    if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not 0 <= rate <= 1:
+        raise ValueError(f"{label} must be a number from 0 to 1, got {rate!r}")
+    return float(rate)
+
+
+def load_gate(path):
+    """The minimum pass rate from a gate file: `{"min_pass_rate": 0.75}`."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read gate file {path}: {error}") from error
+    rate = data.get("min_pass_rate") if isinstance(data, dict) else None
+    return check_rate(rate, f"{path}: min_pass_rate")
+
+
+def evaluate_gate(rows, min_pass_rate):
+    """Every variant/model must reach `min_pass_rate` over the runs the provider did not
+    end. No runs at all, or a group whose runs all hit provider errors, fails the gate:
+    nothing was measured, and a nightly that silently measures nothing hides outages."""
+    groups = group_stats(rows)
+    failures = []
+    if not groups:
+        failures.append("no runs")
+    for group in groups:
+        name = f"{group['variant']} / {group['model']}"
+        if group["pass_rate"] is None:
+            failures.append(f"{name}: every run ended with a provider error")
+        elif group["pass_rate"] + 1e-9 < min_pass_rate:
+            failures.append(f"{name}: pass rate {group['pass_rate']:.0%} "
+                            f"({group['passed']}/{group['valid']}) is below {min_pass_rate:.0%}")
+    return {"min_pass_rate": min_pass_rate, "passed": not failures, "failures": failures}
+
+
+def build_report(rows, gate=None):
+    """The JSON summary `--json-out` writes."""
+    valid = [row for row in rows if not row.get("infra_error")]
+    passed = sum(1 for row in valid if row["passed"])
+    tasks = {}
+    for row in valid:
+        entry = tasks.setdefault(row["task"], {"passed": 0, "valid": 0})
+        entry["valid"] += 1
+        entry["passed"] += 1 if row["passed"] else 0
+    return {
+        "runs": len(rows),
+        "valid": len(valid),
+        "passed": passed,
+        "provider_errors": len(rows) - len(valid),
+        "pass_rate": passed / len(valid) if valid else None,
+        "groups": group_stats(rows),
+        "tasks": dict(sorted(tasks.items())),
+        "gate": gate,
+    }
+
+
+def gate_markdown(gate):
+    verdict = "passed" if gate["passed"] else "FAILED"
+    lines = ["", f"## Gate: {verdict} (minimum pass rate {gate['min_pass_rate']:.0%})", ""]
+    lines += [f"- {failure}" for failure in gate["failures"]]
+    return "\n".join(lines) + "\n"
+
+
 def self_test(tasks):
     """Each grader must fail on the untouched workspace and pass on the reference solution."""
     ok = True
@@ -330,9 +431,26 @@ def main():
                         help="times to start a run again when the provider ended it (rate limit, outage)")
     parser.add_argument("--work", help="directory for run workspaces (default: a new temp directory)")
     parser.add_argument("--out", help="results directory (default: evals/coding/results/<time>)")
+    parser.add_argument("--tasks-dir", default=str(TASKS),
+                        help="where the tasks are (default: tasks/; mock-tasks/ goes with --provider mock)")
+    parser.add_argument("--base-url", help="the mock provider's URL, for --provider mock")
+    parser.add_argument("--min-pass-rate", type=float,
+                        help="exit 1 when a variant/model's pass rate is below this (0 to 1)")
+    parser.add_argument("--gate", nargs="?", const=str(GATE_FILE),
+                        help="read the minimum pass rate from a gate file (default: evals/coding/gate.json)")
+    parser.add_argument("--json-out", help="also write totals, per-task counts and the gate verdict here")
     args = parser.parse_args()
 
-    tasks = load_tasks([task for task in args.tasks.split(",") if task])
+    min_pass_rate = None
+    try:
+        if args.min_pass_rate is not None:
+            min_pass_rate = check_rate(args.min_pass_rate)
+        elif args.gate:
+            min_pass_rate = load_gate(args.gate)
+    except ValueError as error:
+        parser.error(str(error))
+
+    tasks = load_tasks([task for task in args.tasks.split(",") if task], args.tasks_dir)
     if args.self_test:
         sys.exit(0 if self_test(tasks) else 1)
     if not args.variant or not args.model:
@@ -360,8 +478,16 @@ def main():
                   f"{row['model'].split('/')[-1]:28s} it={row['iterations']} {row['seconds']:.0f}s {row['outcome']}",
                   flush=True)
     summary = summarize(rows)
+    gate = evaluate_gate(rows, min_pass_rate) if min_pass_rate is not None else None
+    if gate:
+        summary += gate_markdown(gate)
     (out / "summary.md").write_text(summary, encoding="utf-8")
+    if args.json_out:
+        Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.json_out).write_text(json.dumps(build_report(rows, gate), indent=2) + "\n", encoding="utf-8")
     print(summary)
+    if gate and not gate["passed"]:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

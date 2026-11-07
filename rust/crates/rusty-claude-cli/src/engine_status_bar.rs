@@ -55,10 +55,19 @@ pub(crate) fn model_fields(model: &str) -> ModelFields {
             .provider
             .clone()
             .or_else(|| is_auto.then(|| "zero-x".to_string())),
+        // The name without the gateway's route to it: `GLM-4.7 Flash`, not
+        // `GLM-4.7 Flash (OpenRouter, free)`.
         display_name: entry
             .display_name
-            .clone()
-            .filter(|name| !name.trim().is_empty()),
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| {
+                crate::gateway_catalog::clean_model_name(
+                    &entry.id,
+                    Some(name),
+                    entry.provider.as_deref(),
+                )
+            }),
         reasoning_efforts,
     }
 }
@@ -256,7 +265,8 @@ pub(crate) fn context_report(model: &str, context: &ContextBreakdown) -> Report 
         command: "context",
         title: format!(
             "Context · {} · {} window",
-            crate::provider::shown_model(model),
+            // The model's name, not the gateway's route to it (`/status` has the id).
+            crate::gateway_catalog::model_name(model),
             digits(context.context_window)
         ),
         sections: vec![
@@ -416,5 +426,16 @@ mod tests {
             "{table}"
         );
         assert!(table.contains("| Free |"), "{table}");
+
+        // The title names the model, not the gateway's route to it.
+        let routed = context_report("openai/cohere/north-mini-code:free", &context);
+        assert!(
+            routed.title.contains("north-mini-code") || routed.title.contains("North Mini Code"),
+            "{}",
+            routed.title
+        );
+        for route in ["cohere/", ":free", "openai/", "OpenRouter"] {
+            assert!(!routed.title.contains(route), "{route} in {}", routed.title);
+        }
     }
 }

@@ -8,7 +8,7 @@
 // its output tokens so far and "esc to interrupt" (see live-activity.tsx).
 // See ui/neuron-tui/PORTING.md.
 import { TextAttributes } from '@opentui/core'
-import React, { useEffect, useState } from 'react'
+import React, { memo, useEffect, useState } from 'react'
 
 import { Button } from './button'
 import { LiveActivityLine, LiveTokenCount } from './live-activity'
@@ -18,6 +18,7 @@ import { ShimmerText } from './shimmer-text'
 import { useTheme } from '../hooks/use-theme'
 import { useEngineStore } from '../state/engine-store'
 import { formatElapsedTime } from '../utils/format-elapsed-time'
+import { renderProbe } from '../utils/render-probe'
 
 import type { StatusIndicatorState } from '../utils/status-indicator-state'
 
@@ -53,7 +54,7 @@ const StatusActionButton = ({
 
 const SHIMMER_INTERVAL_MS = 160
 
-interface StatusBarProps {
+export interface StatusBarProps {
   timerStartTime: number | null
   isAtBottom: boolean
   scrollToLatest: () => void
@@ -61,13 +62,38 @@ interface StatusBarProps {
   onStop?: () => void
 }
 
-export const StatusBar = ({
+/**
+ * The chat draws the status bar with a new `statusIndicatorState` object on
+ * each of its renders, which a streaming turn causes many times a second:
+ * the same state (kind and message) with the same other props draws the same
+ * bar, so it is not drawn again. Its live parts (the activity line, the
+ * spinner, the timer) draw themselves.
+ */
+export function sameStatusBarProps(a: StatusBarProps, b: StatusBarProps): boolean {
+  const kindA = a.statusIndicatorState
+  const kindB = b.statusIndicatorState
+  const sameState =
+    kindA === kindB ||
+    (kindA.kind === kindB.kind &&
+      ('message' in kindA ? kindA.message : undefined) ===
+        ('message' in kindB ? kindB.message : undefined))
+  return (
+    sameState &&
+    a.timerStartTime === b.timerStartTime &&
+    a.isAtBottom === b.isAtBottom &&
+    a.scrollToLatest === b.scrollToLatest &&
+    a.onStop === b.onStop
+  )
+}
+
+export const StatusBar = memo(function StatusBar({
   timerStartTime,
   isAtBottom,
   scrollToLatest,
   statusIndicatorState,
   onStop,
-}: StatusBarProps) => {
+}: StatusBarProps) {
+  renderProbe.onRender?.('StatusBar')
   const theme = useTheme()
   const engineConnection = useEngineStore((state) => state.connection)
   const engineError = useEngineStore((state) => state.error)
@@ -233,4 +259,4 @@ export const StatusBar = ({
       </box>
     </box>
   )
-}
+}, sameStatusBarProps)

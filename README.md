@@ -10,7 +10,7 @@ By default Neuron talks to models through the [Zero-X gateway](https://zero-x.li
 You sign in once with `neuron auth login`; the provider API keys stay on the gateway
 and never reach your machine. You can also use your own provider key instead.
 
-> 7.0.0-alpha.4 is Neuron's fourth alpha, built and published by this repository's
+> 7.0.0-alpha.5 is Neuron's fifth alpha, built and published by this repository's
 > release pipeline. Its known limitations are listed in
 > the [changelog](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/CHANGELOG.md).
 > It is a GitHub prerelease, so the install scripts need the versioned commands below.
@@ -30,25 +30,25 @@ and there is none until the first stable release is out.
 **macOS and Linux**
 
 ```sh
-curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.4/install.sh | sh -s -- --version 7.0.0-alpha.4
+curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.sh | sh -s -- --version 7.0.0-alpha.5
 ```
 
 The script installs to `~/.local/bin` and tells you if that directory is not on your
 `PATH`. Pass options after `sh -s --`, for example
-`sh -s -- --version 7.0.0-alpha.4 --install-dir "$HOME/bin"`, or set `NEURON_VERSION`
+`sh -s -- --version 7.0.0-alpha.5 --install-dir "$HOME/bin"`, or set `NEURON_VERSION`
 and `NEURON_INSTALL_DIR`.
 
 **Windows (PowerShell 5.1 or 7)**
 
 ```powershell
-& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.4/install.ps1))) -Version 7.0.0-alpha.4
+& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1))) -Version 7.0.0-alpha.5
 ```
 
 The script installs to `%LOCALAPPDATA%\Programs\Neuron\bin` and only changes your
 `PATH` if you ask it to:
 
 ```powershell
-& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.4/install.ps1))) -Version 7.0.0-alpha.4 -AddToPath
+& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1))) -Version 7.0.0-alpha.5 -AddToPath
 ```
 
 **npm** (Node.js 22.14 or later)
@@ -65,9 +65,9 @@ pip install --pre neuroncli
 ```
 
 The registry packages are published after the GitHub release, so check them first:
-`npm view @zero-x.live/neuron version` should print `7.0.0-alpha.4`, and
-`pip index versions neuroncli --pre` should list `7.0.0a4`. If they still show the
-previous alpha (`7.0.0-alpha.3`, or `7.0.0a3` on PyPI), use the install scripts above
+`npm view @zero-x.live/neuron version` should print `7.0.0-alpha.5`, and
+`pip index versions neuroncli --pre` should list `7.0.0a5`. If they still show the
+previous alpha (`7.0.0-alpha.4`, or `7.0.0a4` on PyPI), use the install scripts above
 for this one. 6.2.0 (npm) and 6.2.4 (PyPI) are old, unsupported builds.
 
 The npm and pip packages are small launchers that download the binaries for the
@@ -82,16 +82,18 @@ uses a binary from that cache when its `bin/native` folder has none, and downloa
 the cache only when that folder is read-only. After that, Neuron starts without network
 access. Ctrl+C goes to Neuron, and the launcher exits with Neuron's exit code.
 
-With the installers or pip, the two default MCP servers (CodebaseMap, which `/mcp`
-lists as `codebase-memory`, and Playwright) start through `npx -y`, so they need
-Node.js; the npm package installs them with Neuron.
+The two default MCP servers (CodebaseMap, which `/mcp` lists as `codebase-memory`,
+and Playwright) never start through `npx -y`: on first use Neuron installs each into
+`~/.neuron/mcp` from downloads whose hashes its connector catalog pins, and later
+starts are offline. Playwright needs Node.js (the npm launcher passes its own).
 
 On a terminal, `neuron` with no prompt opens the full-screen UI, `neuron-tui`. The
 installers put it beside `neuron`, and the launchers fetch it the same way, verified
 by checksum. `neuron --no-tui` (or `NEURON_NO_TUI=1`) keeps the line REPL. Without
 the UI, for example after a failed download, `neuron` runs the line REPL as
-before. Prompts (`neuron "fix the test"`, `neuron -p ...`) and subcommands never
-start it.
+before. On a terminal, `neuron "fix the test"` opens it with that prompt and
+`neuron --resume SESSION` on that session; `neuron -p ...`, `neuron prompt ...` and
+subcommands never start it.
 
 **From source**
 

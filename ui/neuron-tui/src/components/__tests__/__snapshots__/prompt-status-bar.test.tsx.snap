@@ -1,16 +1,16 @@
 // Bun Snapshot v1, https://bun.sh/docs/test/snapshots
 
-exports[`PromptStatusBar 80 columns, unicode glyphs 1`] = `" G Gemini 2.5 Flash │ ● high │ ⎇ feat/tui-status-bar │ ✎ Edit │ ●◕○○○ 35%"`;
+exports[`PromptStatusBar 80 columns, unicode glyphs 1`] = `" G Gemini 2.5 Flash │ ● high │ ⎇ feat/tui-status… │ ✎ Edit │ ●◕○○○ 35%  120K/1M"`;
 
-exports[`PromptStatusBar 120 columns, unicode glyphs 1`] = `" G Gemini 2.5 Flash │ ● high │ ⌂ neuron-v2 ⎇ feat/tui-status-bar +1 ~2 │ ✎ Edit │ ●●●◑○○○○○○ 35%                 5h 12%"`;
+exports[`PromptStatusBar 120 columns, unicode glyphs 1`] = `" G Gemini 2.5 Flash │ ● high │ ⌂ neuron-v2 ⎇ feat/tui-status-bar +1 ~2 │ ✎ Edit │ ●●●◑○○○○○○ 35%                120K/1M"`;
 
-exports[`PromptStatusBar 160 columns, unicode glyphs 1`] = `" G Gemini 2.5 Flash ▾ │ ● think high │ ⌂ neuron-v2 ⎇ feat/tui-status-bar +1 ~2 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx               Free · 5h 12% · 37/100 req"`;
+exports[`PromptStatusBar 160 columns, unicode glyphs 1`] = `" G Gemini 2.5 Flash ▾ │ ● think high │ ⌂ neuron-v2 ⎇ feat/tui-status-bar +1 ~2 │ ✎ Edit workspace │ ●●●◑○○○○○○ 35% ctx                   120K/1M · resets 14:32"`;
 
-exports[`PromptStatusBar 80 columns, console glyphs 1`] = `" G Gemini 2.5 Flash │ ● high │ ± feat/tui-status-bar │ + Edit │ ●●○○○ 35%"`;
+exports[`PromptStatusBar 80 columns, console glyphs 1`] = `" G Gemini 2.5 Flash │ ● high │ ± feat/tui-status… │ + Edit │ ●●○○○ 35%  120K/1M"`;
 
-exports[`PromptStatusBar 120 columns, console glyphs 1`] = `" G Gemini 2.5 Flash │ ● high │ ⌂ neuron-v2 ± feat/tui-status-bar +1 ~2 │ + Edit │ ●●●●○○○○○○ 35%                 5h 12%"`;
+exports[`PromptStatusBar 120 columns, console glyphs 1`] = `" G Gemini 2.5 Flash │ ● high │ ⌂ neuron-v2 ± feat/tui-status-bar +1 ~2 │ + Edit │ ●●●●○○○○○○ 35%                120K/1M"`;
 
-exports[`PromptStatusBar 160 columns, console glyphs 1`] = `" G Gemini 2.5 Flash ▼ │ ● think high │ ⌂ neuron-v2 ± feat/tui-status-bar +1 ~2 │ + Edit workspace │ ●●●●○○○○○○ 35% ctx               Free · 5h 12% · 37/100 req"`;
+exports[`PromptStatusBar 160 columns, console glyphs 1`] = `" G Gemini 2.5 Flash ▼ │ ● think high │ ⌂ neuron-v2 ± feat/tui-status-bar +1 ~2 │ + Edit workspace │ ●●●●○○○○○○ 35% ctx                   120K/1M · resets 14:32"`;
 
 exports[`ContextPopover the breakdown and the account 1`] = `
 "╭──────────────────────────────────────────── Context ─────────────────────────────────────────────╮

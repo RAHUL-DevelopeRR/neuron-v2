@@ -15,6 +15,14 @@ const CONTEXT_WINDOW_ERROR_MARKERS: &[&str] = &[
     "prompt is too long",
     "input is too long",
     "request is too large",
+    // OpenAI "configured limit" errors and llama.cpp context overflow. From
+    // Claw Code (MIT), upstream commits 6ac13ff and 1d516be; upstream's broader
+    // "prompt tokens" / "completion tokens" markers are left out because rate
+    // limit messages contain them too.
+    "input tokens exceed",
+    "exceeds the available context size",
+    "exceed_context_size",
+    "context size has been exceeded",
 ];
 
 #[derive(Debug)]
@@ -1119,6 +1127,44 @@ mod tests {
         assert!(error.is_context_window_failure());
         assert_eq!(error.safe_failure_class(), "context_window");
         assert_eq!(error.request_id(), Some("req_ctx_123"));
+    }
+
+    // From Claw Code (MIT), upstream commits 6ac13ff and 1d516be.
+    #[test]
+    fn classifies_openai_limit_and_llama_cpp_overflow_as_context_window_failures() {
+        let api_error = |message: &str, body: &str| ApiError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            error_type: None,
+            message: (!message.is_empty()).then(|| message.to_string()),
+            request_id: None,
+            body: body.to_string(),
+            retryable: false,
+            suggested_action: None,
+        };
+
+        for (message, body) in [
+            (
+                "Input tokens exceed the configured limit of 922000 tokens. Your messages resulted in 1860900 tokens.",
+                "",
+            ),
+            ("the request exceeds the available context size, try increasing it", ""),
+            (
+                "",
+                r#"{"error":{"code":400,"message":"request too big","type":"exceed_context_size_error"}}"#,
+            ),
+            ("Context size has been exceeded.", ""),
+        ] {
+            let error = api_error(message, body);
+            assert!(error.is_context_window_failure(), "{message}{body}");
+            assert_eq!(error.safe_failure_class(), "context_window");
+        }
+
+        // A rate limit that mentions prompt tokens is not a context overflow.
+        let rate_limited = api_error(
+            "Rate limit reached for prompt tokens per min: Limit 30000, Used 29000, Requested 2000.",
+            "",
+        );
+        assert!(!rate_limited.is_context_window_failure());
     }
 
     #[test]

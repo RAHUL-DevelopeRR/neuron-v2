@@ -22,7 +22,7 @@ import {
 import { runEngineLogin, whenEngineStarted } from '../engine/engine-session'
 import { revealDeferredGitPanel } from '../engine/git-views'
 import { getNeuronEngineClient, runExchange } from '../engine/neuron-engine-client'
-import { withQuestionAnswer } from '../engine/questions'
+import { answerEngineQuestion } from '../engine/question-form'
 import { statusAddendum } from '../engine/status-report'
 import { getProjectRoot } from '../project-files'
 import { useChatStore } from '../state/chat-store'
@@ -437,22 +437,12 @@ export async function routeUserPrompt(
   }
 
   // The engine asked a question (AskUserQuestion) and takes the next submit
-  // as its answer, even while the turn is still running.
-  const { pendingQuestion, pendingQuestionTarget } = useEngineStore.getState()
+  // as its answer, even while the turn is still running: an `answer` with the
+  // question's id, or a plain submit for an older engine's notice.
+  const { pendingQuestion } = useEngineStore.getState()
   if (pendingQuestion && engineReady && trimmed) {
-    useEngineStore.getState().setPendingQuestion(null)
-    // Into the question's block in the turn's message, so it reads above the
-    // agent's reply to it; a chat line when the question is one too.
-    setMessages(
-      (prev) =>
-        (pendingQuestionTarget &&
-          withQuestionAnswer(prev, pendingQuestionTarget, trimmed)) || [
-          ...prev,
-          { ...getUserMessage(trimmed), metadata: { answersQuestion: true, sentToEngine: false } },
-        ],
-    )
     try {
-      engine.submit(trimmed)
+      answerEngineQuestion(trimmed, engine)
     } catch (error) {
       setMessages((prev) => [
         ...prev,

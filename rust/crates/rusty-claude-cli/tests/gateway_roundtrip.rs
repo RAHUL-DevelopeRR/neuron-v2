@@ -24,6 +24,8 @@ struct Recorded {
     method: String,
     path: String,
     authorization: Option<String>,
+    /// The `x-neuron-route` header (the routing hint for `auto`).
+    route: Option<String>,
     body: String,
     /// When the request arrived.
     at: Instant,
@@ -179,6 +181,7 @@ fn serve(stream: TcpStream, requests: &Mutex<Vec<Recorded>>, responder: &Respond
     let path = parts.next().unwrap_or_default().to_string();
     let mut length = 0;
     let mut authorization = None;
+    let mut route = None;
     loop {
         line.clear();
         reader.read_line(&mut line).unwrap();
@@ -190,6 +193,7 @@ fn serve(stream: TcpStream, requests: &Mutex<Vec<Recorded>>, responder: &Respond
         match name.to_ascii_lowercase().as_str() {
             "content-length" => length = value.parse().unwrap(),
             "authorization" => authorization = Some(value),
+            "x-neuron-route" => route = Some(value),
             _ => {}
         }
     }
@@ -199,6 +203,7 @@ fn serve(stream: TcpStream, requests: &Mutex<Vec<Recorded>>, responder: &Respond
         method,
         path,
         authorization,
+        route,
         body: String::from_utf8(body).unwrap(),
         at: Instant::now(),
     };
@@ -363,7 +368,7 @@ fn run(mut command: Command, stdin: Option<&str>) -> Output {
             .write_all(input.as_bytes())
             .unwrap();
     }
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     while child.try_wait().unwrap().is_none() {
         if Instant::now() >= deadline {
             let _ = child.kill();
@@ -420,6 +425,28 @@ fn env_dump_hook() -> String {
     } else {
         format!("env > {HOOK_ENV_DUMP}")
     }
+}
+
+/// `auto` with tools attached asks the gateway for a tool-capable model, and every
+/// chat request of the session carries the same cache key: a hash, not the session id.
+fn assert_agentic_route_and_one_cache_key(gateway: &FakeGateway) {
+    let keys = gateway
+        .requests()
+        .into_iter()
+        .filter(|request| request.path == "/v1/chat/completions")
+        .map(|chat| {
+            assert_eq!(chat.route.as_deref(), Some("agentic"));
+            chat.json()["prompt_cache_key"]
+                .as_str()
+                .expect("a prompt_cache_key")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert_eq!(keys[0].len(), 32, "{keys:?}");
+    assert!(keys[0].chars().all(|c| c.is_ascii_hexdigit()), "{keys:?}");
+    assert_eq!(keys[0], keys[1], "one key for the session");
+    assert!(!keys[0].contains("session"), "{keys:?}");
 }
 
 #[test]
@@ -490,6 +517,7 @@ fn gateway_default_model_preserves_parallel_tool_calls_and_file_results() {
     for request in gateway.requests() {
         assert_bearer(&request, SESSION_TOKEN);
     }
+    assert_agentic_route_and_one_cache_key(&gateway);
     // One startup line naming provider and credential source, never the secret.
     let errors = stderr(&output);
     assert!(
@@ -927,7 +955,7 @@ fn a_blurred_model_is_named_before_the_request_and_others_after_it_fails() {
     assert!(!output.status.success());
     let errors = stderr(&output);
     let warning = errors
-        .find("warning: gemini/gemini-2.5-flash is out of capacity until 2099-01-01 00:00 UTC")
+        .find("warning: Gemini 2.5 Flash is out of capacity until 2099-01-01 00:00 UTC")
         .unwrap_or_else(|| panic!("{errors}"));
     assert!(
         errors.contains("auto routes around it: --model auto."),
@@ -1120,6 +1148,15 @@ fn resumed_usage_command_reads_the_account_from_the_gateway() {
         .args(prompt_args("hello"));
     let output = run(prompt, None);
     assert!(output.status.success(), "{}", stderr(&output));
+    // The prompt run may have read the plan's token window in the background.
+    let account_reads = |gateway: &FakeGateway| {
+        gateway
+            .requests()
+            .into_iter()
+            .filter(|request| request.path == "/api/account")
+            .collect::<Vec<_>>()
+    };
+    let before = account_reads(&gateway).len();
 
     let mut resumed = workspace.command(&gateway);
     resumed
@@ -1132,13 +1169,11 @@ fn resumed_usage_command_reads_the_account_from_the_gateway() {
     assert!(report.contains("Zero-X usage"), "{report}");
     assert!(report.contains("Requests today   42 / 100"), "{report}");
     assert!(!stderr(&output).contains("not yet implemented"));
-    let account = gateway
-        .requests()
-        .into_iter()
-        .filter(|request| request.path == "/api/account")
-        .collect::<Vec<_>>();
-    assert_eq!(account.len(), 1);
-    assert_bearer(&account[0], SESSION_TOKEN);
+    let account = account_reads(&gateway);
+    assert_eq!(account.len(), before + 1);
+    for read in &account {
+        assert_bearer(read, SESSION_TOKEN);
+    }
 }
 
 /// `neuron login` signs in through the device flow: it prints the link and code, polls the

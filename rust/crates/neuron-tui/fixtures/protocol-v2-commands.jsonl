@@ -8,3 +8,10 @@
 {"kind":"command","type":"switch_branch","name":"feat/tui-status-bar","create":false}
 {"kind":"command","type":"capabilities","features":["questions","reports"],"client":"terminal"}
 {"kind":"command","type":"slash","command":"usage","args":""}
+{"kind":"command","type":"answer","id":7,"text":"main"}
+{"kind":"command","type":"list_extensions"}
+{"kind":"command","type":"set_mcp_server_enabled","name":"docs","enabled":false}
+{"kind":"command","type":"list_connector_catalog","query":"git"}
+{"kind":"command","type":"add_mcp_server","id":"github","name":null,"scope":"user","secrets":{"GITHUB_PERSONAL_ACCESS_TOKEN":"example-not-a-token"}}
+{"kind":"command","type":"remove_mcp_server","name":"docs","scope":null}
+{"kind":"command","type":"approve_mcp_server","name":"postgres-tools","fingerprint":"4f1c0de5"}

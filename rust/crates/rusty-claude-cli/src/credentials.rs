@@ -601,6 +601,35 @@ impl CredentialStore {
     }
 }
 
+/// The OS keychain entry `account` of [`KEYRING_SERVICE`], when the keychain is the
+/// store to use (the same `NEURON_CREDENTIAL_STORE` / overridden-home rules as the
+/// Zero-X login); `None` means "use a file".
+pub(crate) fn keychain_entry_for(account: &str) -> Option<Box<dyn SecretBackend>> {
+    let preference =
+        non_empty_env("NEURON_CREDENTIAL_STORE").map(|value| value.trim().to_ascii_lowercase());
+    let use_keychain = match preference.as_deref() {
+        Some("file") => false,
+        Some("keychain") => true,
+        _ => !home_is_overridden(),
+    };
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        use_keychain.then(|| {
+            Box::new(KeychainBackend::new(KEYRING_SERVICE, account)) as Box<dyn SecretBackend>
+        })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (use_keychain, account);
+        None
+    }
+}
+
+/// The provider-key store's name for [`keychain_entry_for`].
+pub(crate) fn keychain_for_account(account: &str) -> Option<Box<dyn SecretBackend>> {
+    keychain_entry_for(account)
+}
+
 fn platform_keychain() -> Option<Box<dyn SecretBackend>> {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {

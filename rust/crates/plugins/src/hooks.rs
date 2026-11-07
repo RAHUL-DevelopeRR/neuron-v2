@@ -491,6 +491,7 @@ mod tests {
             pre_tool_use: vec!["printf 'blocked by plugin'; exit 2".to_string()],
             post_tool_use: Vec::new(),
             post_tool_use_failure: Vec::new(),
+            ..crate::PluginHooks::default()
         });
 
         // when
@@ -518,6 +519,7 @@ mod tests {
             pre_tool_use: vec![failure_hook.to_string(), later_hook.to_string()],
             post_tool_use: Vec::new(),
             post_tool_use_failure: Vec::new(),
+            ..crate::PluginHooks::default()
         });
 
         // when
@@ -551,6 +553,7 @@ mod tests {
             pre_tool_use: vec![hook.to_string()],
             post_tool_use: Vec::new(),
             post_tool_use_failure: Vec::new(),
+            ..crate::PluginHooks::default()
         });
 
         let result = runner.run_pre_tool_use("Bash", r#"{"command":"pwd"}"#);

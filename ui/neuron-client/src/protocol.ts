@@ -167,6 +167,20 @@ export interface AccountDetails {
   usage_updated_at: number | null
   /** Why the plan and usage could not be read. */
   usage_error: string | null
+  /** The plan's rolling token window (Zero-X Free: 1M tokens per 5 hours); absent for a plan without one and from older engines. */
+  usage_window?: UsageWindow | null
+}
+
+/** A rolling usage window (`usage_window` in `/api/account`). Every part may be missing. */
+export interface UsageWindow {
+  /** Tokens used in the window. */
+  tokens: number | null
+  limit_tokens: number | null
+  remaining_tokens: number | null
+  /** When the oldest usage leaves the window (ISO 8601, UTC). */
+  resets_at: string | null
+  /** The window's length: 18000 for five hours. */
+  window_seconds: number | null
 }
 
 /**
@@ -188,8 +202,11 @@ export interface ErrorDetail {
 /** A hook a workspace's settings would turn on. */
 export interface HookPreview {
   event: string
+  /** The command it runs, in full (cut only past a very long length). */
   command: string
   source: string
+  /** The tool name the hook is limited to; absent when it runs for every tool. */
+  matcher?: string
 }
 
 /** An MCP server a workspace's settings would start. */
@@ -199,6 +216,16 @@ export interface McpServerPreview {
   /** The program it starts or the host it connects to; never arguments or headers. */
   target: string | null
   source: string
+  /**
+   * What runs, with secret-looking values shown as `[REDACTED]`; never
+   * environment or headers. Older engines leave it out.
+   */
+  command?: string
+  /**
+   * The launch spec's digest as previewed: an `approve_mcp_server` that sends
+   * it back is refused if the config changed since. Older engines leave it out.
+   */
+  fingerprint?: string
 }
 
 /** A permission rule a workspace's settings would add. */
@@ -227,7 +254,7 @@ export interface McpServerInfo {
   name: string
   /** `bundled`, `user`, `project` or `local`. */
   scope: string
-  /** `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`. */
+  /** `stdio`, `http`, `sse`, `ws`, `sdk` or `zerox` (older engines: `managed_proxy`). */
   transport: string
   /**
    * `starting`, `ready`, `failed`, `pending` (started, tools not found),
@@ -286,6 +313,8 @@ export interface StatusEvent {
   account?: AccountInfo | null
   /** The catalog says the current model reads images; hide the image-paste hint unless true. */
   supports_images?: boolean | null
+  /** Estimated input tokens of each model request the next turn sends; absent from older engines. */
+  request_tokens_estimate?: number | null
 }
 
 export interface SessionStartingEvent {
@@ -477,6 +506,10 @@ export interface TrustPreviewEvent {
   /** Trust would last for this engine only (the home folder, or above it). */
   session_only: boolean
   trusted: boolean
+  /** Trusted before, but its hooks, MCP servers or allow rules changed since. */
+  changed_since_trust?: boolean
+  /** With `changed_since_trust`: the settings keys (`env`, `model`, `hooks`, ...) that differ from what was trusted. */
+  changed_settings?: string[]
   settings_files: string[]
   hooks: HookPreview[]
   mcp_servers: McpServerPreview[]

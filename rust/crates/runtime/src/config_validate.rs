@@ -93,6 +93,8 @@ enum FieldType {
     Object,
     StringArray,
     Number,
+    /// Hook commands: strings or `{"command", "matcher"}` objects.
+    HookList,
 }
 
 impl FieldType {
@@ -103,6 +105,7 @@ impl FieldType {
             Self::Object => "an object",
             Self::StringArray => "an array of strings",
             Self::Number => "a number",
+            Self::HookList => "an array of hook commands (strings or objects with \"command\")",
         }
     }
 
@@ -115,6 +118,7 @@ impl FieldType {
                 .as_array()
                 .is_some_and(|arr| arr.iter().all(|v| v.as_str().is_some())),
             Self::Number => value.as_i64().is_some(),
+            Self::HookList => crate::hook_matcher::is_hook_list(value),
         }
     }
 }
@@ -210,6 +214,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::StringArray,
     },
     FieldSpec {
+        name: "mcpPolicy",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
         name: "provider",
         expected: FieldType::String,
     },
@@ -217,20 +225,68 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "maxIterations",
         expected: FieldType::Number,
     },
+    FieldSpec {
+        name: "workingSetTokens",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "redactSecrets",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "toolCapableModels",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "autoToolModel",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "subagentModel",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "summaryModel",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "reviewerModel",
+        expected: FieldType::String,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "PreToolUse",
-        expected: FieldType::StringArray,
+        expected: FieldType::HookList,
     },
     FieldSpec {
         name: "PostToolUse",
-        expected: FieldType::StringArray,
+        expected: FieldType::HookList,
     },
     FieldSpec {
         name: "PostToolUseFailure",
-        expected: FieldType::StringArray,
+        expected: FieldType::HookList,
+    },
+    FieldSpec {
+        name: "SessionStart",
+        expected: FieldType::HookList,
+    },
+    FieldSpec {
+        name: "UserPromptSubmit",
+        expected: FieldType::HookList,
+    },
+    FieldSpec {
+        name: "Stop",
+        expected: FieldType::HookList,
+    },
+    FieldSpec {
+        name: "PreCompact",
+        expected: FieldType::HookList,
+    },
+    FieldSpec {
+        name: "SubagentStop",
+        expected: FieldType::HookList,
     },
 ];
 
@@ -280,6 +336,62 @@ const PLUGINS_FIELDS: &[FieldSpec] = &[
     },
 ];
 
+/// `mcpPolicy` (read only from the managed settings; see `crate::mcp_policy`).
+const MCP_POLICY_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "allow",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "deny",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "required",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "allowUnvetted",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "allowStdio",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "allowedRemoteHosts",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "toolRules",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "failClosed",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
+        name: "requireSandbox",
+        expected: FieldType::Bool,
+    },
+];
+
+/// `mcpPolicy.toolRules`.
+const MCP_TOOL_RULES_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "allow",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "deny",
+        expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "ask",
+        expected: FieldType::StringArray,
+    },
+];
+
 const SANDBOX_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "enabled",
@@ -300,6 +412,18 @@ const SANDBOX_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "allowedMounts",
         expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "network",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "maxProcesses",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "memoryLimitMb",
+        expected: FieldType::Number,
     },
 ];
 
@@ -512,6 +636,24 @@ pub fn validate_config_file(
             &path_display,
         ));
     }
+    if let Some(policy) = object.get("mcpPolicy").and_then(JsonValue::as_object) {
+        result.merge(validate_object_keys(
+            policy,
+            MCP_POLICY_FIELDS,
+            "mcpPolicy",
+            source,
+            &path_display,
+        ));
+        if let Some(rules) = policy.get("toolRules").and_then(JsonValue::as_object) {
+            result.merge(validate_object_keys(
+                rules,
+                MCP_TOOL_RULES_FIELDS,
+                "mcpPolicy.toolRules",
+                source,
+                &path_display,
+            ));
+        }
+    }
     if let Some(oauth) = object.get("oauth").and_then(JsonValue::as_object) {
         result.merge(validate_object_keys(
             oauth,
@@ -610,6 +752,23 @@ mod tests {
             result.errors[0].kind,
             DiagnosticKind::UnknownKey { .. }
         ));
+    }
+
+    #[test]
+    fn accepts_model_routing_keys_and_types_them() {
+        let source = r#"{"toolCapableModels": ["nemotron-3-ultra"], "autoToolModel": "nemotron-3-ultra", "subagentModel": "a", "summaryModel": "b", "reviewerModel": "c"}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+        let result = validate_config_file(object, source, &test_path());
+        assert!(result.errors.is_empty(), "{result:?}");
+        assert!(result.warnings.is_empty(), "{result:?}");
+
+        let source = r#"{"toolCapableModels": "nemotron-3-ultra"}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+        let result = validate_config_file(object, source, &test_path());
+        assert_eq!(result.errors.len(), 1, "{result:?}");
+        assert_eq!(result.errors[0].field, "toolCapableModels");
     }
 
     #[test]
@@ -805,7 +964,7 @@ mod tests {
 
     #[test]
     fn accepts_provider_and_max_iterations_and_type_checks_them() {
-        let source = r#"{"provider": "openai", "maxIterations": 12}"#;
+        let source = r#"{"provider": "openai", "maxIterations": 12, "workingSetTokens": 40000}"#;
         let parsed = JsonValue::parse(source).expect("valid json");
         let object = parsed.as_object().expect("object");
         let result = validate_config_file(object, source, &test_path());

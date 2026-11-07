@@ -1,6 +1,6 @@
 # Neuron × Zero-X platform contract
 
-Status: v1.2 (2026-10-16; v1.1 amendments in section 6, v1.2 amendments in section 7). This document is the source of truth shared by the Neuron CLI
+Status: v1.3 (2026-11-05; v1.1 amendments in section 6, v1.2 amendments in section 7, v1.3 amendments in section 8). This document is the source of truth shared by the Neuron CLI
 (`RAHUL-DevelopeRR/neuron-v2`) and the Zero-X gateway + website
 (`RAHUL-DevelopeRR/zero-x.live`, `neuroncli/auth-server`). A copy lives in both repos;
 change both together.
@@ -335,3 +335,46 @@ Sync the copy in `neuron-v2`; nothing here changes what the CLI sends or must ha
   the budget, with `upgrade_url` when a paid pool would take it, instead of
   `403 upgrade_required` ("model not in plan"). Clients handle it like any other
   `context_length_exceeded` (compact or shorten).
+
+## 8. v1.3 amendments (Free token window and routing hints, 2026-11-04)
+
+- **Token window (§1, §3.4).** A plan may count tokens over a rolling window
+  (`limits.window_tokens`, `limits.window_seconds`; Free: 1,000,000 per 18,000 s). `GET
+  /api/account` adds `usage_window: null|{tokens, limit_tokens, remaining_tokens,
+  window_seconds, resets_at}`. With a window, `daily_tokens` refuses nothing; the CLI shows
+  the window (`/usage`, `neuron usage`, `/status`), warns at 90% of it, and on such a plan
+  reads `x-neuron-quota-remaining-tokens` as what the window still allows.
+- **Routing hint (§3.2).** The CLI sends `x-neuron-route: agentic` on chat requests that
+  attach tools when the model is `auto`; `auto` then picks only tool-capable models with a
+  good tool-call record.
+- **Prompt cache key (§3.2).** The CLI may send `prompt_cache_key` in chat bodies: a hash of
+  the session id (32 hex characters), never the id itself, the same for every request of a
+  session. The gateway passes it upstream to providers that accept it and strips it
+  otherwise; quota accounting is unchanged. Other OpenAI-compatible providers never get it.
+- **Connector policy (§3.4, 2026-11-05).** `GET /api/account` may add `policy:
+  {connectors: {allowed, denied, required, hosted, allow_unvetted, catalog_version}}`, set
+  per plan (`zerox_plan_policy.connector_policy`, JSON; no organisations yet). `allowed`:
+  catalog ids or `"catalog:*"` the plan allows; missing or `null` means no allow list, and
+  it never restricts servers outside the catalog. `denied`: ids the CLI refuses (it also
+  refuses a server of that name, one that runs the connector's package at another version
+  and one on its remote host). A deny list is a best effort, since a server can run the
+  same code some other way; only `allowed` or `allow_unvetted: false` keeps every other
+  server out. `required`: catalog ids the CLI adds and keeps on.
+  `hosted`: hosted connectors the plan includes (Free: none). `allow_unvetted`: `false`
+  lets only catalog connectors start (default `true`). `catalog_version`: the catalog the
+  policy was written for. A missing `policy` block (or one without `connectors`) means no
+  plan policy. The CLI caches the block for a day and keeps using an older one offline;
+  machine-wide managed settings outrank it. Only ids and flags are sent, nothing about
+  the user's own servers is reported back.
+- **Hosted connectors (2026-11-05).** `https://zero-x.live/mcp/<connector_id>` is a
+  Streamable HTTP MCP endpoint (MCP 2025-06-18) for each connector the user linked on
+  the dashboard, with `Authorization: Bearer <ses_ session or nzx_ key>`. `401`: sign
+  in again. `403` with `{"error": "needs_connect", "connect_url":
+  "https://zero-x.live/dashboard#connectors"}`: the user has not linked that connector
+  (the CLI opens `connect_url` only when it is on the gateway's origin). A call of a
+  destructive-tier tool must carry `x-neuron-confirmed: 1`, which the CLI sends only on
+  the `tools/call` POST of a call the user approved in its permission prompt (it asks for
+  every such call, whatever the mode or rules); without it the proxy answers a
+  JSON-RPC error asking for confirmation. The CLI lists each id in
+  `policy.connectors.hosted` as a server (settings type `"zerox"`) and calls the
+  endpoint only while `NEURON_HOSTED_CONNECTORS=1`; nothing is deployed yet.
