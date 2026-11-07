@@ -23,6 +23,14 @@ The release workflow copies a version's section into its GitHub release notes.
   that script), the same for `pypy`, `npx`, `bunx`, `uv run` and `npm exec`;
   `jq -n -- env` is not read-only; the plugin and MCP child environment drops `PGPASSWORD`,
   `MYSQL_PWD`, `REDIS_URL`, `KUBECONFIG` and names ending in `_DSN` or `_URI`.
+- `WebSearch` goes through the Zero-X gateway (`POST /v1/search`) when you are signed in,
+  with the same sign-in as chat, and shows how many of the day's searches are left. It
+  takes an optional `freshness` (`day`, `week`, `month`, `year`) and still honours
+  `allowed_domains` and `blocked_domains`. When the gateway answers 503, cannot be
+  reached, rejects the sign-in, or you are signed out, it falls back to the local
+  DuckDuckGo search and marks the answer "local fallback" (that search cannot filter by
+  date). When the day's quota is used up it says so and does not scrape instead.
+  Approval is the same as before.
 - Trust screen, MCP: each project server shows what it runs (command line or URL,
   secret-looking values redacted) before you tick it, and the approval is bound to
   what was shown: `trust_preview` servers carry `command` and `fingerprint`, and

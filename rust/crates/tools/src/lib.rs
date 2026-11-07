@@ -795,7 +795,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "WebSearch",
-            description: "Search the web for current information and return cited results. The query is sent to an external search service, so web searches need user approval (once per session) unless the session runs in danger-full-access mode.",
+            description: "Search the web for current information and return cited results. When signed in to Zero-X the search runs through the Zero-X gateway and the remaining daily search quota is shown; otherwise (or if the gateway is unavailable) it falls back to a local DuckDuckGo search, marked as a local fallback. The query is sent to an external search service, so web searches need user approval (once per session) unless the session runs in danger-full-access mode.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -807,6 +807,11 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "blocked_domains": {
                         "type": "array",
                         "items": { "type": "string" }
+                    },
+                    "freshness": {
+                        "type": "string",
+                        "enum": ["day", "week", "month", "year"],
+                        "description": "Only results from the past day, week, month or year (Zero-X gateway search only; the local fallback cannot filter by date)."
                     }
                 },
                 "required": ["query"],
@@ -2713,11 +2718,12 @@ struct WebFetchInput {
     prompt: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct WebSearchInput {
     query: String,
     allowed_domains: Option<Vec<String>>,
     blocked_domains: Option<Vec<String>>,
+    freshness: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3003,6 +3009,8 @@ struct WebFetchOutput {
 #[derive(Debug, Serialize)]
 struct WebSearchOutput {
     query: String,
+    /// `"zero-x gateway"` or `"local fallback"`.
+    source: &'static str,
     results: Vec<WebSearchResultItem>,
     #[serde(rename = "durationSeconds")]
     duration_seconds: f64,
@@ -3199,6 +3207,10 @@ enum WebSearchResultItem {
 struct SearchHit {
     title: String,
     url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    published: Option<String>,
 }
 
 fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
@@ -3228,9 +3240,170 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     })
 }
 
+/// Most results shown to the model.
+const WEB_SEARCH_MAX_HITS: usize = 8;
+
+/// Trims the query and enforces the gateway's 1-400 character limit. Returns the usable query
+/// and a note when it had to be cut (on a character boundary).
+fn normalize_search_query(query: &str) -> Result<(String, Option<String>), String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err("WebSearch needs a non-empty query".to_string());
+    }
+    let total = trimmed.chars().count();
+    if total <= gateway_search::MAX_QUERY_CHARS {
+        return Ok((trimmed.to_string(), None));
+    }
+    let cut = trimmed
+        .char_indices()
+        .nth(gateway_search::MAX_QUERY_CHARS)
+        .map_or(trimmed.len(), |(index, _)| index);
+    Ok((
+        trimmed[..cut].to_string(),
+        Some(format!(
+            "Note: the query was {total} characters and was truncated to {} characters.",
+            gateway_search::MAX_QUERY_CHARS
+        )),
+    ))
+}
+
 fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
+    let (query, truncation) = crate::normalize_search_query(&input.query)?;
+    let mut input = input.clone();
+    input.query = query;
+    let mut output = execute_web_search_checked(&input)?;
+    if let Some(note) = truncation {
+        for item in &mut output.results {
+            if let WebSearchResultItem::Commentary(text) = item {
+                text.push('\n');
+                text.push_str(&note);
+                break;
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn execute_web_search_checked(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
     let started = Instant::now();
+    if let Some(freshness) = input.freshness.as_deref() {
+        if !gateway_search::FRESHNESS_VALUES.contains(&freshness) {
+            return Err(format!(
+                "freshness must be one of {}, got {freshness:?}",
+                gateway_search::FRESHNESS_VALUES.join(", ")
+            ));
+        }
+    }
     let client = build_http_client()?;
+
+    // Domain filters are applied here after the gateway answers, so ask for the most results
+    // when filtering to leave something after the cut.
+    let filtering = input.allowed_domains.is_some() || input.blocked_domains.is_some();
+    let count = if filtering { 10 } else { 8 };
+    let fallback_reason =
+        match gateway_search::search(&input.query, input.freshness.as_deref(), count) {
+            gateway_search::GatewayOutcome::Answer(answer) => {
+                return Ok(gateway_web_search_output(input, answer, started));
+            }
+            gateway_search::GatewayOutcome::Refused(message) => return Err(message),
+            gateway_search::GatewayOutcome::Fallback(reason) => reason,
+        };
+    execute_local_web_search(input, &client, started, &fallback_reason)
+}
+
+fn filter_search_hits(hits: &mut Vec<SearchHit>, input: &WebSearchInput) {
+    if let Some(allowed) = input.allowed_domains.as_ref() {
+        hits.retain(|hit| host_matches_list(&hit.url, allowed));
+    }
+    if let Some(blocked) = input.blocked_domains.as_ref() {
+        hits.retain(|hit| !host_matches_list(&hit.url, blocked));
+    }
+    dedupe_hits(hits);
+    hits.truncate(WEB_SEARCH_MAX_HITS);
+}
+
+fn render_search_hits(hits: &[SearchHit]) -> String {
+    hits.iter()
+        .map(|hit| {
+            let mut line = format!("- [{}]({})", hit.title, hit.url);
+            if let Some(published) = &hit.published {
+                line = format!("{line} ({published})");
+            }
+            if let Some(snippet) = &hit.snippet {
+                line = format!("{line}: {snippet}");
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        )
+}
+
+fn gateway_web_search_output(
+    input: &WebSearchInput,
+    answer: gateway_search::GatewayAnswer,
+    started: Instant,
+) -> WebSearchOutput {
+    let mut hits = answer
+        .hits
+        .into_iter()
+        .map(|hit| SearchHit {
+            title: hit.title,
+            url: hit.url,
+            snippet: hit.snippet,
+            published: hit.published,
+        })
+        .collect::<Vec<_>>();
+    filter_search_hits(&mut hits, input);
+
+    let mut lines = Vec::new();
+    if hits.is_empty() {
+        lines.push(format!(
+            "No web search results matched the query {:?}.",
+            input.query
+        ));
+    } else {
+        lines.push(format!(
+            "Search results for {:?}. Include a Sources section in the final answer.",
+            input.query
+        ));
+        lines.push(render_search_hits(&hits));
+    }
+    let via = match (&answer.provider, answer.cached) {
+        (Some(provider), true) => format!("Source: Zero-X gateway ({provider}, cached)."),
+        (Some(provider), false) => format!("Source: Zero-X gateway ({provider})."),
+        (None, _) => "Source: Zero-X gateway.".to_string(),
+    };
+    lines.push(via);
+    if let Some(quota) = &answer.quota {
+        lines.push(quota.describe());
+    }
+
+    WebSearchOutput {
+        query: input.query.clone(),
+        source: "zero-x gateway",
+        results: vec![
+            WebSearchResultItem::Commentary(lines.join(
+                "
+",
+            )),
+            WebSearchResultItem::SearchResult {
+                tool_use_id: String::from("web_search_1"),
+                content: hits,
+            },
+        ],
+        duration_seconds: started.elapsed().as_secs_f64(),
+    }
+}
+
+fn execute_local_web_search(
+    input: &WebSearchInput,
+    client: &Client,
+    started: Instant,
+    fallback_reason: &str,
+) -> Result<WebSearchOutput, String> {
     let search_url = build_search_url(&input.query)?;
     let response = client
         .get(search_url.as_str())
@@ -3256,32 +3429,31 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
         hits = extract_search_hits_from_generic_links(&html, search_url.host_str());
     }
 
-    if let Some(allowed) = input.allowed_domains.as_ref() {
-        hits.retain(|hit| host_matches_list(&hit.url, allowed));
-    }
-    if let Some(blocked) = input.blocked_domains.as_ref() {
-        hits.retain(|hit| !host_matches_list(&hit.url, blocked));
-    }
+    filter_search_hits(&mut hits, input);
 
-    dedupe_hits(&mut hits);
-    hits.truncate(8);
-
+    let mut note = format!("Source: local fallback (DuckDuckGo); {fallback_reason}.");
+    if input.freshness.is_some() {
+        note.push_str(" The freshness filter was not applied.");
+    }
     let summary = if hits.is_empty() {
-        format!("No web search results matched the query {:?}.", input.query)
-    } else {
-        let rendered_hits = hits
-            .iter()
-            .map(|hit| format!("- [{}]({})", hit.title, hit.url))
-            .collect::<Vec<_>>()
-            .join("\n");
         format!(
-            "Search results for {:?}. Include a Sources section in the final answer.\n{}",
-            input.query, rendered_hits
+            "No web search results matched the query {:?}.
+{note}",
+            input.query
+        )
+    } else {
+        format!(
+            "Search results for {:?}. Include a Sources section in the final answer.
+{}
+{note}",
+            input.query,
+            render_search_hits(&hits)
         )
     };
 
     Ok(WebSearchOutput {
         query: input.query.clone(),
+        source: "local fallback",
         results: vec![
             WebSearchResultItem::Commentary(summary),
             WebSearchResultItem::SearchResult {
@@ -3487,6 +3659,8 @@ fn extract_search_hits(html: &str) -> Vec<SearchHit> {
             hits.push(SearchHit {
                 title: title.trim().to_string(),
                 url: decoded_url,
+                snippet: None,
+                published: None,
             });
         }
         remaining = &after_tag[end_anchor_idx + 4..];
@@ -3531,6 +3705,8 @@ fn extract_search_hits_from_generic_links(html: &str, search_host: Option<&str>)
             hits.push(SearchHit {
                 title: title.trim().to_string(),
                 url: decoded_url,
+                snippet: None,
+                published: None,
             });
         }
         remaining = &after_tag[end_anchor_idx + 4..];
@@ -8181,6 +8357,7 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 }
 
 mod agent_worktree;
+mod gateway_search;
 pub mod lane_completion;
 pub mod pdf_extract;
 mod powershell;
@@ -12445,6 +12622,467 @@ printf 'pwsh:%s' "$1"
         );
     }
 
+    /// A fake Zero-X gateway: answers every request with one canned response and keeps
+    /// each full request (head and body) for the assertions.
+    struct FakeGateway {
+        addr: SocketAddr,
+        requests: Arc<Mutex<Vec<String>>>,
+        shutdown: Option<std::sync::mpsc::Sender<()>>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl FakeGateway {
+        fn spawn(status: u16, reason: &'static str, body: &str) -> Self {
+            Self::spawn_with_headers(status, reason, "", body)
+        }
+
+        fn spawn_with_headers(
+            status: u16,
+            reason: &'static str,
+            headers: &str,
+            body: &str,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake gateway");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("addr");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&requests);
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let response = HttpResponse {
+                status,
+                reason,
+                content_type: "application/json",
+                headers: headers.to_string(),
+                body: body.to_string(),
+            };
+            let handle = thread::spawn(move || loop {
+                if rx.try_recv().is_ok() {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).expect("blocking");
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(20)))
+                            .expect("read timeout");
+                        let mut data = Vec::new();
+                        let mut chunk = [0_u8; 4096];
+                        loop {
+                            let size = stream.read(&mut chunk).expect("read request");
+                            data.extend_from_slice(&chunk[..size]);
+                            let text = String::from_utf8_lossy(&data).into_owned();
+                            if let Some(head_end) = text.find("\r\n\r\n") {
+                                let length = text[..head_end]
+                                    .lines()
+                                    .find_map(|line| {
+                                        line.to_ascii_lowercase()
+                                            .strip_prefix("content-length:")
+                                            .and_then(|value| value.trim().parse::<usize>().ok())
+                                    })
+                                    .unwrap_or(0);
+                                if data.len() >= head_end + 4 + length || size == 0 {
+                                    break;
+                                }
+                            } else if size == 0 {
+                                break;
+                            }
+                        }
+                        seen.lock()
+                            .expect("requests")
+                            .push(String::from_utf8_lossy(&data).into_owned());
+                        stream
+                            .write_all(response.to_bytes().as_slice())
+                            .expect("write response");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("gateway accept failed: {error}"),
+                }
+            });
+            Self {
+                addr,
+                requests,
+                shutdown: Some(tx),
+                handle: Some(handle),
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().expect("requests").clone()
+        }
+    }
+
+    impl Drop for FakeGateway {
+        fn drop(&mut self) {
+            if let Some(tx) = self.shutdown.take() {
+                let _ = tx.send(());
+            }
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// Points the gateway origin at a fake and (optionally) signs in; undone on drop.
+    struct GatewayEnv;
+
+    impl GatewayEnv {
+        fn new(addr: SocketAddr, signed_in: bool) -> Self {
+            std::env::set_var("NEURON_API_BASE", format!("http://{addr}/v1"));
+            runtime::set_zerox_token_provider(if signed_in {
+                Some(Arc::new(|| Ok("ses_secret_test_token".to_string())))
+            } else {
+                None
+            });
+            Self
+        }
+    }
+
+    impl Drop for GatewayEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("NEURON_API_BASE");
+            std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+            runtime::set_zerox_token_provider(None);
+        }
+    }
+
+    const GATEWAY_OK: &str = r#"{"results":[
+        {"title":"Reqwest docs","url":"https://docs.rs/reqwest","snippet":"HTTP client","published":"2026-11-01T00:00:00.000Z"},
+        {"title":"Blocked","url":"https://example.com/x","snippet":"nope"},
+        {"title":"Tokio","url":"https://tokio.rs/","snippet":"runtime"}],
+        "provider":"searxng","cached":false,
+        "quota":{"remaining":37,"limit":40,"resets_at":"2026-11-08T00:00:00.000Z","research":{"remaining":3,"limit":3}}}"#;
+
+    const DDG_PAGE: &str = r#"<html><body>
+        <a class="result__a" href="https://docs.rs/local">Local result</a>
+        <a class="result__a" href="https://example.com/local">Blocked local</a></body></html>"#;
+
+    fn search_output(result: &str) -> serde_json::Value {
+        serde_json::from_str(result).expect("valid json")
+    }
+
+    fn commentary(output: &serde_json::Value) -> String {
+        output["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .find_map(|item| item.as_str())
+            .expect("commentary")
+            .to_string()
+    }
+
+    fn hits(output: &serde_json::Value) -> Vec<serde_json::Value> {
+        output["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .find(|item| item.get("content").is_some())
+            .expect("hits block")["content"]
+            .as_array()
+            .expect("content")
+            .clone()
+    }
+
+    #[test]
+    fn signed_in_web_search_uses_the_gateway_with_the_session_bearer() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let _env = GatewayEnv::new(gateway.addr, true);
+
+        let result = execute_tool(
+            "WebSearch",
+            &json!({"query": "rust http", "freshness": "week"}),
+        )
+        .expect("gateway search succeeds");
+        let output = search_output(&result);
+
+        assert_eq!(output["source"], "zero-x gateway");
+        let found = hits(&output);
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0]["snippet"], "HTTP client");
+        let note = commentary(&output);
+        assert!(note.contains("37 of 40 searches left today"), "{note}");
+        assert!(note.contains("2026-11-08"), "{note}");
+        assert!(!note.contains("local fallback"), "{note}");
+        assert!(!result.contains("ses_secret_test_token"));
+
+        let requests = gateway.requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(request.starts_with("POST /v1/search "), "{request}");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer ses_secret_test_token"),
+            "{request}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+        assert_eq!(body["query"], "rust http");
+        assert_eq!(body["freshness"], "week");
+        assert_eq!(body["count"], 8);
+    }
+
+    #[test]
+    fn gateway_results_honour_allowed_and_blocked_domains() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let _env = GatewayEnv::new(gateway.addr, true);
+
+        let allowed = execute_tool(
+            "WebSearch",
+            &json!({"query": "rust http", "allowed_domains": ["https://DOCS.rs/"]}),
+        )
+        .expect("allowed filter");
+        let found = hits(&search_output(&allowed));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["url"], "https://docs.rs/reqwest");
+
+        let blocked = execute_tool(
+            "WebSearch",
+            &json!({"query": "rust http", "blocked_domains": ["EXAMPLE.com"]}),
+        )
+        .expect("blocked filter");
+        let urls = hits(&search_output(&blocked))
+            .iter()
+            .map(|hit| hit["url"].as_str().expect("url").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(urls, ["https://docs.rs/reqwest", "https://tokio.rs/"]);
+
+        // Filtering asks for the most results so the cut leaves something.
+        assert!(gateway
+            .requests()
+            .iter()
+            .all(|request| request.contains("\"count\":10")));
+    }
+
+    #[test]
+    fn an_invalid_freshness_is_rejected_before_any_request() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let _env = GatewayEnv::new(gateway.addr, true);
+
+        let error = execute_tool(
+            "WebSearch",
+            &json!({"query": "rust http", "freshness": "decade"}),
+        )
+        .expect_err("bad freshness");
+        assert!(error.contains("freshness"), "{error}");
+        assert_eq!(gateway.requests().len(), 0);
+    }
+
+    #[test]
+    fn exhausted_gateway_quota_is_reported_and_never_scraped() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(
+            429,
+            "Too Many Requests",
+            r#"{"error":"search_quota_exhausted","message":"x","exhausted":"searches","resets_at":"2026-11-08T00:00:00.000Z"}"#,
+        );
+        let local_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&local_hits);
+        let local = TestServer::spawn(Arc::new(move |_: &str| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            HttpResponse::html(200, "OK", DDG_PAGE)
+        }));
+        let _env = GatewayEnv::new(gateway.addr, true);
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", local.addr()),
+        );
+
+        let error = execute_tool("WebSearch", &json!({"query": "rust http"}))
+            .expect_err("an exhausted quota is an error");
+        assert!(error.contains("quota exhausted"), "{error}");
+        assert!(error.contains("2026-11-08"), "{error}");
+        assert!(error.contains("Not falling back"), "{error}");
+        assert!(!error.contains("ses_secret_test_token"));
+        assert_eq!(gateway.requests().len(), 1);
+        assert_eq!(local_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_503_from_the_gateway_falls_back_to_the_marked_local_search() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(
+            503,
+            "Service Unavailable",
+            r#"{"error":"search_unavailable","message":"later"}"#,
+        );
+        let local = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(
+                request_line.contains("GET /html/?q=rust+http "),
+                "{request_line}"
+            );
+            HttpResponse::html(200, "OK", DDG_PAGE)
+        }));
+        let _env = GatewayEnv::new(gateway.addr, true);
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", local.addr()),
+        );
+
+        let result = execute_tool(
+            "WebSearch",
+            &json!({"query": "rust http", "blocked_domains": ["example.com"], "freshness": "day"}),
+        )
+        .expect("the local search answers");
+        let output = search_output(&result);
+
+        assert_eq!(gateway.requests().len(), 1);
+        assert_eq!(output["source"], "local fallback");
+        let note = commentary(&output);
+        assert!(note.contains("local fallback"), "{note}");
+        assert!(note.contains("unavailable (503)"), "{note}");
+        assert!(note.contains("freshness filter was not applied"), "{note}");
+        let found = hits(&output);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["url"], "https://docs.rs/local");
+    }
+
+    #[test]
+    fn signed_out_web_search_goes_straight_to_the_local_search() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let local = TestServer::spawn(Arc::new(|_: &str| HttpResponse::html(200, "OK", DDG_PAGE)));
+        let _env = GatewayEnv::new(gateway.addr, false);
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", local.addr()),
+        );
+
+        let result =
+            execute_tool("WebSearch", &json!({"query": "rust http"})).expect("local search");
+        let output = search_output(&result);
+
+        assert!(gateway.requests().is_empty(), "no sign-in, no gateway call");
+        assert_eq!(output["source"], "local fallback");
+        assert!(commentary(&output).contains("not signed in to Zero-X"));
+        assert_eq!(hits(&output).len(), 2);
+    }
+
+    #[test]
+    fn an_unreachable_gateway_falls_back_to_the_local_search() {
+        let _guard = env_guard();
+        // A port that was just free and has no listener.
+        let dead = TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr");
+        let local = TestServer::spawn(Arc::new(|_: &str| HttpResponse::html(200, "OK", DDG_PAGE)));
+        let _env = GatewayEnv::new(dead, true);
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", local.addr()),
+        );
+
+        let result = execute_tool("WebSearch", &json!({"query": "rust http"})).expect("fallback");
+        let output = search_output(&result);
+        assert_eq!(output["source"], "local fallback");
+        assert!(commentary(&output).contains("could not be reached"));
+        assert!(!result.contains("ses_secret_test_token"));
+    }
+
+    #[test]
+    fn a_gateway_redirect_is_never_followed_and_falls_back() {
+        let _guard = env_guard();
+        let target = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let gateway = FakeGateway::spawn_with_headers(
+            307,
+            "Temporary Redirect",
+            &format!("Location: http://{}/v1/search\r\n", target.addr),
+            "",
+        );
+        let local = TestServer::spawn(Arc::new(|_: &str| HttpResponse::html(200, "OK", DDG_PAGE)));
+        let _env = GatewayEnv::new(gateway.addr, true);
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", local.addr()),
+        );
+
+        let result = execute_tool("WebSearch", &json!({"query": "rust http"})).expect("fallback");
+        let output = search_output(&result);
+        assert_eq!(output["source"], "local fallback");
+        assert!(commentary(&output).contains("redirect"), "{result}");
+        assert_eq!(gateway.requests().len(), 1);
+        assert!(
+            target.requests().is_empty(),
+            "the redirect target got a request"
+        );
+        assert!(!result.contains("ses_secret_test_token"));
+    }
+
+    #[test]
+    fn empty_and_whitespace_queries_are_rejected_before_any_request() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let _env = GatewayEnv::new(gateway.addr, true);
+        for query in ["", "   \t\n "] {
+            let error =
+                execute_tool("WebSearch", &json!({ "query": query })).expect_err("empty query");
+            assert!(error.contains("non-empty query"), "{error}");
+        }
+        assert_eq!(gateway.requests().len(), 0);
+    }
+
+    #[test]
+    fn a_long_query_is_trimmed_truncated_and_noted() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let _env = GatewayEnv::new(gateway.addr, true);
+        let query = format!("  {}  ", "a".repeat(450));
+
+        let result = execute_tool("WebSearch", &json!({ "query": query })).expect("search");
+        let note = commentary(&search_output(&result));
+        assert!(note.contains("450 characters"), "{note}");
+        assert!(note.contains("truncated to 400"), "{note}");
+        let requests = gateway.requests();
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).expect("body"))
+                .expect("json");
+        assert_eq!(body["query"].as_str().expect("query"), "a".repeat(400));
+    }
+
+    #[test]
+    fn a_multibyte_query_is_cut_on_a_character_boundary() {
+        let (cut, note) = crate::normalize_search_query(&"é".repeat(401)).expect("ok");
+        assert_eq!(cut, "é".repeat(400));
+        assert!(note.is_some());
+        let (same, note) = crate::normalize_search_query(&"é".repeat(400)).expect("ok");
+        assert_eq!(same.chars().count(), 400);
+        assert!(note.is_none());
+        let (mixed, _) =
+            crate::normalize_search_query(&format!("{}日本", "x".repeat(399))).expect("ok");
+        assert_eq!(mixed, format!("{}日", "x".repeat(399)));
+    }
+
+    #[test]
+    fn a_gateway_400_is_a_clear_error_and_not_scraped() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(
+            400,
+            "Bad Request",
+            r#"{"error":"invalid_request","message":"bad"}"#,
+        );
+        let local_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&local_hits);
+        let local = TestServer::spawn(Arc::new(move |_: &str| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            HttpResponse::html(200, "OK", DDG_PAGE)
+        }));
+        let _env = GatewayEnv::new(gateway.addr, true);
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", local.addr()),
+        );
+
+        let error = execute_tool("WebSearch", &json!({"query": "rust http"})).expect_err("400");
+        assert!(error.contains("invalid"), "{error}");
+        assert!(error.contains("Not falling back"), "{error}");
+        assert_eq!(local_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     struct TestServer {
         addr: SocketAddr,
         shutdown: Option<std::sync::mpsc::Sender<()>>,
@@ -12521,6 +13159,7 @@ printf 'pwsh:%s' "$1"
         status: u16,
         reason: &'static str,
         content_type: &'static str,
+        headers: String,
         body: String,
     }
 
@@ -12530,6 +13169,7 @@ printf 'pwsh:%s' "$1"
                 status,
                 reason,
                 content_type: "text/html; charset=utf-8",
+                headers: String::new(),
                 body: body.to_string(),
             }
         }
@@ -12539,16 +13179,18 @@ printf 'pwsh:%s' "$1"
                 status,
                 reason,
                 content_type: "text/plain; charset=utf-8",
+                headers: String::new(),
                 body: body.to_string(),
             }
         }
 
         fn to_bytes(&self) -> Vec<u8> {
             format!(
-                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                 self.status,
                 self.reason,
                 self.content_type,
+                self.headers,
                 self.body.len(),
                 self.body
             )

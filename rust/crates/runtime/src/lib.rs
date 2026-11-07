@@ -211,8 +211,8 @@ pub use mcp_stdio::{
 };
 pub use mcp_toggle::{set_mcp_server_enabled, McpToggleOutcome};
 pub use mcp_zerox::{
-    hosted_connectors_enabled, set_zerox_token_provider, valid_connector_id, zerox_connect_url,
-    zerox_endpoint, zerox_needs_connect, zerox_origin, ZeroxTokenProvider,
+    hosted_connectors_enabled, set_zerox_token_provider, valid_connector_id, zerox_bearer_token,
+    zerox_connect_url, zerox_endpoint, zerox_needs_connect, zerox_origin, ZeroxTokenProvider,
     ZEROX_HOSTED_CONNECTORS_ENV,
 };
 pub use model_routing::{ModelRouting, ModelRoutingSettings};
