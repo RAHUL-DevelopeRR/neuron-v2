@@ -254,6 +254,9 @@ struct Plan {
     /// Engines to wait for before the new one starts.
     wait: Vec<Arc<dyn EngineHandle>>,
     evicted: Option<(ChatId, u64)>,
+    /// The chat's own engine was taken out to be replaced. Its exit is not
+    /// told when a new engine takes its place; when none does, it is.
+    replaced: bool,
 }
 
 fn display_path(path: &Path) -> String {
@@ -363,7 +366,9 @@ impl EngineRegistry {
 
     /// A new engine for the chat, replacing the one that runs. `resume`: `None`
     /// continues the chat's own session, `Some("")` starts a fresh one,
-    /// `Some(id)` continues that one.
+    /// `Some(id)` continues that one. When the new engine cannot start, the old
+    /// one is gone all the same: the window gets its `exited` exit, carrying
+    /// the reason nothing replaced it.
     pub fn restart(
         self: &Arc<Self>,
         id: &str,
@@ -419,18 +424,11 @@ impl EngineRegistry {
             Box::new(move |line| lines.on_line(&line_chat, generation, line)),
             Box::new(move |exit| exits.on_exit(&exit_chat, generation, exit)),
         );
-        let mut chats = lock(&self.chats);
         let handle = match spawned {
             Ok(handle) => handle,
-            Err(error) => {
-                if let Some(chat) = chats.get_mut(id) {
-                    chat.starting = false;
-                    chat.pending_exit = None;
-                    chat.generation = plan.previous_generation;
-                }
-                return Err(error);
-            }
+            Err(error) => return Err(self.abandon(id, &plan, error)),
         };
+        let mut chats = lock(&self.chats);
         let Some(chat) = chats.get_mut(id) else {
             // Closed while it was starting.
             drop(chats);
@@ -449,6 +447,36 @@ impl EngineRegistry {
             self.events.exit(id, generation, exit, ExitReason::Exited);
         }
         Ok(generation)
+    }
+
+    /// A start that will not finish: the chat is as it was, without an engine.
+    /// If the start had taken the chat's own engine out to replace it, the
+    /// window is told that engine is gone, with `error` as the reason. Returns
+    /// `error`.
+    fn abandon(&self, id: &str, plan: &Plan, error: String) -> String {
+        let replaced = {
+            let mut chats = lock(&self.chats);
+            if let Some(chat) = chats.get_mut(id) {
+                chat.starting = false;
+                chat.pending_exit = None;
+                chat.generation = plan.previous_generation;
+                plan.replaced
+            } else {
+                false
+            }
+        };
+        if replaced {
+            self.events.exit(
+                id,
+                plan.previous_generation,
+                EngineExit {
+                    code: None,
+                    error: Some(error.clone()),
+                },
+                ExitReason::Exited,
+            );
+        }
+        error
     }
 
     /// The part of a start that holds the lock: no stopping, no spawning.
@@ -503,11 +531,12 @@ impl EngineRegistry {
         let mut evicted = None;
         let mut lingering = lock(&self.lingering);
         lingering.retain(|handle| handle.running());
-        // The engine this one replaces; its exit is not news to the window.
-        let old = chats
-            .get_mut(id)
-            .and_then(|chat| chat.handle.take())
-            .filter(|handle| handle.running());
+        // The engine this one replaces; its exit is not news to the window
+        // unless nothing takes its place (`abandon`). One that already ended
+        // on its own is not waited for, but its exit was not told either.
+        let taken = chats.get_mut(id).and_then(|chat| chat.handle.take());
+        let replaced = taken.is_some();
+        let old = taken.filter(|handle| handle.running());
         if let Some(old) = &old {
             lingering.push(Arc::clone(old));
             stop.push(Arc::clone(old));
@@ -553,6 +582,7 @@ impl EngineRegistry {
             stop,
             wait,
             evicted,
+            replaced,
         })))
     }
 
@@ -1514,6 +1544,70 @@ mod tests {
         assert!(fixture.registry.summary(&chat.chat).unwrap().running);
         assert_eq!(old.generation, 1);
         assert_eq!(fixture.spawner.last().generation, 2);
+    }
+
+    /// A restart whose new engine cannot start still tells the window that the
+    /// old engine is gone, with the reason nothing took its place. The old
+    /// engine's own exit, when it comes, is not told twice.
+    #[test]
+    fn a_failed_restart_tells_the_window_the_old_engine_is_gone() {
+        let fixture = Fixture::with("restart-fails", true, MAX_RUNNING, MAX_CHATS);
+        let chat = fixture.open();
+        let old = fixture.spawner.last();
+        let denied = "[engine:denied] The system would not let Neuron run the engine.";
+        *lock(&fixture.spawner.refuse) = Some(denied.into());
+        let error = fixture
+            .registry
+            .restart(&chat.chat, &Launch::default(), None, false)
+            .unwrap_err();
+        assert_eq!(error, denied);
+        assert_eq!(old.engine.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture.exits(),
+            [(chat.chat.clone(), 1, ExitReason::Exited)]
+        );
+        assert_eq!(
+            lock(&fixture.events.errors).clone(),
+            [Some(denied.to_string())]
+        );
+        let summary = fixture.registry.summary(&chat.chat).unwrap();
+        assert!(!summary.running);
+        assert_eq!(summary.generation, 1);
+        (old.exit.lock().unwrap().take().unwrap())(EngineExit {
+            code: Some(0),
+            error: None,
+        });
+        assert_eq!(fixture.exits().len(), 1);
+
+        // An engine that had just ended on its own, before its exit was told,
+        // is told the same way.
+        *lock(&fixture.spawner.refuse) = None;
+        let other = fixture.open();
+        let ended = fixture.spawner.last();
+        ended.engine.alive.store(false, Ordering::SeqCst);
+        *lock(&fixture.spawner.refuse) = Some(denied.into());
+        fixture
+            .registry
+            .restart(&other.chat, &Launch::default(), None, false)
+            .unwrap_err();
+        (ended.exit.lock().unwrap().take().unwrap())(EngineExit {
+            code: Some(1),
+            error: None,
+        });
+        assert_eq!(
+            fixture.exits()[1..],
+            [(other.chat.clone(), other.generation, ExitReason::Exited)]
+        );
+
+        // Once an engine can start, the chat starts again.
+        *lock(&fixture.spawner.refuse) = None;
+        assert!(
+            fixture
+                .registry
+                .restart(&chat.chat, &Launch::default(), None, false)
+                .unwrap()
+                .running
+        );
     }
 
     #[test]

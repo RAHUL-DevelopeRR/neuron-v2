@@ -325,6 +325,32 @@ describe('the chat host: resilience', () => {
     expect(controller.getState().connectionError).toContain('the engine pipe is closed')
   })
 
+  test("a failed restart: the old engine's exit, with the host's reason, reaches the chat and the stop listeners", async () => {
+    const ipc = new FakeIpc()
+    opened(ipc)
+    const denied = '[engine:denied] The system would not let Neuron run the engine.'
+    // The host stopped the old engine and could not start the new one: it says so, then refuses.
+    ipc.on('chat_resume', () => {
+      ipc.emit('neuron://chat-exit', { chat: 'c1aaaaaa', generation: 1, code: null, error: denied, reason: 'exited' })
+      return Promise.reject(denied)
+    })
+    const host = chatChatsHost(ipc)
+    const stopped: Array<[string, string]> = []
+    host.onStopped((id, reason) => stopped.push([id, reason]))
+    const { controller } = await host.open({})
+    await expect(host.resume('c1aaaaaa')).rejects.toThrow(denied)
+    expect(stopped).toEqual([['c1aaaaaa', 'exited']])
+    expect(controller.getState().connection).toBe('exited')
+    expect(controller.getState().connectionError).toBe(denied)
+    // Once an engine can start, the chat starts again.
+    ipc.on('chat_resume', () => {
+      ipc.emit('neuron://chat-line', { chat: 'c1aaaaaa', generation: 3, line: ready })
+      return summary('c1aaaaaa', 3)
+    })
+    await host.resume('c1aaaaaa')
+    expect(controller.getState().connection).toBe('ready')
+  })
+
   test('closing a chat that has its own copy fails with has_worktree and keeps the chat', async () => {
     const ipc = new FakeIpc()
     opened(ipc)
