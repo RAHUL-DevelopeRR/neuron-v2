@@ -676,7 +676,7 @@ such a call is not run. Turn one off like any other server (`/mcp disable <serve
 | `NEURON_NO_TUI=1` | neuron | Use the line REPL instead of the full-screen UI |
 | `NEURON_TUI_ASCII` | neuron-tui | `1` draws with the classic-console character set everywhere, `0` with the Unicode one |
 | `NEURON_AMBIGUOUS_WIDE` | neuron-tui | `1`: the terminal draws East Asian ambiguous-width characters (`│ ● ○`) two columns wide, so the status bar measures them so; `0`: one column. Unset, a Chinese, Japanese or Korean locale counts as `1` |
-| `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: the latest release; a prerelease such as `7.0.0-alpha.4` must be named) |
+| `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: the latest release; a prerelease such as `7.0.0-alpha.5` must be named) |
 | `NEURON_INSTALL_DIR` | install.sh, install.ps1 | Install directory |
 | `NEURON_BINARY_PATH` | npm and pip launchers | Run this binary instead of the downloaded one |
 | `NEURON_CACHE_DIR` | npm and pip launchers | Where downloaded binaries are cached |

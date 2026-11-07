@@ -3,7 +3,7 @@
 Notable changes to Neuron. Versions follow [semantic versioning](https://semver.org/).
 The release workflow copies a version's section into its GitHub release notes.
 
-## 7.0.0-alpha.5 (unreleased)
+## 7.0.0-alpha.5 (2026-11-07)
 
 - Trust hardening: the npm and PyPI launchers now check the downloaded binary against the
   release `SHA256SUMS` (from the GitHub release even when `NEURON_DOWNLOAD_BASE` is a
