@@ -10,6 +10,8 @@
 //! - `200`: the results, plus the remaining quota, are shown to the model.
 //! - `429` / `402` (quota used up) and `403` (suspended): the search is refused with a clear
 //!   message; the tool does not quietly scrape instead, so the budget means something.
+//! - `400` (invalid query): refused with a clear message, not scraped.
+//! - Any redirect (`3xx`) is never followed and counts as a gateway fault.
 //! - `503 search_unavailable`, any other server error, a network error, a rejected sign-in
 //!   (`401`) or no sign-in at all: the caller falls back to the local `DuckDuckGo` scrape and
 //!   marks the answer "local fallback".
@@ -21,6 +23,9 @@ use serde_json::{json, Value};
 
 /// Freshness values the gateway accepts.
 pub(crate) const FRESHNESS_VALUES: [&str; 4] = ["day", "week", "month", "year"];
+
+/// Longest query the gateway accepts, in characters (contract section 17).
+pub(crate) const MAX_QUERY_CHARS: usize = 400;
 
 /// Largest result count the gateway allows.
 const MAX_COUNT: u32 = 10;
@@ -77,12 +82,7 @@ pub(crate) enum GatewayOutcome {
 }
 
 /// Asks the gateway for up to `count` results.
-pub(crate) fn search(
-    client: &Client,
-    query: &str,
-    freshness: Option<&str>,
-    count: u32,
-) -> GatewayOutcome {
+pub(crate) fn search(query: &str, freshness: Option<&str>, count: u32) -> GatewayOutcome {
     let Ok(token) = runtime::zerox_bearer_token() else {
         return GatewayOutcome::Fallback(
             "not signed in to Zero-X (run `neuron login`)".to_string(),
@@ -98,6 +98,9 @@ pub(crate) fn search(
         body["freshness"] = Value::String(freshness.to_string());
     }
 
+    let Ok(client) = build_gateway_client() else {
+        return GatewayOutcome::Fallback("the Zero-X gateway client could not start".to_string());
+    };
     let response = client
         .post(format!("{origin}/v1/search"))
         .bearer_auth(token)
@@ -121,6 +124,16 @@ pub(crate) fn search(
     interpret(status, &text)
 }
 
+/// A client for the gateway call only. It never follows a redirect, so a `307`/`308` cannot
+/// re-send the bearer or the query body to another target.
+fn build_gateway_client() -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("clawd-rust-tools/0.1")
+        .build()
+}
+
 /// Turns the gateway's status and body into an outcome.
 fn interpret(status: u16, text: &str) -> GatewayOutcome {
     let value: Value = serde_json::from_str(text).unwrap_or(Value::Null);
@@ -133,6 +146,13 @@ fn interpret(status: u16, text: &str) -> GatewayOutcome {
         403 => GatewayOutcome::Refused(
             "Zero-X web search is not available: this account is suspended (contact support@zero-x.live). Not falling back to a local scrape."
                 .to_string(),
+        ),
+        400 => GatewayOutcome::Refused(
+            "Zero-X web search rejected the query as invalid (HTTP 400, queries are 1 to 400 characters). Not falling back to a local scrape; rephrase the query and try again."
+                .to_string(),
+        ),
+        300..=399 => GatewayOutcome::Fallback(
+            "the Zero-X gateway answered with a redirect, which is never followed".to_string(),
         ),
         401 => GatewayOutcome::Fallback(
             "Zero-X rejected the sign-in (run `neuron login` again)".to_string(),
@@ -223,6 +243,8 @@ mod tests {
         assert!(matches!(interpret(503, "{}"), GatewayOutcome::Fallback(_)));
         assert!(matches!(interpret(502, "{}"), GatewayOutcome::Fallback(_)));
         assert!(matches!(interpret(401, "{}"), GatewayOutcome::Fallback(_)));
+        assert!(matches!(interpret(400, "{}"), GatewayOutcome::Refused(_)));
+        assert!(matches!(interpret(307, ""), GatewayOutcome::Fallback(_)));
     }
 
     #[test]

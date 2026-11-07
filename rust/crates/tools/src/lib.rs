@@ -2673,7 +2673,7 @@ struct WebFetchInput {
     prompt: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct WebSearchInput {
     query: String,
     allowed_domains: Option<Vec<String>>,
@@ -3198,7 +3198,48 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
 /// Most results shown to the model.
 const WEB_SEARCH_MAX_HITS: usize = 8;
 
+/// Trims the query and enforces the gateway's 1-400 character limit. Returns the usable query
+/// and a note when it had to be cut (on a character boundary).
+fn normalize_search_query(query: &str) -> Result<(String, Option<String>), String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err("WebSearch needs a non-empty query".to_string());
+    }
+    let total = trimmed.chars().count();
+    if total <= gateway_search::MAX_QUERY_CHARS {
+        return Ok((trimmed.to_string(), None));
+    }
+    let cut = trimmed
+        .char_indices()
+        .nth(gateway_search::MAX_QUERY_CHARS)
+        .map_or(trimmed.len(), |(index, _)| index);
+    Ok((
+        trimmed[..cut].to_string(),
+        Some(format!(
+            "Note: the query was {total} characters and was truncated to {} characters.",
+            gateway_search::MAX_QUERY_CHARS
+        )),
+    ))
+}
+
 fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
+    let (query, truncation) = crate::normalize_search_query(&input.query)?;
+    let mut input = input.clone();
+    input.query = query;
+    let mut output = execute_web_search_checked(&input)?;
+    if let Some(note) = truncation {
+        for item in &mut output.results {
+            if let WebSearchResultItem::Commentary(text) = item {
+                text.push('\n');
+                text.push_str(&note);
+                break;
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn execute_web_search_checked(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
     let started = Instant::now();
     if let Some(freshness) = input.freshness.as_deref() {
         if !gateway_search::FRESHNESS_VALUES.contains(&freshness) {
@@ -3215,7 +3256,7 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
     let filtering = input.allowed_domains.is_some() || input.blocked_domains.is_some();
     let count = if filtering { 10 } else { 8 };
     let fallback_reason =
-        match gateway_search::search(&client, &input.query, input.freshness.as_deref(), count) {
+        match gateway_search::search(&input.query, input.freshness.as_deref(), count) {
             gateway_search::GatewayOutcome::Answer(answer) => {
                 return Ok(gateway_web_search_output(input, answer, started));
             }
@@ -12522,6 +12563,15 @@ printf 'pwsh:%s' "$1"
 
     impl FakeGateway {
         fn spawn(status: u16, reason: &'static str, body: &str) -> Self {
+            Self::spawn_with_headers(status, reason, "", body)
+        }
+
+        fn spawn_with_headers(
+            status: u16,
+            reason: &'static str,
+            headers: &str,
+            body: &str,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake gateway");
             listener.set_nonblocking(true).expect("nonblocking");
             let addr = listener.local_addr().expect("addr");
@@ -12532,6 +12582,7 @@ printf 'pwsh:%s' "$1"
                 status,
                 reason,
                 content_type: "application/json",
+                headers: headers.to_string(),
                 body: body.to_string(),
             };
             let handle = thread::spawn(move || loop {
@@ -12863,6 +12914,105 @@ printf 'pwsh:%s' "$1"
         assert!(!result.contains("ses_secret_test_token"));
     }
 
+    #[test]
+    fn a_gateway_redirect_is_never_followed_and_falls_back() {
+        let _guard = env_guard();
+        let target = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let gateway = FakeGateway::spawn_with_headers(
+            307,
+            "Temporary Redirect",
+            &format!("Location: http://{}/v1/search\r\n", target.addr),
+            "",
+        );
+        let local = TestServer::spawn(Arc::new(|_: &str| HttpResponse::html(200, "OK", DDG_PAGE)));
+        let _env = GatewayEnv::new(gateway.addr, true);
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", local.addr()),
+        );
+
+        let result = execute_tool("WebSearch", &json!({"query": "rust http"})).expect("fallback");
+        let output = search_output(&result);
+        assert_eq!(output["source"], "local fallback");
+        assert!(commentary(&output).contains("redirect"), "{result}");
+        assert_eq!(gateway.requests().len(), 1);
+        assert!(
+            target.requests().is_empty(),
+            "the redirect target got a request"
+        );
+        assert!(!result.contains("ses_secret_test_token"));
+    }
+
+    #[test]
+    fn empty_and_whitespace_queries_are_rejected_before_any_request() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let _env = GatewayEnv::new(gateway.addr, true);
+        for query in ["", "   \t\n "] {
+            let error =
+                execute_tool("WebSearch", &json!({ "query": query })).expect_err("empty query");
+            assert!(error.contains("non-empty query"), "{error}");
+        }
+        assert_eq!(gateway.requests().len(), 0);
+    }
+
+    #[test]
+    fn a_long_query_is_trimmed_truncated_and_noted() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let _env = GatewayEnv::new(gateway.addr, true);
+        let query = format!("  {}  ", "a".repeat(450));
+
+        let result = execute_tool("WebSearch", &json!({ "query": query })).expect("search");
+        let note = commentary(&search_output(&result));
+        assert!(note.contains("450 characters"), "{note}");
+        assert!(note.contains("truncated to 400"), "{note}");
+        let requests = gateway.requests();
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).expect("body"))
+                .expect("json");
+        assert_eq!(body["query"].as_str().expect("query"), "a".repeat(400));
+    }
+
+    #[test]
+    fn a_multibyte_query_is_cut_on_a_character_boundary() {
+        let (cut, note) = crate::normalize_search_query(&"é".repeat(401)).expect("ok");
+        assert_eq!(cut, "é".repeat(400));
+        assert!(note.is_some());
+        let (same, note) = crate::normalize_search_query(&"é".repeat(400)).expect("ok");
+        assert_eq!(same.chars().count(), 400);
+        assert!(note.is_none());
+        let (mixed, _) =
+            crate::normalize_search_query(&format!("{}日本", "x".repeat(399))).expect("ok");
+        assert_eq!(mixed, format!("{}日", "x".repeat(399)));
+    }
+
+    #[test]
+    fn a_gateway_400_is_a_clear_error_and_not_scraped() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(
+            400,
+            "Bad Request",
+            r#"{"error":"invalid_request","message":"bad"}"#,
+        );
+        let local_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&local_hits);
+        let local = TestServer::spawn(Arc::new(move |_: &str| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            HttpResponse::html(200, "OK", DDG_PAGE)
+        }));
+        let _env = GatewayEnv::new(gateway.addr, true);
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", local.addr()),
+        );
+
+        let error = execute_tool("WebSearch", &json!({"query": "rust http"})).expect_err("400");
+        assert!(error.contains("invalid"), "{error}");
+        assert!(error.contains("Not falling back"), "{error}");
+        assert_eq!(local_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     struct TestServer {
         addr: SocketAddr,
         shutdown: Option<std::sync::mpsc::Sender<()>>,
@@ -12939,6 +13089,7 @@ printf 'pwsh:%s' "$1"
         status: u16,
         reason: &'static str,
         content_type: &'static str,
+        headers: String,
         body: String,
     }
 
@@ -12948,6 +13099,7 @@ printf 'pwsh:%s' "$1"
                 status,
                 reason,
                 content_type: "text/html; charset=utf-8",
+                headers: String::new(),
                 body: body.to_string(),
             }
         }
@@ -12957,16 +13109,18 @@ printf 'pwsh:%s' "$1"
                 status,
                 reason,
                 content_type: "text/plain; charset=utf-8",
+                headers: String::new(),
                 body: body.to_string(),
             }
         }
 
         fn to_bytes(&self) -> Vec<u8> {
             format!(
-                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                 self.status,
                 self.reason,
                 self.content_type,
+                self.headers,
                 self.body.len(),
                 self.body
             )
