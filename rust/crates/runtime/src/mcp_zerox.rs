@@ -69,6 +69,12 @@ pub fn set_zerox_token_provider(provider: Option<ZeroxTokenProvider>) {
         .unwrap_or_else(PoisonError::into_inner) = provider;
 }
 
+/// The Zero-X sign-in as the bearer for a call to the gateway's own origin (web search), or
+/// why there is none. Never log or print the value.
+pub fn zerox_bearer_token() -> Result<String, String> {
+    zerox_token()
+}
+
 /// The Zero-X sign-in for a hosted connector.
 pub(crate) fn zerox_token() -> Result<String, String> {
     let provider = TOKEN_PROVIDER
