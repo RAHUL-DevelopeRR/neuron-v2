@@ -412,7 +412,8 @@ class InstallShTests(unittest.TestCase):
         result = self.run_installer(GITHUB_TOKEN=GITHUB_TOKEN)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.server.paths()[0], "/repos/neuron/releases/latest")
-        self.assertEqual(self.server.authorization, [None, None, None])
+        # The releases lookup, then SHA256SUMS, the .sha256 file and the binary: none carries the token.
+        self.assertEqual(self.server.authorization, [None, None, None, None])
 
     def test_self_check_runs_the_binary_from_the_install_directory(self) -> None:
         # The temporary directory may be mounted noexec; the binary has to run from the install directory anyway.
