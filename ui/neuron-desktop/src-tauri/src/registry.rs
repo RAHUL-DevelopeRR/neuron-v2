@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,9 @@ const SHUTDOWN_WAIT: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(3)
 };
+/// How long the app's shutdown then waits for starts under way to give up. The
+/// wait ends as soon as they have, so tests keep it as long.
+const STARTS_WAIT: Duration = Duration::from_secs(3);
 
 /// Why a chat's engine ended, as the window is told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -198,6 +201,21 @@ pub struct EngineRegistry {
     idle_after: Duration,
     next_generation: AtomicU64,
     next_chat: AtomicU64,
+    /// The app is closing: no engine starts any more. Set under the `chats` lock.
+    closing: AtomicBool,
+    /// Starts from `reserve` to their end, whether their chat is still there
+    /// or not; the app's shutdown waits for them. Counted up under the `chats`
+    /// lock.
+    starts: AtomicUsize,
+}
+
+/// One start under way, counted until it ends by whatever path.
+struct StartUnderWay<'a>(&'a AtomicUsize);
+
+impl Drop for StartUnderWay<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// A chat id the registry could have minted: `c` and 4 to 24 of `[0-9a-z]`.
@@ -259,6 +277,9 @@ struct Plan {
     replaced: bool,
 }
 
+/// Why nothing starts once the app is closing.
+const CLOSING: &str = "Neuron is closing.";
+
 fn display_path(path: &Path) -> String {
     worktree::plain(path).to_string_lossy().into_owned()
 }
@@ -292,6 +313,8 @@ impl EngineRegistry {
             idle_after,
             next_generation: AtomicU64::new(0),
             next_chat: AtomicU64::new(0),
+            closing: AtomicBool::new(false),
+            starts: AtomicUsize::new(0),
         })
     }
 
@@ -399,6 +422,9 @@ impl EngineRegistry {
             Reserved::Already(generation) => return Ok(generation),
             Reserved::Go(plan) => plan,
         };
+        // `reserve` counted this start; it stops counting once the engine is
+        // stored or ended.
+        let _under_way = StartUnderWay(&self.starts);
         // Without the lock: stop, wait, spawn.
         for handle in &plan.stop {
             handle.stop();
@@ -407,6 +433,10 @@ impl EngineRegistry {
         if let Some((victim, generation)) = &plan.evicted {
             self.events
                 .exit(victim, *generation, ended(), ExitReason::Evicted);
+        }
+        // The app began closing meanwhile: nothing more starts.
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(self.abandon(id, &plan, CLOSING.into()));
         }
         let request = SpawnRequest {
             chat: id,
@@ -429,6 +459,13 @@ impl EngineRegistry {
             Err(error) => return Err(self.abandon(id, &plan, error)),
         };
         let mut chats = lock(&self.chats);
+        if self.closing.load(Ordering::SeqCst) {
+            // Ended while the chat still counts as starting: the app's shutdown
+            // waits for that, so this engine is gone before the app is.
+            drop(chats);
+            handle.kill_tree();
+            return Err(self.abandon(id, &plan, CLOSING.into()));
+        }
         let Some(chat) = chats.get_mut(id) else {
             // Closed while it was starting.
             drop(chats);
@@ -451,8 +488,8 @@ impl EngineRegistry {
 
     /// A start that will not finish: the chat is as it was, without an engine.
     /// If the start had taken the chat's own engine out to replace it, the
-    /// window is told that engine is gone, with `error` as the reason. Returns
-    /// `error`.
+    /// window is told that engine is gone, with `error` as the reason (not
+    /// while the app is closing: there is no window to tell). Returns `error`.
     fn abandon(&self, id: &str, plan: &Plan, error: String) -> String {
         let replaced = {
             let mut chats = lock(&self.chats);
@@ -465,7 +502,7 @@ impl EngineRegistry {
                 false
             }
         };
-        if replaced {
+        if replaced && !self.closing.load(Ordering::SeqCst) {
             self.events.exit(
                 id,
                 plan.previous_generation,
@@ -488,6 +525,9 @@ impl EngineRegistry {
         replace: bool,
     ) -> Result<Reserved, String> {
         let mut chats = lock(&self.chats);
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(CLOSING.into());
+        }
         let chat = chats.get(id).ok_or("No such chat.")?;
         if chat.discarding {
             return Err("discarding".into());
@@ -567,6 +607,9 @@ impl EngineRegistry {
         let previous_generation = chat.generation;
         chat.generation = generation;
         chat.starting = true;
+        // Under the lock with the `closing` check above: a shutdown either
+        // stopped this start or waits for it.
+        self.starts.fetch_add(1, Ordering::SeqCst);
         chat.pending_exit = None;
         chat.busy = false;
         chat.waiting = false;
@@ -841,13 +884,26 @@ impl EngineRegistry {
         reaped.into_iter().map(|(id, _)| id).collect()
     }
 
-    /// The app is closing: every engine saves and stops, and whatever is left
-    /// after a short wait is ended with its children.
+    /// The app is closing: no engine starts any more, every engine saves and
+    /// stops (one already told to stop, too), and whatever is left after a
+    /// short wait is ended with its children. A chat still starting is waited
+    /// for: its start gives up and ends any engine it brought up, so no engine
+    /// outlives the app.
     pub fn shutdown_all(&self) {
-        let handles: Vec<_> = lock(&self.chats)
-            .values_mut()
-            .filter_map(|chat| chat.handle.take())
-            .collect();
+        let handles: Vec<_> = {
+            let mut chats = lock(&self.chats);
+            // Under the lock: a start reserved after this sees it, and one
+            // reserved before counts as starting below.
+            self.closing.store(true, Ordering::SeqCst);
+            let mut handles: Vec<_> = chats
+                .values_mut()
+                .filter_map(|chat| chat.handle.take())
+                .collect();
+            // Told to stop, not exited yet: a closed chat's engine, one stopped
+            // to make room or for being idle, one being replaced.
+            handles.append(&mut lock(&self.lingering));
+            handles
+        };
         for handle in &handles {
             handle.stop();
         }
@@ -857,6 +913,13 @@ impl EngineRegistry {
         }
         for handle in &handles {
             handle.kill_tree();
+        }
+        // A start that waited for one of those engines goes on now and gives
+        // up; one that was spawning ends what it spawned. A start counts even
+        // when its chat was closed meanwhile.
+        let deadline = Instant::now() + STARTS_WAIT;
+        while self.starts.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -998,6 +1061,10 @@ mod tests {
         obeys: bool,
         /// The engine ends before `spawn` has returned.
         exits_while_starting: AtomicBool,
+        /// `spawn` waits while this is set, like an engine slow to come up.
+        held: AtomicBool,
+        /// Starts that reached `spawn` (held there or not).
+        entered: AtomicU64,
     }
 
     impl FakeSpawner {
@@ -1016,6 +1083,10 @@ mod tests {
             on_line: LineFn,
             on_exit: ExitFn,
         ) -> Result<Arc<dyn EngineHandle>, String> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            while self.held.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             if let Some(error) = lock(&self.refuse).clone() {
                 return Err(error);
             }
@@ -1759,6 +1830,140 @@ mod tests {
             assert_eq!(spawned.engine.stops.load(Ordering::SeqCst), 1);
             assert_eq!(spawned.engine.kills.load(Ordering::SeqCst), 1);
             assert!(!spawned.engine.running());
+        }
+    }
+
+    /// Quitting while a chat's engine is starting: the start is waited for, and
+    /// the engine it brings up is ended before `shutdown_all` returns.
+    #[test]
+    fn quitting_while_a_chat_starts_ends_that_engine_too() {
+        quit_during_a_start("quit-starting", false);
+    }
+
+    /// The same for a chat closed while its engine starts: it is no longer
+    /// listed, but its start is still waited for.
+    #[test]
+    fn quitting_waits_for_the_start_of_a_chat_closed_meanwhile() {
+        quit_during_a_start("quit-closed-starting", true);
+    }
+
+    /// Restarts a chat whose new engine is held inside `spawn` (closing the chat
+    /// meanwhile when `close`), quits, and lets the engine come up once the app
+    /// is closing. When `shutdown_all` returns, that engine must be gone.
+    fn quit_during_a_start(name: &str, close: bool) {
+        let fixture = Fixture::with(name, true, MAX_RUNNING, MAX_CHATS);
+        let chat = fixture.open();
+        fixture.spawner.held.store(true, Ordering::SeqCst);
+        let registry = Arc::clone(&fixture.registry);
+        let id = chat.chat.clone();
+        let restart =
+            std::thread::spawn(move || registry.restart(&id, &Launch::default(), None, false));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fixture.spawner.entered.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < deadline, "the restart never reached spawn");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if close {
+            fixture.registry.close(&chat.chat).unwrap();
+        }
+
+        let (registry, spawner) = (Arc::clone(&fixture.registry), Arc::clone(&fixture.spawner));
+        let quit = std::thread::spawn(move || {
+            registry.shutdown_all();
+            // What is there the moment the app would exit.
+            let engines = spawner.all();
+            let running = engines
+                .iter()
+                .filter(|spawned| spawned.engine.running())
+                .count();
+            (engines.len(), running)
+        });
+        // The engine comes up once the app has begun closing.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !fixture.registry.closing.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        fixture.spawner.held.store(false, Ordering::SeqCst);
+
+        let (started, running) = quit.join().unwrap();
+        assert_eq!(
+            started, 2,
+            "shutdown_all returned before the start was over"
+        );
+        assert_eq!(running, 0);
+        assert!(restart.join().unwrap().is_err());
+        assert_eq!(
+            fixture.spawner.last().engine.kills.load(Ordering::SeqCst),
+            1
+        );
+    }
+
+    /// Quitting also ends engines told to stop that have not exited yet (here a
+    /// closed chat's), and nothing starts once the app is closing.
+    #[test]
+    fn quitting_ends_engines_still_stopping_and_starts_nothing_after() {
+        // Never obeys: a stopped engine lingers until it is ended.
+        let fixture = Fixture::with("quit-lingering", false, MAX_RUNNING, MAX_CHATS);
+        let closed = fixture.open();
+        let kept = fixture.open();
+        fixture.registry.close(&closed.chat).unwrap();
+        let lingering = fixture.spawner.all()[0].engine.clone();
+        assert!(lingering.running(), "told to stop, not gone yet");
+
+        fixture.registry.shutdown_all();
+        for spawned in fixture.spawner.all() {
+            assert!(
+                !spawned.engine.running(),
+                "engine {} still runs",
+                spawned.generation
+            );
+        }
+        assert_eq!(lingering.kills.load(Ordering::SeqCst), 1);
+
+        assert_eq!(fixture.open_error(), "Neuron is closing.");
+        assert!(fixture
+            .registry
+            .ensure_running(&kept.chat, &Launch::default())
+            .is_err());
+        assert_eq!(fixture.spawner.all().len(), 2);
+    }
+
+    /// Quitting while a start waits for room (the engine it stopped has not
+    /// exited yet) leaves no engine running, whichever finishes first.
+    #[test]
+    fn quitting_while_a_start_waits_for_room_leaves_nothing_running() {
+        // Never obeys, and room for one: the new chat waits for the one it stops.
+        let fixture = Fixture::with("quit-waiting", false, 1, MAX_CHATS);
+        fixture.open();
+        let evicted = fixture.spawner.last().engine.clone();
+        let (registry, dir) = (Arc::clone(&fixture.registry), fixture.dir.clone());
+        let opening = std::thread::spawn(move || {
+            registry.open(
+                OpenRequest {
+                    path: dir,
+                    resume: None,
+                    worktree: None,
+                },
+                &Launch::default(),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while evicted.stops.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the first chat was never stopped"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        fixture.registry.shutdown_all();
+        let _ = opening.join().unwrap();
+        for spawned in fixture.spawner.all() {
+            assert!(
+                !spawned.engine.running(),
+                "engine {} still runs",
+                spawned.generation
+            );
         }
     }
 
