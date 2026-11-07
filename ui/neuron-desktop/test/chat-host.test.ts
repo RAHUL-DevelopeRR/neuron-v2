@@ -430,3 +430,144 @@ describe('the chat host: the host\'s newer refusals', () => {
     expect(controller.getState().connection).toBe('ready')
   })
 })
+
+describe('the chat host: replies the engine waits for', () => {
+  const NOT_KEEPING_UP = 'The Neuron engine is not keeping up. Try again in a moment.'
+  const input = '{"command":"rm -rf target"}'
+  const engineLine = (generation: number, event: Record<string, unknown>) => ({ chat: 'c1aaaaaa', generation, line: JSON.stringify(event) })
+  const askPermission = (generation: number, id: number) =>
+    engineLine(generation, {
+      type: 'permission_requested',
+      id,
+      request: { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: null, input, session_prefixes: [] },
+    })
+  const pause = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms))
+  const until = async (check: () => boolean, ms = 2000) => {
+    const deadline = Date.now() + ms
+    while (!check() && Date.now() < deadline) await pause(2)
+    return check()
+  }
+  /** What chat_send was given, as messages. */
+  const sent = (ipc: FakeIpc) => ipc.calls('chat_send').map((call) => JSON.parse(String(call.line)) as Record<string, unknown>)
+  const replies = (ipc: FakeIpc) => sent(ipc).filter((message) => message.kind === 'permission_reply')
+  /** chat_send refuses the first `count` messages `pick` chooses, as a full input queue does. */
+  const refusing = (ipc: FakeIpc, pick: (message: Record<string, unknown>) => boolean, count: number) => {
+    let left = count
+    ipc.on('chat_send', (args) => {
+      const message = JSON.parse(String(args.line)) as Record<string, unknown>
+      if (pick(message) && left > 0) {
+        left -= 1
+        return Promise.reject(NOT_KEEPING_UP)
+      }
+      return undefined
+    })
+  }
+  const start = async (ipc: FakeIpc) => {
+    ipc.on('chat_open', () => {
+      ipc.emit('neuron://chat-line', { chat: 'c1aaaaaa', generation: 1, line: ready })
+      return summary('c1aaaaaa', 1)
+    })
+    const host = createChatHost(ipc, { capabilities: DESKTOP_CAPABILITIES, launchOptions: () => ({}), replyRetryMs: [1, 1, 1] })
+    const { controller } = await host.open({})
+    return { host, controller }
+  }
+
+  test('an approval the full input queue refused goes again until the engine takes it, and the turn goes on', async () => {
+    const ipc = new FakeIpc()
+    refusing(ipc, (message) => message.kind === 'permission_reply', 2)
+    const { controller } = await start(ipc)
+    controller.submit('clean up')
+    ipc.emit('neuron://chat-line', engineLine(1, { type: 'tool_call_started', id: 't1', name: 'bash', input, cut_off: false }))
+    ipc.emit('neuron://chat-line', askPermission(1, 7))
+    expect(controller.getState().permissions.map((permission) => permission.id)).toEqual([7])
+
+    controller.answerPermission(7, { kind: 'allow_once' })
+    // Refused twice, taken the third time: the same reply each time.
+    expect(await until(() => replies(ipc).length === 3)).toBe(true)
+    expect(new Set(replies(ipc).map((reply) => JSON.stringify(reply))).size).toBe(1)
+    await pause(20)
+    expect(replies(ipc)).toHaveLength(3)
+
+    // The engine has its answer, so the turn is not over and nothing failed.
+    const state = controller.getState()
+    expect(state.connection).toBe('ready')
+    expect(state.busy).toBe(true)
+    expect(state.permissions).toEqual([])
+    expect(state.items.filter((item) => item.kind === 'error' || item.kind === 'notice')).toEqual([])
+    expect(state.items.find((item) => item.kind === 'tool')).toMatchObject({ state: 'running' })
+  })
+
+  test("an answer to the agent's question that the queue refused goes again too", async () => {
+    const ipc = new FakeIpc()
+    refusing(ipc, (message) => message.type === 'answer', 1)
+    const { controller } = await start(ipc)
+    controller.submit('pick one')
+    ipc.emit('neuron://chat-line', engineLine(1, { type: 'question', id: 4, question: 'Which crate?', options: ['api', 'tools'] }))
+    controller.answer(4, 'api')
+    const answers = () => sent(ipc).filter((message) => message.type === 'answer')
+    expect(await until(() => answers().length === 2)).toBe(true)
+    expect(answers()[1]).toEqual({ kind: 'command', type: 'answer', id: 4, text: 'api' })
+    const state = controller.getState()
+    expect(state.busy).toBe(true)
+    expect(state.items.filter((item) => item.kind === 'error')).toEqual([])
+    expect(state.items.find((item) => item.kind === 'question')).toMatchObject({ answered: true })
+  })
+
+  test('past the quick retries the chat says once that the answer is waiting', async () => {
+    const ipc = new FakeIpc()
+    refusing(ipc, (message) => message.kind === 'permission_reply', 6)
+    const { controller } = await start(ipc)
+    controller.submit('clean up')
+    ipc.emit('neuron://chat-line', askPermission(1, 7))
+    controller.answerPermission(7, { kind: 'deny', note: null })
+    expect(await until(() => replies(ipc).length === 7)).toBe(true)
+    const notices = controller.getState().items.filter((item) => item.kind === 'notice')
+    expect(notices).toEqual([expect.objectContaining({ text: 'The Neuron engine is busy. Your answer goes as soon as it catches up.' })])
+    expect(controller.getState().busy).toBe(true)
+  })
+
+  test("a refused reply stops going once the engine's turn is over", async () => {
+    const ipc = new FakeIpc()
+    refusing(ipc, (message) => message.kind === 'permission_reply', Infinity)
+    const { controller } = await start(ipc)
+    controller.submit('clean up')
+    ipc.emit('neuron://chat-line', askPermission(1, 7))
+    controller.answerPermission(7, { kind: 'allow_once' })
+    expect(await until(() => replies(ipc).length >= 2)).toBe(true)
+    // An interrupt ended the turn: the engine no longer waits for that answer.
+    ipc.emit('neuron://chat-line', engineLine(1, { type: 'turn_finished' }))
+    const afterTurn = replies(ipc).length
+    await pause(30)
+    expect(replies(ipc)).toHaveLength(afterTurn)
+    expect(controller.getState().busy).toBe(false)
+  })
+
+  test('a refused reply stops going once its engine is replaced or gone', async () => {
+    const ipc = new FakeIpc()
+    refusing(ipc, (message) => message.kind === 'permission_reply', Infinity)
+    ipc.on('chat_resume', () => {
+      ipc.emit('neuron://chat-line', { chat: 'c1aaaaaa', generation: 2, line: ready })
+      return summary('c1aaaaaa', 2)
+    })
+    const { host, controller } = await start(ipc)
+    ipc.emit('neuron://chat-line', askPermission(1, 7))
+    controller.answerPermission(7, { kind: 'allow_once' })
+    expect(await until(() => replies(ipc).length >= 2)).toBe(true)
+
+    // A new engine for the chat: the old engine's approval goes with it.
+    await host.resume('c1aaaaaa')
+    const afterRestart = replies(ipc).length
+    await pause(30)
+    expect(replies(ipc)).toHaveLength(afterRestart)
+
+    // The new engine's own approval goes again, until that engine ends.
+    ipc.emit('neuron://chat-line', askPermission(2, 1))
+    controller.answerPermission(1, { kind: 'allow_once' })
+    expect(await until(() => replies(ipc).length >= afterRestart + 2)).toBe(true)
+    ipc.emit('neuron://chat-exit', { chat: 'c1aaaaaa', generation: 2, code: 0, error: null, reason: 'exited' })
+    const afterExit = replies(ipc).length
+    await pause(30)
+    expect(replies(ipc)).toHaveLength(afterExit)
+    expect(controller.getState().connection).toBe('exited')
+  })
+})

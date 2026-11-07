@@ -63,6 +63,21 @@ const START_TIMEOUT_MS = 30_000
 
 export const NOT_KEEPING_UP = 'The Neuron engine is not keeping up. Try again in a moment.'
 
+/**
+ * A reply the engine waits for (an approval, an answer to its question) that its
+ * full input queue refused goes again after these waits (ms), then after the last
+ * one each time, until the engine takes it or is gone. Dropped, it would leave the
+ * engine waiting for ever.
+ */
+const REPLY_RETRY_MS: readonly number[] = [250, 500, 1000, 2000]
+
+/** Said once a refused reply has waited past the quick retries. */
+export const REPLY_WAITING = 'The Neuron engine is busy. Your answer goes as soon as it catches up.'
+
+/** The messages the engine waits for. */
+const awaitedReply = (message: ClientMessage): boolean =>
+  message.kind === 'permission_reply' || (message.kind === 'command' && message.type === 'answer')
+
 const startTimeout = (ms: number) => `The Neuron engine did not start within ${ms >= 1000 ? Math.round(ms / 1000) : ms / 1000} seconds.`
 
 const infoOf = (summary: Summary): ChatInfo => ({
@@ -164,12 +179,21 @@ class ChatBus {
   }
 }
 
+/** Which engine and turn a message went to, and how often the engine's queue refused it. */
+interface Sent {
+  generation: number
+  turn: number
+  attempt: number
+}
+
 /** One chat's engine as the controller sees it. */
 class ChatTransport implements EngineTransport, Handler {
   readonly echoesActions = false
   private listeners = new Set<(action: SessionAction) => void>()
   private closeListeners = new Set<(close: TransportClose) => void>()
   private ready = false
+  /** The engine's finished turns: a reply refused in an earlier turn is moot. */
+  private turn = 0
   private launchError: string | null = null
   /** Why the engine ended before it was ready, for a `start` that comes after. */
   private failure: string | null = null
@@ -182,6 +206,7 @@ class ChatTransport implements EngineTransport, Handler {
     readonly chat: string,
     private generation: number,
     private readonly timeoutMs: number,
+    private readonly retryMs: readonly number[] = REPLY_RETRY_MS,
   ) {}
 
   /** Whether an event is this transport's engine's; a newer one is adopted while a launch runs. */
@@ -199,6 +224,8 @@ class ChatTransport implements EngineTransport, Handler {
       this.waiting?.resolve()
     } else if (parsed.event.type === 'error' && !this.ready) {
       this.launchError = parsed.event.message
+    } else if (parsed.event.type === 'turn_finished') {
+      this.turn += 1
     }
     for (const listener of [...this.listeners]) listener(parsed.event)
   }
@@ -266,14 +293,23 @@ class ChatTransport implements EngineTransport, Handler {
 
   send(message: ClientMessage): void {
     if (!this.ready) throw new Error('The Neuron engine is not running.')
-    void this.ipc.invoke('chat_send', { chat: this.chat, line: JSON.stringify(message) }).catch((failure: unknown) => this.sendFailed(failure))
+    this.deliver(message, { generation: this.generation, turn: this.turn, attempt: 0 })
+  }
+
+  /** Hands one message to the host. */
+  private deliver(message: ClientMessage, sent: Sent): void {
+    void this.ipc
+      .invoke('chat_send', { chat: this.chat, line: JSON.stringify(message) })
+      .catch((failure: unknown) => this.sendFailed(message, failure, sent))
   }
 
   /** The host could not hand a message to the engine: this chat is no longer connected. */
-  private sendFailed(failure: unknown): void {
+  private sendFailed(message: ClientMessage, failure: unknown, sent: Sent): void {
     const error = chatError(failure).message
-    // A full input queue is a refusal of this message, not the end of the engine.
     if (error === NOT_KEEPING_UP) {
+      // The engine waits for this one: it goes again, and the turn goes on.
+      if (awaitedReply(message)) return this.retry(message, sent)
+      // A full input queue is a refusal of this message, not the end of the engine.
       for (const listener of [...this.listeners]) {
         listener({ type: 'error', message: error })
         listener({ type: 'turn_finished' })
@@ -283,6 +319,24 @@ class ChatTransport implements EngineTransport, Handler {
     if (!this.ready) return
     this.ready = false
     for (const listener of [...this.closeListeners]) listener({ code: null, error })
+  }
+
+  /** Whether the engine and the turn a reply went to still wait for it. */
+  private stillWaits(sent: Sent): boolean {
+    return this.ready && sent.generation === this.generation && sent.turn === this.turn
+  }
+
+  /** Sends a refused reply again later, while the engine and the turn it is for go on. */
+  private retry(message: ClientMessage, sent: Sent): void {
+    if (!this.stillWaits(sent)) return
+    const waits = this.retryMs.length > 0 ? this.retryMs : REPLY_RETRY_MS
+    const last = waits.length - 1
+    // Past the quick retries, the chat says why nothing happens yet.
+    if (sent.attempt === last) for (const listener of [...this.listeners]) listener({ type: 'notice', message: REPLY_WAITING })
+    const timer = setTimeout(() => {
+      if (this.stillWaits(sent)) this.deliver(message, { ...sent, attempt: sent.attempt + 1 })
+    }, waits[Math.min(sent.attempt, last)]) as unknown as { unref?: () => void }
+    timer.unref?.()
   }
 
   subscribe(listener: (action: SessionAction) => void): () => void {
@@ -315,9 +369,12 @@ export function createChatHost(
     now?: () => number
     /** How long an engine has to say `ready` (default 30 s). */
     startTimeoutMs?: number
+    /** The waits (ms) before a refused approval or answer goes again (default 250 ms, rising to 2 s). */
+    replyRetryMs?: readonly number[]
   },
 ): TauriChats {
   const bus = new ChatBus(ipc, options.now ?? Date.now)
+  const replyRetryMs = options.replyRetryMs ?? REPLY_RETRY_MS
   const transports = new Map<string, ChatTransport>()
   const controllers = new Map<string, SessionController>()
   const infos = new Map<string, ChatInfo>()
@@ -332,7 +389,7 @@ export function createChatHost(
   }
 
   const attach = (summary: Summary) => {
-    const transport = new ChatTransport(ipc, summary.chat, summary.generation, options.startTimeoutMs ?? START_TIMEOUT_MS)
+    const transport = new ChatTransport(ipc, summary.chat, summary.generation, options.startTimeoutMs ?? START_TIMEOUT_MS, replyRetryMs)
     const controller = new SessionController(transport, { client: 'desktop', capabilities: options.capabilities })
     transports.set(summary.chat, transport)
     controllers.set(summary.chat, controller)
