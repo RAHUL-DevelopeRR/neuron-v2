@@ -270,16 +270,48 @@ pub fn parse_account(value: &Value) -> AccountSummary {
     }
 }
 
+/// The last account this process read and when (Unix seconds): what the system prompt's
+/// session block and the `neuron_status` tool fall back on when offline.
+static LAST_ACCOUNT: std::sync::Mutex<Option<(AccountSummary, u64)>> = std::sync::Mutex::new(None);
+
+/// The last account read, with the time it was read.
+pub(crate) fn last_known() -> Option<(AccountSummary, u64)> {
+    LAST_ACCOUNT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// Forgets the last account read (after `/logout`).
+pub(crate) fn forget_last() {
+    *LAST_ACCOUNT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
 pub fn fetch_account(
     base_url: &str,
     token: &SecureString,
 ) -> Result<AccountSummary, GatewayHttpError> {
+    fetch_account_within(base_url, token, ACCOUNT_TIMEOUT)
+}
+
+/// [`fetch_account`] giving up after `timeout`.
+pub(crate) fn fetch_account_within(
+    base_url: &str,
+    token: &SecureString,
+    timeout: std::time::Duration,
+) -> Result<AccountSummary, GatewayHttpError> {
     let value = gateway_http::get_json(
         &gateway_http::account_url(base_url, "/api/account"),
         Some(token.expose()),
-        ACCOUNT_TIMEOUT,
+        timeout,
     )?;
     let account = parse_account(&value);
+    *LAST_ACCOUNT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((account.clone(), crate::clock::now_unix()));
     // Every read keeps the plan window current for the status lines and the guard.
     crate::plan_window::remember(&account);
     remember_connector_policy(&runtime::default_config_home(), &value);

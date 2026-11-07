@@ -144,6 +144,7 @@ pub(crate) fn remember(account: &AccountSummary) {
 
 /// Forgets the window (after `/logout`).
 pub(crate) fn forget() {
+    crate::account::forget_last();
     *known() = Known::new();
 }
 

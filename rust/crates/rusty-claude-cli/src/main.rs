@@ -47,6 +47,7 @@ mod api_client;
 mod args;
 mod artifacts_view;
 mod auth;
+mod awareness;
 mod brand;
 mod clock;
 mod credentials;
