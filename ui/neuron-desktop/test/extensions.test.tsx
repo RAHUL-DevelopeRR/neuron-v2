@@ -144,6 +144,175 @@ describe('MCP on/off', () => {
   })
 })
 
+/**
+ * What the engine sends from 7.0.0-alpha.5 (engine.rs's `extensions_event`): servers that wait for
+ * approval, are refused by a deny rule or the connector policy, or are hosted connectors not linked
+ * yet; `required` on the ones the policy keeps on; transport `zerox` (older engines: `managed_proxy`).
+ */
+describe('MCP rows on an alpha.5 engine', () => {
+  // The reasons are the engine's own wording (a blocked server's is the policy's).
+  const APPROVAL_WHY = 'a workspace server: run /mcp approve docs to start it'
+  const REFUSED_WHY = "your organization's connector policy does not allow shell-tools"
+  const UNLINKED_WHY = 'not linked to your Zero-X account; connect it at https://zero-x.live/connect/github (/mcp connect github)'
+  const approval = server('docs', { scope: 'project', status: 'needs_approval', tools: [], error: APPROVAL_WHY })
+  const refused = server('shell-tools', { scope: 'managed', status: 'blocked', tools: [], error: REFUSED_WHY })
+  const unlinked = server('github', {
+    transport: 'zerox',
+    status: 'needs_connect',
+    tools: [],
+    error: UNLINKED_WHY,
+    connect_url: 'https://zero-x.live/connect/github',
+  })
+
+  const panel = (servers: Array<Record<string, unknown>>, onSetEnabled?: (name: string, enabled: boolean) => void) =>
+    render(<ExtensionsPanel extensions={{ mcpServers: servers, plugins: [], skills: [], agents: [] } as never} onRefresh={() => {}} onSetEnabled={onSetEnabled} />)
+  const rowOf = (name: string) => screen.getByText(name, { selector: '.extension-name' }).closest('li') as HTMLElement
+  const statusOf = (name: string) => within(rowOf(name)).getByText(/./, { selector: '.extension-status' }).textContent
+
+  test('the new statuses read as words, not as their wire names', () => {
+    panel([approval, refused, unlinked])
+    expect(statusOf('docs')).toBe('needs approval')
+    expect(statusOf('shell-tools')).toBe('blocked')
+    expect(statusOf('github')).toBe('not connected')
+    for (const wire of ['needs_approval', 'needs_connect']) expect(document.body.textContent).not.toContain(wire)
+  })
+
+  test('a status this build does not know is shown as the engine sent it', () => {
+    panel([server('later', { status: 'quarantined', tools: [] })])
+    expect(statusOf('later')).toBe('quarantined')
+  })
+
+  test("the engine's reason is the row's detail, visible without a click and shown once", () => {
+    panel([approval, refused, unlinked])
+    for (const [name, reason] of [
+      ['docs', APPROVAL_WHY],
+      ['shell-tools', REFUSED_WHY],
+      ['github', UNLINKED_WHY],
+    ]) {
+      expect(within(rowOf(name)).getByText(reason)).toBeTruthy()
+      // The head has nothing more to show, so a click adds nothing and hides nothing.
+      fireEvent.click(within(rowOf(name)).getAllByRole('button')[0]!)
+      expect(within(rowOf(name)).getAllByText(reason)).toHaveLength(1)
+    }
+  })
+
+  test('a refused server reads as an error; one that only waits does not', () => {
+    panel([approval, refused, unlinked])
+    expect(within(rowOf('shell-tools')).getByText(REFUSED_WHY).className).toContain('error-line')
+    expect(within(rowOf('docs')).getByText(APPROVAL_WHY).className).not.toContain('error-line')
+    expect(within(rowOf('github')).getByText(UNLINKED_WHY).className).not.toContain('error-line')
+  })
+
+  test('a failed server still shows its error only when its row is opened', () => {
+    panel([server('ghost', { status: 'failed', tools: [], error: 'spawn failed: not found' })])
+    expect(screen.queryAllByText('spawn failed: not found').length).toBe(0)
+    fireEvent.click(within(rowOf('ghost')).getAllByRole('button')[0]!)
+    expect(screen.getByText('spawn failed: not found')).toBeTruthy()
+  })
+
+  test('a status without a reason shows no detail line', () => {
+    panel([server('docs', { status: 'blocked', tools: [], error: null })])
+    expect(statusOf('docs')).toBe('blocked')
+    expect(rowOf('docs').querySelectorAll('.extension-detail').length).toBe(0)
+  })
+
+  test('a server that needs approval says how to approve it, as a quiet hint with no command of its own', () => {
+    const calls: string[] = []
+    panel([approval, refused, unlinked, server('ok')], (name, enabled) => calls.push(`${name}:${enabled}`))
+    const hint = within(rowOf('docs')).getByText('Approve it with /mcp approve docs in the chat')
+    expect(hint.className).toContain('muted')
+    // Text only: no button or link to press, so nothing new is sent to the engine.
+    expect(hint.closest('button, a')?.tagName ?? null).toBeNull()
+    fireEvent.click(hint)
+    expect(calls).toEqual([])
+    expect(within(rowOf('docs')).queryAllByRole('button', { name: /approve/i }).length).toBe(0)
+    // Only that status gets it, and it names its own server.
+    expect(screen.getAllByText(/Approve it with/)).toHaveLength(1)
+    for (const name of ['shell-tools', 'github', 'ok']) expect(within(rowOf(name)).queryAllByText(/Approve it with/).length).toBe(0)
+  })
+
+  test('the hint names the server it is about', () => {
+    panel([server('team_db-2', { status: 'needs_approval', tools: [], error: null })])
+    expect(screen.getByText('Approve it with /mcp approve team_db-2 in the chat')).toBeTruthy()
+  })
+
+  test('a server that waits for approval but was turned off reads off, with no reason and no hint', () => {
+    panel([{ ...approval, enabled: false }])
+    expect(statusOf('docs')).toBe('off')
+    expect(screen.queryAllByText(/Approve it with/).length).toBe(0)
+    expect(screen.queryAllByText(APPROVAL_WHY).length).toBe(0)
+  })
+
+  test('a hosted connector is "hosted", whichever name the engine gives its transport', () => {
+    panel([
+      server('new-engine', { transport: 'zerox', scope: 'managed' }),
+      server('old-engine', { transport: 'managed_proxy', scope: 'user' }),
+      server('local', { transport: 'stdio' }),
+      server('remote', { transport: 'http' }),
+    ])
+    const meta = (name: string) => rowOf(name).querySelector('.extension-head .muted')?.textContent
+    expect(meta('new-engine')).toBe('managed · hosted · 1 tool')
+    expect(meta('old-engine')).toBe('user · hosted · 1 tool')
+    expect(meta('local')).toBe('user · stdio · 1 tool')
+    expect(meta('remote')).toBe('user · http · 1 tool')
+    for (const wire of ['zerox', 'managed_proxy']) expect(document.body.textContent).not.toContain(wire)
+  })
+
+  test('a required server has a locked "Required" marker and no On/Off switch, and the marker does nothing', () => {
+    const calls: string[] = []
+    panel([server('policy-docs', { scope: 'managed', transport: 'zerox', required: true }), server('docs'), server('plain', { required: false })], (name, enabled) =>
+      calls.push(`${name}:${enabled}`),
+    )
+    expect(screen.queryAllByRole('switch', { name: 'policy-docs' }).length).toBe(0)
+    expect(within(rowOf('policy-docs')).queryAllByText(/^(On|Off)$/).length).toBe(0)
+    // The others keep theirs, and only the required row is marked.
+    expect(screen.getByRole('switch', { name: 'docs' })).toBeTruthy()
+    expect(screen.getByRole('switch', { name: 'plain' })).toBeTruthy()
+    expect(screen.getAllByText('Required')).toHaveLength(1)
+
+    const marker = within(rowOf('policy-docs')).getByText('Required')
+    expect(marker.getAttribute('title')).toMatch(/policy/i)
+    // Not a control: nothing to press, focus or switch.
+    expect(marker.closest('button, a, [role="switch"], [tabindex]')?.tagName ?? null).toBeNull()
+    fireEvent.click(marker)
+    fireEvent.keyDown(marker, { key: 'Enter' })
+    expect(calls).toEqual([])
+    // It still reads as the row's own status and count.
+    expect(statusOf('policy-docs')).toBe('ready')
+  })
+
+  test('a required server is marked even when the engine has no switches', () => {
+    panel([server('policy-docs', { required: true }), server('docs')])
+    expect(screen.queryAllByRole('switch').length).toBe(0)
+    expect(within(rowOf('policy-docs')).getByText('Required')).toBeTruthy()
+    expect(within(rowOf('docs')).queryAllByText('Required').length).toBe(0)
+  })
+
+  test('on the Extensions page, from the engine to the row', async () => {
+    const { engine } = await start({}, undefined, FEATURES_WITH_TOGGLE)
+    openExtensions()
+    await emit(
+      engine,
+      extensions(approval, refused, unlinked, server('policy-docs', { scope: 'managed', transport: 'zerox', required: true }), server('legacy', { transport: 'managed_proxy' })),
+    )
+    const rows = within(screen.getByRole('list', { name: 'MCP servers' }))
+    expect(rows.getByText('needs approval')).toBeTruthy()
+    expect(rows.getByText('blocked')).toBeTruthy()
+    expect(rows.getByText('not connected')).toBeTruthy()
+    expect(rows.getByText(APPROVAL_WHY)).toBeTruthy()
+    expect(rows.getByText('Approve it with /mcp approve docs in the chat')).toBeTruthy()
+    expect(rows.getByText('Required')).toBeTruthy()
+    expect(rows.queryAllByRole('switch', { name: 'policy-docs' }).length).toBe(0)
+    expect(rows.getByRole('switch', { name: 'legacy' })).toBeTruthy()
+    expect(rows.getAllByText(/hosted/)).toHaveLength(3)
+    // Reading the rows asks nothing new of the engine.
+    const kinds = new Set(engine.commands().map((command) => (command as { type: string }).type))
+    expect(kinds.has('approve_mcp_server')).toBe(false)
+    expect(sent(engine, 'slash')).toEqual([])
+    await expectAccessible()
+  })
+})
+
 describe('which engine runs', () => {
   const openDiagnostics = () => {
     fireEvent.click(within(screen.getByRole('navigation', { name: 'Neuron' })).getByRole('button', { name: 'Settings' }))

@@ -10,7 +10,24 @@ const STATUS_LABEL: Record<string, string> = {
   unsupported: 'unsupported',
   not_started: 'not started',
   disabled: 'off',
+  needs_approval: 'needs approval',
+  blocked: 'blocked',
+  needs_connect: 'not connected',
 }
+
+/**
+ * Statuses whose `error` is not a failure but the reason the server is not running: it waits for the
+ * user, or a deny rule or the connector policy refuses it. The row shows the reason at once; a failed
+ * server's error stays behind a click.
+ */
+const REASON_STATUSES: ReadonlySet<string> = new Set(['needs_approval', 'blocked', 'needs_connect'])
+
+/** Hosted connectors through Zero-X (older engines said `managed_proxy`); a person reads them as hosted. */
+const HOSTED_TRANSPORTS: ReadonlySet<string> = new Set(['zerox', 'managed_proxy'])
+const transportLabel = (transport: string) => (HOSTED_TRANSPORTS.has(transport) ? 'hosted' : transport)
+
+/** A padlock (U+1F512) followed by the text variation selector (U+FE0E), which asks for a plain glyph like the window's others. */
+const LOCK = String.fromCodePoint(0x1f512, 0xfe0e)
 
 /** How often the panel asks again while a server is still starting. */
 const STARTING_REFRESH_MS = 2_000
@@ -32,42 +49,58 @@ interface Toggle {
 function McpServerRow({ server, toggle }: { server: McpServerInfo; toggle: Toggle | null }) {
   const [open, setOpen] = useState(false)
   const off = isOff(server)
-  const detail = server.error ?? (server.tools.length ? server.tools.join(', ') : null)
+  // Why the server is not running, where that is what the row has to say: shown at once, not behind a click.
+  const reason = !off && REASON_STATUSES.has(server.status) ? server.error : null
+  const toolList = server.tools.length ? server.tools.join(', ') : null
+  const detailError = reason ? null : server.error
+  const detail = detailError ?? toolList
   return (
     <li className="extension-row">
       <button className="tree-row extension-head" onClick={() => detail && setOpen(!open)} aria-expanded={detail ? open : undefined}>
         <span className={`extension-status status-${off ? 'disabled' : server.status}`}>{off ? 'off' : (STATUS_LABEL[server.status] ?? server.status)}</span>
         <span className="extension-name">{server.name}</span>
         <span className="muted small">
-          {server.scope} · {server.transport}
+          {server.scope} · {transportLabel(server.transport)}
           {server.status === 'ready' && !off && ` · ${server.tools.length} tool${server.tools.length === 1 ? '' : 's'}`}
         </span>
       </button>
-      {toggle && (
-        <button
-          role="switch"
-          className="extension-toggle"
-          aria-label={server.name}
-          aria-checked={toggle.pending === undefined ? !off : toggle.pending}
-          aria-busy={toggle.pending !== undefined || undefined}
-          // Not `disabled`: keyboard focus stays on the switch while it waits, and clicks are ignored.
-          aria-disabled={toggle.pending !== undefined || undefined}
-          onClick={() => {
-            if (toggle.pending === undefined) toggle.onToggle(off)
-          }}
-        >
-          <span className="switch-track" aria-hidden>
-            <span className="switch-thumb" />
-          </span>
-          <span className="muted small">{toggle.pending === undefined ? (off ? 'Off' : 'On') : toggle.pending ? 'Turning on…' : 'Turning off…'}</span>
-        </button>
+      {server.required === true ? (
+        // The connector policy keeps it on: a marker, not a control, so nothing here can be pressed.
+        <span className="extension-required muted small" title="Your connector policy requires this server, so it stays on">
+          <span aria-hidden>{LOCK}</span> Required
+        </span>
+      ) : (
+        toggle && (
+          <button
+            role="switch"
+            className="extension-toggle"
+            aria-label={server.name}
+            aria-checked={toggle.pending === undefined ? !off : toggle.pending}
+            aria-busy={toggle.pending !== undefined || undefined}
+            // Not `disabled`: keyboard focus stays on the switch while it waits, and clicks are ignored.
+            aria-disabled={toggle.pending !== undefined || undefined}
+            onClick={() => {
+              if (toggle.pending === undefined) toggle.onToggle(off)
+            }}
+          >
+            <span className="switch-track" aria-hidden>
+              <span className="switch-thumb" />
+            </span>
+            <span className="muted small">{toggle.pending === undefined ? (off ? 'Off' : 'On') : toggle.pending ? 'Turning on…' : 'Turning off…'}</span>
+          </button>
+        )
       )}
       {toggle?.error && (
         <div className="error-line small extension-detail" role="alert">
           {toggle.error}
         </div>
       )}
-      {open && detail && <div className={server.error ? 'error-line small extension-detail' : 'muted small extension-detail'}>{detail}</div>}
+      {reason && <div className={`${server.status === 'blocked' ? 'error-line' : 'muted'} small extension-detail`}>{reason}</div>}
+      {!off && server.status === 'needs_approval' && (
+        // Typed in the chat, which sends it to the engine as a slash command: the panel has no command of its own for it.
+        <div className="muted small extension-detail">{`Approve it with /mcp approve ${server.name} in the chat`}</div>
+      )}
+      {open && detail && <div className={detailError ? 'error-line small extension-detail' : 'muted small extension-detail'}>{detail}</div>}
     </li>
   )
 }
