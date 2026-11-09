@@ -462,6 +462,17 @@ describe('NeuronHost slash policy for remote peers', () => {
     expect(engine.sent).toEqual([])
   })
 
+  test('so are the alpha.5 slash commands that do what the refused commands do', async () => {
+    await startHost({ remoteOnly: true })
+    // /effort and /reasoning set the thinking level, /branch switches or creates a branch, /permissions
+    // sets the mode, /mcp adds, approves or removes servers, /hooks changes hooks, /plan toggles plan mode.
+    const names = ['effort', 'reasoning', 'branch', 'permissions', 'mcp', 'hooks', 'plan', 'Effort', ' MCP ']
+    const errors = await remote(names.map((name) => slash(name, 'danger-full-access')))
+    expect(errors).toHaveLength(names.length)
+    expect(errors[0]).toContain('Only the Neuron desktop app')
+    expect(engine.sent).toEqual([])
+  })
+
   test('a local peer may still use any slash command', async () => {
     await startHost()
     const peer = await attach('desktop')
