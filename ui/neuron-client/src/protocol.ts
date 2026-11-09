@@ -1178,17 +1178,24 @@ export function parseUiEvent(value: unknown): ParsedLine {
 }
 
 const MAX_TEXT = 256 * 1024
+const MAX_NOTE = 4096
 const MAX_ATTACHMENTS = 20
 const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp']
 
-/** A string no longer than `max` UTF-16 units. */
+/**
+ * A UTF-16 surrogate without its partner. JSON.stringify writes it as an escape, which serde_json refuses,
+ * so the engine would drop the whole line after the host had acted on it.
+ */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+
+/** A string no longer than `max` UTF-16 units, without a lone surrogate. */
 function isText(value: unknown, max: number): value is string {
-  return typeof value === 'string' && value.length <= max
+  return typeof value === 'string' && value.length <= max && !LONE_SURROGATE.test(value)
 }
 
 /** Remote peers may only name paths inside the workspace: relative, no `..`, no NUL. */
 function isWorkspaceRelative(path: unknown): path is string {
-  if (typeof path !== 'string' || path === '' || path.length > 4096 || path.includes('\0')) return false
+  if (!isText(path, 4096) || path === '' || path.includes('\0')) return false
   if (/^[\\/]/.test(path) || /^[A-Za-z]:/.test(path)) return false
   return !path.split(/[\\/]/).includes('..')
 }
@@ -1216,6 +1223,8 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
     }
     if (decision.kind === 'deny') {
       // Rebuilt from `note` alone: `session` would refuse matching calls for the rest of the session, and a remote peer may not decide that.
+      // A note is text of at most 4096 characters; anything that is not text is dropped.
+      if (typeof decision.note === 'string' && !isText(decision.note, MAX_NOTE)) return null
       const note = typeof decision.note === 'string' ? decision.note : null
       return { kind: 'permission_reply', id: message.id as number, decision: { kind: 'deny', note } }
     }

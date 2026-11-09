@@ -446,6 +446,22 @@ describe('NeuronHost policy for peers', () => {
     await until('the preview', () => engine.sent.length === 1)
     expect(engine.sent[0]).toEqual({ kind: 'command', type: 'rewind', checkpoint: 1, mode: 'code_only', dry_run: true })
   })
+
+  test('a denial whose note has a lone surrogate is refused, and the request stays open', async () => {
+    await startHost()
+    const input = '{"command":"cargo test"}'
+    engine.emit({ type: 'tool_call_started', id: 't1', name: 'bash', input, cut_off: false })
+    engine.emit({
+      type: 'permission_requested',
+      id: 7,
+      request: { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: null, input, session_prefixes: [] },
+    })
+    // serde_json would refuse that line, and the engine would go on waiting for an answer the host had counted as given.
+    const errors = await sendAsPeer([{ kind: 'permission_reply', id: 7, decision: { kind: 'deny', note: 'x\ud800y' } }])
+    expect(errors).toEqual(['Not a Neuron remote frame.'])
+    expect(engine.sent).toEqual([])
+    expect(host!.state.permissions.map((permission) => permission.id)).toEqual([7])
+  })
 })
 
 describe('NeuronHost slash policy for remote peers', () => {

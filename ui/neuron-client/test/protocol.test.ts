@@ -45,6 +45,7 @@ import {
   type BranchInfo,
   type ChangedFile,
   type CheckpointInfo,
+  type ClientMessage,
   type ConnectorInfo,
   type ConnectorVariable,
   type ContextBreakdown,
@@ -945,5 +946,55 @@ describe('untrusted peers: attachments and length caps', () => {
     expect(cmd('capabilities', { features: Array(33).fill('f') })).toBeNull()
     expect(cmd('capabilities', { features: ['x'.repeat(64)] })).not.toBeNull()
     expect(cmd('capabilities', { features: ['x'.repeat(65)] })).toBeNull()
+  })
+})
+
+describe('untrusted peers: text the engine can read', () => {
+  /**
+   * serde_json refuses a lone surrogate in a line, so the engine would drop the whole message after the host
+   * had acted on it (a prompt shown as sent, a permission request marked answered, the engine still waiting).
+   */
+  const LONE = ['x\ud800y', '\ud800', 'tail\ud83d', '\udc00head', 'x\ude00y', '\ud800𐈀']
+  const PAIRED = ['a😀b', '😀', '𝒳 and 𝒴', 'ü ß 日本語']
+
+  /** Every string a frame can carry to the engine, each placed in a message that is otherwise valid. */
+  const through: Array<[string, (text: string) => unknown]> = [
+    ['a prompt', (text) => ({ kind: 'command', type: 'submit', text })],
+    ['an attachment path', (text) => ({ kind: 'command', type: 'submit', text: 'go', attachments: [{ kind: 'file', path: text }] })],
+    ['a slash command name', (text) => ({ kind: 'command', type: 'slash', command: text })],
+    ['slash arguments', (text) => ({ kind: 'command', type: 'slash', command: 'model', args: text })],
+    ['a model name', (text) => ({ kind: 'command', type: 'set_model', model: text })],
+    ['an answer', (text) => ({ kind: 'command', type: 'answer', id: 1, text })],
+    ['a session to resume', (text) => ({ kind: 'command', type: 'resume', session: text })],
+    ['a capability', (text) => ({ kind: 'command', type: 'capabilities', features: [text] })],
+    ['a client name', (text) => ({ kind: 'command', type: 'capabilities', features: ['f'], client: text })],
+    ['an MCP server name', (text) => ({ kind: 'command', type: 'set_mcp_server_enabled', name: text, enabled: true })],
+    ['a commit message', (text) => ({ kind: 'command', type: 'commit', message: text })],
+    ['a denial note', (text) => ({ kind: 'permission_reply', id: 4, decision: { kind: 'deny', note: text } })],
+  ]
+
+  test('a lone surrogate is refused wherever text reaches the engine', () => {
+    for (const [what, make] of through) {
+      for (const text of LONE) expect({ what, text, result: parseClientMessage(make(text)) }).toEqual({ what, text, result: null })
+    }
+  })
+
+  test('a surrogate pair is text like any other', () => {
+    for (const [what, make] of through) {
+      for (const text of PAIRED) {
+        expect({ what, text, accepted: parseClientMessage(make(text)) !== null }).toEqual({ what, text, accepted: true })
+      }
+    }
+  })
+
+  test('a denial note may be 4096 characters at most, and a note that is not text is still dropped', () => {
+    const deny = (note: unknown) => parseClientMessage({ kind: 'permission_reply', id: 4, decision: { kind: 'deny', note } })
+    const reply = (note: string | null): ClientMessage => ({ kind: 'permission_reply', id: 4, decision: { kind: 'deny', note } })
+    expect(deny('x'.repeat(4096))).toEqual(reply('x'.repeat(4096)))
+    expect(deny('x'.repeat(4097))).toBeNull()
+    expect(deny('x'.repeat(900 * 1024))).toBeNull()
+    expect(deny(null)).toEqual(reply(null))
+    expect(deny(undefined)).toEqual(reply(null))
+    expect(deny(7)).toEqual(reply(null))
   })
 })
