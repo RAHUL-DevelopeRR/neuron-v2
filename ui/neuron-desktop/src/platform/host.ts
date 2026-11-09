@@ -1,7 +1,9 @@
 /** The desktop UI in a browser, attached to a Neuron host over WebSocket. */
 
-import { SessionController, WebSocketTransport, type SocketLike } from '@neuron/client'
+import { DESKTOP_CAPABILITIES, SessionController, WebSocketTransport, type SocketLike } from '@neuron/client'
 
+import { browserStore } from './store'
+import { safeExternalUrl } from './links'
 import type { DirListing, FileContent, GitStatusView, Platform, Project, TerminalSession } from './types'
 
 export interface HostPlatformOptions {
@@ -31,10 +33,13 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
     kind: 'host',
     label: new URL(options.url.replace(/^ws/, 'http')).host,
     // A host serves one workspace; it restarts its engine for clients on its machine.
-    can: { openProject: false, restart: true, terminal: true, git: true },
+    can: { openProject: false, restart: true, terminal: true, git: true, pickFolder: false, updates: false, multiChat: false },
+    store: browserStore('neuron.desktop.'),
+    // The host starts its engine with its own options.
+    setLaunchOptions: () => {},
     connect() {
       connecting ??= (async () => {
-        controller = new SessionController(transport)
+        controller = new SessionController(transport, { client: 'desktop', capabilities: DESKTOP_CAPABILITIES })
         await controller.start()
         return controller
       })()
@@ -46,6 +51,9 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
       return current ? [current] : []
     },
     openProject: () => Promise.reject(new Error('This Neuron host serves one project.')),
+    pickFolder: async () => null,
+    appVersion: async () => null,
+    checkForUpdate: async () => null,
     restart: async (resume) => {
       await transport.rpc('engine.restart', { resume: resume ?? '' })
     },
@@ -83,6 +91,21 @@ export function hostPlatform(options: HostPlatformOptions): Platform {
         },
       }
     },
-    openExternal: (url) => window.open(url, '_blank', 'noopener,noreferrer'),
+    openExternal: (url) => {
+      const safe = safeExternalUrl(url)
+      if (safe) window.open(safe, '_blank', 'noopener,noreferrer')
+    },
+    // L5: extensions and resilience. The engine is behind a host here; the app does not choose it.
+    engineInfo: async () => null,
+    hostDiagnostics: async () => null,
+    // L3: composer. A Neuron host has no staging folder or save dialog on this side.
+    stageAttachment: () => Promise.reject(new Error('Images can only be attached in the Neuron desktop app.')),
+    exportSave: () => Promise.reject(new Error('Saving a chat is only available in the Neuron desktop app.')),
+    // L2: review and git: the browser build has no way to change or open files on the host.
+    gitRevert: () => Promise.reject(new Error('Reverting a file needs the desktop app.')),
+    openInEditor: () => Promise.reject(new Error('Opening a file in an editor needs the desktop app.')),
+    // L4: multi-chat. A host serves one engine: no chats, no notifications.
+    notify: async () => 'unsupported',
+    setAttention: () => {},
   }
 }

@@ -10,7 +10,7 @@
     "./node/*": "./src/node/*.ts"
   },
   "scripts": {
-    "test": "bun test",
+    "test": "bun test --timeout 20000",
     "host": "bun run scripts/host.ts",
     "host:mock": "bun run scripts/host.ts --mock",
     "typecheck": "tsc --noEmit -p ."

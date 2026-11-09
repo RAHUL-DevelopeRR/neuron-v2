@@ -1,7 +1,27 @@
 import { hostPlatform } from './host'
 import type { Platform } from './types'
 
-export type { DirEntry, DirListing, FileContent, GitChange, GitStatusView, Platform, Project, TerminalSession } from './types'
+export type {
+  ChatErrorCode,
+  ChatHost,
+  ChatInfo,
+  DirEntry,
+  DirListing,
+  EngineInfo,
+  FileContent,
+  GitChange,
+  GitStatusView,
+  KeyValueStore,
+  LaunchOptions,
+  Platform,
+  Project,
+  TerminalSession,
+  UpdateInfo,
+  WorktreeInfo,
+  WorktreeStatus,
+} from './types'
+export { ChatError } from './types'
+export { browserStore } from './store'
 
 /** Inside Tauri, its bridge; in a browser, the host named by the page's settings. */
 export async function detectPlatform(): Promise<Platform> {
@@ -13,7 +33,7 @@ export async function detectPlatform(): Promise<Platform> {
   const token = import.meta.env.VITE_NEURON_HOST_TOKEN as string | undefined
   if (!url || !token) {
     throw new Error(
-      'No Neuron host configured. Start one with `bun run host --mock --token-file <file>` in ui/neuron-client, ' +
+      'No Neuron host configured. Start one with `bun run host --mock --owner-on-loopback --token-file <file>` in ui/neuron-client, ' +
         'then `NEURON_HOST_URL=<url> NEURON_HOST_TOKEN_FILE=<file> bun run dev` here.',
     )
   }

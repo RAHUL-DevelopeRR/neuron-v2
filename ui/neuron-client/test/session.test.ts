@@ -373,3 +373,199 @@ describe('E2: extensions', () => {
     expect(state.extensions).toBeNull()
   })
 })
+
+describe('WP3: gateway problems', () => {
+  test('a failing prompt keeps its text and the problem, until the next prompt', () => {
+    let state = run(
+      [
+        { type: 'local/submitted', text: 'refactor the parser', attachments: [{ kind: 'file', path: 'src/parse.rs' }] },
+        { type: 'error', message: 'gateway error insufficient_quota: Daily quota reached' },
+        { type: 'turn_finished' },
+      ],
+      started(),
+    )
+    expect(state.problem?.kind).toBe('quota')
+    expect(state.unsent).toEqual({ text: 'refactor the parser', attachments: [{ kind: 'file', path: 'src/parse.rs' }] })
+    const error = state.items.at(-1)
+    expect(error).toMatchObject({ kind: 'error', problem: { kind: 'quota' } })
+    state = run([{ type: 'local/submitted', text: 'try again', attachments: [] }], state)
+    expect(state.problem).toBeNull()
+    expect(state.unsent).toBeNull()
+  })
+
+  test('a reply already started: nothing to put back', () => {
+    const state = run(
+      [
+        { type: 'local/submitted', text: 'explain', attachments: [] },
+        { type: 'text_delta', text: 'The parser…' },
+        { type: 'error', message: 'Could not reach Zero-X: connection reset' },
+      ],
+      started(),
+    )
+    expect(state.problem?.kind).toBe('unreachable')
+    expect(state.unsent).toBeNull()
+  })
+
+  test('other errors are plain error lines', () => {
+    const state = run([{ type: 'error', message: 'unknown slash command /frobnicate' }], started())
+    expect(state.problem).toBeNull()
+    expect(state.items.at(-1)).toEqual({ kind: 'error', key: expect.any(String), text: 'unknown slash command /frobnicate' })
+  })
+})
+
+describe('protocol v2: the account and the trust preview', () => {
+  test('account events fill the account; signing out clears it', () => {
+    const account = {
+      email: 'rahul@zero-x.live',
+      name: 'Rahul S',
+      plan: 'pro',
+      plan_name: 'Pro',
+      source: 'device',
+      expires_at: null,
+      limits: null,
+      usage_today: null,
+      resets_at: null,
+      credit_balance_cents: null,
+      suspended: false,
+      dashboard_url: 'https://zero-x.live/dashboard',
+      pricing_url: 'https://zero-x.live/pricing',
+      usage_updated_at: null,
+      usage_error: null,
+    }
+    let state = run([{ type: 'account', signed_in: true, account }], started())
+    expect(state.account?.name).toBe('Rahul S')
+    state = run([{ type: 'account', signed_in: false, account: null }], state)
+    expect(state.account).toBeNull()
+  })
+
+  test('the trust preview, until the folder is trusted or the engine restarts', () => {
+    const preview = {
+      type: 'trust_preview' as const,
+      cwd,
+      root: cwd,
+      is_git_root: true,
+      session_only: false,
+      trusted: false,
+      settings_files: [],
+      hooks: [],
+      mcp_servers: [{ name: 'postgres-tools', transport: 'stdio', target: 'pg-mcp', source: '.neuron/settings.json' }],
+      permission_rules: [],
+      other_settings: [],
+    }
+    let state = run([preview], started())
+    expect(state.trustPreview?.mcp_servers[0]?.name).toBe('postgres-tools')
+    state = run([{ type: 'workspace_trusted', cwd, restart_required: true }], state)
+    expect(state.trustPreview).toBeNull()
+    state = run([preview, { type: 'ready', protocol: 1, version: '6.3.0', features: [] }], state)
+    expect(state.trustPreview).toBeNull()
+  })
+
+  test('a typed error detail becomes the problem', () => {
+    const state = run(
+      [
+        { type: 'local/submitted', text: 'go', attachments: [] },
+        {
+          type: 'error',
+          message: 'Daily quota reached',
+          detail: { code: 'insufficient_quota', status: 429, upgrade_url: null, resets_at: '2026-10-24T00:00:00Z', retry_after_seconds: null },
+        },
+      ],
+      started(),
+    )
+    expect(state.problem).toMatchObject({ kind: 'quota', resetsAt: '2026-10-24T00:00:00Z' })
+    expect(state.unsent?.text).toBe('go')
+  })
+})
+
+describe('alpha.5: what the clients keep and what they leave alone', () => {
+  const branches: UiEvent = {
+    type: 'branches',
+    current: 'main',
+    branches: [{ name: 'main', upstream: 'origin/main', ahead: 0, behind: 0, last_commit_ms: 1793404800000 }],
+    dirty: true,
+  }
+  const catalog: UiEvent = { type: 'connector_catalog', version: '2026-11-04.1', connectors: [] }
+  const hookStarted: UiEvent = { type: 'hook_started', event: 'PreToolUse', matcher: 'bash', command: './scripts/check-paths.sh', tool_use_id: 'toolu_1' }
+  const hookFinished: UiEvent = { type: 'hook_finished', event: 'PreToolUse', command: './scripts/check-paths.sh', outcome: 'ok', duration_ms: 12 }
+  const ignored = [branches, catalog, hookStarted, hookFinished]
+
+  test('branches, the connector catalog and hook progress change nothing', () => {
+    const before = run([{ type: 'local/submitted', text: 'go' }, { type: 'text_delta', text: 'working' }], started())
+    for (const event of ignored) expect(reduceSession(before, event)).toBe(before)
+  })
+
+  test('an action this client does not know, from a newer host, changes nothing', () => {
+    const before = run([{ type: 'local/submitted', text: 'go' }, { type: 'text_delta', text: 'working' }], started())
+    // Not a `SessionAction` as far as this client can tell. The reducer's default is exhaustive at compile time and still returns the state at run time.
+    const future = { type: 'a_future_event', anything: 1 } as unknown as SessionAction
+    expect(reduceSession(before, future)).toBe(before)
+  })
+
+  test('they do not split a reply that is streaming', () => {
+    const state = run([{ type: 'text_delta', text: 'one ' }, hookStarted, hookFinished, branches, catalog, { type: 'text_delta', text: 'two' }], started())
+    expect(state.items).toMatchObject([{ kind: 'assistant', text: 'one two', streaming: true }])
+  })
+
+  test('status keeps the status bar fields', () => {
+    const context = {
+      context_window: 131072,
+      output_reserve: 16384,
+      system_tokens: 4100,
+      tool_schema_tokens: 11800,
+      tool_count: 23,
+      instruction_tokens: 2300,
+      instruction_files: ['NEURON.md'],
+      conversation_tokens: 18000,
+      tool_output_tokens: 6200,
+      used_tokens: 42400,
+      threshold_tokens: 91750,
+    }
+    const fields = {
+      provider: 'cloudflare',
+      model_display_name: 'GLM 5.2',
+      served_model_display_name: 'GLM 5.2',
+      reasoning_effort: 'high',
+      reasoning_efforts: ['low', 'medium', 'high', 'max'],
+      full_access_allowed: false,
+      context,
+    }
+    const state = run([status(fields)], started())
+    expect(state.status).toMatchObject(fields)
+    // Trusting the workspace rewrites the status; the new fields stay.
+    expect(run([{ type: 'workspace_trusted', cwd, restart_required: true }], state).status).toMatchObject(fields)
+  })
+
+  test('models, MCP servers and permission requests keep their new fields', () => {
+    const model = {
+      id: 'glm-5.2',
+      display_name: 'GLM 5.2',
+      available: true,
+      unavailable_reason: null,
+      context_window: 131072,
+      tiers: ['free'],
+      provider: 'cloudflare',
+      reasoning_efforts: ['low', 'medium', 'high'],
+      supports_reasoning: true,
+    }
+    const servers = [
+      { name: 'linear', scope: 'managed', transport: 'zerox', status: 'needs_connect', tools: [], error: 'not linked to your Zero-X account', enabled: true, connect_url: 'https://zero-x.live/dashboard#connectors' },
+      { name: 'postgres-tools', scope: 'project', transport: 'stdio', status: 'needs_approval', tools: [], error: 'a workspace server', enabled: true },
+      { name: 'codebase-memory', scope: 'managed', transport: 'stdio', status: 'ready', tools: ['search_graph'], error: null, enabled: true, catalog: 'codebase-memory', required: true },
+      { name: 'notes', scope: 'local', transport: 'stdio', status: 'blocked', tools: [], error: 'refused by policy', enabled: true, unpinned: true },
+      { name: 'github', scope: 'user', transport: 'http', status: 'ready', tools: ['get_me'], error: null, enabled: true, tool_tiers: { get_me: 'read' } },
+    ]
+    const input = '{"command":"cargo test"}'
+    const request = { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: null, input, session_prefixes: [], project_rules: ['Bash(cargo test:*)'] }
+    const state = run(
+      [
+        { type: 'models', current: 'glm-5.2', models: [model] },
+        { type: 'extensions', mcp_servers: servers, plugins: [], skills: [], agents: [] },
+        { type: 'permission_requested', id: 7, request },
+      ],
+      started(),
+    )
+    expect(state.models).toEqual([model])
+    expect(state.extensions?.mcpServers).toEqual(servers)
+    expect(state.permissions[0].request).toEqual(request)
+  })
+})

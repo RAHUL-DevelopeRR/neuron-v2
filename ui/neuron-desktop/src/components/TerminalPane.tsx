@@ -8,7 +8,7 @@ import { dark, fonts } from '@neuron/client'
 import type { Platform, TerminalSession } from '../platform'
 
 /** A shell in the workspace, in xterm.js. It starts when the pane first opens. */
-export function TerminalPane({ platform }: { platform: Platform }) {
+export function TerminalPane({ platform, folder }: { platform: Platform; /** The chat's folder: the shell opens again when it changes. */ folder?: string }) {
   const box = useRef<HTMLDivElement>(null)
   const [status, setStatus] = useState<string | null>('Starting the shell…')
 
@@ -27,19 +27,20 @@ export function TerminalPane({ platform }: { platform: Platform }) {
     let session: TerminalSession | null = null
     let disposed = false
     const cleanups: Array<() => void> = []
+    setStatus('Starting the shell…')
     platform.openTerminal(term.cols, term.rows).then(
       (opened) => {
         if (disposed) return opened.close()
         session = opened
-        setStatus(null)
+        if (!disposed) setStatus(null)
         cleanups.push(
           opened.onData((data) => term.write(data)),
-          opened.onExit((code) => setStatus(`The shell exited${code === null ? '' : ` (code ${code})`}.`)),
+          opened.onExit((code) => !disposed && setStatus(`The shell exited${code === null ? '' : ` (code ${code})`}.`)),
         )
         const input = term.onData((data) => opened.write(data))
         cleanups.push(() => input.dispose())
       },
-      (error: Error) => setStatus(error.message),
+      (error: Error) => !disposed && setStatus(error.message),
     )
     const observer = new ResizeObserver(() => {
       fit.fit()
@@ -51,9 +52,10 @@ export function TerminalPane({ platform }: { platform: Platform }) {
       observer.disconnect()
       for (const cleanup of cleanups) cleanup()
       session?.close()
+      session = null
       term.dispose()
     }
-  }, [platform])
+  }, [platform, folder])
 
   return (
     <div className="terminal-pane">

@@ -1,7 +1,12 @@
 // Serves one Neuron engine to remote clients (the desktop app in a browser,
 // the mobile app on the LAN):
 //
-//   bun run host [--mock] [--lan] [--port N] [--cwd DIR] [--token-file FILE] [--show-token]
+//   bun run host [--mock] [--lan] [--port N] [--cwd DIR] [--token-file FILE] [--show-token] [--owner-on-loopback]
+//
+// --owner-on-loopback is for the desktop app in a browser on this machine: it lets a client on this
+// machine use every slash command (a new session, the permission mode, login) and resume by path.
+// Never use it together with `neuron engine --share`: that bridge's phone reaches this host from
+// 127.0.0.1 too, and the host cannot tell it from you.
 //
 // --mock runs the engine against the mock Anthropic service in a temp home,
 // with no account and no network (needs `cargo build -p rusty-claude-cli -p
@@ -73,6 +78,7 @@ const host = new NeuronHost({
   name: mockMode ? 'Neuron (mock)' : os.hostname(),
   hostname: flag('--lan') ? '0.0.0.0' : '127.0.0.1',
   port: Number(value('--port') ?? 0),
+  ownerOnLoopback: flag('--owner-on-loopback'),
 })
 
 let stopping = false
@@ -106,4 +112,5 @@ if (flag('--lan')) {
 }
 console.log(`  token file: ${tokenFile}`)
 if (flag('--show-token')) console.log(`  token:      ${token}`)
+if (flag('--owner-on-loopback')) console.log('  owner:      clients on this machine may use every slash command. Do not combine with `neuron engine --share`.')
 console.log('Ctrl-C stops it.')

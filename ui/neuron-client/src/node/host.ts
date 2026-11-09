@@ -2,13 +2,21 @@
  * A Neuron host (Bun): owns one engine and serves it to remote clients over
  * WebSocket with the protocol in `../remote.ts`. The desktop app uses it in a
  * browser during development, and the mobile app on the LAN; the zero-x.live
- * relay will carry the same frames.
+ * relay will carry the same frames, and whoever builds it must apply this
+ * host's policy, not only `parseClientMessage`.
  *
  * Security: it binds to 127.0.0.1 unless told otherwise, every client must
- * open with the pairing token, browser origins other than local ones are
- * refused, and remote clients cannot shut the engine down. The `fs.*` methods
- * only read inside the workspace. Terminals (`term.open`) are only for clients
- * on this machine, since a shell would bypass the engine's permission prompts.
+ * open with the pairing token, and browser origins other than local ones are
+ * refused. A frame from a peer meets `parseClientMessage` first, which passes
+ * only the commands in `PEER_PASSES` (test/protocol.test.ts). Passing is not
+ * permission: `forward` still refuses, for every peer, local or not, what
+ * `HOST_POLICY` calls `owner_only` (`shutdown` among it), a rewind that is not
+ * a dry run, slash commands outside `REMOTE_SLASH` and a `resume` that names
+ * anything but a session id, and `trust_workspace` for a peer on another
+ * machine. A second `interrupt` in one turn still ends the engine.
+ * The `fs.*` methods only read inside the workspace. Terminals (`term.open`)
+ * are only for clients on this machine, since a shell would bypass the
+ * engine's permission prompts.
  */
 
 import { timingSafeEqual } from 'crypto'
@@ -16,7 +24,7 @@ import { promises as fs } from 'fs'
 import path from 'path'
 
 import type { EngineTransport } from '../controller'
-import { CAPABILITY_QUESTIONS, FEATURE_CAPABILITIES, commandMessage } from '../protocol'
+import { CAPABILITY_QUESTIONS, FEATURE_CAPABILITIES, commandMessage, type ClientMessage, type EngineCommand } from '../protocol'
 import {
   REMOTE_PROTOCOL,
   parseClientFrame,
@@ -46,6 +54,14 @@ export interface HostOptions {
   /** Whether a client's address is this machine (loopback by default; tests override it). */
   isLocal?: (address: string) => boolean
   /**
+   * Treats a client on this machine as the owner: it may use any slash command and resume a session by path,
+   * which the desktop app in a browser needs (a new session, the permission mode, login). Off by default.
+   * Never turn it on while a share bridge (`neuron engine --share`) is connected: the bridge's phone reaches this
+   * host from 127.0.0.1 too, so the host cannot tell it from the owner. What `HOST_POLICY` calls `owner_only`
+   * stays refused either way.
+   */
+  ownerOnLoopback?: boolean
+  /**
    * A new engine, continuing `resume` (a session id) when given: lets clients on this
    * machine restart it (`engine.restart`), as trusting the workspace needs.
    */
@@ -63,7 +79,11 @@ interface Peer {
   name: string
   kind: ClientKind
   timer: ReturnType<typeof setTimeout> | null
-  /** The client connected from this machine (loopback). */
+  /**
+   * The client connected from this machine (loopback). That says where the socket came from, not who is
+   * typing: a phone behind `neuron engine --share` is local too. It opens only `term.open`, `engine.restart`
+   * and `trust_workspace`; the slash and resume walls bind every peer.
+   */
   local: boolean
   terminals: Map<number, { process: ReturnType<typeof Bun.spawn>; terminal: Terminal }>
 }
@@ -74,6 +94,60 @@ const MAX_FRAME_BYTES = 1_000_000
 const MAX_READ_BYTES = 512 * 1024
 const MAX_LIST_ENTRIES = 2_000
 const MAX_TERMINALS_PER_CLIENT = 4
+
+/** Slash commands that only read. No peer may send any other, local or not, unless it is on this machine and the host was started with `ownerOnLoopback`. */
+const REMOTE_SLASH = new Set(['help', 'status', 'cost', 'context', 'usage', 'doctor', 'changes', 'diff', 'stats', 'memory', 'model'])
+
+const OWNER_ONLY = 'Only the Neuron desktop app can change your files, history or settings.'
+
+/**
+ * What the host does with each engine command a peer sends, local or not. Every `EngineCommand` tag is
+ * decided here, on purpose: a new one fails `bun run typecheck` until someone chooses.
+ * - `owner_only`: refused to every peer. These change the workspace, the history, the user's settings or
+ *   what the agent may do, or cost the engine real work, and the phone app has no screen for them.
+ *   `parseClientMessage` already drops all of them but `shutdown`, `commit` and `set_mcp_server_enabled`
+ *   before they get here; this is the second wall, for the day the first has a hole. (`forward` answers
+ *   `shutdown` first, with a message of its own.)
+ * - `forward`: goes on to the engine, after what `forward` still checks: `slash` only for `REMOTE_SLASH`
+ *   (and `/resume` with a session id), `resume` only by session id, `rewind` only as a dry run and
+ *   `trust_workspace` only for a peer on this machine. `capabilities` is dropped: the host speaks for all
+ *   its clients. A peer on this machine of a host started with `ownerOnLoopback` is exempt from the `slash`
+ *   and `resume` checks, and from nothing else.
+ * Every `PEER_REFUSED` tag in test/protocol.test.ts is `owner_only` here.
+ */
+export const HOST_POLICY: Record<EngineCommand['type'], 'forward' | 'owner_only'> = {
+  submit: 'forward',
+  slash: 'forward',
+  set_model: 'forward',
+  list_models: 'forward',
+  interrupt: 'forward',
+  shutdown: 'owner_only',
+  capabilities: 'forward',
+  answer: 'forward',
+  list_sessions: 'forward',
+  resume: 'forward',
+  trust_workspace: 'forward',
+  list_extensions: 'forward',
+  trust_preview: 'forward',
+  refresh_account: 'forward',
+  set_mcp_server_enabled: 'owner_only',
+  commit: 'owner_only',
+  rewind: 'forward',
+  list_connector_catalog: 'owner_only',
+  add_mcp_server: 'owner_only',
+  remove_mcp_server: 'owner_only',
+  approve_mcp_server: 'owner_only',
+  set_reasoning_effort: 'owner_only',
+  set_permission_mode: 'owner_only',
+  list_branches: 'owner_only',
+  switch_branch: 'owner_only',
+}
+
+const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const LOOPBACK_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$/i
+
+/** A session id or `latest`, never a path. */
+const isSessionRef = (value: unknown): boolean => typeof value === 'string' && (value === 'latest' || SESSION_ID.test(value))
 
 const isLoopback = (address: string) => address === '::1' || address.startsWith('127.') || address === '::ffff:127.0.0.1'
 
@@ -180,7 +254,8 @@ export class NeuronHost {
         },
         message(socket, message) {
           const text = typeof message === 'string' ? message : new TextDecoder().decode(message)
-          void host.receive(socket, text)
+          // Bun exits on an unhandled rejection, so nothing a frame sets off may escape: its peer is told, the host serves on.
+          host.receive(socket, text).catch(() => host.failed(socket))
         },
         close(socket) {
           if (socket.data.timer) clearTimeout(socket.data.timer)
@@ -204,7 +279,8 @@ export class NeuronHost {
     try {
       const { hostname, host } = new URL(origin)
       if (['localhost', '127.0.0.1', '[::1]', 'tauri.localhost'].includes(hostname)) return true
-      return host === hostHeader
+      // A page served by this host itself: its Host header must still be a loopback name.
+      return hostHeader !== null && host === hostHeader && LOOPBACK_HOST.test(hostHeader)
     } catch {
       return false
     }
@@ -212,6 +288,26 @@ export class NeuronHost {
 
   private send(socket: Socket, frame: HostFrame): void {
     socket.send(JSON.stringify(frame))
+  }
+
+  /** A frame made the host throw: tells that peer, without the details, and goes on serving. */
+  private failed(socket: Socket): void {
+    try {
+      this.send(socket, { t: 'error', message: 'The host could not handle that frame.', fatal: false })
+    } catch {
+      // The peer is gone: there is no one to tell, and nothing may escape from here either.
+    }
+  }
+
+  /** Hands `message` to the engine. When the engine has just died, the peer is told and this returns false. */
+  private toEngine(socket: Socket, message: ClientMessage): boolean {
+    try {
+      this.transport.send(message)
+      return true
+    } catch {
+      this.send(socket, { t: 'error', message: 'The engine is not running.', fatal: false })
+      return false
+    }
   }
 
   private broadcast(frame: HostFrame): void {
@@ -222,7 +318,7 @@ export class NeuronHost {
   /** Applies an action to the host's session and sends it to every client. */
   private record(action: SessionAction): void {
     this.seq += 1
-    this.state = reduceSession(this.state, action)
+    this.state = reduceSession(this.state, action, Date.now())
     this.broadcast({ t: 'action', seq: this.seq, action })
   }
 
@@ -270,22 +366,44 @@ export class NeuronHost {
     this.broadcast({ t: 'clients', count: this.clientCount })
   }
 
-  private forward(socket: Socket, message: import('../protocol').ClientMessage): void {
+  private forward(socket: Socket, message: ClientMessage): void {
     const refuse = (text: string) => this.send(socket, { t: 'error', message: text, fatal: false })
     if (this.state.connection !== 'ready') return refuse('The engine is not running.')
     if (message.kind === 'permission_reply') {
+      // "Always allow in this project" saves rules into the project's settings for good: the desktop app's call.
+      if (message.decision.kind === 'allow_for_project') return refuse(OWNER_ONLY)
       // The first answer wins; later ones (another client's) are dropped.
       if (!this.state.permissions.some((permission) => permission.id === message.id)) return
-      this.transport.send(message)
+      // Answered only once the engine has the answer: when it just died, the request stays open.
+      if (!this.toEngine(socket, message)) return
       return this.record({ type: 'local/permission_answered', id: message.id, decision: message.decision })
     }
     if (message.type === 'shutdown') return refuse('Only the machine running Neuron can stop the engine.')
     // The host speaks for all its clients.
     if (message.type === 'capabilities') return
+    // Whatever `HOST_POLICY` does not say `forward` (a tag it does not know fails closed), and a rewind that is not a dry run.
+    if (HOST_POLICY[message.type] !== 'forward' || (message.type === 'rewind' && message.dry_run !== true)) {
+      return refuse(OWNER_ONLY)
+    }
+    // The next two walls hold for every peer, local or not: a phone behind `neuron engine --share` reaches this host
+    // from 127.0.0.1, so `local` says where a socket came from, not who is typing. Only a host started with
+    // `ownerOnLoopback` lets a peer on this machine past them.
+    const owner = this.options.ownerOnLoopback === true && socket.data.local
+    if (!owner && message.type === 'slash') {
+      const name = message.command.trim().toLowerCase()
+      const allowed =
+        REMOTE_SLASH.has(name) || (name === 'resume' && isSessionRef(typeof message.args === 'string' ? message.args.trim() : ''))
+      if (!allowed) return refuse(OWNER_ONLY)
+    }
+    if (!owner && message.type === 'resume' && !isSessionRef(message.session)) {
+      return refuse('A remote client can only resume a session by its id.')
+    }
+    // `local` is for this, `term.open`, `engine.restart` and `ownerOnLoopback`; the share bridge filters `trust_workspace` for its phone itself.
     if (message.type === 'trust_workspace' && !socket.data.local) {
       return refuse('Only the machine running Neuron can trust its workspace.')
     }
-    this.transport.send(message)
+    // Nothing is recorded for a message the engine did not get.
+    if (!this.toEngine(socket, message)) return
     if (message.type === 'submit') this.record({ type: 'local/submitted', text: message.text, attachments: message.attachments })
     else if (message.type === 'slash') this.record({ type: 'local/slash', command: message.command, args: message.args })
     else if (message.type === 'answer') this.record({ type: 'local/answered', id: message.id, text: message.text })
