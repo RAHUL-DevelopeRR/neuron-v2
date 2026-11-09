@@ -49,8 +49,8 @@ const CATALOG: ModelInfo[] = [
   entry('nvidia/stepfun-ai/step-5-preview', 'Step 5 Preview (NVIDIA)', 'nvidia'),
   // No catalog name: the model part of the id, without its route and tag.
   entry('openrouter/z-ai/glm-4.7-flash:free', null, 'openrouter'),
-  // The provider the catalog names counts as a route too.
-  entry('z-ai/glm-5.2', 'GLM 5.2 (Z.ai)', 'z.ai'),
+  // Z.ai is a route whatever provider the catalog gives (the client cleans its spellings by name).
+  entry('z-ai/glm-5.2', 'GLM 5.2 (Z.ai)', 'zhipu'),
 ]
 const CATALOG_NAMES = ['GPT-OSS 120B', 'North Mini Code', 'Llama 3.3 70B', 'Step 5 Preview', 'glm-4.7-flash', 'GLM 5.2']
 

@@ -109,6 +109,57 @@ describe('model names', () => {
   })
 })
 
+// This client's own cases: the owner's rule names Z.ai as a provider never shown, but gateway_catalog.rs
+// and the terminal UI have no Z.ai route word yet, so only this copy cleans it by name.
+describe('Z.ai is a route too', () => {
+  test('a name ending in (Z.ai) is cleaned, whatever the catalog says the provider is', () => {
+    for (const provider of [null, undefined, '', 'z.ai', 'zai', 'z-ai', 'zhipu', 'openrouter', 'acme']) {
+      expect(cleanModelName('z-ai/glm-5.2', 'GLM 5.2 (Z.ai)', provider)).toBe('GLM 5.2')
+    }
+  })
+
+  test('every spelling, in any case, alone or beside another route', () => {
+    for (const spelling of ['Z.ai', 'z.ai', 'Z.AI', 'zai', 'Zai', 'ZAI', 'z-ai', 'Z-AI']) {
+      expect(cleanModelName('x/m', `GLM 5.2 (${spelling})`, null)).toBe('GLM 5.2')
+    }
+    expect(cleanModelName('x/m', 'GLM 4.7 Flash (Z.ai, free)', null)).toBe('GLM 4.7 Flash')
+    expect(cleanModelName('x/m', 'GLM 4.7 Flash (OpenRouter, Z.ai)', null)).toBe('GLM 4.7 Flash')
+    expect(cleanModelName('x/m', 'GLM 4.7 Flash (Z.ai) (free)', null)).toBe('GLM 4.7 Flash')
+    expect(cleanModelName('x/m', 'GLM 4.7 Flash (free) (Z.ai)', null)).toBe('GLM 4.7 Flash')
+  })
+
+  test('a model whose own name merely has those letters in it is left alone', () => {
+    for (const name of [
+      'Zaire 7B',
+      'Mazai Chat',
+      'Gonzaiz Pro',
+      'Zaidoo (Preview)',
+      'Lazai Pro (32B)',
+      'Model (Zaire)',
+      'Model (Zaitech)',
+      'Model (Z.ai Labs)',
+      'Model (Zai Labs)',
+      'Model (not-zai)',
+      'Z.ai Model',
+      'Zai Model',
+    ]) {
+      expect(cleanModelName('x/m', name, null)).toBe(name)
+      expect(cleanModelName('x/m', name, 'zai')).toBe(name)
+    }
+    // No catalog name: the id's model part, which is the model's own name.
+    expect(cleanModelName('acme/zai-large')).toBe('zai-large')
+    expect(cleanModelName('openrouter/z-ai/glm-4.7-flash:free')).toBe('glm-4.7-flash')
+  })
+
+  test('two models that differ only by that route are told apart by a number, not by the route', () => {
+    const catalog = [
+      { id: 'z-ai/glm-5.2', display_name: 'GLM 5.2 (Z.ai)', provider: 'openrouter' },
+      { id: 'openrouter/glm-5.2', display_name: 'GLM 5.2 (OpenRouter)', provider: 'openrouter' },
+    ]
+    expect([...sameNameSuffixes(catalog)]).toEqual([['openrouter/glm-5.2', ' (2)']])
+  })
+})
+
 // The same cases as gateway_catalog.rs's `family_ids_and_route_ids_find_the_same_catalog_entry`.
 describe('finding a model in the catalog', () => {
   const catalog = [

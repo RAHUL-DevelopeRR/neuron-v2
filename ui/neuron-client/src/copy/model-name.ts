@@ -12,7 +12,8 @@
  * The raw id stays where a power user looks for it: `/status` and the
  * engine's JSON output. Mirrors `clean_model_name` in
  * rust/crates/rusty-claude-cli/src/gateway_catalog.rs and the terminal UI's
- * ui/neuron-tui/src/utils/model-name.ts: change the three together. Engines
+ * ui/neuron-tui/src/utils/model-name.ts: change the three together (except the
+ * Z.ai spellings in `ROUTE_WORDS`, which only this copy has so far). Engines
  * from 7.0.0-alpha.5 send names already cleaned (`model_display_name`,
  * `served_model_display_name`); an older engine's, and the catalog's own, are
  * cleaned here the same way. Two catalog models whose names are then the same
@@ -48,6 +49,12 @@ const ROUTE_WORDS: ReadonlySet<string> = new Set([
   'paid',
   'free tier',
   'paid tier',
+  // The owner's rule names Z.ai, which gateway_catalog.rs and the terminal UI's list do not have yet:
+  // only this copy cleans these spellings. A name that merely has these letters in it is not a match,
+  // as a part has to be exactly one of them.
+  'z.ai',
+  'zai',
+  'z-ai',
 ])
 
 /** The id without the `openai/` transport prefix the engine adds. */
