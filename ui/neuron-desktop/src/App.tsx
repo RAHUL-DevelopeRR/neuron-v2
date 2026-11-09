@@ -514,14 +514,21 @@ export function App({ platform }: { platform: Platform }) {
       })
   }, [effortPending, ready, state.busy, permission, question, state.items, controller, platform])
 
-  // What allowing the folder would turn on, asked for once per folder.
+  // What allowing the folder would turn on, asked for once per folder, and again whenever the folder is
+  // untrusted after it was trusted: from 7.0.0-alpha.5 the engine asks for trust again when a folder's
+  // hooks, MCP launch specs or allow rules change, and the dialog needs the new list, not none or the old.
   const canPreview = hasFeature(state, FEATURE_TRUST_PREVIEW)
+  const trusted = state.status?.workspace_trusted === true
   const previewAsked = useRef<string | null>(null)
   useEffect(() => {
+    if (trusted) {
+      previewAsked.current = null
+      return
+    }
     if (!controller || !ready || !untrusted || !folder || !canPreview || previewAsked.current === folder) return
     previewAsked.current = folder
     controller.trustPreview()
-  }, [controller, ready, untrusted, folder, canPreview])
+  }, [controller, ready, trusted, untrusted, folder, canPreview])
 
   // The usage page reads the plan and usage again.
   const canRefreshAccount = hasFeature(state, FEATURE_ACCOUNT)

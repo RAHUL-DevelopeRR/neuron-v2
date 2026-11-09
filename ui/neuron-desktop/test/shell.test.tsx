@@ -13,7 +13,7 @@ import { accountView, type AccountDetails, type ClientMessage, type ErrorDetail,
 import { App } from '../src/App'
 import { UsagePanel } from '../src/components/SettingsPage'
 import { LINKS } from '../src/links'
-import { FakeEngine, fakePlatform, type FakePlatformOptions } from './fake-platform'
+import { ALL_FEATURES, FakeEngine, fakePlatform, type FakePlatformOptions } from './fake-platform'
 
 afterEach(() => {
   cleanup()
@@ -559,5 +559,82 @@ describe('protocol v2: the account event and the trust preview', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Allow Neuron in this folder' }))
     await emit(engine, { type: 'workspace_trusted', cwd: '/home/rahul', restart_required: true, session_only: true, root: '/home/rahul' })
     await waitFor(() => expect(platform.trustedOnce).toEqual([null]))
+  })
+
+  // From 7.0.0-alpha.5 the engine asks for trust again when a trusted folder's hooks, MCP launch specs or
+  // allow rules change: the same folder is untrusted once more, and the dialog needs a fresh preview.
+  describe('a trusted folder that asks for trust again', () => {
+    const trustDialog = () => screen.getByRole('dialog', { name: 'Before Neuron works here' })
+    const preview = (commands: string[], over: Record<string, unknown> = {}): UiEvent =>
+      ({
+        type: 'trust_preview',
+        cwd: '/work/app',
+        root: '/work/app',
+        is_git_root: true,
+        session_only: false,
+        trusted: false,
+        settings_files: ['/work/app/.neuron/settings.json'],
+        hooks: commands.map((command) => ({ event: 'PreToolUse', command, source: '/work/app/.neuron/settings.json' })),
+        mcp_servers: [],
+        permission_rules: [],
+        other_settings: [],
+        ...over,
+      }) as UiEvent
+    const listed = () =>
+      within(within(trustDialog()).getByRole('list', { name: 'What this folder turns on' }))
+        .getAllByRole('listitem')
+        .map((item) => item.textContent)
+
+    test('trusted, then untrusted again, asks what the folder turns on a second time', async () => {
+      const { engine } = await start({ workspace_trusted: false })
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+      await emit(engine, preview(['lint']))
+      expect(listed()).toEqual(['1 hook that runs commands around tool calls'])
+
+      // Every status says the folder is untrusted: that is not a new question.
+      await emit(engine, engine.status({ workspace_trusted: false }))
+      expect(sent(engine, 'trust_preview')).toHaveLength(1)
+
+      // Trusted: the dialog is gone.
+      await emit(engine, engine.status({ workspace_trusted: true }))
+      expect(screen.queryAllByRole('dialog', { name: 'Before Neuron works here' }).length).toBe(0)
+      expect(sent(engine, 'trust_preview')).toHaveLength(1)
+
+      // Its hooks changed and the engine wants trust again: the preview is asked for again, and replaces the old one.
+      await emit(engine, engine.status({ workspace_trusted: false }))
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(2))
+      await emit(engine, preview(['lint', 'deploy'], { changed_since_trust: true, changed_settings: ['hooks'] }))
+      expect(listed()).toEqual(['2 hooks that run commands around tool calls'])
+
+      // And once more only, for as long as it stays untrusted.
+      await emit(engine, engine.status({ workspace_trusted: false }))
+      expect(sent(engine, 'trust_preview')).toHaveLength(2)
+    })
+
+    test('allowed, the engine restarted, and a later change asks again', async () => {
+      const { engine, platform } = await start({ workspace_trusted: false })
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+      await emit(engine, preview(['lint']))
+      fireEvent.click(within(trustDialog()).getByRole('button', { name: 'Allow Neuron in this folder' }))
+      await emit(engine, { type: 'workspace_trusted', cwd: '/work/app', restart_required: true })
+      await waitFor(() => expect(platform.restarts).toEqual([null]))
+      // The fresh engine says it is ready and that the folder is trusted.
+      await emit(engine, { type: 'ready', protocol: 1, version: '6.3.0', features: ALL_FEATURES }, engine.status({ workspace_trusted: true }))
+      expect(screen.queryAllByRole('dialog', { name: 'Before Neuron works here' }).length).toBe(0)
+      expect(sent(engine, 'trust_preview')).toHaveLength(1)
+
+      // Later, an MCP launch spec changes.
+      await emit(engine, engine.status({ workspace_trusted: false }))
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(2))
+      await emit(engine, preview([], { mcp_servers: [{ name: 'postgres-tools', transport: 'stdio', target: 'pg-mcp --new', source: '/work/app/.neuron/settings.json' }] }))
+      expect(listed()).toEqual(['1 MCP server: postgres-tools'])
+    })
+
+    test('a folder that stays untrusted is asked about once', async () => {
+      const { engine } = await start({ workspace_trusted: false })
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+      for (let round = 0; round < 3; round++) await emit(engine, engine.status({ workspace_trusted: false }))
+      expect(sent(engine, 'trust_preview')).toHaveLength(1)
+    })
   })
 })
