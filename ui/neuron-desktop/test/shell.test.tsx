@@ -649,18 +649,18 @@ describe('protocol v2: the account event and the trust preview', () => {
     })
   })
 
+  /** The engine process ends, as a crash or a stop does. */
+  const exits = (engine: FakeEngine) =>
+    act(async () => {
+      for (const listener of engine.closeListeners) listener({ code: 1, error: 'The Neuron engine stopped (exit code 1).' })
+    })
+  /** A fresh engine says it is ready, and what it makes of the folder. */
+  const comesBack = (engine: FakeEngine, trusted: boolean) =>
+    emit(engine, { type: 'ready', protocol: 1, version: '6.3.0', features: ALL_FEATURES }, engine.status({ workspace_trusted: trusted }))
+
   // A fresh engine's `ready` clears the preview the dialog had, so an engine that goes away and comes
   // back while the folder stays untrusted has to be asked again, or the dialog opens without its list.
   describe('an engine that restarts while the folder stays untrusted', () => {
-    /** The engine process ends, as a crash or a stop does. */
-    const exits = (engine: FakeEngine) =>
-      act(async () => {
-        for (const listener of engine.closeListeners) listener({ code: 1, error: 'The Neuron engine stopped (exit code 1).' })
-      })
-    /** A fresh engine says it is ready, and what it makes of the folder. */
-    const comesBack = (engine: FakeEngine, trusted: boolean) =>
-      emit(engine, { type: 'ready', protocol: 1, version: '6.3.0', features: ALL_FEATURES }, engine.status({ workspace_trusted: trusted }))
-
     test('one that exits and comes back is asked for the preview again, once', async () => {
       const { engine } = await start({ workspace_trusted: false })
       await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
@@ -699,6 +699,102 @@ describe('protocol v2: the account event and the trust preview', () => {
       await comesBack(engine, true)
       expect(screen.queryAllByRole('dialog', { name: 'Before Neuron works here' }).length).toBe(0)
       expect(sent(engine, 'trust_preview')).toHaveLength(1)
+    })
+  })
+
+  // Allow is answered by `workspace_trusted`, and then a restart. From 7.0.0-alpha.5 the engine can refuse
+  // it too: when the project's settings changed after the dialog's list was made it trusts nothing and
+  // answers with an `error` and a fresh `trust_preview`, and when it cannot record the trust, with an
+  // `error` (engine_trust.rs). No restart follows, so the dialog has to be usable again, not stuck on
+  // "Starting Neuron with this folder's settings" with both buttons off.
+  describe('an Allow the engine did not act on', () => {
+    const STALE =
+      'The settings in /work/app changed after the trust screen was shown, so nothing was trusted. Read what it asks for now and allow again.'
+    const primary = () => trustDialog().querySelector<HTMLButtonElement>('button.primary')!
+    /** Whether each of the dialog's buttons is off, in order. */
+    const off = () => [...trustDialog().querySelectorAll<HTMLButtonElement>('.trust-buttons button')].map((button) => button.disabled)
+    /** An untrusted folder, with the dialog's list when asked for, and Allow pressed on it. */
+    async function allowed(withPreview = true) {
+      const started = await start({ workspace_trusted: false })
+      await waitFor(() => expect(sent(started.engine, 'trust_preview')).toHaveLength(1))
+      if (withPreview) await emit(started.engine, preview(['lint']))
+      fireEvent.click(primary())
+      expect(sent(started.engine, 'trust_workspace')).toHaveLength(1)
+      // While it waits both buttons are off and the first says what is happening.
+      expect(off()).toEqual([true, true])
+      expect(primary().textContent).toBe(trustCopy.restarting)
+      return started
+    }
+
+    test('a stale Allow, answered with an error and a fresh preview, can be allowed again', async () => {
+      const { engine, platform } = await allowed()
+      await emit(engine, { type: 'error', message: STALE }, preview(['lint', 'deploy']))
+      expect(off()).toEqual([false, false])
+      expect(primary().textContent).toBe(trustCopy.allow)
+      // The dialog shows what the files say now.
+      expect(listed()).toEqual(['2 hooks that run commands around tool calls'])
+      expect(platform.restarts).toEqual([])
+
+      // Allowed again, this time it is trusted, and the usual restart follows.
+      fireEvent.click(primary())
+      expect(sent(engine, 'trust_workspace')).toHaveLength(2)
+      expect(off()).toEqual([true, true])
+      await emit(engine, { type: 'workspace_trusted', cwd: '/work/app', restart_required: true })
+      await waitFor(() => expect(platform.restarts).toEqual([null]))
+    })
+
+    test('the preview may come before the error', async () => {
+      const { engine } = await allowed()
+      await emit(engine, preview(['lint', 'deploy']), { type: 'error', message: STALE })
+      expect(off()).toEqual([false, false])
+    })
+
+    test('a fresh preview alone ends the wait', async () => {
+      const { engine } = await allowed()
+      await emit(engine, preview(['lint', 'deploy']))
+      expect(off()).toEqual([false, false])
+    })
+
+    test('an Allow the engine could not record, answered with an error alone, can be tried again', async () => {
+      const { engine } = await allowed()
+      await emit(engine, { type: 'error', message: 'could not trust /work/app: permission denied' })
+      expect(off()).toEqual([false, false])
+      // What the dialog showed is still what it shows.
+      expect(listed()).toEqual(['1 hook that runs commands around tool calls'])
+      fireEvent.click(primary())
+      expect(sent(engine, 'trust_workspace')).toHaveLength(2)
+    })
+
+    test('an engine that goes away while Allow waits leaves the dialog usable on the next one', async () => {
+      const { engine } = await allowed()
+      await exits(engine)
+      await comesBack(engine, false)
+      expect(off()).toEqual([false, false])
+      fireEvent.click(primary())
+      expect(sent(engine, 'trust_workspace')).toHaveLength(2)
+    })
+
+    test('the first preview, arriving after Allow was pressed, is not an answer to it', async () => {
+      const { engine, platform } = await allowed(false)
+      // It is the answer to the dialog's own request: nothing was refused, so the wait goes on.
+      await emit(engine, preview(['lint']))
+      expect(off()).toEqual([true, true])
+      await emit(engine, { type: 'workspace_trusted', cwd: '/work/app', restart_required: true })
+      await waitFor(() => expect(platform.restarts).toEqual([null]))
+    })
+
+    test('an error that was there before Allow does not end the wait', async () => {
+      const started = await start({ workspace_trusted: false })
+      const { engine, platform } = started
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+      await emit(engine, preview(['lint']), { type: 'error', message: 'The gateway could not be reached.' })
+      fireEvent.click(primary())
+      expect(off()).toEqual([true, true])
+      // Something else the engine says meanwhile changes nothing either.
+      await emit(engine, engine.status({ workspace_trusted: false }), { type: 'notice', message: 'Checking the folder.' } as UiEvent)
+      expect(off()).toEqual([true, true])
+      await emit(engine, { type: 'workspace_trusted', cwd: '/work/app', restart_required: true })
+      await waitFor(() => expect(platform.restarts).toEqual([null]))
     })
   })
 

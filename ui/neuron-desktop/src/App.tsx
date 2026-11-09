@@ -16,6 +16,7 @@ import {
   sessionAccount,
   type SessionController,
   type TranscriptItem,
+  type TrustPreviewEvent,
 } from '@neuron/client'
 
 import { AccountRow, SignOutDialog, type AccountAction } from './components/AccountMenu'
@@ -472,6 +473,25 @@ export function App({ platform }: { platform: Platform }) {
       void platform.restart(keep, { trustOnce: trustedOnce.current }).catch((error: Error) => setLaunchError(error.message))
     }
   }, [trusting, state.restartRequired, state.items, platform, sessionId])
+
+  // An Allow the engine does not act on ends the wait too, or the dialog stays on "starting" with both
+  // buttons off until the app is restarted. From 7.0.0-alpha.5 the engine refuses an Allow that arrives after
+  // the project's settings changed with an `error` and a fresh `trust_preview`, and one it could not record
+  // with an `error`; it trusts nothing and no restart follows. A lost engine never answers. What the dialog
+  // showed when Allow was pressed tells an answer from what was already there: an error that arrived since,
+  // a preview that replaced the one shown (a first preview, arriving late, is the answer to the dialog's
+  // own request and not a refusal), or an engine that is not ready.
+  const allowedAt = useRef<{ preview: TrustPreviewEvent | null; errors: ReadonlySet<string> } | null>(null)
+  useEffect(() => {
+    const at = allowedAt.current
+    if (!trusting || !at) return
+    const refreshed = at.preview !== null && state.trustPreview !== null && state.trustPreview !== at.preview
+    const failed = state.items.some((item) => item.kind === 'error' && !at.errors.has(item.key))
+    if (refreshed || failed || !ready) {
+      allowedAt.current = null
+      setTrusting(false)
+    }
+  }, [trusting, ready, state.trustPreview, state.items])
 
   const changes = useMemo(() => changedPaths(state), [state])
   // Re-read the tree, git and open files whenever a call finishes.
@@ -963,6 +983,10 @@ export function App({ platform }: { platform: Platform }) {
           working={trusting}
           canPickFolder={platform.can.pickFolder}
           onAllow={() => {
+            allowedAt.current = {
+              preview: state.trustPreview,
+              errors: new Set(state.items.filter((item) => item.kind === 'error').map((item) => item.key)),
+            }
             setTrusting(true)
             trustedOnce.current = state.trustPreview?.session_only === true
             controller.trustWorkspace()
