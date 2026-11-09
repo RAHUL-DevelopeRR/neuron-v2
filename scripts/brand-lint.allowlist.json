@@ -109,64 +109,10 @@
   "accepted": [],
   "baseline": [
     {
-      "file": "rust/crates/commands/src/lib.rs",
-      "text": "Inspect Claude config files",
-      "owner": "WP1 (T6)",
-      "reason": "/config summary; becomes \"Show Neuron settings files\""
-    },
-    {
-      "file": "rust/crates/commands/src/lib.rs",
-      "text": "Inspect loaded Claude instruction memory files",
-      "owner": "WP1 (T6)",
-      "reason": "/memory summary; becomes \"Show loaded instruction files\""
-    },
-    {
-      "file": "rust/crates/commands/src/lib.rs",
-      "text": "Show or set the Anthropic API key",
-      "owner": "WP1 (T6)",
-      "reason": "becomes \"Show or set a provider API key\""
-    },
-    {
-      "file": "rust/crates/runtime/src/prompt.rs",
-      "text": "Claude Opus 4.6",
-      "owner": "WP1 (T6)",
-      "reason": "FRONTIER_MODEL_NAME: the system prompt tells every model it is this model family; name the model in use or none"
-    },
-    {
-      "file": "rust/crates/runtime/src/prompt.rs",
-      "text": "# Claude instructions",
-      "owner": "WP1 (T6)",
-      "reason": "instruction-file heading; becomes \"# Project instructions\""
-    },
-    {
-      "file": "rust/crates/rusty-claude-cli/src/args.rs",
-      "text": "Claude Code/OMC plugin command",
-      "owner": "WP1 (T6)",
-      "reason": "OMC compatibility note; just say plugin slash commands are not loaded yet"
-    },
-    {
-      "file": "rust/crates/rusty-claude-cli/src/args.rs",
-      "text": "For Anthropic directly, set ANTHROPIC_API_KEY",
-      "owner": "WP1",
-      "reason": "found by brand-lint, not in the plan's T6 list: name the variables without naming the provider"
-    },
-    {
       "file": "rust/crates/rusty-claude-cli/src/main.rs",
       "text": "set CLAUDE_CODE_UPSTREAM=",
       "owner": "WP1",
       "reason": "found by brand-lint, not in the plan's T6 list: the dump-manifests hint names the reference product's variable; rename it (keep the old name as an alias) or accept it here"
-    },
-    {
-      "file": "rust/crates/telemetry/src/lib.rs",
-      "text": "claude-code-20250219",
-      "owner": "WP1 (T6)",
-      "reason": "DEFAULT_AGENTIC_BETA: the reference product's beta header on every request to the provider"
-    },
-    {
-      "file": "rust/crates/telemetry/src/lib.rs",
-      "text": "claude-code",
-      "owner": "WP1 (T6)",
-      "reason": "DEFAULT_APP_NAME; becomes neuron"
     }
   ]
 }

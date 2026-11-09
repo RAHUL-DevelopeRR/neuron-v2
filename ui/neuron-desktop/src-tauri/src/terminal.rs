@@ -194,6 +194,30 @@ mod tests {
         assert_eq!(utf8_prefix_len(&[0xff, b'a']), 2);
     }
 
+    /// Plays the part of the app's terminal while it waits up to `time` for a shell to end,
+    /// and returns the shell that ended. ConPTY asks where the cursor is and holds the shell
+    /// until it is told, and on older Windows (windows-2022) its closing too. xterm.js gives
+    /// the answer in the app; the test does here, from its own thread and not the output's.
+    fn serve(
+        terminals: &Terminals,
+        output: &mpsc::Receiver<(u32, String)>,
+        exit: &mpsc::Receiver<u32>,
+        time: Duration,
+    ) -> Option<u32> {
+        let until = Instant::now() + time;
+        loop {
+            if let Ok(id) = exit.try_recv() {
+                return Some(id);
+            }
+            let left = until.checked_duration_since(Instant::now())?;
+            if let Ok((id, text)) = output.recv_timeout(left.min(Duration::from_millis(50))) {
+                if text.contains("\x1b[6n") {
+                    let _ = terminals.write(id, "\x1b[1;1R");
+                }
+            }
+        }
+    }
+
     #[test]
     fn closes_only_the_terminals_under_a_folder() {
         let base = std::env::temp_dir().join(format!("neuron-term-{}", std::process::id()));
@@ -202,16 +226,17 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         let terminals = Terminals::default();
         let (exit_tx, exit) = mpsc::channel::<u32>();
+        let (out_tx, out) = mpsc::channel::<(u32, String)>();
         let mut ids = Vec::new();
         for cwd in [&inside, &outside] {
-            let tx = exit_tx.clone();
+            let (tx, out_tx) = (exit_tx.clone(), out_tx.clone());
             ids.push(
                 terminals
                     .open(
                         cwd,
                         80,
                         24,
-                        |_, _| {},
+                        move |id, text| drop(out_tx.send((id, text))),
                         move |id, _| {
                             let _ = tx.send(id);
                         },
@@ -219,15 +244,18 @@ mod tests {
                     .expect("a terminal"),
             );
         }
+        // Both shells are running, and have been told where the cursor is, before one closes.
+        let settle = serve(&terminals, &out, &exit, Duration::from_secs(3));
+        assert_eq!(settle, None, "no shell ends by itself");
         terminals.close_under(&base.join("wt"));
-        let closed = exit
-            .recv_timeout(Duration::from_secs(20))
-            .expect("one closes");
-        assert_eq!(closed, ids[0]);
+        let closed = serve(&terminals, &out, &exit, Duration::from_secs(20));
+        assert_eq!(closed, Some(ids[0]), "the shell under the folder closes");
         // The other keeps running.
-        assert!(exit.recv_timeout(Duration::from_millis(800)).is_err());
+        let other = serve(&terminals, &out, &exit, Duration::from_millis(800));
+        assert_eq!(other, None, "the shell outside the folder keeps running");
         terminals.close_all();
-        assert_eq!(exit.recv_timeout(Duration::from_secs(20)).unwrap(), ids[1]);
+        let last = serve(&terminals, &out, &exit, Duration::from_secs(20));
+        assert_eq!(last, Some(ids[1]), "close_all ends the rest");
         let _ = std::fs::remove_dir_all(&base);
     }
 

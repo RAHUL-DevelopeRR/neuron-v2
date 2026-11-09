@@ -105,12 +105,18 @@ export const plantedFine = ['claude-sonnet-4-6', 'CLAUDE.md', '.claude/skills', 
       `${UI} Claude , meet the Claude Code way`,
     ].sort())
 
-    // The real baseline still applies to the copied files; entries for files
-    // that are not in this tree are reported as stale.
-    assert.ok(result.baselined.some((hit) => hit.file === PROMPT && hit.excerpt === 'Claude Opus 4.6'))
-    assert.ok(result.baselined.some((hit) => hit.file === TELEMETRY && hit.excerpt === 'claude-code-20250219'))
-    assert.ok(result.staleBaseline.some((entry) => entry.file === 'rust/crates/rusty-claude-cli/src/args.rs'))
-    assert.ok(!result.staleBaseline.some((entry) => entry.file === COMMANDS))
+    // A baseline entry moves its leak from the failures to the baselined hits; one whose
+    // text is gone from the file, or whose file is not in this tree, is reported as stale.
+    // The entries are planted here: the real baseline only holds what is still unfixed,
+    // which shrinks as leaks are fixed and can be empty.
+    const knownLeak = { file: TELEMETRY, text: 'claude-cli/1.0', owner: 'test', reason: 'planted' }
+    const goneText = { file: COMMANDS, text: 'text that is not in the file', owner: 'test', reason: 'planted' }
+    const absentFile = { file: 'rust/crates/rusty-claude-cli/src/args.rs', text: 'a file that is not in this tree', owner: 'test', reason: 'planted' }
+    const withBaseline = lint({ root, config: { ...config, baseline: [knownLeak, goneText, absentFile] } })
+    assert.ok(withBaseline.baselined.some((hit) => hit.file === TELEMETRY && hit.excerpt === 'claude-cli/1.0' && hit.owner === 'test'))
+    assert.ok(!withBaseline.failures.some((hit) => hit.file === TELEMETRY))
+    assert.equal(withBaseline.failures.length, result.failures.length - 1)
+    assert.deepEqual(withBaseline.staleBaseline, [goneText, absentFile])
 
     // Exit codes: new leaks fail, --report never fails.
     assert.equal(run('--root', root).status, 1)
@@ -123,10 +129,18 @@ export const plantedFine = ['claude-sonnet-4-6', 'CLAUDE.md', '.claude/skills', 
 test('baseline entries warn by default and fail with --strict', () => {
   const root = copyTree([PROMPT])
   try {
-    const plain = run('--root', root)
+    // A known leak planted in the copy, with a baseline entry of its own in a copy of the allowlist.
+    edit(root, PROMPT, (source) => source.replace('#[cfg(test)]', 'pub const PLANTED_KNOWN: &str = "Claude Opus 9.9";\n\n#[cfg(test)]'))
+    const allowlist = JSON.parse(fs.readFileSync(path.join(path.dirname(SCRIPT), 'brand-lint.allowlist.json'), 'utf8'))
+    const configFile = path.join(root, 'allowlist.json')
+    fs.writeFileSync(configFile, JSON.stringify({ ...allowlist, baseline: [{ file: PROMPT, text: 'Claude Opus 9.9', owner: 'WP-test', reason: 'planted' }] }))
+
+    const plain = run('--root', root, '--config', configFile)
     assert.equal(plain.status, 0, plain.stdout + plain.stderr)
-    assert.match(plain.stdout, /prompt\.rs:\d+:\d+: warning: Claude in prompt text: "Claude Opus 4\.6" \(baseline, WP1/)
-    assert.equal(run('--root', root, '--strict').status, 1)
+    assert.match(plain.stdout, /prompt\.rs:\d+:\d+: warning: Claude in prompt text: "Claude Opus 9\.9" \(baseline, WP-test: planted\)/)
+    assert.equal(run('--root', root, '--config', configFile, '--strict').status, 1)
+    // Without the entry the same leak is new, and fails.
+    assert.equal(run('--root', root).status, 1)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
