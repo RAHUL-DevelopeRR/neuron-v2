@@ -603,18 +603,23 @@ describe('NeuronHost policy for the alpha.5 commands', () => {
     return errors
   }
 
-  test('a peer on another machine may list the branches and the connector catalog', async () => {
-    await startHost({ remoteOnly: true })
-    const errors = await fromAnotherMachine([
-      { kind: 'command', type: 'list_branches' },
-      { kind: 'command', type: 'list_connector_catalog', query: 'git' },
-    ])
-    expect(errors).toEqual([])
-    expect(engine.sent).toEqual([
-      { kind: 'command', type: 'list_branches' },
-      { kind: 'command', type: 'list_connector_catalog', query: 'git' },
-    ])
-  })
+  // They only read, but every call costs the engine real work and no phone screen uses the answer.
+  // The gate drops them, so the host answers "not a frame" and the engine hears nothing.
+  const reads = [
+    { kind: 'command', type: 'list_branches' },
+    { kind: 'command', type: 'list_connector_catalog', query: 'git' },
+  ]
+  for (const [where, options] of [
+    ['another machine', { remoteOnly: true }],
+    ['this machine', { localOnly: true }],
+  ] as const) {
+    test(`a peer on ${where} cannot list the branches or the connector catalog`, async () => {
+      await startHost(options)
+      const errors = await sendAsPeer(reads)
+      expect(engine.sent).toEqual([])
+      expect(errors).toEqual(reads.map(() => 'Not a Neuron remote frame.'))
+    })
+  }
 
   /** Commands that change something: a connector to run or remove, the permission mode, the branch, how turns run. */
   const changes = [

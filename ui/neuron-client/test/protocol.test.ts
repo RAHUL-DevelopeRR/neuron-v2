@@ -487,8 +487,6 @@ type CommandType = EngineCommand['type']
  * refuses some of them to every peer, local or not (`shutdown`, `commit`, `set_mcp_server_enabled`, a
  * rewind that is not a dry run, a slash command outside its read-only list, a `resume` that names
  * anything but a session id), and `trust_workspace` to a peer on another machine.
- * `list_branches` and `list_connector_catalog` are the alpha.5 commands that only read: the engine
- * lists the local branches, or the connectors of its built-in catalog, and changes nothing.
  */
 const PEER_PASSES = [
   'submit',
@@ -508,19 +506,22 @@ const PEER_PASSES = [
   'set_mcp_server_enabled',
   'commit',
   'rewind',
-  'list_connector_catalog',
-  'list_branches',
 ] as const satisfies readonly CommandType[]
 
 /**
  * Refused on purpose: `parseClientMessage` returns null, so the frame never reaches the host, let
- * alone the engine. Each of these changes something, and the phone app has no screen for any of it:
+ * alone the engine. The phone app has no screen for any of these. Six of them change something:
  * - `add_mcp_server` adds a connector for the engine to run, and stores the secrets typed for it;
  * - `approve_mcp_server` starts a workspace's server, which runs the command its settings name;
  * - `remove_mcp_server` deletes a server's settings, its stored secrets and its sign-in;
  * - `set_permission_mode` can raise what the agent may do without asking, up to full access;
  * - `switch_branch` checks out another branch, which rewrites the files of the workspace;
  * - `set_reasoning_effort` changes how every following turn runs, and what it costs.
+ * Two only read, but every call costs the engine real work and the reducer discards both answers:
+ * - `list_branches` spawns a thread and about four git processes per call, even during a turn;
+ * - `list_connector_catalog` answers about 4.9 KB to a 73-byte request and reloads the config.
+ * The host also broadcasts each answer to every peer. Open them again only with a screen that needs
+ * them and a rate limit.
  */
 const PEER_REFUSED = [
   'add_mcp_server',
@@ -529,6 +530,8 @@ const PEER_REFUSED = [
   'set_permission_mode',
   'switch_branch',
   'set_reasoning_effort',
+  'list_branches',
+  'list_connector_catalog',
 ] as const satisfies readonly CommandType[]
 
 type Undecided = Exclude<CommandType, (typeof PEER_PASSES)[number] | (typeof PEER_REFUSED)[number]>
@@ -776,18 +779,6 @@ describe('client messages from untrusted peers', () => {
       mode: 'code_only',
       dry_run: true,
     })
-    expect(parseClientMessage({ kind: 'command', type: 'list_branches', all: true })).toEqual({ kind: 'command', type: 'list_branches' })
-    expect(parseClientMessage({ kind: 'command', type: 'list_connector_catalog' })).toEqual({ kind: 'command', type: 'list_connector_catalog' })
-    expect(parseClientMessage({ kind: 'command', type: 'list_connector_catalog', query: 'git hub', x: 1 })).toEqual({
-      kind: 'command',
-      type: 'list_connector_catalog',
-      query: 'git hub',
-    })
-    expect(parseClientMessage({ kind: 'command', type: 'list_connector_catalog', query: '' })).toEqual({
-      kind: 'command',
-      type: 'list_connector_catalog',
-      query: '',
-    })
     expect(parseClientMessage({ kind: 'permission_reply', id: 4, decision: { kind: 'deny', note: 'no' } })).toEqual({
       kind: 'permission_reply',
       id: 4,
@@ -816,9 +807,6 @@ describe('client messages from untrusted peers', () => {
       { kind: 'command', type: 'rewind', checkpoint: 1, mode: 'everything' },
       { kind: 'command', type: 'rewind', checkpoint: 1 },
       { kind: 'command', type: 'rewind', checkpoint: 1, mode: 'chat_only', dry_run: 'true' },
-      { kind: 'command', type: 'list_connector_catalog', query: 7 },
-      { kind: 'command', type: 'list_connector_catalog', query: null },
-      { kind: 'command', type: 'list_connector_catalog', query: ['git'] },
       { kind: 'permission_reply', id: 'one', decision: { kind: 'allow_once' } },
       { kind: 'permission_reply', id: 1, decision: { kind: 'allow_forever' } },
       { kind: 'other' },
@@ -850,6 +838,21 @@ describe('client messages from untrusted peers', () => {
     ]
     for (const change of changes) {
       expect({ type: change.type, result: parseClientMessage({ kind: 'command', ...change }) }).toEqual({ type: change.type, result: null })
+    }
+  })
+
+  test('the two commands that only read are refused too: every call costs the engine real work', () => {
+    const reads: Array<Record<string, unknown> & { type: string }> = [
+      { type: 'list_branches' },
+      { type: 'list_branches', all: true },
+      { type: 'list_connector_catalog' },
+      { type: 'list_connector_catalog', query: '' },
+      { type: 'list_connector_catalog', query: 'git hub' },
+      { type: 'list_connector_catalog', query: 'x'.repeat(256) },
+      { type: 'list_connector_catalog', query: 7 },
+    ]
+    for (const read of reads) {
+      expect({ type: read.type, result: parseClientMessage({ kind: 'command', ...read }) }).toEqual({ type: read.type, result: null })
     }
   })
 
@@ -924,7 +927,6 @@ describe('untrusted peers: attachments and length caps', () => {
       ['slash', (n) => ({ command: 'm', args: 'x'.repeat(n) }), 64 * 1024],
       ['set_model', (n) => ({ model: 'x'.repeat(n) }), 256],
       ['resume', (n) => ({ session: 'x'.repeat(n) }), 512],
-      ['list_connector_catalog', (n) => ({ query: 'x'.repeat(n) }), 256],
     ]
     for (const [type, make, cap] of cases) {
       expect(cmd(type, make(cap))).not.toBeNull()

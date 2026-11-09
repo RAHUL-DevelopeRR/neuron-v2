@@ -1053,7 +1053,8 @@ export type EngineCommand =
   | { type: 'rewind'; checkpoint: number; mode: RewindMode; dry_run?: boolean }
   /**
    * Feature `mcp_catalog`: the catalog connectors whose id, name, publisher or description contain every
-   * word of `query` (all when empty), as a `connector_catalog` event. Read-only.
+   * word of `query` (all when empty), as a `connector_catalog` event. Read-only, but a remote peer may not
+   * send it: every call reloads the config and answers kilobytes.
    */
   | { type: 'list_connector_catalog'; query?: string }
   /**
@@ -1079,7 +1080,7 @@ export type EngineCommand =
    * peer may not send it: it can raise what the agent may do.
    */
   | { type: 'set_permission_mode'; mode: string }
-  /** Feature `status_bar`: the local branches, as a `branches` event. Read-only. */
+  /** Feature `status_bar`: the local branches, as a `branches` event. Read-only, but a remote peer may not send it: every call runs git. */
   | { type: 'list_branches' }
   /**
    * Feature `status_bar`: check out `name` (`create`: a new branch from HEAD). Refused while a turn runs or
@@ -1248,18 +1249,12 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
     case 'list_extensions':
     case 'trust_preview':
     case 'refresh_account':
-    // Read-only: the engine lists its local branches and changes nothing.
-    case 'list_branches':
       return { kind: 'command', type: message.type }
     case 'list_sessions':
       if (message.scope === undefined) return { kind: 'command', type: 'list_sessions' }
       return message.scope === 'project' || message.scope === 'all'
         ? { kind: 'command', type: 'list_sessions', scope: message.scope }
         : null
-    // Read-only: a search over the engine's built-in connector catalog.
-    case 'list_connector_catalog':
-      if (message.query === undefined) return { kind: 'command', type: 'list_connector_catalog' }
-      return isText(message.query, 256) ? { kind: 'command', type: 'list_connector_catalog', query: message.query } : null
     case 'capabilities': {
       if (
         !Array.isArray(message.features) ||
@@ -1312,6 +1307,12 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
     case 'set_permission_mode':
     case 'switch_branch':
     case 'set_reasoning_effort':
+    // These two only read, and are refused all the same: no phone screen uses either answer, and every
+    // call costs the engine real work (`list_branches` runs git, `list_connector_catalog` reloads the
+    // config and answers kilobytes), which the host then broadcasts to every peer. Open them again only
+    // with a screen that needs them and a rate limit.
+    case 'list_branches':
+    case 'list_connector_catalog':
       return null
     default:
       // Any other command, including one a newer engine adds, stays refused until someone decides on it.
