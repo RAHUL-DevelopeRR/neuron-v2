@@ -33,7 +33,7 @@ export async function detectPlatform(): Promise<Platform> {
   const token = import.meta.env.VITE_NEURON_HOST_TOKEN as string | undefined
   if (!url || !token) {
     throw new Error(
-      'No Neuron host configured. Start one with `bun run host --mock --token-file <file>` in ui/neuron-client, ' +
+      'No Neuron host configured. Start one with `bun run host --mock --owner-on-loopback --token-file <file>` in ui/neuron-client, ' +
         'then `NEURON_HOST_URL=<url> NEURON_HOST_TOKEN_FILE=<file> bun run dev` here.',
     )
   }

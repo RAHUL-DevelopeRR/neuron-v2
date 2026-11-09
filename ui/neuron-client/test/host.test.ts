@@ -63,7 +63,9 @@ const controllers: SessionController[] = []
 /** Engines the host's restart made, with the session each was asked to continue. */
 let restarted: Array<{ engine: FakeEngine; resume: string | null }> = []
 
-async function startHost(options: { remoteOnly?: boolean; localOnly?: boolean; features?: string[]; trusted?: boolean } = {}) {
+async function startHost(
+  options: { remoteOnly?: boolean; localOnly?: boolean; ownerOnLoopback?: boolean; features?: string[]; trusted?: boolean } = {},
+) {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'neuron-host-test-'))
   fs.mkdirSync(path.join(root, 'src'))
   fs.writeFileSync(path.join(root, 'src', 'main.rs'), 'fn main() {}\n')
@@ -77,6 +79,7 @@ async function startHost(options: { remoteOnly?: boolean; localOnly?: boolean; f
     name: 'test host',
     ...(options.remoteOnly && { isLocal: () => false }),
     ...(options.localOnly && { isLocal: () => true }),
+    ...(options.ownerOnLoopback && { ownerOnLoopback: true }),
     restart: (resume) => {
       const next = new FakeEngine(options.features, true)
       restarted.push({ engine: next, resume })
@@ -599,6 +602,37 @@ describe('NeuronHost walls for a peer on this machine', () => {
     expect(engine.sent).toEqual([])
     expect(errors).toHaveLength(paths.length)
   })
+
+  // The desktop app in a browser runs through a host and is the owner: a new session is `/clear --confirm`, the
+  // permission mode is `/permissions`, and so on. A host started for that says so; none does by default.
+  test('a host started with ownerOnLoopback lets a peer on this machine use the owner slash commands and resume by path', async () => {
+    await startHost({ localOnly: true, ownerOnLoopback: true })
+    const owner = [
+      slash('permissions', 'workspace-write'),
+      slash('clear', '--confirm'),
+      slash('plan', 'off'),
+      slash('login'),
+      slash('logout'),
+      resume('sessions/2026-11-07.json'),
+    ]
+    expect(await sendAsPeer(owner)).toEqual([])
+    expect(engine.sent).toHaveLength(owner.length)
+  })
+
+  test('ownerOnLoopback gives nothing to a peer that is not on this machine', async () => {
+    await startHost({ remoteOnly: true, ownerOnLoopback: true })
+    const twins = [slash('permissions', 'danger-full-access'), slash('clear', '--confirm'), slash('logout')]
+    const errors = await sendAsPeer([...twins, resume('/etc/passwd')])
+    expect(engine.sent).toEqual([])
+    expect(errors).toEqual([...twins.map(() => OWNER_ONLY), BY_ID])
+  })
+
+  test('without ownerOnLoopback a peer on this machine gets the same walls as any other', async () => {
+    await startHost({ localOnly: true })
+    const errors = await sendAsPeer([slash('permissions', 'workspace-write'), slash('clear', '--confirm'), resume('sessions/2026-11-07.json')])
+    expect(engine.sent).toEqual([])
+    expect(errors).toEqual([OWNER_ONLY, OWNER_ONLY, BY_ID])
+  })
 })
 
 describe('NeuronHost policy for the alpha.5 commands', () => {
@@ -713,6 +747,27 @@ describe('NeuronHost policy for the alpha.5 commands', () => {
         const refused = forwardPastTheGate(message, local).map((frame) => frame.t)
         expect({ tag: tag(message), local, refused }).toEqual({ tag: tag(message), local, refused: ['error'] })
       }
+    }
+    expect(engine.sent).toEqual([])
+  })
+
+  test('ownerOnLoopback does not open what the host policy keeps for the desktop app', async () => {
+    await startHost({ localOnly: true, ownerOnLoopback: true })
+    for (const message of [...changes, ...reads, { kind: 'command', type: 'commit', message: 'x' } as const]) {
+      const frames = forwardPastTheGate(message, true)
+      expect({ type: message.type, frames }).toEqual({
+        type: message.type,
+        frames: [{ t: 'error', message: 'Only the Neuron desktop app can change your files, history or settings.', fatal: false }],
+      })
+    }
+    expect(engine.sent).toEqual([])
+  })
+
+  test('a command the host policy does not know is refused, not forwarded', async () => {
+    await startHost()
+    for (const local of [false, true]) {
+      const frames = forwardPastTheGate({ kind: 'command', type: 'frobnicate' } as unknown as ClientMessage, local)
+      expect(frames).toEqual([{ t: 'error', message: 'Only the Neuron desktop app can change your files, history or settings.', fatal: false }])
     }
     expect(engine.sent).toEqual([])
   })

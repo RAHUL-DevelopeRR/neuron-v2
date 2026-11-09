@@ -41,3 +41,10 @@ That serves an engine running against the mock to remote clients. Point the desk
 browser) or the mobile app at the printed URL, with the token from the printed token file.
 `--lan` listens on the network for a phone, and `--show-token` prints the token. Without `--mock`
 it runs your own `neuron` in `--cwd`.
+
+A host holds every client to the same walls, whether it comes from this machine or not: no commit,
+rewind, connector or permission-mode command, only the read-only slash commands, and `resume` by
+session id. The desktop app in a browser needs more (a new session and the permission mode are slash
+commands), so start the host with `--owner-on-loopback` for it. That lets a client on this machine use
+every slash command. Never combine it with `neuron engine --share`: the phone behind that bridge also
+reaches the host from 127.0.0.1, and the host cannot tell it from you.

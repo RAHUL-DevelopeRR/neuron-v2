@@ -44,7 +44,8 @@ async function startApp() {
   mock = await startMockService()
   home = makeMockHome(mock.baseUrl, 'neuron-desktop-e2e')
   const transport = new StdioTransport({ binary: neuronBinary, cwd: home.workspace, model: 'sonnet', permissionMode: 'workspace-write', env: home.env })
-  host = new NeuronHost({ transport, token: TOKEN, root: home.workspace, name: 'e2e' })
+  // The app in this test is the owner: a new session and the permission mode are slash commands.
+  host = new NeuronHost({ transport, token: TOKEN, root: home.workspace, name: 'e2e', ownerOnLoopback: true })
   await host.start()
   render(<App platform={hostPlatform({ url: host.url, token: TOKEN, connect: (url) => new BunWebSocket(url) })} />)
   await element('textarea[aria-label="Message Neuron"]')

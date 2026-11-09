@@ -54,6 +54,14 @@ export interface HostOptions {
   /** Whether a client's address is this machine (loopback by default; tests override it). */
   isLocal?: (address: string) => boolean
   /**
+   * Treats a client on this machine as the owner: it may use any slash command and resume a session by path,
+   * which the desktop app in a browser needs (a new session, the permission mode, login). Off by default.
+   * Never turn it on while a share bridge (`neuron engine --share`) is connected: the bridge's phone reaches this
+   * host from 127.0.0.1 too, so the host cannot tell it from the owner. What `HOST_POLICY` calls `owner_only`
+   * stays refused either way.
+   */
+  ownerOnLoopback?: boolean
+  /**
    * A new engine, continuing `resume` (a session id) when given: lets clients on this
    * machine restart it (`engine.restart`), as trusting the workspace needs.
    */
@@ -87,7 +95,7 @@ const MAX_READ_BYTES = 512 * 1024
 const MAX_LIST_ENTRIES = 2_000
 const MAX_TERMINALS_PER_CLIENT = 4
 
-/** Slash commands that only read. No peer, local or not, may send any other. */
+/** Slash commands that only read. No peer may send any other, local or not, unless it is on this machine and the host was started with `ownerOnLoopback`. */
 const REMOTE_SLASH = new Set(['help', 'status', 'cost', 'context', 'usage', 'doctor', 'changes', 'diff', 'stats', 'memory', 'model'])
 
 const OWNER_ONLY = 'Only the Neuron desktop app can change your files, history or settings.'
@@ -103,7 +111,8 @@ const OWNER_ONLY = 'Only the Neuron desktop app can change your files, history o
  * - `forward`: goes on to the engine, after what `forward` still checks: `slash` only for `REMOTE_SLASH`
  *   (and `/resume` with a session id), `resume` only by session id, `rewind` only as a dry run and
  *   `trust_workspace` only for a peer on this machine. `capabilities` is dropped: the host speaks for all
- *   its clients.
+ *   its clients. A peer on this machine of a host started with `ownerOnLoopback` is exempt from the `slash`
+ *   and `resume` checks, and from nothing else.
  * Every `PEER_REFUSED` tag in test/protocol.test.ts is `owner_only` here.
  */
 export const HOST_POLICY: Record<EngineCommand['type'], 'forward' | 'owner_only'> = {
@@ -133,11 +142,6 @@ export const HOST_POLICY: Record<EngineCommand['type'], 'forward' | 'owner_only'
   list_branches: 'owner_only',
   switch_branch: 'owner_only',
 }
-
-/** The `owner_only` tags of {@link HOST_POLICY}, read from the table itself so the two cannot drift apart. */
-const OWNER_ONLY_COMMANDS: ReadonlySet<string> = new Set(
-  Object.entries(HOST_POLICY).flatMap(([type, policy]) => (policy === 'owner_only' ? [type] : [])),
-)
 
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const LOOPBACK_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$/i
@@ -377,22 +381,24 @@ export class NeuronHost {
     if (message.type === 'shutdown') return refuse('Only the machine running Neuron can stop the engine.')
     // The host speaks for all its clients.
     if (message.type === 'capabilities') return
-    // What `HOST_POLICY` calls owner_only, and a rewind that is not a dry run.
-    if (OWNER_ONLY_COMMANDS.has(message.type) || (message.type === 'rewind' && message.dry_run !== true)) {
+    // Whatever `HOST_POLICY` does not say `forward` (a tag it does not know fails closed), and a rewind that is not a dry run.
+    if (HOST_POLICY[message.type] !== 'forward' || (message.type === 'rewind' && message.dry_run !== true)) {
       return refuse(OWNER_ONLY)
     }
-    // The next two walls hold for every peer, local or not. A phone behind `neuron engine --share` reaches this
-    // host from 127.0.0.1, so `local` says where a socket came from, not who is typing.
-    if (message.type === 'slash') {
+    // The next two walls hold for every peer, local or not: a phone behind `neuron engine --share` reaches this host
+    // from 127.0.0.1, so `local` says where a socket came from, not who is typing. Only a host started with
+    // `ownerOnLoopback` lets a peer on this machine past them.
+    const owner = this.options.ownerOnLoopback === true && socket.data.local
+    if (!owner && message.type === 'slash') {
       const name = message.command.trim().toLowerCase()
       const allowed =
         REMOTE_SLASH.has(name) || (name === 'resume' && isSessionRef(typeof message.args === 'string' ? message.args.trim() : ''))
       if (!allowed) return refuse(OWNER_ONLY)
     }
-    if (message.type === 'resume' && !isSessionRef(message.session)) {
+    if (!owner && message.type === 'resume' && !isSessionRef(message.session)) {
       return refuse('A remote client can only resume a session by its id.')
     }
-    // `local` is only for this, `term.open` and `engine.restart`; the share bridge filters `trust_workspace` for its phone itself.
+    // `local` is for this, `term.open`, `engine.restart` and `ownerOnLoopback`; the share bridge filters `trust_workspace` for its phone itself.
     if (message.type === 'trust_workspace' && !socket.data.local) {
       return refuse('Only the machine running Neuron can trust its workspace.')
     }
