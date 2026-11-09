@@ -1879,6 +1879,7 @@ dependencies = [
  "dirs",
  "hex",
  "hmac",
+ "icu_normalizer",
  "keyring",
  "mock-anthropic-service",
  "neuron-tui",

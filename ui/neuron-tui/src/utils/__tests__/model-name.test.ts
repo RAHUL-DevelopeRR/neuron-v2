@@ -1,35 +1,109 @@
 import { describe, expect, test } from 'bun:test'
+import fs from 'node:fs'
+import path from 'node:path'
 
 import { cleanModelName, distinctModelName, isAutoModel, sameNameSuffixes } from '../model-name'
 
-// The same cases as gateway_catalog.rs's
-// `model_names_leave_out_the_route_to_the_model`: the two must agree.
-describe('model names', () => {
-  test('leave out the route the gateway takes to the model', () => {
-    expect(cleanModelName('cohere/north-mini-code:free', 'North Mini Code (OpenRouter, free)', 'openrouter')).toBe(
-      'North Mini Code',
-    )
-    expect(cleanModelName('groq/openai/gpt-oss-120b', 'GPT-OSS 120B (Groq)', 'groq')).toBe('GPT-OSS 120B')
-    expect(
-      cleanModelName('@cf/meta/llama-3.3-70b-instruct-fp8-fast', 'Llama 3.3 70B (Workers AI)', 'cloudflare'),
-    ).toBe('Llama 3.3 70B')
-    expect(cleanModelName('nvidia/stepfun-ai/step-5-preview', 'Step 5 Preview (NVIDIA)', null)).toBe('Step 5 Preview')
-    expect(cleanModelName('gemini/gemini-2.5-flash', 'Gemini 2.5 Flash', 'gemini')).toBe('Gemini 2.5 Flash')
+// The owner's rule is hard: a provider's name is never shown. Three copies of the cleaner keep it (the shared
+// client's ui/neuron-client/src/copy/model-name.ts, this UI's utils/model-name.ts and `clean_model_name` in
+// rust/crates/rusty-claude-cli/src/gateway_catalog.rs), and all three answer the cases in one file, read by each
+// one's tests, so none of them can drift from the others:
+// rust/crates/rusty-claude-cli/tests/fixtures/model-names.json (its `$comment` says how the cases are built).
+type Case = [id: string, displayName: string | null, provider: string | null, expected: string]
+
+interface Vectors {
+  sections: Array<{ name: string; cases: Case[] }>
+  providerShapes: { providers: string[]; brackets: Array<[string, string]>; gaps: string[]; prefix: string; expected: string }
+  joinedRoutes: { joiners: string[]; extras: string[]; expected: string }
+  separatedRoutes: { separators: string[]; extras: Array<[string, string]> }
+}
+
+const vectors = JSON.parse(
+  fs.readFileSync(
+    path.resolve(import.meta.dir, '../../../../../rust/crates/rusty-claude-cli/tests/fixtures/model-names.json'),
+    'utf8',
+  ),
+) as Vectors
+
+const clean = (name: string, provider: string | null = null) => cleanModelName('x/model', name, provider)
+
+describe('model names: the cases every copy of the cleaner answers the same way', () => {
+  for (const section of vectors.sections) {
+    test(section.name, () => {
+      expect(section.cases.length).toBeGreaterThan(0)
+      for (const [id, displayName, provider, expected] of section.cases) {
+        expect([id, displayName, provider, cleanModelName(id, displayName, provider)]).toEqual([id, displayName, provider, expected])
+      }
+    })
+  }
+
+  test('every provider, in every bracket, whitespace and case', () => {
+    const { providers, brackets, gaps, prefix, expected } = vectors.providerShapes
+    let tried = 0
+    for (const provider of providers) {
+      for (const form of [provider, provider.toLowerCase(), provider.toUpperCase()]) {
+        for (const [open, close] of brackets) {
+          for (const gap of gaps) {
+            const name = `${prefix}${gap}${open}${form}${close}`
+            expect([name, clean(name)]).toEqual([name, expected])
+            tried++
+          }
+        }
+      }
+    }
+    expect(tried).toBe(providers.length * 3 * brackets.length * gaps.length)
   })
 
-  test('keep a parenthesis about the model itself', () => {
-    expect(cleanModelName('x/qwen', 'Qwen3 (32B)', null)).toBe('Qwen3 (32B)')
-    expect(cleanModelName('x/m', 'Model (Preview, Groq)', null)).toBe('Model (Preview, Groq)')
-    expect(cleanModelName('x', '(Groq)', null)).toBe('(Groq)')
+  test('a provider with free, paid, a tier or the cloud beside it, in one part, is still a route', () => {
+    const { joiners, extras, expected } = vectors.joinedRoutes
+    for (const joiner of joiners) {
+      for (const extra of extras) {
+        const name = `Model (Groq${joiner}${extra})`
+        expect([name, clean(name)]).toEqual([name, expected])
+      }
+    }
   })
 
-  test('treat the provider the catalog names as a route too', () => {
-    expect(cleanModelName('x/m', 'Fast (Acme)', 'acme')).toBe('Fast')
+  test('with a separator each part is judged alone: a route goes, a bare AI, Cloud or Preview stays', () => {
+    const { separators, extras } = vectors.separatedRoutes
+    for (const separator of separators) {
+      for (const [extra, expected] of extras) {
+        const name = `Model (Groq${separator}${extra})`
+        expect([name, clean(name)]).toEqual([name, expected])
+      }
+    }
   })
 
-  test('name auto Auto, whatever its catalog entry says', () => {
-    expect(cleanModelName('auto', 'Auto (best available model)', 'zero-x')).toBe('Auto')
-    expect(cleanModelName('openai/auto')).toBe('Auto')
+  test('is idempotent: cleaning what was cleaned changes nothing', () => {
+    let tried = 0
+    for (const section of vectors.sections) {
+      for (const [id, displayName, provider] of section.cases) {
+        const once = cleanModelName(id, displayName, provider)
+        expect([id, once, provider, cleanModelName(id, once, provider)]).toEqual([id, once, provider, once])
+        // The same names on a route id, the way the engine's own notices meet them.
+        const routed = cleanModelName('groq/openai/gpt-oss-120b', displayName, 'groq')
+        expect([displayName, cleanModelName('groq/openai/gpt-oss-120b', routed, 'groq')]).toEqual([displayName, routed])
+        tried++
+      }
+    }
+    // Guards the loop itself: an emptied or misread file would pass it with nothing tried.
+    expect(tried).toBeGreaterThan(150)
+  })
+
+  test('groups inside groups are looked at only so deep, so no name can overflow the stack', () => {
+    const deep = `Model ${'('.repeat(100_000)}Groq${')'.repeat(100_000)}`
+    expect(() => clean(deep)).not.toThrow()
+    expect(clean(deep).startsWith('Model')).toBe(true)
+    // A long name is not slow either.
+    const started = Date.now()
+    clean(`${'word '.repeat(20_000)}(Groq)`)
+    clean(`Model${'(a)'.repeat(2_000)}(Groq)`)
+    expect(Date.now() - started).toBeLessThan(2_000)
+  })
+})
+
+describe('model names, auto and the numbering of names that are the same', () => {
+  test('auto is told by its id, whatever its catalog entry says', () => {
     expect(isAutoModel('openai/auto')).toBe(true)
     expect(isAutoModel('gemini/gemini-2.5-flash')).toBe(false)
   })
@@ -54,9 +128,18 @@ describe('model names', () => {
     expect(distinctModelName(catalog, undefined, 'GPT-OSS 20B')).toBe('GPT-OSS 20B')
   })
 
-  test('without a display name, use the model part of the id', () => {
-    expect(cleanModelName('openai/cohere/north-mini-code:free')).toBe('north-mini-code')
-    expect(cleanModelName('claude-sonnet-4-6')).toBe('claude-sonnet-4-6')
-    expect(cleanModelName('x', '  ')).toBe('x')
+  test('numbers models whose names are the same once every route is off', () => {
+    const catalog = [
+      { id: 'a/m', display_name: 'GPT-OSS 20B [Groq]', provider: null },
+      { id: 'b/m', display_name: 'GPT-OSS 20B（NVIDIA）', provider: null },
+      { id: 'c/m', display_name: 'GPT-OSS 20B (Together.ai)', provider: null },
+      { id: 'd/m', display_name: 'GPT-OSS 20B (Preview, Bedrock)', provider: null },
+      { id: 'z-ai/glm-5.2', display_name: 'GPT-OSS 20B (Z.ai)', provider: null },
+    ]
+    expect([...sameNameSuffixes(catalog)]).toEqual([
+      ['b/m', ' (2)'],
+      ['c/m', ' (3)'],
+      ['z-ai/glm-5.2', ' (4)'],
+    ])
   })
 })

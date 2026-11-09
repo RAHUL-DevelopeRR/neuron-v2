@@ -1,6 +1,7 @@
 /**
  * How the UI names a model to a person: the catalog's name without the way
- * the Zero-X gateway reaches it.
+ * the Zero-X gateway reaches it. Neuron never shows the provider a model is
+ * routed through (Groq, OpenRouter, NVIDIA, Z.ai, ...).
  *
  *   North Mini Code (OpenRouter, free)   →  North Mini Code
  *   GPT-OSS 120B (Groq)                  →  GPT-OSS 120B
@@ -8,17 +9,26 @@
  *   auto                                 →  Auto
  *
  * The raw id stays where a power user looks for it: `/status`, the line
- * REPL's `/model` list and the engine's JSON output. Mirrors
- * `clean_model_name` in rust/crates/rusty-claude-cli/src/gateway_catalog.rs;
- * the engine sends names already cleaned (`model_display_name`,
- * `served_model_display_name`), and this cleans the catalog's and older
- * engines' names the same way. Two catalog models whose names are then the
- * same are told apart by a number ({@link sameNameSuffixes}).
+ * REPL's `/model` list and the engine's JSON output. The engine sends names
+ * already cleaned (`model_display_name`, `served_model_display_name`), and
+ * this cleans the catalog's and older engines' names the same way. Two
+ * catalog models whose names are then the same are told apart by a number
+ * ({@link sameNameSuffixes}).
+ *
+ * The same rules are kept in three places: this file (its cleaning code is
+ * the shared client's, ui/neuron-client/src/copy/model-name.ts) and
+ * `clean_model_name` in rust/crates/rusty-claude-cli/src/gateway_catalog.rs.
+ * All three answer the cases in
+ * rust/crates/rusty-claude-cli/tests/fixtures/model-names.json, which each
+ * one's tests read: change a rule in all three, and add its case to that file.
  */
 
 import type { ModelInfo } from '../engine/protocol'
 
-/** What a display name's last parenthesis holds when it names the route, not the model. */
+/**
+ * What a part of a group at the end of a display name is, whole and in lower case, when it names the route
+ * and not the model.
+ */
 const ROUTE_WORDS: ReadonlySet<string> = new Set([
   'openrouter',
   'groq',
@@ -45,48 +55,243 @@ const ROUTE_WORDS: ReadonlySet<string> = new Set([
   'paid',
   'free tier',
   'paid tier',
+  // The owner's rule names Z.ai, in the spellings a catalog uses. A name that merely has these letters in it
+  // is not a match, as a part has to be exactly one of them.
+  'z.ai',
+  'zai',
+  'z-ai',
 ])
+
+/**
+ * The providers' words. A part that is not one of {@link ROUTE_WORDS} is still a route when every word of it
+ * (lower case, with `-`, `_` and `·` as spaces) is a {@link ROUTE_TOKENS} and at least one is one of these:
+ * "Groq Cloud", "OpenRouter free", "Workers-AI", "Together.ai". The hyphenated spellings can only match
+ * whole, through ROUTE_WORDS, as a hyphen is a space here.
+ */
+const PROVIDER_WORDS: ReadonlySet<string> = new Set([
+  'openrouter',
+  'groq',
+  'nvidia',
+  'nim',
+  'workers',
+  'cloudflare',
+  'google',
+  'vertex',
+  'cerebras',
+  'together',
+  'fireworks',
+  'deepinfra',
+  'sambanova',
+  'hugging',
+  'huggingface',
+  'azure',
+  'zero-x',
+  'bedrock',
+  'novita',
+  'nebius',
+  'ollama',
+  'z.ai',
+  'zai',
+  'z-ai',
+  'together.ai',
+])
+
+/**
+ * What a route is made of: the providers' words, and what goes with them ("free", "Cloud", "Inference"). Alone
+ * a bare "(AI)" or "(Cloud)" is not a route, as it has no provider's word. "face" and "studio" only finish
+ * "Hugging Face" and "Google AI Studio" when something follows them ("Hugging Face free").
+ */
+const ROUTE_TOKENS: ReadonlySet<string> = new Set([
+  ...PROVIDER_WORDS,
+  'free',
+  'paid',
+  'tier',
+  'cloud',
+  'ai',
+  'inference',
+  'api',
+  'face',
+  'studio',
+])
+
+/** Brackets a group can be in, opening and closing, including the full-width parentheses. Any closer closes any opener. */
+const OPENERS = '([（'
+const CLOSERS = ')]）'
+/** What separates the parts of a group. */
+const SEPARATORS = ',，·|'
+/** How deep groups inside groups are looked at: a name is not a tree, so more than this is left as it came. */
+const MAX_DEPTH = 6
+
+/**
+ * Characters that show nothing: a soft hyphen, zero-width spaces and joiners, a word joiner, a byte order mark.
+ * Written as escapes, never as the characters, so they can be seen; the `u` flag makes `\u{..}` mean them.
+ */
+const INVISIBLE = /[\u{ad}\u{200b}-\u{200d}\u{2060}\u{feff}]/u
+/** The same, to take them all out (a global pattern is stateful with `.test`, so there are two). */
+const INVISIBLE_ALL = /[\u{ad}\u{200b}-\u{200d}\u{2060}\u{feff}]/gu
+
+/** Whitespace of every kind (a no-break space, a tab, a full-width space) and the characters that show nothing. */
+const isBlank = (char: string): boolean => /\s/u.test(char) || INVISIBLE.test(char)
+
+/** `text` without blanks at the end. A loop: a pattern such as `\s+$` is quadratic on a long run of them. */
+function trimEndAll(text: string): string {
+  let end = text.length
+  while (end > 0 && isBlank(text[end - 1]!)) end--
+  return text.slice(0, end)
+}
+
+/** `text` without blanks at either end. */
+function trimAll(text: string): string {
+  const end = trimEndAll(text)
+  let start = 0
+  while (start < end.length && isBlank(end[start]!)) start++
+  return end.slice(start)
+}
+
+/** `text` as route words are compared with: width folded (`Ｇｒｏｑ` is `Groq`), nothing invisible, lower case. */
+const folded = (text: string): string => text.normalize('NFKC').replace(INVISIBLE_ALL, '').toLowerCase().trim()
+
+/** `key` with `-`, `_` and `·` as spaces, in single spaces. */
+const spaced = (key: string): string => key.replace(/[-_·]+/g, ' ').replace(/\s+/g, ' ').trim()
+
+/** Whether `part` (a whole part of a group, or a whole name) names a route: `provider` is the catalog's, if it is one. */
+function isRoute(part: string, provider: string | null | undefined): boolean {
+  const key = folded(part)
+  if (key === '') return false
+  if (ROUTE_WORDS.has(key)) return true
+  const words = spaced(key).split(' ')
+  if (provider && spaced(folded(provider)) === words.join(' ')) return true
+  return words.every((word) => ROUTE_TOKENS.has(word)) && words.some((word) => PROVIDER_WORDS.has(word))
+}
+
+/** A group of brackets at the end of a name. */
+interface Group {
+  /** The blanks before its opener, as they came. */
+  gap: string
+  open: string
+  close: string
+  /** What is between the brackets. */
+  inner: string
+  /** The group as it came, brackets included. */
+  text: string
+}
+
+/** The index of the opener that matches the closer at the end of `text`, or -1. */
+function openerOf(text: string): number {
+  let depth = 0
+  for (let index = text.length - 1; index >= 0; index--) {
+    const char = text[index]!
+    if (CLOSERS.includes(char)) depth++
+    else if (OPENERS.includes(char) && --depth === 0) return index
+  }
+  return -1
+}
+
+/** `text` as what comes before the groups at its end, and those groups, in order. */
+function peelGroups(text: string): { base: string; groups: Group[] } {
+  let rest = trimEndAll(text)
+  const groups: Group[] = []
+  while (rest !== '' && CLOSERS.includes(rest[rest.length - 1]!)) {
+    const open = openerOf(rest)
+    if (open < 0) break
+    const before = rest.slice(0, open)
+    const base = trimEndAll(before)
+    groups.push({ gap: before.slice(base.length), open: rest[open]!, close: rest[rest.length - 1]!, inner: rest.slice(open + 1, -1), text: rest.slice(open) })
+    rest = base
+  }
+  return { base: rest, groups: groups.reverse() }
+}
+
+/** `inner` cut at its separators, outside any brackets inside it. */
+function splitParts(inner: string): string[] {
+  const parts: string[] = []
+  let depth = 0
+  let start = 0
+  for (let index = 0; index < inner.length; index++) {
+    const char = inner[index]!
+    if (OPENERS.includes(char)) depth++
+    else if (CLOSERS.includes(char)) depth = Math.max(0, depth - 1)
+    else if (depth === 0 && SEPARATORS.includes(char)) {
+      parts.push(inner.slice(start, index))
+      start = index + 1
+    }
+  }
+  parts.push(inner.slice(start))
+  return parts
+}
+
+/**
+ * What is left of a group's `inner` once its route parts are off: `null` when nothing is, `inner` itself
+ * when none was a route, else what is kept, separated by commas.
+ */
+function scrubGroup(inner: string, provider: string | null | undefined, depth: number): string | null {
+  const kept: string[] = []
+  let changed = false
+  for (const raw of splitParts(inner)) {
+    const part = trimAll(raw)
+    const cleaned = scrub(part, provider, depth + 1)
+    if (cleaned === '' || isRoute(cleaned, provider)) {
+      changed = true
+      continue
+    }
+    if (cleaned !== part) changed = true
+    kept.push(cleaned)
+  }
+  if (kept.length === 0) return null
+  return changed ? kept.join(', ') : inner
+}
+
+/**
+ * `text` without the groups at its end that only name a route, and without the route in those that hold
+ * more. `''` when what is left is itself only a route. Returned as it came (trimmed) when nothing was taken
+ * off, so a name without a route keeps its spacing; a group that stays keeps its brackets and its gap.
+ */
+function scrub(text: string, provider: string | null | undefined, depth = 0): string {
+  const whole = trimAll(text)
+  if (depth > MAX_DEPTH) return whole
+  const { base, groups } = peelGroups(whole)
+  let rest = base
+  let changed = false
+  for (const group of groups) {
+    const inner = scrubGroup(group.inner, provider, depth)
+    if (inner === null) {
+      changed = true
+    } else if (inner === group.inner) {
+      rest += group.gap + group.text
+    } else {
+      changed = true
+      rest += group.gap + group.open + inner + group.close
+    }
+  }
+  const result = changed ? trimAll(rest) : whole
+  // A name that is only a route has nothing to show. The catalog's provider counts for parts of a group, not
+  // for a whole name: a model may be named like the provider that serves it.
+  return isRoute(result, null) ? '' : result
+}
 
 /** The id without the `openai/` transport prefix the engine adds. */
 const shownId = (id: string): string => id.trim().replace(/^openai\//, '')
 
-export const isAutoModel = (id: string): boolean => shownId(id).toLowerCase() === 'auto'
-
-/** `name` without trailing parentheses that only name its route (or `provider`). */
-function withoutRoute(name: string, provider: string | null | undefined): string {
-  let kept = name.trim()
-  for (;;) {
-    const open = kept.lastIndexOf(' (')
-    if (open < 0 || !kept.endsWith(')')) break
-    const parts = kept.slice(open + 2, -1).split(',').map((part) => part.trim())
-    const onlyRoute = parts.every(
-      (part) =>
-        part !== '' &&
-        (ROUTE_WORDS.has(part.toLowerCase()) ||
-          (!!provider && provider.toLowerCase() === part.toLowerCase())),
-    )
-    if (!onlyRoute) break
-    kept = kept.slice(0, open).trimEnd()
-  }
-  return kept || name.trim()
-}
-
 /**
- * The name for model `id`, from its catalog `displayName` (served by
- * `provider`, the catalog's `owned_by`) when it has one.
+ * The name for model `id`, from its catalog `displayName` (served by `provider`, the catalog's `owned_by`)
+ * when it has one, without the way the gateway reaches it. When there is no name, or nothing is left of it
+ * (it was only a route), or it is the id (or has a `/`, so is one), the last segment of the id, without its tag.
  */
-export function cleanModelName(
-  id: string,
-  displayName?: string | null,
-  provider?: string | null,
-): string {
+export function cleanModelName(id: string, displayName?: string | null, provider?: string | null): string {
   const shown = shownId(id)
   if (shown.toLowerCase() === 'auto') return 'Auto'
   const name = displayName?.trim()
-  if (name) return withoutRoute(name, provider)
+  if (name) {
+    const cleaned = scrub(name, provider)
+    const key = cleaned.toLowerCase()
+    if (cleaned !== '' && !cleaned.includes('/') && key !== shown.toLowerCase() && key !== id.trim().toLowerCase()) return cleaned
+  }
   const leaf = shown.split('/').pop()!.split(':')[0]!
   return leaf || shown
 }
+
+/** Whether `id` is the gateway's `auto` (it picks a model per request). */
+export const isAutoModel = (id: string): boolean => shownId(id).toLowerCase() === 'auto'
 
 type NamedModel = Pick<ModelInfo, 'id' | 'display_name' | 'provider'>
 

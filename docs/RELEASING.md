@@ -337,8 +337,11 @@ gh workflow run mobile-eas.yml --repo RAHUL-DevelopeRR/neuron-v2 --ref <branch> 
 ## Brand lint
 
 [`scripts/brand-lint.mjs`](../scripts/brand-lint.mjs) keeps the reference
-product's and its maker's names out of Neuron (plan guardrail 2, T6). Its
-configuration is [`scripts/brand-lint.allowlist.json`](../scripts/brand-lint.allowlist.json).
+product's and its maker's names out of Neuron (plan guardrail 2, T6). It also
+keeps out of the UI the providers a model is routed through (Groq, OpenRouter,
+NVIDIA, Z.ai): the owner's rule is that a person is told which model answered,
+never which provider served it. Its configuration is
+[`scripts/brand-lint.allowlist.json`](../scripts/brand-lint.allowlist.json).
 
 **What it reads.** Only string literals and UI text, never comments or tests:
 
@@ -357,17 +360,32 @@ configuration is [`scripts/brand-lint.allowlist.json`](../scripts/brand-lint.all
 - `identity`: the app name and beta headers, in `telemetry` and `api`. This
   scope looks only for the reference product's name.
 - `engine`: the rest of the engine. Report only: it warns but never fails.
+- `ui-route`: the same files as `ui`, for the provider names (the `route` rule).
+  It fails. The two model-name cleaners (`ui/neuron-client/src/copy/model-name.ts`
+  and `ui/neuron-tui/src/utils/model-name.ts`) are left out by the scope's own
+  `exclude`: they name providers in order to take them off a catalog's names.
+- `engine-route`: the `route` rule over every crate's `src/`. Report only: a
+  provider the user brings their own key for (OpenRouter sign-in, provider
+  setup) names itself on purpose, so which of these strings the rule covers is
+  the owner's call. The Rust cleaner (`gateway_catalog.rs`) is left out.
+
+A file is read once for each rule that includes it, so a UI file is read by
+`ui` for the brand and by `ui-route` for the providers. A scope's own `exclude`
+leaves files out of that scope only; the top-level `exclude` leaves them out of
+all of them (tests and fixtures, which carry provider names as data).
 
 **What is allowed.**
 
-- Model IDs exactly as catalogs return them (`claude-sonnet-4-6`).
+- Model IDs exactly as catalogs return them (`claude-sonnet-4-6`), and ids with
+  a route in front (`groq/openai/gpt-oss-120b`, `z-ai/glm-5.2`): identifiers,
+  not names a person reads.
 - Compatibility files and directories (`CLAUDE.md`, `.claude/`, `AGENTS.md`).
 - The provider's own environment variables (`ANTHROPIC_API_KEY`), the provider
   ID `anthropic`, and its protocol headers and API host.
 - Internal crate names (`rusty-claude-cli`, `mock-anthropic-service`), which are
   renamed before any public source release (P2).
 
-A display name such as "Claude Opus 4.6" still fails.
+A display name such as "Claude Opus 4.6" or "GPT-OSS 120B (Groq)" still fails.
 
 **Run it.**
 

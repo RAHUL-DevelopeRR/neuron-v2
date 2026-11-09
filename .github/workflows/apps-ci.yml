@@ -62,7 +62,8 @@ jobs:
             exit 0
           fi
           touches() { if grep -Eq "$1" files.txt; then echo true; else echo false; fi; }
-          apps="$(touches '^(ui/neuron-(client|desktop|mobile)/|\.github/workflows/apps-ci\.yml$)')"
+          # The model-name cases are shared with the engine and the terminal UI (Rust CI): the client reads them too.
+          apps="$(touches '^(ui/neuron-(client|desktop|mobile)/|rust/crates/rusty-claude-cli/tests/fixtures/model-names\.json$|\.github/workflows/apps-ci\.yml$)')"
           # Brand lint reads ui/neuron-* and the engine's help, prompt and request identity.
           brand="$(touches '^(ui/neuron-|rust/crates/|scripts/brand-lint|\.github/workflows/apps-ci\.yml$)')"
           echo "apps=$apps" >> "$GITHUB_OUTPUT"

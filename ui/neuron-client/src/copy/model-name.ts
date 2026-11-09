@@ -15,12 +15,15 @@
  * the catalog's own, are cleaned here the same way. Two catalog models whose
  * names are then the same are told apart by a number ({@link sameNameSuffixes}).
  *
- * This copy is STRICTER than `clean_model_name` in
- * rust/crates/rusty-claude-cli/src/gateway_catalog.rs and the terminal UI's
- * ui/neuron-tui/src/utils/model-name.ts, on purpose: the owner's rule is that a
- * provider's name is never shown, and those two only take off a plain
- * " (Route)" at the end of a name when everything in it is a route. This one
- * also takes off, from the groups at the end of a name:
+ * The same rules are kept in three places: this file, the terminal UI's
+ * ui/neuron-tui/src/utils/model-name.ts and `clean_model_name` in
+ * rust/crates/rusty-claude-cli/src/gateway_catalog.rs (the engine's own
+ * notices, status and JSON output). All three answer the cases in
+ * rust/crates/rusty-claude-cli/tests/fixtures/model-names.json, which each
+ * one's tests read: change a rule in all three, and add its case to that file.
+ *
+ * The owner's rule is that a provider's name is never shown, so from the
+ * groups at the end of a name this takes off:
  *
  *  - any bracket (`[Groq]`, full-width `（Groq）`), with or without a space
  *    before it, after any whitespace (a no-break space, a tab);
@@ -34,8 +37,7 @@
  * one), is the last segment of the id instead. A model's own name is never
  * scrubbed: a maker's name inside it ("NVIDIA Nemotron 3 Ultra") stays, and so
  * does a group that is about the model ("(Preview)", "(AI)"). Names without a
- * route come back as they came. When Rust and the terminal UI catch up, this
- * note and the tests that say "stricter" go.
+ * route come back as they came.
  */
 
 import type { ModelInfo } from '../protocol'
@@ -70,9 +72,8 @@ const ROUTE_WORDS: ReadonlySet<string> = new Set([
   'paid',
   'free tier',
   'paid tier',
-  // The owner's rule names Z.ai, which gateway_catalog.rs and the terminal UI's list do not have yet:
-  // only this copy cleans these spellings. A name that merely has these letters in it is not a match,
-  // as a part has to be exactly one of them.
+  // The owner's rule names Z.ai, in the spellings a catalog uses. A name that merely has these letters in it
+  // is not a match, as a part has to be exactly one of them.
   'z.ai',
   'zai',
   'z-ai',
