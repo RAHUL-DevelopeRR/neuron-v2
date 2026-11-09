@@ -28,21 +28,32 @@ pub mod default_skills;
 mod file_ops;
 mod git_context;
 pub mod green_contract;
+mod hook_matcher;
 mod hooks;
 mod json;
 mod lane_events;
+pub mod lifecycle_hooks;
 pub mod lsp_client;
 mod mcp;
+pub mod mcp_approvals;
+pub mod mcp_audit;
+pub mod mcp_catalog;
 mod mcp_client;
 mod mcp_http;
+pub mod mcp_install;
 pub mod mcp_lifecycle_hardened;
 mod mcp_oauth;
+pub mod mcp_output;
+pub mod mcp_pins;
+pub mod mcp_policy;
+pub mod mcp_sandbox;
 pub mod mcp_server;
 mod mcp_stdio;
 #[cfg(test)]
 mod mcp_test_http;
 mod mcp_toggle;
 pub mod mcp_tool_bridge;
+pub mod mcp_zerox;
 pub mod model_registry;
 pub mod model_routing;
 pub mod net_allow;
@@ -53,6 +64,7 @@ pub mod permission_enforcer;
 mod permissions;
 pub mod plugin_lifecycle;
 mod policy_engine;
+pub mod project_permissions;
 mod prompt;
 pub mod recovery_recipes;
 pub mod redaction;
@@ -99,14 +111,14 @@ pub use compact::{
     DEFAULT_MAX_SUMMARY_TOKENS, DERIVED_CONTEXT_NOTE,
 };
 pub use config::{
-    ConfigEntry, ConfigError, ConfigLoader, ConfigSource, IgnoredProjectSettings,
-    McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
-    McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
-    McpWebSocketServerConfig, OAuthConfig, PreviewHook, PreviewMcpServer, PreviewPermissionRule,
-    ProjectSettingsAction, ProjectTrust, ProviderFallbackConfig, ResolvedPermissionMode,
-    RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
-    RuntimePluginConfig, ScopedMcpServerConfig, WorkspaceTrustPreview, CLAW_SETTINGS_SCHEMA_NAME,
-    UNTRUSTED_WORKSPACE_KEYS,
+    default_config_home, BlockedMcpServer, ConfigEntry, ConfigError, ConfigLoader, ConfigSource,
+    IgnoredProjectSettings, McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig,
+    McpRemoteServerConfig, McpSandboxNetwork, McpSandboxProfile, McpSdkServerConfig,
+    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, OAuthConfig,
+    PreviewHook, PreviewMcpServer, PreviewPermissionRule, ProjectSettingsAction, ProjectTrust,
+    ProviderFallbackConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig,
+    RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig,
+    WorkspaceTrustPreview, CLAW_SETTINGS_SCHEMA_NAME, UNTRUSTED_WORKSPACE_KEYS,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,
@@ -116,11 +128,11 @@ pub use conversation::{
     auto_compaction_threshold_from_env, auto_compaction_threshold_override_from_env,
     is_refusal_stop_reason, is_truncation_stop_reason, is_turn_end_note, resolve_max_iterations,
     ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ChangeReviewer,
-    ConversationRuntime, HarnessConfig, PromptCacheEvent, ReviewRequest, RuntimeError,
-    RuntimeErrorKind, StaticToolExecutor, ToolError, ToolExecutor, TurnOutcome, TurnSummary,
-    AUTO_CHECKS_ENV_VAR, COMPLETION_CHECK_ENV_VAR, DEFAULT_MAX_ITERATIONS,
-    FAILED_RESPONSE_NOTE_PREFIX, INTERRUPTED_RESPONSE_NOTE, INTERRUPTED_TOOL_RESULT,
-    MAX_ITERATIONS_ENV_VAR, REFUSAL_STOP_REASON,
+    ConversationRuntime, HarnessConfig, PromptCacheEvent, RequestEstimate, RequestGuard,
+    ReviewRequest, RuntimeError, RuntimeErrorKind, StaticToolExecutor, ToolError, ToolExecutor,
+    TurnOutcome, TurnSummary, AUTO_CHECKS_ENV_VAR, BUDGET_STOPPED_NOTE, COMPLETION_CHECK_ENV_VAR,
+    DEFAULT_MAX_ITERATIONS, FAILED_RESPONSE_NOTE_PREFIX, INTERRUPTED_RESPONSE_NOTE,
+    INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR, REFUSAL_STOP_REASON,
 };
 pub use file_ops::{
     display_path, edit_file, edit_file_in_workspace, glob_search, grep_search,
@@ -129,8 +141,10 @@ pub use file_ops::{
     StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
+pub use hook_matcher::{matcher_matches, validate_matcher, HookCommand, HookSource};
 pub use hooks::{
-    HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
+    HookAbortSignal, HookEvent, HookOutcome, HookProgressEvent, HookProgressReporter,
+    HookRunResult, HookRunner, LifecycleHookInput, ToolUseIdReporter,
 };
 pub use lane_events::{
     compute_event_fingerprint, dedupe_superseded_commit_events, dedupe_terminal_events,
@@ -142,11 +156,27 @@ pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
     scoped_mcp_config_hash, unwrap_ccr_proxy_url,
 };
+pub use mcp_approvals::{
+    approve_mcp_server, approve_mcp_server_as_shown, McpApprovalOutcome, McpApprovals,
+};
+pub use mcp_audit::{McpAuditCall, McpAuditLog};
+pub use mcp_catalog::{
+    verify_mcp_catalog_update, McpCatalog, McpCatalogEntry, McpCatalogVariable, McpToolTier,
+    MCP_CATALOG_UPDATE_PUBLIC_KEY,
+};
 pub use mcp_client::{
     McpClientAuth, McpClientBootstrap, McpClientTransport, McpManagedProxyTransport,
     McpRemoteTransport, McpSdkTransport, McpStdioTransport,
 };
 pub use mcp_http::expand_env_refs as expand_mcp_header_value;
+pub use mcp_install::{
+    delete_mcp_secret, expand_mcp_header, install_mcp_server, load_mcp_secret,
+    mcp_catalog_entry_for, mcp_catalog_servers, mcp_secret_key, mcp_secret_target,
+    mcp_verified_spec_for, missing_mcp_variables, remove_mcp_server, resolve_mcp_secret_references,
+    save_mcp_secret, McpFetch, McpHttpFetch, McpInstallOutcome, McpInstallRequest, McpInstallScope,
+    McpInstallState, McpInstallStore, McpRemoveOutcome, McpVerifiedLaunch, McpVerifiedSource,
+    McpVerifiedSpec,
+};
 pub use mcp_lifecycle_hardened::{
     McpDegradedReport, McpErrorSurface, McpFailedServer, McpLifecyclePhase, McpLifecycleState,
     McpLifecycleValidator, McpPhaseResult,
@@ -156,6 +186,18 @@ pub use mcp_oauth::{
     generate_mcp_pkce, load_mcp_tokens, login_mcp_server, mcp_token_key, parse_token_response,
     parse_www_authenticate, refresh_mcp_tokens, save_mcp_tokens, set_mcp_token_store, token_action,
     McpAuthDiscovery, McpLoginOptions, McpOAuthTokens, McpTokenStore, TokenAction,
+};
+pub use mcp_output::{
+    default_mcp_spill_dir, format_mcp_tool_output, McpToolOutput, MCP_OUTPUT_MAX_CHARS,
+};
+pub use mcp_pins::{
+    mcp_server_unpinned, mcp_unpinned_servers, pin_mcp_server, McpPin, McpPinOutcome, McpPins,
+};
+pub use mcp_policy::{
+    check_managed_settings_owner, clear_gateway_policy, managed_settings_path,
+    managed_settings_root, read_gateway_policy, store_gateway_policy, GatewayConnectorPolicy,
+    GatewayPolicyCache, ManagedMcpPolicy, McpGatewayPolicyStatus, McpPolicySource, McpPolicyStatus,
+    McpRequirement,
 };
 pub use mcp_server::{McpServer, McpServerSpec, ToolCallHandler, MCP_SERVER_PROTOCOL_VERSION};
 pub use mcp_stdio::{
@@ -168,6 +210,11 @@ pub use mcp_stdio::{
     McpToolCallResult, McpToolDiscoveryReport, UnsupportedMcpServer,
 };
 pub use mcp_toggle::{set_mcp_server_enabled, McpToggleOutcome};
+pub use mcp_zerox::{
+    hosted_connectors_enabled, set_zerox_token_provider, valid_connector_id, zerox_bearer_token,
+    zerox_connect_url, zerox_endpoint, zerox_needs_connect, zerox_origin, ZeroxTokenProvider,
+    ZEROX_HOSTED_CONNECTORS_ENV,
+};
 pub use model_routing::{ModelRouting, ModelRoutingSettings};
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
@@ -178,10 +225,11 @@ pub use oauth::{
 };
 pub use parallel_tools::ConcurrentToolCall;
 pub use permissions::{
-    non_interactive_hint, parse_permission_response, quote_allow_rules, render_permission_prompt,
-    url_host, ConsolePermissionPrompter, PermissionContext, PermissionMode, PermissionOutcome,
-    PermissionOverride, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
-    PermissionRemedy, PermissionRequest, SessionApprovals, ToolCallAssessment,
+    deny_for_session_label, non_interactive_hint, parse_permission_response, quote_allow_rules,
+    render_permission_prompt, rule_covers_mcp_server, url_host, user_declined_message,
+    ConsolePermissionPrompter, PermissionContext, PermissionDecider, PermissionMode,
+    PermissionOutcome, PermissionOverride, PermissionPolicy, PermissionPromptDecision,
+    PermissionPrompter, PermissionRemedy, PermissionRequest, SessionApprovals, ToolCallAssessment,
     NON_INTERACTIVE_PERMISSION_HINT,
 };
 pub use plugin_lifecycle::{

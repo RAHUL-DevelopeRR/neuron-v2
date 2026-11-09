@@ -10,7 +10,8 @@
 //! ends it on shutdown. HTTP+SSE: a GET opens an event stream whose first `endpoint`
 //! event names the URL to POST to; responses come back on the stream.
 //!
-//! Static `headers` may reference environment variables as `${NAME}`. Header values
+//! Static `headers` may reference environment variables as `${NAME}` and secrets kept
+//! in the keychain as `${secret:NAME}` (see `mcp_install`). Header values
 //! and tokens never appear in errors or debug output.
 
 use std::collections::VecDeque;
@@ -25,7 +26,9 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::mcp_client::{McpClientBootstrap, McpClientTransport, McpRemoteTransport};
+use crate::mcp_client::{
+    McpClientBootstrap, McpClientTransport, McpManagedProxyTransport, McpRemoteTransport,
+};
 use crate::mcp_oauth::{auth_required, bearer_token, canonical_resource_uri};
 use crate::mcp_stdio::{
     JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpInitializeParams, McpInitializeResult,
@@ -50,6 +53,7 @@ pub(crate) fn initialize_params_json() -> Value {
 
 /// A started MCP server: a child process (stdio) or a remote endpoint.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // one per server; the process is the common case
 pub(crate) enum McpConnection {
     Stdio(McpStdioProcess),
     Remote(Box<McpRemoteConnection>),
@@ -58,15 +62,23 @@ pub(crate) enum McpConnection {
 impl McpConnection {
     pub(crate) fn spawn(bootstrap: &McpClientBootstrap) -> io::Result<Self> {
         match &bootstrap.transport {
-            McpClientTransport::Stdio(transport) => {
-                Ok(Self::Stdio(McpStdioProcess::spawn(transport)?))
-            }
+            McpClientTransport::Stdio(transport) => Ok(Self::Stdio(McpStdioProcess::spawn(
+                &crate::mcp_install::prepare_stdio_transport(&bootstrap.server_name, transport)?,
+            )?)),
             McpClientTransport::Http(transport) => Ok(Self::Remote(Box::new(
                 McpRemoteConnection::new(&bootstrap.server_name, transport, Flavor::Streamable)?,
             ))),
             McpClientTransport::Sse(transport) => Ok(Self::Remote(Box::new(
                 McpRemoteConnection::new(&bootstrap.server_name, transport, Flavor::LegacySse)?,
             ))),
+            McpClientTransport::ManagedProxy(proxy)
+                if crate::mcp_zerox::hosted_connectors_enabled() =>
+            {
+                Ok(Self::Remote(Box::new(McpRemoteConnection::zerox(
+                    &bootstrap.server_name,
+                    proxy,
+                )?)))
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -148,12 +160,23 @@ impl McpConnection {
         self.request(id, "tools/list", params).await
     }
 
+    /// Calls a tool. `confirmed`: the user approved this call in the permission prompt,
+    /// which a hosted connector is told (`x-neuron-confirmed`); other servers never are.
     pub(crate) async fn call_tool(
         &mut self,
         id: JsonRpcId,
         params: McpToolCallParams,
+        confirmed: bool,
     ) -> io::Result<JsonRpcResponse<McpToolCallResult>> {
-        self.request(id, "tools/call", Some(params)).await
+        match self {
+            Self::Remote(remote) => {
+                remote.confirmed = confirmed && remote.is_hosted();
+                let response = remote.request(id, "tools/call", Some(params)).await;
+                remote.confirmed = false;
+                response
+            }
+            Self::Stdio(_) => self.request(id, "tools/call", Some(params)).await,
+        }
     }
 
     pub(crate) async fn list_resources(
@@ -180,7 +203,7 @@ fn transport_label(transport: &McpClientTransport) -> &'static str {
         McpClientTransport::Http(_) => "http",
         McpClientTransport::WebSocket(_) => "ws",
         McpClientTransport::Sdk(_) => "sdk",
-        McpClientTransport::ManagedProxy(_) => "managed_proxy",
+        McpClientTransport::ManagedProxy(_) => "zerox",
     }
 }
 
@@ -349,6 +372,18 @@ struct LegacyStream {
     post_url: String,
 }
 
+/// How a remote server is signed in to.
+enum RemoteAuth {
+    /// Its own OAuth tokens, when `neuron mcp login` stored some.
+    OAuth,
+    /// A hosted connector: the Zero-X sign-in, read when the connection first sends
+    /// and again after a `401`. `origin` is the gateway's, the only place it goes.
+    Zerox {
+        token: Option<String>,
+        origin: String,
+    },
+}
+
 /// One remote MCP server connection.
 pub(crate) struct McpRemoteConnection {
     server_name: String,
@@ -362,6 +397,9 @@ pub(crate) struct McpRemoteConnection {
     session_id: Option<String>,
     protocol_version: Option<String>,
     legacy: Option<LegacyStream>,
+    auth: RemoteAuth,
+    /// The `tools/call` being sent was approved by the user (hosted connectors only).
+    confirmed: bool,
 }
 
 impl fmt::Debug for McpRemoteConnection {
@@ -372,6 +410,7 @@ impl fmt::Debug for McpRemoteConnection {
             .field("flavor", &self.flavor)
             .field("headers", &self.headers.len())
             .field("has_session", &self.session_id.is_some())
+            .field("hosted", &self.is_hosted())
             .finish_non_exhaustive()
     }
 }
@@ -401,12 +440,49 @@ impl McpRemoteConnection {
             headers: transport
                 .headers
                 .iter()
-                .map(|(name, value)| (name.clone(), expand_env_refs(value)))
-                .collect(),
+                .map(|(name, value)| {
+                    crate::mcp_install::expand_mcp_header(server_name, &transport.url, value)
+                        .map(|value| (name.clone(), value))
+                        .map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))
+                })
+                .collect::<io::Result<_>>()?,
             session_id: None,
             protocol_version: None,
             legacy: None,
+            auth: RemoteAuth::OAuth,
+            confirmed: false,
         })
+    }
+
+    /// A hosted connector: Streamable HTTP to the gateway's `/mcp/<id>`, signed in with
+    /// the Zero-X sign-in. Fails when its settings name another endpoint.
+    pub(crate) fn zerox(server_name: &str, proxy: &McpManagedProxyTransport) -> io::Result<Self> {
+        let refused = |error: String| io::Error::new(io::ErrorKind::InvalidInput, error);
+        let url = crate::mcp_zerox::resolve_zerox_endpoint(server_name, &proxy.url, &proxy.id)
+            .map_err(refused)?;
+        let origin = crate::mcp_zerox::zerox_origin().map_err(refused)?;
+        Ok(Self {
+            server_name: server_name.to_string(),
+            resource: url.clone(),
+            url,
+            flavor: Flavor::Streamable,
+            // The gateway speaks Streamable HTTP only.
+            may_fall_back: false,
+            client: transport_client(),
+            headers: Vec::new(),
+            session_id: None,
+            protocol_version: None,
+            legacy: None,
+            auth: RemoteAuth::Zerox {
+                token: None,
+                origin,
+            },
+            confirmed: false,
+        })
+    }
+
+    fn is_hosted(&self) -> bool {
+        matches!(self.auth, RemoteAuth::Zerox { .. })
     }
 
     fn with_headers(&self, mut builder: RequestBuilder, bearer: Option<&str>) -> RequestBuilder {
@@ -430,13 +506,16 @@ impl McpRemoteConnection {
     /// Sends a request built by `build` with the stored token, refreshing the token
     /// and trying once more on a `401`.
     async fn send_authorized(
-        &self,
-        build: impl Fn(Option<&str>) -> RequestBuilder,
+        &mut self,
+        build: impl Fn(&Self, Option<&str>) -> RequestBuilder,
     ) -> io::Result<Response> {
+        if self.is_hosted() {
+            return self.send_zerox(build).await;
+        }
         let mut forced = false;
         loop {
             let bearer = bearer_token(&self.server_name, &self.resource, forced).await?;
-            let response = build(bearer.as_deref())
+            let response = build(self, bearer.as_deref())
                 .send()
                 .await
                 .map_err(|error| http_error(&error))?;
@@ -448,6 +527,66 @@ impl McpRemoteConnection {
                 continue;
             }
             return Err(auth_required(&self.server_name, None));
+        }
+    }
+
+    /// [`Self::send_authorized`] for a hosted connector: the Zero-X sign-in as the
+    /// bearer, read again once after a `401` (the user may have signed in since); a
+    /// second `401` asks the user to sign in again. A `403` that says `needs_connect`
+    /// marks the server as waiting for its connector to be linked; any other answer
+    /// past the sign-in clears that mark.
+    async fn send_zerox(
+        &mut self,
+        build: impl Fn(&Self, Option<&str>) -> RequestBuilder,
+    ) -> io::Result<Response> {
+        let mut reread = false;
+        loop {
+            let (token, origin) = match &mut self.auth {
+                RemoteAuth::Zerox { token, origin } => {
+                    if token.is_none() || reread {
+                        *token = Some(crate::mcp_zerox::zerox_token().map_err(|error| {
+                            io::Error::new(io::ErrorKind::PermissionDenied, error)
+                        })?);
+                    }
+                    (token.clone(), origin.clone())
+                }
+                RemoteAuth::OAuth => (None, String::new()),
+            };
+            let response = build(self, token.as_deref())
+                .send()
+                .await
+                .map_err(|error| http_error(&error))?;
+            match response.status() {
+                StatusCode::UNAUTHORIZED if !reread => reread = true,
+                StatusCode::UNAUTHORIZED => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        crate::mcp_zerox::sign_in_again(&self.server_name),
+                    ))
+                }
+                StatusCode::FORBIDDEN => {
+                    let body = response.text().await.unwrap_or_default();
+                    let Some(connect_url) = crate::mcp_zerox::needs_connect_url(&body, &origin)
+                    else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "Zero-X refused the hosted connector `{}` (HTTP 403)",
+                                self.server_name
+                            ),
+                        ));
+                    };
+                    crate::mcp_zerox::note_needs_connect(&self.server_name, &connect_url);
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        crate::mcp_zerox::needs_connect_message(&self.server_name, &connect_url),
+                    ));
+                }
+                _ => {
+                    crate::mcp_zerox::note_connected(&self.server_name);
+                    return Ok(response);
+                }
+            }
         }
     }
 
@@ -514,12 +653,22 @@ impl McpRemoteConnection {
         wait_id: Option<&JsonRpcId>,
     ) -> io::Result<PostOutcome> {
         let body = message.to_string();
+        // Only the POST that carries the approved `tools/call` says it was confirmed,
+        // never an answer to a request the server sends while it runs.
+        let confirmed =
+            self.confirmed && message.get("method").and_then(Value::as_str) == Some("tools/call");
         let response = self
-            .send_authorized(|bearer| {
-                self.with_headers(self.client.post(&self.url), bearer)
+            .send_authorized(|this, bearer| {
+                let request = this
+                    .with_headers(this.client.post(&this.url), bearer)
                     .header(CONTENT_TYPE, "application/json")
                     .header("Accept", "application/json, text/event-stream")
-                    .body(body.clone())
+                    .body(body.clone());
+                if confirmed {
+                    request.header(crate::mcp_zerox::ZEROX_CONFIRMED_HEADER, "1")
+                } else {
+                    request
+                }
             })
             .await?;
         let status = response.status();
@@ -611,8 +760,8 @@ impl McpRemoteConnection {
             return Ok(());
         }
         let response = self
-            .send_authorized(|bearer| {
-                self.with_headers(self.client.get(&self.url), bearer)
+            .send_authorized(|this, bearer| {
+                this.with_headers(this.client.get(&this.url), bearer)
                     .header("Accept", "text/event-stream")
             })
             .await?;
@@ -651,11 +800,11 @@ impl McpRemoteConnection {
         Ok(())
     }
 
-    async fn post_legacy(&self, post_url: &str, message: &Value) -> io::Result<()> {
+    async fn post_legacy(&mut self, post_url: &str, message: &Value) -> io::Result<()> {
         let body = message.to_string();
         let response = self
-            .send_authorized(|bearer| {
-                self.with_headers(self.client.post(post_url), bearer)
+            .send_authorized(|this, bearer| {
+                this.with_headers(this.client.post(post_url), bearer)
                     .header(CONTENT_TYPE, "application/json")
                     .body(body.clone())
             })
@@ -698,14 +847,11 @@ impl McpRemoteConnection {
             return Err(invalid_data("the event stream is gone"));
         };
         loop {
-            let event = match stream.reader.next_event().await? {
-                Some(event) => event,
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "the event stream closed before the response",
-                    ))
-                }
+            let Some(event) = stream.reader.next_event().await? else {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the event stream closed before the response",
+                ));
             };
             if !matches!(event.event.as_deref(), None | Some("message")) || event.data.is_empty() {
                 continue;
@@ -734,8 +880,9 @@ impl McpRemoteConnection {
         if self.session_id.is_none() {
             return;
         }
-        let request =
-            self.send_authorized(|bearer| self.with_headers(self.client.delete(&self.url), bearer));
+        let request = self.send_authorized(|this, bearer| {
+            this.with_headers(this.client.delete(&this.url), bearer)
+        });
         let _ = tokio::time::timeout(DELETE_WAIT, request).await;
         self.session_id = None;
     }
@@ -744,7 +891,7 @@ impl McpRemoteConnection {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
 
     use serde_json::json;
@@ -757,6 +904,8 @@ mod tests {
     use crate::mcp_oauth::{save_mcp_tokens, unix_now};
     use crate::mcp_stdio::McpServerManager;
     use crate::mcp_test_http::{mcp_reply, FakeRequest, FakeResponse, FakeServer};
+    use crate::mcp_zerox::tests::ZeroxTestGateway;
+    use crate::mcp_zerox::zerox_needs_connect;
 
     fn remote(kind: &str, url: &str, headers: &[(&str, &str)]) -> ScopedMcpServerConfig {
         let config = McpRemoteServerConfig {
@@ -826,7 +975,10 @@ mod tests {
             "{:?}",
             report.failed_servers
         );
-        assert!(report.unsupported_servers.is_empty());
+        assert_eq!(
+            report.unsupported_servers,
+            [] as [crate::mcp_stdio::UnsupportedMcpServer; 0]
+        );
         let names: Vec<_> = report
             .tools
             .iter()
@@ -1048,5 +1200,282 @@ mod tests {
         )
         .unwrap();
         assert!(!format!("{connection:?}").contains("hidden"));
+    }
+
+    fn hosted(id: &str) -> ScopedMcpServerConfig {
+        ScopedMcpServerConfig {
+            scope: ConfigSource::Managed,
+            config: McpServerConfig::ManagedProxy(crate::config::McpManagedProxyServerConfig {
+                url: String::new(),
+                id: id.to_string(),
+            }),
+        }
+    }
+
+    /// The gateway's `/mcp/<id>`: `Bearer ses_linked` reaches a server with one read and
+    /// one destructive GitHub tool; `ses_unlinked` has not linked the connector; any
+    /// other sign-in is refused. A tool call is answered on an SSE stream that pings the
+    /// client before the result.
+    fn gateway() -> FakeServer {
+        gateway_linking(&Arc::new(AtomicBool::new(false)))
+    }
+
+    /// [`gateway`], where `ses_unlinked` has linked the connector once `linked` is set.
+    fn gateway_linking(linked: &Arc<AtomicBool>) -> FakeServer {
+        let origin = Arc::new(Mutex::new(String::new()));
+        let server_origin = Arc::clone(&origin);
+        let linked = Arc::clone(linked);
+        let server = FakeServer::spawn(Arc::new(move |request: &FakeRequest| {
+            if !request.path().starts_with("/mcp/") {
+                return FakeResponse::status(404);
+            }
+            match request.header("authorization") {
+                Some("Bearer ses_linked") => {}
+                Some("Bearer ses_unlinked") if linked.load(Ordering::SeqCst) => {}
+                Some("Bearer ses_unlinked") => {
+                    let connect_url =
+                        format!("{}/dashboard#connectors", server_origin.lock().unwrap());
+                    return FakeResponse::json(
+                        403,
+                        &json!({"error": "needs_connect", "connect_url": connect_url}),
+                    );
+                }
+                _ => return FakeResponse::status(401),
+            }
+            if request.method == "DELETE" {
+                return FakeResponse::status(200);
+            }
+            let message = request.json();
+            if message["method"] == "tools/list" {
+                let tool = |name: &str| json!({"name": name, "inputSchema": {"type": "object"}});
+                return FakeResponse::json(
+                    200,
+                    &json!({"jsonrpc": "2.0", "id": message["id"], "result": {
+                        "tools": [tool("get_me"), tool("delete_repository")]
+                    }}),
+                );
+            }
+            match mcp_reply(&message) {
+                None => FakeResponse::status(202),
+                Some(reply) if message["method"] == "tools/call" => FakeResponse::sse(&[
+                    json!({"jsonrpc": "2.0", "id": "gateway-ping", "method": "ping"}),
+                    reply,
+                ]),
+                Some(reply) => FakeResponse::json(200, &reply),
+            }
+        }));
+        *origin.lock().unwrap() = server.url.clone();
+        server
+    }
+
+    #[test]
+    fn a_linked_hosted_connector_is_ready_with_the_zerox_sign_in() {
+        let server = gateway();
+        let _gateway = ZeroxTestGateway::new(&server.url, Some("ses_linked"));
+        let mut manager = manager("github", hosted("github"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let report = runtime.block_on(manager.discover_tools_best_effort());
+
+        assert!(
+            report.failed_servers.is_empty(),
+            "{:?}",
+            report.failed_servers
+        );
+        assert_eq!(
+            report.unsupported_servers,
+            [] as [crate::mcp_stdio::UnsupportedMcpServer; 0]
+        );
+        assert_eq!(report.tools.len(), 2);
+        assert_eq!(zerox_needs_connect("github"), None);
+        runtime.block_on(manager.shutdown()).unwrap();
+        let requests = server.requests();
+        assert!(requests
+            .iter()
+            .all(|request| request.path() == "/mcp/github"
+                && request.header("authorization") == Some("Bearer ses_linked")));
+    }
+
+    #[test]
+    fn an_unlinked_hosted_connector_needs_connect_until_it_answers() {
+        let server = gateway();
+        let gateway_guard = ZeroxTestGateway::new(&server.url, Some("ses_unlinked"));
+        let mut manager = manager("hosted-unlinked", hosted("github"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let report = runtime.block_on(manager.discover_tools_best_effort());
+
+        let connect_url = format!("{}/dashboard#connectors", server.url);
+        assert_eq!(report.failed_servers.len(), 1);
+        assert!(
+            report.failed_servers[0]
+                .error
+                .contains(&format!("connect it at {connect_url}")),
+            "{}",
+            report.failed_servers[0].error
+        );
+        assert_eq!(
+            zerox_needs_connect("hosted-unlinked").as_deref(),
+            Some(connect_url.as_str())
+        );
+
+        // Linked on the dashboard: the next start clears the mark.
+        drop(gateway_guard);
+        let _linked = ZeroxTestGateway::new(&server.url, Some("ses_linked"));
+        let mut linked = self::manager("hosted-unlinked", hosted("github"));
+        let report = runtime.block_on(linked.discover_tools_best_effort());
+        assert_eq!(
+            report.failed_servers,
+            [] as [crate::mcp_stdio::McpDiscoveryFailure; 0]
+        );
+        assert_eq!(zerox_needs_connect("hosted-unlinked"), None);
+    }
+
+    #[test]
+    fn a_hosted_connector_linked_while_running_starts_again() {
+        let linked = Arc::new(AtomicBool::new(false));
+        let server = gateway_linking(&linked);
+        let _gateway = ZeroxTestGateway::new(&server.url, Some("ses_unlinked"));
+        let mut manager = manager("hosted-later", hosted("github"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let report = runtime.block_on(manager.discover_tools_best_effort());
+        assert_eq!(report.failed_servers.len(), 1);
+        assert_eq!(manager.unlinked_hosted_servers(), vec!["hosted-later"]);
+        assert_eq!(manager.confirmed_tools(), [] as [std::string::String; 0]);
+
+        // Still not linked: it stays unlinked, with no tools.
+        assert!(runtime
+            .block_on(manager.rediscover_server("hosted-later"))
+            .is_err());
+        assert_eq!(manager.unlinked_hosted_servers(), vec!["hosted-later"]);
+
+        linked.store(true, Ordering::SeqCst);
+        let tools = runtime
+            .block_on(manager.rediscover_server("hosted-later"))
+            .expect("linked now");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(
+            manager.unlinked_hosted_servers(),
+            [] as [std::string::String; 0]
+        );
+        assert_eq!(zerox_needs_connect("hosted-later"), None);
+        assert_eq!(
+            manager.confirmed_tools(),
+            vec!["mcp__hosted-later__delete_repository"]
+        );
+        runtime
+            .block_on(manager.call_tool("mcp__hosted-later__get_me", Some(json!({}))))
+            .expect("its tools are routed");
+    }
+
+    #[test]
+    fn a_refused_zerox_sign_in_asks_to_sign_in_again() {
+        let server = gateway();
+        let expired = ZeroxTestGateway::new(&server.url, Some("ses_expired"));
+        let mut manager = manager("hosted-expired", hosted("github"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let report = runtime.block_on(manager.discover_tools_best_effort());
+
+        assert_eq!(report.failed_servers.len(), 1);
+        let error = &report.failed_servers[0].error;
+        assert!(
+            error.contains("run `neuron login` to sign in again"),
+            "{error}"
+        );
+        assert!(!error.contains("ses_expired"), "{error}");
+        // The sign-in is read again after the first 401 before giving up.
+        assert!(server.requests().len() >= 2);
+
+        drop(expired);
+        let _signed_out = ZeroxTestGateway::new(&server.url, None);
+        let mut signed_out = self::manager("hosted-signed-out", hosted("github"));
+        let report = runtime.block_on(signed_out.discover_tools_best_effort());
+        assert!(report.failed_servers[0]
+            .error
+            .contains("not signed in to Zero-X"));
+    }
+
+    #[test]
+    fn only_user_approved_destructive_calls_are_confirmed_to_the_gateway() {
+        let server = gateway();
+        let _gateway = ZeroxTestGateway::new(&server.url, Some("ses_linked"));
+        let mut manager = manager("github", hosted("github"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(manager.discover_tools_best_effort());
+
+        let mut confirmed = |tool: &str, approved: bool| {
+            let before = server.requests().len();
+            runtime
+                .block_on(manager.call_tool_approved(
+                    &format!("mcp__github__{tool}"),
+                    Some(json!({})),
+                    approved,
+                ))
+                .unwrap();
+            let requests = server.requests();
+            let call = requests[before..]
+                .iter()
+                .find(|request| request.json()["method"] == "tools/call")
+                .expect("tools/call sent")
+                .clone();
+            call.header("x-neuron-confirmed").map(str::to_string)
+        };
+
+        assert_eq!(confirmed("delete_repository", true).as_deref(), Some("1"));
+        // Allowed by a rule or the mode, not by the user: not confirmed.
+        assert_eq!(confirmed("delete_repository", false), None);
+        // A read-tier tool is never confirmed.
+        assert_eq!(confirmed("get_me", true), None);
+        // Nothing else carries it, the answers to the gateway's pings during a
+        // confirmed call included.
+        let requests = server.requests();
+        let ping_answers = requests
+            .iter()
+            .filter(|request| request.json()["id"] == "gateway-ping")
+            .collect::<Vec<_>>();
+        assert_eq!(ping_answers.len(), 3, "one per tool call");
+        assert!(requests
+            .iter()
+            .filter(|request| request.json()["method"] != "tools/call")
+            .all(|request| request.header("x-neuron-confirmed").is_none()));
+    }
+
+    #[test]
+    fn other_servers_are_never_told_a_call_was_confirmed() {
+        let server = streamable_server(false);
+        let mut manager = manager(
+            "remote-plain",
+            remote("http", &format!("{}/mcp", server.url), &[]),
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(manager.discover_tools_best_effort());
+        runtime
+            .block_on(manager.call_tool_approved(
+                "mcp__remote-plain__echo",
+                Some(json!({"text": "x"})),
+                true,
+            ))
+            .unwrap();
+        assert!(server
+            .requests()
+            .iter()
+            .all(|request| request.header("x-neuron-confirmed").is_none()));
+    }
+
+    #[test]
+    fn hosted_connectors_stay_unsupported_while_switched_off() {
+        let server = gateway();
+        let _gateway = ZeroxTestGateway::off(&server.url);
+        let mut manager = manager("github", hosted("github"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let report = runtime.block_on(manager.discover_tools_best_effort());
+
+        assert_eq!(report.unsupported_servers.len(), 1);
+        assert!(report.unsupported_servers[0]
+            .reason
+            .contains("NEURON_HOSTED_CONNECTORS=1"));
+        assert!(server.requests().is_empty(), "nothing reaches the gateway");
     }
 }

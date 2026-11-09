@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use crate::config::ConfigLoader;
+use crate::config::{is_workspace_entry, ConfigLoader};
 
 /// What [`set_mcp_server_enabled`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +37,7 @@ fn disabled_names(object: &Map<String, Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn read_object(path: &Path) -> Result<Map<String, Value>, String> {
+pub(crate) fn read_object(path: &Path) -> Result<Map<String, Value>, String> {
     match fs::read_to_string(path) {
         Ok(text) if text.trim().is_empty() => Ok(Map::new()),
         Ok(text) => match serde_json::from_str::<Value>(&text) {
@@ -50,7 +50,7 @@ fn read_object(path: &Path) -> Result<Map<String, Value>, String> {
     }
 }
 
-fn write_object(path: &Path, object: &Map<String, Value>) -> Result<(), String> {
+pub(crate) fn write_object(path: &Path, object: &Map<String, Value>) -> Result<(), String> {
     let failed = |error: io::Error| format!("cannot write {}: {error}", path.display());
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(failed)?;
@@ -76,7 +76,18 @@ pub fn set_mcp_server_enabled(
     let settings_path = loader.config_home().join("settings.json");
     if !enabled {
         let config = loader.load().map_err(|error| error.to_string())?;
-        if config.mcp().get(name).is_none() && config.mcp().disabled().get(name).is_none() {
+        let mcp = config.mcp();
+        if let Some(requirement) = mcp.required().get(name) {
+            return Err(format!(
+                "`{name}` is required by {} and cannot be turned off",
+                requirement.by.describe()
+            ));
+        }
+        let configured = mcp.get(name).is_some()
+            || mcp.disabled().contains_key(name)
+            || mcp.needs_approval().contains_key(name)
+            || mcp.blocked().contains_key(name);
+        if !configured {
             return Err(format!("no MCP server named `{name}` is configured"));
         }
     }
@@ -104,15 +115,18 @@ pub fn set_mcp_server_enabled(
         write_object(&settings_path, &object)?;
     }
     let still_disabled_by = if enabled {
+        // An untrusted workspace's `disabledMcpServers` is dropped when loading,
+        // so only the files the loader applies can keep the server off.
+        let workspace_trusted = loader.workspace_is_trusted();
         loader
             .discover()
             .into_iter()
+            .filter(|entry| workspace_trusted || !is_workspace_entry(entry))
             .map(|entry| entry.path)
             .filter(|path| *path != settings_path)
             .filter(|path| {
                 read_object(path)
-                    .map(|object| disabled_names(&object).iter().any(|other| other == name))
-                    .unwrap_or(false)
+                    .is_ok_and(|object| disabled_names(&object).iter().any(|other| other == name))
             })
             .collect()
     } else {
@@ -173,7 +187,7 @@ mod tests {
 
         let outcome = set_mcp_server_enabled(&loader, "remote", true).unwrap();
         assert!(outcome.changed);
-        assert!(outcome.still_disabled_by.is_empty());
+        assert_eq!(outcome.still_disabled_by, [] as [std::path::PathBuf; 0]);
         let config = loader.load().unwrap();
         assert!(config.mcp().get("remote").is_some());
         assert!(config.mcp().disabled().is_empty());
@@ -206,6 +220,36 @@ mod tests {
         let outcome = set_mcp_server_enabled(&loader, "b", true).unwrap();
         assert!(!outcome.changed);
         assert_eq!(outcome.still_disabled_by.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_untrusted_workspace_file_does_not_count_as_still_disabling() {
+        let root = temp_root();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".neuron");
+        fs::create_dir_all(cwd.join(".neuron")).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"mcpServers":{"b":{"command":"b"}},"disabledMcpServers":["b"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            cwd.join(".neuron").join("settings.json"),
+            r#"{"disabledMcpServers":["b"]}"#,
+        )
+        .unwrap();
+        let loader = ConfigLoader::new(&cwd, &home).with_project_trust(ProjectTrust::Untrusted);
+
+        let outcome = set_mcp_server_enabled(&loader, "b", true).unwrap();
+        assert!(outcome.changed);
+        assert!(
+            outcome.still_disabled_by.is_empty(),
+            "the untrusted project file is not applied: {:?}",
+            outcome.still_disabled_by
+        );
+        assert!(loader.load().unwrap().mcp().get("b").is_some());
         let _ = fs::remove_dir_all(root);
     }
 }

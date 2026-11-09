@@ -108,11 +108,21 @@ export function copyPackage(target) {
   return target;
 }
 
-export function releaseRoutes({version = VERSION, asset, data, checksum}) {
-  return new Map([
-    [`/v${version}/${asset}`, {body: data}],
-    [`/v${version}/${asset}.sha256`, {body: checksum ?? `${sha256(data)}  ${asset}\n`}],
-  ]);
+/**
+ * Routes for a release: the asset, its .sha256 sidecar and the release SHA256SUMS
+ * (which lists `asset` and every entry of `also`, a list of {asset, data}).
+ * `sums` replaces the SHA256SUMS body.
+ */
+export function releaseRoutes({version = VERSION, asset, data, checksum, sums, also = []}) {
+  const routes = new Map();
+  const lines = [];
+  for (const entry of [{asset, data, checksum}, ...also]) {
+    routes.set(`/v${version}/${entry.asset}`, {body: entry.data});
+    routes.set(`/v${version}/${entry.asset}.sha256`, {body: entry.checksum ?? `${sha256(entry.data)}  ${entry.asset}\n`});
+    lines.push(`${sha256(entry.data)}  ${entry.asset}`);
+  }
+  routes.set(`/v${version}/SHA256SUMS`, {body: sums ?? `${lines.join('\n')}\n`});
+  return routes;
 }
 
 /** Starts an HTTP server on 127.0.0.1 serving `routes` (path -> {status, body}). */

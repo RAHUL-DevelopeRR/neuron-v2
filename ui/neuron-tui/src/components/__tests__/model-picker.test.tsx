@@ -70,9 +70,19 @@ async function openPicker() {
     await new Promise((resolve) => setTimeout(resolve, 20))
     await setup.renderOnce()
   }
+  /**
+   * Draws until `done` holds, for up to 2 s: under load a key's effect can
+   * land after one settle's 20 ms, and the next key then goes to the wrong row.
+   */
+  const settleUntil = async (done: () => boolean) => {
+    const deadline = Date.now() + 2000
+    await settle()
+    while (!done() && Date.now() < deadline) await settle()
+  }
   await settle()
   return Object.assign(setup, {
     settle,
+    settleUntil,
     closes: () => closes,
     /** The focused row's line. */
     focused: () =>
@@ -139,16 +149,18 @@ describe('ModelPicker rows that cannot be picked', () => {
     useEngineStore.getState().setModels(models)
     const picker = await openPicker()
     picker.mockInput.pressArrow('down')
-    await picker.settle()
+    await picker.settleUntil(() => picker.focused()?.includes('› Model 1') ?? false)
+    expect(picker.focused()).toContain('› Model 1')
     picker.mockInput.pressEnter()
-    await picker.settle()
+    await picker.settleUntil(() => picker.captureCharFrame().includes("can't be picked"))
     expect(switched).toEqual([])
     expect(picker.closes()).toBe(0)
     expect(picker.captureCharFrame()).toContain("Model 1 can't be picked: needs a plan upgrade.")
 
     // Moving on clears it.
     picker.mockInput.pressArrow('down')
-    await picker.settle()
+    await picker.settleUntil(() => !picker.captureCharFrame().includes("can't be picked"))
+    expect(picker.focused()).toContain('› Model 2')
     expect(picker.captureCharFrame()).not.toContain("can't be picked")
   })
 

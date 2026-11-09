@@ -1,3 +1,5 @@
+import { hasIncompleteCodeFence, hasMarkdown, streamingMarkdownSplit } from './markdown-renderer'
+
 import type { ChatMessage, ContentBlock, TextContentBlock } from '../types/chat'
 
 // Small wrapper to avoid repeating the ai-message map/update pattern.
@@ -25,8 +27,56 @@ export type BatchedMessageUpdater = MessageUpdater & {
   dispose: () => void
 }
 
-/** Default interval for batched updates in milliseconds */
-export const DEFAULT_FLUSH_INTERVAL_MS = 100
+/**
+ * Default interval for batched updates in milliseconds: about 30 updates a
+ * second, so streamed text moves smoothly (at 100 ms it came in steps). Each
+ * update draws only the streaming message, and of its text only what came
+ * after the last finished block (see ContentWithMarkdown).
+ */
+export const DEFAULT_FLUSH_INTERVAL_MS = 33
+
+/**
+ * The interval while the text each update parses again is long: a list, a
+ * table or a quote has no blank line to cut it at, so every update parses
+ * all of it, and 30 times a second made a long list answer 2 to 4 times as
+ * costly as 10 times a second. 100 ms is what every answer had in alpha.4.
+ */
+export const LONG_REPARSE_FLUSH_INTERVAL_MS = 100
+
+/**
+ * From how many characters of text parsed again per update the interval
+ * grows. Paragraphs, headings and code are cut at their blank lines and stay
+ * well under it; a list, table or quote passes it after about 170 words.
+ */
+export const LONG_REPARSE_CHARS = 1024
+
+/**
+ * How many characters of `message` each update parses again, as
+ * ContentWithMarkdown draws it: of its last block when that is text (the one
+ * streaming; earlier ones do not change, so they are not drawn again), the
+ * part after its finished blocks (streamingMarkdownSplit) and before a code
+ * fence still open (drawn as typed, not parsed). Text with no Markdown is
+ * drawn as it is and costs nothing to parse.
+ */
+export function reparsedChars(message: ChatMessage | undefined): number {
+  if (!message) return 0
+  const blocks = message.blocks ?? []
+  const last = blocks[blocks.length - 1]
+  const content = !last ? message.content : last.type === 'text' ? last.content : ''
+  if (!content || !hasMarkdown(content)) return 0
+  const start = Math.max(0, streamingMarkdownSplit(content))
+  const end = hasIncompleteCodeFence(content)
+    ? Math.max(start, content.lastIndexOf('```'))
+    : content.length
+  return end - start
+}
+
+/** The time between two updates of `message` while it streams. */
+export function streamingFlushIntervalMs(message: ChatMessage | undefined): number {
+  return reparsedChars(message) >= LONG_REPARSE_CHARS
+    ? LONG_REPARSE_FLUSH_INTERVAL_MS
+    : DEFAULT_FLUSH_INTERVAL_MS
+}
 
 export const createMessageUpdater = (
   aiMessageId: string,
@@ -120,16 +170,25 @@ export const createMessageUpdater = (
   }
 }
 
-/** Batched updater that queues updates and flushes at a regular interval. */
+/**
+ * Batched updater that queues updates and flushes at a regular interval.
+ * Without `flushIntervalMs` the interval follows the message: every
+ * DEFAULT_FLUSH_INTERVAL_MS, or every LONG_REPARSE_FLUSH_INTERVAL_MS while
+ * each update parses much of its text again (streamingFlushIntervalMs).
+ */
 export const createBatchedMessageUpdater = (
   aiMessageId: string,
   setMessages: SetMessagesFn,
-  flushIntervalMs: number = DEFAULT_FLUSH_INTERVAL_MS,
+  flushIntervalMs?: number,
 ): BatchedMessageUpdater => {
   // Queue of message updater functions to be applied on next flush
   const pendingUpdaters: Array<(msg: ChatMessage) => ChatMessage> = []
   let intervalId: ReturnType<typeof setInterval> | null = null
   let isDisposed = false
+  // For the adaptive interval: when the last flush was, and the time it wants
+  // until the next one (from the message as it left it).
+  let lastFlushAt = -Infinity
+  let nextFlushGapMs = DEFAULT_FLUSH_INTERVAL_MS
 
   const flush = () => {
     if (pendingUpdaters.length === 0) return
@@ -138,14 +197,20 @@ export const createBatchedMessageUpdater = (
     const updaters = pendingUpdaters.splice(0, pendingUpdaters.length)
 
     // Compose all pending updaters into a single transform
+    let flushed: ChatMessage | undefined
     const composedUpdater = (msg: ChatMessage): ChatMessage => {
-      return updaters.reduce((m, fn) => fn(m), msg)
+      flushed = updaters.reduce((m, fn) => fn(m), msg)
+      return flushed
     }
 
     // Apply composed update to the target message
     setMessages((prev) =>
       prev.map((msg) => (msg.id === aiMessageId ? composedUpdater(msg) : msg)),
     )
+    lastFlushAt = Date.now()
+    if (flushIntervalMs === undefined && flushed) {
+      nextFlushGapMs = streamingFlushIntervalMs(flushed)
+    }
   }
 
   const dispose = () => {
@@ -159,8 +224,18 @@ export const createBatchedMessageUpdater = (
     }
   }
 
-  // Start the periodic flush interval
-  intervalId = setInterval(flush, flushIntervalMs)
+  // Start the periodic flush interval. The adaptive one ticks at the short
+  // interval and lets a tick pass while the message wants the long one (a
+  // tick counts as on time within half a tick, as timers fire late).
+  const tick =
+    flushIntervalMs !== undefined
+      ? flush
+      : () => {
+          const elapsed = Date.now() - lastFlushAt
+          if (elapsed < nextFlushGapMs - DEFAULT_FLUSH_INTERVAL_MS / 2) return
+          flush()
+        }
+  intervalId = setInterval(tick, flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS)
 
   const updateAiMessage = (updater: (msg: ChatMessage) => ChatMessage) => {
     if (isDisposed) {

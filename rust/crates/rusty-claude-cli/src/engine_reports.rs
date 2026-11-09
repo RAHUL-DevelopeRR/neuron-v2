@@ -141,7 +141,32 @@ pub(crate) fn usage(
             });
         plan.push(format!("Subscription: {status}{renewal}."));
     }
-    let mut sections = vec![section("Today", today)];
+    let mut sections = Vec::new();
+    // A plan with a token window is refused by the window, not by today's tokens: it
+    // comes first.
+    if let Some(window) = account.window().map(|window| window.as_of(now)) {
+        let mut text = format!(
+            "**{}**\n\n{} of {} tokens used",
+            window.summary(),
+            amount(window.used()),
+            group_digits(window.limit_tokens)
+        );
+        if let Some(length) = window.length() {
+            text.push_str(&format!(" in this {length} window"));
+        }
+        text.push('.');
+        if let Some(resets_at) = &window.resets_at {
+            text.push_str(&format!("\n\nFrees up {}.", describe_time(resets_at, now)));
+        }
+        if window.is_near_limit() {
+            text.push_str(&format!(
+                "\n\n**Nearly used up:** {} tokens left. Requests are refused until the window frees up.",
+                amount(window.remaining())
+            ));
+        }
+        sections.push(section("Token window", text));
+    }
+    sections.push(section("Today", today));
     if !plan.is_empty() {
         sections.push(section("Plan", plan.join("\n\n")));
     }
@@ -314,6 +339,34 @@ mod tests {
             }
             other => panic!("a report event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn usage_shows_the_token_window_first_on_a_plan_with_one() {
+        let free = crate::account::parse_account(&serde_json::json!({
+            "plan": {"id": "free", "name": "Free"},
+            "limits": {"daily_requests": 100, "daily_tokens": 5_000_000, "window_tokens": 1_000_000, "window_seconds": 18_000},
+            "usage_today": {"requests": 12, "tokens": 900_000},
+            "usage_window": {"tokens": 920_000, "limit_tokens": 1_000_000, "remaining_tokens": 80_000,
+                "window_seconds": 18_000, "resets_at": "2026-10-24T14:20:00Z"}
+        }));
+        let report = usage(&free, 0, "https://p", "https://d");
+        assert_eq!(report.sections[0].heading.as_deref(), Some("Token window"));
+        let window = &report.sections[0].markdown;
+        assert!(
+            window.starts_with("**Free 920K/1M, resets 14:20 UTC**\n\n"),
+            "{window}"
+        );
+        assert!(
+            window.contains("920,000 of 1,000,000 tokens used in this 5-hour window."),
+            "{window}"
+        );
+        assert!(window.contains("Frees up 2026-10-24 14:20 UTC"), "{window}");
+        assert!(
+            window.contains("**Nearly used up:** 80,000 tokens left."),
+            "{window}"
+        );
+        assert_eq!(report.sections[1].heading.as_deref(), Some("Today"));
     }
 
     #[test]

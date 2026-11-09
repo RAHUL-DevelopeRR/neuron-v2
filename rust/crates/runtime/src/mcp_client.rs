@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use crate::config::{McpOAuthConfig, McpServerConfig, ScopedMcpServerConfig};
+use crate::config::{
+    ConfigSource, McpOAuthConfig, McpSandboxProfile, McpServerConfig, ScopedMcpServerConfig,
+};
 use crate::mcp::{mcp_server_signature, mcp_tool_prefix, normalize_name_for_mcp};
 
 pub const DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS: u64 = 60_000;
@@ -21,6 +23,8 @@ pub struct McpStdioTransport {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub tool_call_timeout_ms: Option<u64>,
+    /// The resolved sandbox profile ([`crate::mcp_sandbox::resolve_mcp_sandbox`]).
+    pub sandbox: McpSandboxProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,20 +69,39 @@ impl McpClientBootstrap {
             normalized_name: normalize_name_for_mcp(server_name),
             tool_prefix: mcp_tool_prefix(server_name),
             signature: mcp_server_signature(&config.config),
-            transport: McpClientTransport::from_config(&config.config),
+            transport: McpClientTransport::from_named_config(
+                server_name,
+                Some(config.scope),
+                &config.config,
+            ),
         }
     }
 }
 
 impl McpClientTransport {
+    /// The transport for `config`; a stdio server's sandbox profile is resolved without
+    /// knowing its name or scope (see [`Self::from_named_config`]).
     #[must_use]
     pub fn from_config(config: &McpServerConfig) -> Self {
+        Self::from_named_config("", None, config)
+    }
+
+    /// The transport for the server `server_name` from `scope`: a bundled server gets the
+    /// sandbox profile of the catalog entry of its name, and workspace settings cannot
+    /// turn the sandbox off.
+    #[must_use]
+    pub fn from_named_config(
+        server_name: &str,
+        scope: Option<ConfigSource>,
+        config: &McpServerConfig,
+    ) -> Self {
         match config {
-            McpServerConfig::Stdio(config) => Self::Stdio(McpStdioTransport {
-                command: config.command.clone(),
-                args: config.args.clone(),
-                env: config.env.clone(),
-                tool_call_timeout_ms: config.tool_call_timeout_ms,
+            McpServerConfig::Stdio(stdio) => Self::Stdio(McpStdioTransport {
+                command: stdio.command.clone(),
+                args: stdio.args.clone(),
+                env: stdio.env.clone(),
+                tool_call_timeout_ms: stdio.tool_call_timeout_ms,
+                sandbox: crate::mcp_sandbox::resolve_mcp_sandbox(server_name, scope, config).0,
             }),
             McpServerConfig::Sse(config) => Self::Sse(McpRemoteTransport {
                 url: config.url.clone(),
@@ -149,6 +172,7 @@ mod tests {
                 args: vec!["mcp-server".to_string()],
                 env: BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]),
                 tool_call_timeout_ms: Some(15_000),
+                sandbox: None,
             }),
         };
 
@@ -168,9 +192,41 @@ mod tests {
                     Some("secret")
                 );
                 assert_eq!(transport.tool_call_timeout_ms, Some(15_000));
+                assert_eq!(
+                    transport.sandbox,
+                    crate::config::McpSandboxProfile::default(),
+                    "an unvetted server gets the default sandbox"
+                );
             }
             other => panic!("expected stdio transport, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_bundled_server_bootstraps_with_its_catalog_sandbox() {
+        let config = ScopedMcpServerConfig {
+            scope: ConfigSource::Bundled,
+            config: McpServerConfig::Stdio(McpStdioServerConfig {
+                command: "node".to_string(),
+                args: vec!["/opt/neuron/node_modules/@playwright/mcp/cli.js".to_string()],
+                env: BTreeMap::new(),
+                tool_call_timeout_ms: None,
+                sandbox: None,
+            }),
+        };
+        let bootstrap = McpClientBootstrap::from_scoped_config("playwright", &config);
+        let McpClientTransport::Stdio(transport) = bootstrap.transport else {
+            panic!("expected stdio transport");
+        };
+        assert_eq!(
+            transport.sandbox.network,
+            crate::config::McpSandboxNetwork::Any
+        );
+        assert!(transport
+            .sandbox
+            .fs_write
+            .iter()
+            .any(|path| path.contains("ms-playwright")));
     }
 
     #[test]

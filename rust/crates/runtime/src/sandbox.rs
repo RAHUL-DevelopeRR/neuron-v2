@@ -158,7 +158,8 @@ impl SandboxConfig {
 pub fn detect_container_environment() -> ContainerEnvironment {
     let proc_1_cgroup = fs::read_to_string("/proc/1/cgroup").ok();
     detect_container_environment_from(SandboxDetectionInputs {
-        env_pairs: env::vars().collect(),
+        // `env::vars()` panics on non-UTF-8 entries; skip them instead.
+        env_pairs: crate::remote::utf8_env_vars().collect(),
         dockerenv_exists: Path::new("/.dockerenv").exists(),
         containerenv_exists: Path::new("/run/.containerenv").exists(),
         proc_1_cgroup: proc_1_cgroup.as_deref(),
@@ -362,7 +363,7 @@ pub enum SeatbeltNetwork {
     ProxyOnly(u16),
 }
 
-fn sbpl_string(path: &str) -> String {
+pub(crate) fn sbpl_string(path: &str) -> String {
     format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
 }
 

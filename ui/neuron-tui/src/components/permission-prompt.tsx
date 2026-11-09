@@ -3,7 +3,9 @@
  * place (and the keyboard) while a request waits:
  *
  *   y  allow this call            a  allow it for the session (when offered)
- *   n  deny (also Esc)            e  deny with a note for the model
+ *   p  always allow it in this project (when the engine offers rules to save)
+ *   n  deny (also Esc)            d  deny it for the rest of the session
+ *   e  deny with a note for the model
  *
  * Ctrl-C interrupts the turn, as it does everywhere else while one runs.
  * Other keys are ignored for the first 300 ms, so a key that was already on
@@ -43,7 +45,11 @@ const isCtrlC = (key: Pick<KeyEvent, 'name' | 'ctrl' | 'meta'>): boolean =>
 /** What a key does at the prompt (not while the note is being written). */
 export function resolvePermissionKey(
   key: Pick<KeyEvent, 'name' | 'ctrl' | 'meta'>,
-  options: { armed: boolean; canAllowForSession: boolean },
+  options: {
+    armed: boolean
+    canAllowForSession: boolean
+    canAllowForProject?: boolean
+  },
 ): PermissionKeyAction {
   // Never guarded: stopping the turn answers nothing.
   if (isCtrlC(key)) return { type: 'interrupt' }
@@ -55,9 +61,18 @@ export function resolvePermissionKey(
       return options.canAllowForSession
         ? { type: 'decide', decision: { kind: 'allow_for_session' } }
         : { type: 'none' }
+    case 'p':
+      return options.canAllowForProject
+        ? { type: 'decide', decision: { kind: 'allow_for_project' } }
+        : { type: 'none' }
     case 'n':
     case 'escape':
       return { type: 'decide', decision: { kind: 'deny', note: null } }
+    case 'd':
+      return {
+        type: 'decide',
+        decision: { kind: 'deny', note: null, session: true },
+      }
     case 'e':
       return { type: 'write-note' }
     default:
@@ -88,6 +103,25 @@ export function interruptAtPermission(id: number): void {
     }
   }
   answerPermission(id, { kind: 'deny', note: null })
+}
+
+const SHELL_TOOLS = new Set(['bash', 'PowerShell'])
+
+/**
+ * The prompt's first line after the tool name: what the call wants and why it
+ * asks. A shell command is "outside the auto-allow list" of the mode, not a
+ * request for full access.
+ */
+export function permissionHeadline(view: PermissionView): string {
+  const shell = SHELL_TOOLS.has(view.tool)
+  if (view.current_mode === 'prompt') {
+    return shell
+      ? ' wants to run this command (prompt mode asks every time)'
+      : ' wants approval (prompt mode asks every time)'
+  }
+  return shell
+    ? ' wants to run this command (outside the auto-allow list)'
+    : ` wants approval (${view.current_mode} does not cover this call)`
 }
 
 /** The part of a call's input worth showing: the command, path or URL. */
@@ -131,6 +165,8 @@ export const PermissionPrompt = ({
   )
   const view = request.request
   const canAllowForSession = view.session_prefixes.length > 0
+  const projectRules = view.project_rules ?? []
+  const canAllowForProject = projectRules.length > 0
 
   useEffect(() => {
     setArmed(false)
@@ -150,7 +186,11 @@ export const PermissionPrompt = ({
           else interruptAtPermission(request.id)
           return
         }
-        const action = resolvePermissionKey(key, { armed, canAllowForSession })
+        const action = resolvePermissionKey(key, {
+          armed,
+          canAllowForSession,
+          canAllowForProject,
+        })
         if (action.type === 'none') return
         key.preventDefault?.()
         if (action.type === 'write-note') {
@@ -163,7 +203,7 @@ export const PermissionPrompt = ({
         }
         answerPermission(request.id, action.decision)
       },
-      [armed, canAllowForSession, note, request.id],
+      [armed, canAllowForSession, canAllowForProject, note, request.id],
     ),
   )
 
@@ -196,7 +236,7 @@ export const PermissionPrompt = ({
         <span fg={theme.foreground} attributes={TextAttributes.BOLD}>
           {view.tool}
         </span>
-        <span fg={theme.muted}>{` needs ${view.required_mode} (now ${view.current_mode})`}</span>
+        <span fg={theme.muted}>{permissionHeadline(view)}</span>
       </text>
       <text style={{ wrapMode: 'word', fg: theme.foreground }}>{summary}</text>
       {view.reason ? (
@@ -205,6 +245,11 @@ export const PermissionPrompt = ({
       {canAllowForSession ? (
         <text style={{ wrapMode: 'word', fg: theme.muted }}>
           {`For the session: ${view.session_prefixes.join(', ')}`}
+        </text>
+      ) : null}
+      {canAllowForProject ? (
+        <text style={{ wrapMode: 'word', fg: theme.muted }}>
+          {`For this project: ${projectRules.join(', ')} (saved to .neuron/settings.local.json)`}
         </text>
       ) : null}
       {note ? (
@@ -247,7 +292,9 @@ export const PermissionPrompt = ({
           <text>
             {option('y', 'allow once')}
             {canAllowForSession ? option('a', 'allow for session') : null}
+            {canAllowForProject ? option('p', 'always allow in project') : null}
             {option('n', 'deny')}
+            {option('d', 'deny for session')}
             {option('e', 'deny with a note', true)}
           </text>
           <text style={{ fg: theme.muted }}>esc deny · ctrl-c stop the turn</text>

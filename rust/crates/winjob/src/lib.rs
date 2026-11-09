@@ -1,4 +1,4 @@
-//! Windows Job Objects for sandboxed shell commands.
+//! Windows Job Objects for sandboxed shell commands and MCP servers.
 //!
 //! A [`Job`] is created with `KILL_ON_JOB_CLOSE`, so dropping it kills every
 //! process still in it, and optionally an active-process limit (fork-bomb
@@ -33,7 +33,7 @@ pub use imp::{resume_process, Job};
 mod imp {
     use std::io;
     use std::mem::{size_of, zeroed};
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, RawHandle};
     use std::process::Child;
     use std::ptr::{null, null_mut};
 
@@ -43,11 +43,11 @@ mod imp {
     };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
-        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-        TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-        JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
@@ -117,13 +117,56 @@ mod imp {
 
         /// Puts `child` (and every process it starts from now on) in the job.
         pub fn assign(&self, child: &Child) -> io::Result<()> {
-            let process = child.as_raw_handle();
-            // SAFETY: both handles are valid for the duration of the call.
+            self.assign_raw(child.as_raw_handle())
+        }
+
+        /// [`Job::assign`] for a process handle from elsewhere (an async runtime's
+        /// child). A handle that is not a live process makes the call fail; it is
+        /// never closed or kept.
+        pub fn assign_raw(&self, process: RawHandle) -> io::Result<()> {
+            // SAFETY: the job handle is valid; Windows checks the process handle and
+            // fails the call when it is not one.
             let ok = unsafe { AssignProcessToJobObject(self.handle, process.cast()) };
             if ok == 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
+        }
+
+        /// The ids of the processes in the job (at most the first 1024).
+        pub fn process_ids(&self) -> io::Result<Vec<u32>> {
+            const MAX_IDS: usize = 1024;
+            // A `usize` buffer keeps the list aligned: two `u32` counts, then the ids.
+            let mut buffer = vec![0_usize; MAX_IDS + 2];
+            let size =
+                u32::try_from(buffer.len() * size_of::<usize>()).expect("buffer size fits u32");
+            let list = buffer
+                .as_mut_ptr()
+                .cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
+            // SAFETY: `list` points at `size` writable, suitably aligned bytes.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    self.handle,
+                    JobObjectBasicProcessIdList,
+                    list.cast(),
+                    size,
+                    null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: Windows filled in the header and `NumberOfProcessIdsInList` ids,
+            // which fit the buffer it was given.
+            let ids = unsafe {
+                let count = ((*list).NumberOfProcessIdsInList as usize).min(MAX_IDS);
+                let first = std::ptr::addr_of!((*list).ProcessIdList).cast::<usize>();
+                std::slice::from_raw_parts(first, count).to_vec()
+            };
+            Ok(ids
+                .into_iter()
+                .filter_map(|id| u32::try_from(id).ok())
+                .collect())
         }
 
         /// How many processes are alive in the job.
@@ -274,6 +317,28 @@ mod tests {
             wait_with_deadline(&mut child, Duration::from_secs(5)),
             "closing the job must kill the tree"
         );
+    }
+
+    #[test]
+    fn process_ids_lists_the_tree() {
+        let job = Job::new(&JobLimits::default()).expect("job");
+        let mut child = spawn_suspended("ping -n 30 127.0.0.1 >NUL");
+        job.assign_raw(std::os::windows::io::AsRawHandle::as_raw_handle(&child))
+            .expect("assign");
+        resume_process(child.id()).expect("resume");
+        let started = Instant::now();
+        let mut ids = Vec::new();
+        while started.elapsed() < Duration::from_secs(10) {
+            ids = job.process_ids().expect("query");
+            if ids.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(ids.contains(&child.id()), "{ids:?}");
+        assert!(ids.len() >= 2, "cmd and its ping: {ids:?}");
+        drop(job);
+        assert!(wait_with_deadline(&mut child, Duration::from_secs(5)));
     }
 
     #[test]

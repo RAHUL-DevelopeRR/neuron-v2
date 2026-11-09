@@ -37,6 +37,7 @@ Environment variables:
 | `NEURON_BINARY_PATH` | Run this native binary instead (development builds). |
 | `NEURON_CACHE_DIR` | Cache directory for downloaded binaries. |
 | `NEURON_DOWNLOAD_BASE` | Release mirror base URL (HTTPS, or loopback HTTP for testing). |
+| `NEURON_CHECKSUMS_BASE` | Where `SHA256SUMS` is fetched from (default: the GitHub release, even with a mirror). The download is refused unless it is listed there. |
 
 Behind a proxy on Node 24+, set `NODE_USE_ENV_PROXY=1` together with
 `HTTPS_PROXY` so the download goes through it.
@@ -44,8 +45,9 @@ Behind a proxy on Node 24+, set `NODE_USE_ENV_PROXY=1` together with
 ## Default integrations
 
 Ponytail, antislop, gstack and Agent Reach instructions are embedded in the
-binary and loaded on demand. The Codebase Memory and Playwright MCP servers are installed with this
-package and enabled by default. Agent Reach's CLI channels need their own setup;
+binary and loaded on demand. The Codebase Memory and Playwright MCP servers are enabled by default;
+Neuron installs each on first use from downloads whose hashes it pins (they are not npm
+dependencies of this package). Agent Reach's CLI channels need their own setup;
 Playwright provides browser control, while desktop control needs a separately
 configured MCP server. See
 [default integrations](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/docs/DEFAULT_INTEGRATIONS.md)

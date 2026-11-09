@@ -1,6 +1,6 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron.
 // See ui/neuron-tui/PORTING.md.
-import { castDraft, enableMapSet } from 'immer'
+import { castDraft, enableMapSet, isDraft, original } from 'immer'
 import { create } from 'zustand'
 import { immer } from 'zustand/middleware/immer'
 
@@ -216,8 +216,18 @@ export const useChatStore = create<ChatStore>()(
 
     setMessages: (value) =>
       set((state) => {
-        state.messages =
-          typeof value === 'function' ? value(state.messages) : value
+        // An updater gets the messages themselves, not immer's draft of them.
+        // Through the draft every message it reads became a proxy, and the
+        // result was walked again to finalize them: a streaming turn's
+        // updates (many a second) paid for the whole transcript each time.
+        // Updaters build new arrays and objects (they never mutate), so they
+        // read the same values either way.
+        const previous = isDraft(state.messages)
+          ? (original(state.messages) as ChatMessage[])
+          : state.messages
+        state.messages = castDraft(
+          typeof value === 'function' ? value(previous) : value,
+        )
       }),
 
     setStreamingAgents: (value) =>

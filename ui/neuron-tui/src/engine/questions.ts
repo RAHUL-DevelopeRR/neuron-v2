@@ -1,8 +1,11 @@
 /**
  * The engine's AskUserQuestion, drawn where the agent asked it.
  *
- * The engine asks with a notice ("Question: Which branch?\n  1. main\n  2. dev
- * \n  Answer with 1-2 or in your own words.") and takes the next submit as
+ * With the `questions` capability the engine asks with a `question` event
+ * (its id, the question and its options) and takes an `answer` command with
+ * that id; ./question-form.ts also opens the question form for it. Older
+ * engines ask with a notice ("Question: Which branch?\n  1. main\n  2. dev
+ * \n  Answer with 1-2 or in your own words.") and take the next submit as
  * the answer. During a turn the question goes into the turn's own message, in
  * place of the AskUserQuestion tool row (an `ask-user` block), and the answer
  * is written into that block; the agent's reply to it follows below. Drawn
@@ -10,6 +13,7 @@
  * reply.
  */
 
+import type { QuestionEvent } from './protocol'
 import type { AskUserContentBlock, ChatMessage, ContentBlock } from '../types/chat'
 
 /** AskUserQuestion reaches the UI as a notice with this prefix. */
@@ -79,6 +83,32 @@ export function engineQuestionBlock(
     // Always set: it marks an engine question (answered in the input).
     hint: parsed.hint ?? '',
   }
+}
+
+/** The `ask-user` block for a `question` event, not answered yet. */
+export function questionEventBlock(
+  event: Pick<QuestionEvent, 'question' | 'options'>,
+  toolCallId: string,
+): AskUserContentBlock {
+  const options = event.options.filter((option) => option.trim().length > 0)
+  return {
+    type: 'ask-user',
+    toolCallId,
+    questions: [{ question: event.question.trim(), options: options.map((label) => ({ label })) }],
+    // Always set: it marks an engine question (answered in the input or the form).
+    hint:
+      options.length > 0 ? `Answer with 1-${options.length} or in your own words.` : '',
+  }
+}
+
+/** A `question` event as an older engine's notice reads, for a chat line outside a turn. */
+export function questionNoticeText(event: Pick<QuestionEvent, 'question' | 'options'>): string {
+  const lines = [`${QUESTION_PREFIX} ${event.question.trim()}`]
+  event.options.forEach((option, index) => lines.push(`  ${index + 1}. ${option}`))
+  if (event.options.length > 0) {
+    lines.push(`Answer with 1-${event.options.length} or in your own words.`)
+  }
+  return lines.join('\n')
 }
 
 /** The answer as the block shows it: "2" picks the second option. */

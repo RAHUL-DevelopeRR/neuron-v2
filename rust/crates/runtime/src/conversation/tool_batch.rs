@@ -71,7 +71,8 @@ where
                     "the tool executor returned no result for this call",
                 ))
             });
-            let (output, is_error) = self.after_tool_ran(&call.tool_name, &call.input, &[], result);
+            let (output, is_error) =
+                self.after_tool_ran(&call.tool_use_id, &call.tool_name, &call.input, &[], result);
             let message = ConversationMessage::tool_result(
                 call.tool_use_id.clone(),
                 call.tool_name.clone(),
@@ -99,6 +100,7 @@ where
     /// (which may block it and add its own).
     pub(super) fn after_tool_ran(
         &mut self,
+        tool_use_id: &str,
         tool_name: &str,
         input: &str,
         pre_hook_messages: &[String],
@@ -110,9 +112,9 @@ where
         };
         let output = merge_hook_feedback(pre_hook_messages, output, false);
         let post_hook_result = if is_error {
-            self.run_post_tool_use_failure_hook(tool_name, input, &output)
+            self.run_post_tool_use_failure_hook(tool_use_id, tool_name, input, &output)
         } else {
-            self.run_post_tool_use_hook(tool_name, input, &output, false)
+            self.run_post_tool_use_hook(tool_use_id, tool_name, input, &output, false)
         };
         let post_hook_blocked = post_hook_result.is_denied()
             || post_hook_result.is_failed()
@@ -382,20 +384,29 @@ mod tests {
                 call("c", "read_file"),
             ],
         );
-        assert!(runtime.tool_executor.batches.is_empty());
+        assert_eq!(
+            runtime.tool_executor.batches,
+            [] as [std::vec::Vec<std::string::String>; 0]
+        );
         assert_eq!(runtime.tool_executor.peak.load(Ordering::SeqCst), 1);
 
         let runtime = run(
             MockTools::new(true),
             vec![call("a", "read_file"), call("w", "write_file")],
         );
-        assert!(runtime.tool_executor.batches.is_empty());
+        assert_eq!(
+            runtime.tool_executor.batches,
+            [] as [std::vec::Vec<std::string::String>; 0]
+        );
 
         let runtime = run(
             MockTools::new(false),
             vec![call("a", "read_file"), call("b", "read_file")],
         );
-        assert!(runtime.tool_executor.batches.is_empty());
+        assert_eq!(
+            runtime.tool_executor.batches,
+            [] as [std::vec::Vec<std::string::String>; 0]
+        );
         assert_eq!(runtime.tool_executor.peak.load(Ordering::SeqCst), 1);
         assert_eq!(result_ids(&runtime), vec!["a=result a", "b=result b"]);
     }

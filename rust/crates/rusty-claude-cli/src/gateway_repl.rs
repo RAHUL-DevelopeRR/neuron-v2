@@ -94,7 +94,10 @@ pub(crate) fn session_catalog() -> Option<std::sync::Arc<crate::gateway_catalog:
 /// Catalog listing appended to `/model` when the session runs on Zero-X, with the
 /// models' status as of now.
 pub(crate) fn gateway_model_listing(current_model: &str) -> Option<String> {
-    let catalog = session_catalog()?;
+    let Some(catalog) = session_catalog() else {
+        // A provider on the user's own key lists that provider's models.
+        return crate::provider_auth::active_provider_model_listing(current_model);
+    };
     Some(crate::gateway_catalog::render_model_list(
         &crate::gateway_catalog::with_session_status(&catalog),
         current_model,

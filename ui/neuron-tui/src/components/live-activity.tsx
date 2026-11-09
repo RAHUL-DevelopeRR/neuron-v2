@@ -8,7 +8,7 @@
  * draws them, with a spinner, and the turn's output tokens so far.
  */
 
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 
 import { ShimmerText } from './shimmer-text'
 import {
@@ -18,9 +18,10 @@ import {
 } from '../engine/live-turn'
 import { useTheme } from '../hooks/use-theme'
 import { useEngineStore } from '../state/engine-store'
-import { useLiveTurnStore } from '../state/live-turn-store'
+import { useLiveTurnStore, type LiveTurnState } from '../state/live-turn-store'
 import { formatTokenCount } from '../utils/format-token-count'
 import { GLYPHS } from '../utils/glyphs'
+import { renderProbe } from '../utils/render-probe'
 
 const SPINNER_INTERVAL_MS = 100
 const SHIMMER_INTERVAL_MS = 160
@@ -60,13 +61,51 @@ export function useLiveClock(): number {
   return now
 }
 
+/**
+ * The live turn as the status line decides when to draw it. Every token
+ * moves `lastTokenAt`, which only matters once the stream has been silent for
+ * STALL_AFTER_MS (engine/live-turn.ts): here it is kept to the whole second after it, so
+ * the line is drawn again when what it says can change (a new call, the
+ * stream turning from thinking to responding), not for every token. The live
+ * clock's tick draws it again each second anyway.
+ */
+export function liveActivityInput(state: LiveTurnState): LiveTurnState {
+  const lastTokenAt =
+    state.lastTokenAt === null ? null : Math.ceil(state.lastTokenAt / 1000) * 1000
+  return lastTokenAt === state.lastTokenAt ? state : { ...state, lastTokenAt }
+}
+
+const ACTIVITY_FIELDS = ['active', 'calls', 'model', 'stream', 'requestSentAt', 'lastTokenAt'] as const
+
+/** The fields of the live turn the status line reads, unchanged until one of them changes. */
+function sameActivityInput(a: LiveTurnState, b: LiveTurnState): boolean {
+  return ACTIVITY_FIELDS.every((field) => Object.is(a[field], b[field]))
+}
+
+/** {@link liveActivityInput}, the same object for as long as the line would read the same. */
+function useLiveActivityInput(): LiveTurnState {
+  const previous = useRef<LiveTurnState | null>(null)
+  return useLiveTurnStore((state) => {
+    const next = liveActivityInput(state)
+    if (previous.current && sameActivityInput(previous.current, next)) return previous.current
+    previous.current = next
+    return next
+  })
+}
+
 /** What the running turn is doing, for the status line's left side. */
 export const LiveActivityLine = () => {
+  renderProbe.onRender?.('LiveActivityLine')
   const theme = useTheme()
-  const live = useLiveTurnStore((state) => state)
+  const live = useLiveActivityInput()
   const awaitingApproval = useEngineStore((state) => state.permissionQueue.length > 0)
   useLiveClock()
-  const activity = describeLiveActivity(live, { now: liveTurnNow(), awaitingApproval })
+  // Drawn with the exact time of the last token: the rounded one only says when to draw.
+  const { lastTokenAt } = useLiveTurnStore.getState()
+  const activity = describeLiveActivity(
+    { ...live, lastTokenAt },
+    { now: liveTurnNow(), awaitingApproval },
+  )
   const color = activity.stalled ? theme.warning : theme.secondary
   const head = activity.target
     ? `${activity.verb} ${shortTarget(activity.target)}`

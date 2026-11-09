@@ -625,6 +625,11 @@ pub(crate) fn keychain_entry_for(account: &str) -> Option<Box<dyn SecretBackend>
     }
 }
 
+/// The provider-key store's name for [`keychain_entry_for`].
+pub(crate) fn keychain_for_account(account: &str) -> Option<Box<dyn SecretBackend>> {
+    keychain_entry_for(account)
+}
+
 fn platform_keychain() -> Option<Box<dyn SecretBackend>> {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {

@@ -474,7 +474,7 @@ mod tests {
     fn put_stores_content_addressed_objects_with_a_manifest() {
         let root = TempRoot::new("put");
         let mut store = ArtifactStore::open(&root.0, "session-a").unwrap();
-        assert!(store.list().is_empty());
+        assert_eq!(store.list(), []);
         let entry = store
             .put("report.md", "agent", "report", b"# Report\n")
             .unwrap();
@@ -533,7 +533,7 @@ mod tests {
 
         let small = offload_tool_result(Some(&mut store), "bash", "short".to_string(), 100, cap);
         assert_eq!(small, "short");
-        assert!(store.list().is_empty());
+        assert_eq!(store.list(), []);
 
         let preview = offload_tool_result(Some(&mut store), "bash", output.clone(), 100, cap);
         let entry = store.list()[0].clone();

@@ -4,6 +4,7 @@
 //! mode that was active; `/plan off` restores exactly that mode (it never
 //! escalates to danger-full-access on its own).
 
+use std::collections::BTreeSet;
 use std::sync::{Mutex, PoisonError};
 
 use runtime::PermissionMode;
@@ -51,6 +52,16 @@ pub(crate) fn exit_plan_mode(current: PermissionMode) -> PermissionMode {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .exit(current)
+}
+
+/// The only tools a plan-mode turn has: reading and searching. MCP tools and their
+/// wrappers are not among them, so no connector runs while planning, whatever its
+/// annotations claim.
+pub(crate) fn plan_mode_tools() -> BTreeSet<String> {
+    ["read_file", "glob_search", "grep_search", "list_directory"]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 /// Wraps a user prompt with the plan-mode instructions.

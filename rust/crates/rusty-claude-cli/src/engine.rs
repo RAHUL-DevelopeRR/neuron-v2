@@ -41,6 +41,7 @@ use super::*;
 use crate::device_login::{DeviceCode, DeviceLoginObserver};
 use crate::engine_account::{self, SharedAccountCache};
 use crate::engine_reports;
+use crate::engine_status_bar::{self, PermissionChoice, StatusBarFields};
 use crate::engine_trust;
 use crate::error_detail::DetailedError;
 use crate::session_presence::{self, SessionPresence};
@@ -69,6 +70,17 @@ use std::sync::{MutexGuard, PoisonError};
 
 /// How often a pending question checks whether its turn was interrupted.
 const ANSWER_CANCEL_POLL: Duration = Duration::from_millis(250);
+
+/// How often an idle engine looks whether the MCP servers starting in the background are
+/// up (see `Engine::serve`).
+const MCP_START_POLL: Duration = Duration::from_millis(500);
+
+/// Between commands, about the MCP servers starting in the background: whether to keep
+/// watching (they still start), and whether to send the extensions again (a start that
+/// was being watched has ended, ready or failed).
+fn mcp_start_watch(watching: bool, starting: bool) -> (bool, bool) {
+    (starting, watching && !starting)
+}
 
 /// How long `/commit` waits for the model to draft a message before it names the files
 /// instead.
@@ -226,9 +238,15 @@ fn run_engine(
         return match started {
             Ok((mut engine, resumed)) => {
                 engine.announce();
+                let source = if resumed.is_some() {
+                    "resume"
+                } else {
+                    "startup"
+                };
                 if let Some(report) = resumed {
                     engine.notice(&report);
                 }
+                engine.cli.run_session_start_hooks(source);
                 let _ = ready.send(Ok(()));
                 let exit = engine.serve(queue);
                 engine.close();
@@ -282,6 +300,13 @@ fn run_engine(
                 }),
             }
         }
+        engine
+            .cli
+            .run_session_start_hooks(if signed_out.options.resume.is_some() {
+                "resume"
+            } else {
+                "startup"
+            });
         // The end of the `/login` that got here.
         engine.finish_turn();
         let exit = engine.serve(queue);
@@ -386,9 +411,16 @@ impl SignedOut<'_> {
                 | EngineCommand::Interrupt
                 | EngineCommand::Capabilities { .. }
                 | EngineCommand::Answer { .. } => {}
-                EngineCommand::Commit { .. } | EngineCommand::Rewind { .. } => {
+                EngineCommand::Commit { .. }
+                | EngineCommand::Rewind { .. }
+                | EngineCommand::SwitchBranch { .. } => {
                     self.fail("Sign in to Zero-X first: /login.");
                 }
+                EngineCommand::SetReasoningEffort { .. }
+                | EngineCommand::SetPermissionMode { .. } => {
+                    self.send(UiEvent::error("Sign in to Zero-X first: /login."));
+                }
+                EngineCommand::ListBranches => self.send(branches_event()),
                 EngineCommand::ListModels => self.send(UiEvent::Models {
                     current: shown_model(&self.options.model).to_string(),
                     models: Vec::new(),
@@ -411,6 +443,20 @@ impl SignedOut<'_> {
                 EngineCommand::SetMcpServerEnabled { name, enabled } => {
                     for event in mcp_toggle_events(&name, enabled) {
                         self.send(event);
+                    }
+                }
+                EngineCommand::ListConnectorCatalog { query } => {
+                    self.send(crate::engine_mcp::connector_catalog_event(&query));
+                }
+                command @ (EngineCommand::AddMcpServer { .. }
+                | EngineCommand::RemoveMcpServer { .. }
+                | EngineCommand::ApproveMcpServer { .. }) => {
+                    let change = crate::engine_mcp::mcp_change_events(command);
+                    for event in change.events {
+                        self.send(event);
+                    }
+                    if let Some(name) = change.sign_in {
+                        crate::engine_mcp::sign_in_in_background(name, self.events.clone());
                     }
                 }
                 EngineCommand::RefreshAccount => self.send_account(),
@@ -470,6 +516,14 @@ impl SignedOut<'_> {
             &account,
             true,
             None,
+            None,
+            StatusBarFields {
+                model: engine_status_bar::model_fields(&self.options.model),
+                reasoning_effort: self.options.reasoning_effort.clone(),
+                full_access_allowed: self.options.permission_mode
+                    == PermissionMode::DangerFullAccess,
+                context: None,
+            },
         ));
     }
 
@@ -555,9 +609,14 @@ fn status_event(
     account: &AccountState,
     sign_in_required: bool,
     served_model: Option<&str>,
+    request_tokens_estimate: Option<usize>,
+    bar: StatusBarFields,
 ) -> UiEvent {
     let cwd = env::current_dir().unwrap_or_default();
     let shown = shown_model(model);
+    let served = served_model
+        .map(shown_model)
+        .filter(|served| *served != shown);
     UiEvent::Status {
         model: shown.to_string(),
         permission_mode: permission_mode.as_str().to_string(),
@@ -571,10 +630,34 @@ fn status_event(
         sign_in_required,
         account: account.info.clone(),
         supports_images: crate::gateway_catalog::model_supports_images(model),
-        served_model: served_model
-            .map(shown_model)
-            .filter(|served| *served != shown)
-            .map(ToString::to_string),
+        served_model: served.map(ToString::to_string),
+        served_model_display_name: served.map(crate::gateway_catalog::model_name),
+        request_tokens_estimate: request_tokens_estimate
+            .map(|tokens| u64::try_from(tokens).unwrap_or(u64::MAX)),
+        provider: bar.model.provider,
+        model_display_name: bar.model.display_name,
+        reasoning_effort: bar.reasoning_effort,
+        reasoning_efforts: bar.model.reasoning_efforts,
+        full_access_allowed: bar.full_access_allowed,
+        context: bar.context,
+    }
+}
+
+/// The workspace's local branches ([`UiEvent::Branches`]); none outside a repository.
+fn branches_event() -> UiEvent {
+    let cwd = env::current_dir().unwrap_or_default();
+    let repo = crate::source_control::Repo::discover(&cwd).ok().flatten();
+    let Some(repo) = repo else {
+        return UiEvent::Branches {
+            current: None,
+            branches: Vec::new(),
+            dirty: false,
+        };
+    };
+    UiEvent::Branches {
+        current: repo.branch(),
+        branches: repo.branches().unwrap_or_default(),
+        dirty: repo.has_tracked_changes().unwrap_or(false),
     }
 }
 
@@ -697,51 +780,24 @@ fn shorten_json_strings(input: &str, limit: usize) -> String {
     }
 }
 
-/// `TrustWorkspace`: records trust for the working directory's git root (the folder itself
-/// outside git) in the trust store; the home folder is trusted for this engine only. The
-/// workspace's own settings, hooks and MCP servers load when a session starts, so the UI
-/// restarts the engine to use them.
+/// `TrustWorkspace` for the working directory ([`engine_trust::trust_workspace_events`]).
 fn trust_workspace_events() -> Vec<UiEvent> {
-    let cwd = env::current_dir().unwrap_or_default();
-    match runtime::workspace_trust::trust_workspace_root(&cwd) {
-        Ok(trusted) => vec![
-            UiEvent::WorkspaceTrusted {
-                cwd: cwd.display().to_string(),
-                restart_required: true,
-                root: Some(trusted.root.display().to_string()),
-                session_only: trusted.session_only,
-            },
-            UiEvent::Notice {
-                message: if trusted.session_only {
-                    format!(
-                        "Trusted {} for this session only. Its settings, hooks and MCP servers load when the session restarts.",
-                        cwd.display()
-                    )
-                } else {
-                    format!(
-                        "Trusted {}. Its settings, hooks and MCP servers load when the session restarts.",
-                        trusted.root.display()
-                    )
-                },
-                kind: None,
-            },
-        ],
-        Err(error) => vec![UiEvent::error(format!(
-            "could not trust {}: {error}",
-            cwd.display()
-        ))],
-    }
+    engine_trust::trust_workspace_events(&env::current_dir().unwrap_or_default())
 }
 
 /// `ListExtensions`: the configured MCP servers with what each is doing now, the
 /// plugins, and the skills and agent definitions this workspace sees. A server's
 /// command, arguments, environment and headers are left out: they can hold secrets.
-fn extensions_event() -> UiEvent {
+pub(crate) fn extensions_event() -> UiEvent {
     let cwd = env::current_dir().unwrap_or_default();
     let loader = ConfigLoader::default_for(&cwd);
     let config = loader.load();
     let snapshot = extensions_snapshot();
     let live = snapshot.as_ref().and_then(|snapshot| snapshot.mcp.as_ref());
+    let store = runtime::McpInstallStore::in_config_home(loader.config_home());
+    let unpinned = |server: &runtime::ScopedMcpServerConfig| {
+        runtime::mcp_server_unpinned(&store, server.scope, &server.config, &cwd)
+    };
     let mcp_servers =
         match &config {
             Ok(config) => {
@@ -751,6 +807,13 @@ fn extensions_event() -> UiEvent {
                     .iter()
                     .map(|(name, server)| {
                         let (status, tools, error) = mcp_server_status(name, live);
+                        let tool_tiers = mcp_tool_tiers(server, &tools);
+                        let required = config.mcp().required().get(name);
+                        let (status, error, connect_url) = match hosted_needs_connect(name, server)
+                        {
+                            Some((why, url)) => ("needs_connect", Some(why), Some(url)),
+                            None => (status, error, None),
+                        };
                         McpServerInfo {
                             name: name.clone(),
                             scope: config_scope_id(server.scope).to_string(),
@@ -759,6 +822,13 @@ fn extensions_event() -> UiEvent {
                             tools,
                             error,
                             enabled: true,
+                            catalog: catalog_id(server).or_else(|| {
+                                required.and_then(|required| required.catalog_id.clone())
+                            }),
+                            required: required.is_some(),
+                            unpinned: unpinned(server),
+                            connect_url,
+                            tool_tiers,
                         }
                     })
                     .collect();
@@ -771,8 +841,46 @@ fn extensions_event() -> UiEvent {
                         tools: Vec::new(),
                         error: None,
                         enabled: false,
+                        catalog: catalog_id(server),
+                        required: false,
+                        unpinned: unpinned(server),
+                        connect_url: None,
+                        tool_tiers: BTreeMap::new(),
                     }
                 }));
+                // Configured and switched on, but not started: waiting for approval, or
+                // refused by a deny rule or the connector policy.
+                let not_started = config
+                    .mcp()
+                    .needs_approval()
+                    .iter()
+                    .map(|(name, server)| {
+                        (
+                            name,
+                            server,
+                            "needs_approval",
+                            format!("a workspace server: run /mcp approve {name} to start it"),
+                        )
+                    })
+                    .chain(config.mcp().blocked().iter().map(|(name, blocked)| {
+                        (name, &blocked.server, "blocked", blocked.reason.clone())
+                    }));
+                servers.extend(
+                    not_started.map(|(name, server, status, why)| McpServerInfo {
+                        name: name.clone(),
+                        scope: config_scope_id(server.scope).to_string(),
+                        transport: mcp_transport_id(server.transport()).to_string(),
+                        status: status.to_string(),
+                        tools: Vec::new(),
+                        error: Some(why),
+                        enabled: true,
+                        catalog: catalog_id(server),
+                        required: false,
+                        unpinned: unpinned(server),
+                        connect_url: None,
+                        tool_tiers: BTreeMap::new(),
+                    }),
+                );
                 servers.sort_by(|left, right| left.name.cmp(&right.name));
                 servers
             }
@@ -813,6 +921,57 @@ fn extensions_event() -> UiEvent {
             "agents",
         ),
     }
+}
+
+/// A hosted connector the gateway said is not linked to the account: why, and the
+/// page to link it on. It stays so until the gateway answers it again.
+fn hosted_needs_connect(
+    name: &str,
+    server: &runtime::ScopedMcpServerConfig,
+) -> Option<(String, String)> {
+    if server.transport() != runtime::McpTransport::ManagedProxy {
+        return None;
+    }
+    let url = runtime::zerox_needs_connect(name)?;
+    Some((
+        format!("not linked to your Zero-X account; connect it at {url} (/mcp connect {name})"),
+        url,
+    ))
+}
+
+/// The catalog's tier of each of `tools` on `server` (a hosted connector's entry by its
+/// id, a catalog connector's by its launch spec), as permission prompts use it: a tool the
+/// entry does not list gets its default tier. Empty for any other server.
+fn mcp_tool_tiers(
+    server: &runtime::ScopedMcpServerConfig,
+    tools: &[String],
+) -> BTreeMap<String, String> {
+    let entry = match &server.config {
+        runtime::McpServerConfig::ManagedProxy(proxy) => {
+            runtime::McpCatalog::builtin().get(&proxy.id)
+        }
+        _ if server.scope == runtime::ConfigSource::Bundled => None,
+        config => runtime::mcp_catalog_entry_for(config),
+    };
+    let Some(entry) = entry else {
+        return BTreeMap::new();
+    };
+    tools
+        .iter()
+        .map(|tool| {
+            let tier = entry.pinned_tier(tool).unwrap_or(entry.default_tier);
+            (tool.clone(), tier.as_str().to_string())
+        })
+        .collect()
+}
+
+/// The catalog connector a configured server was added from (see
+/// `runtime::mcp_catalog_entry_for`); bundled servers are Neuron's own.
+fn catalog_id(server: &runtime::ScopedMcpServerConfig) -> Option<String> {
+    if server.scope == runtime::ConfigSource::Bundled {
+        return None;
+    }
+    runtime::mcp_catalog_entry_for(&server.config).map(|entry| entry.id.clone())
 }
 
 /// `SetMcpServerEnabled`: switches the server in the user settings (see
@@ -890,6 +1049,7 @@ fn config_scope_id(scope: ConfigSource) -> &'static str {
         ConfigSource::User => "user",
         ConfigSource::Project => "project",
         ConfigSource::Local => "local",
+        ConfigSource::Managed => "managed",
     }
 }
 
@@ -900,7 +1060,7 @@ pub(crate) fn mcp_transport_id(transport: runtime::McpTransport) -> &'static str
         runtime::McpTransport::Http => "http",
         runtime::McpTransport::Ws => "ws",
         runtime::McpTransport::Sdk => "sdk",
-        runtime::McpTransport::ManagedProxy => "managed_proxy",
+        runtime::McpTransport::ManagedProxy => "zerox",
     }
 }
 
@@ -1042,6 +1202,20 @@ impl Shared {
             .name("neuron-engine-models".to_string())
             .spawn(move || {
                 let _ = events.send(models_event(&current));
+            })
+            .is_ok()
+    }
+
+    /// [`EngineCommand::ListBranches`] while a turn runs, on a thread of its own; `false`
+    /// when the engine is not running.
+    fn answer_branches(&self) -> bool {
+        let Some(events) = lock(&self.events).clone() else {
+            return false;
+        };
+        thread::Builder::new()
+            .name("neuron-engine-branches".to_string())
+            .spawn(move || {
+                let _ = events.send(branches_event());
             })
             .is_ok()
     }
@@ -1211,6 +1385,8 @@ fn forward_commands(
             // It only reads the catalog, so a running turn need not end first. Between
             // turns it queues, after a `SetModel` sent before it.
             EngineCommand::ListModels if shared.turn_running() && shared.answer_models() => {}
+            // Likewise the branches: git reads them, the turn need not end first.
+            EngineCommand::ListBranches if shared.turn_running() && shared.answer_branches() => {}
             command => {
                 if queue.send(command).is_err() {
                     return;
@@ -1258,10 +1434,13 @@ fn models_event(current_model: &str) -> UiEvent {
                     status: model.status.clone(),
                     available_again_at: model.available_again_at.clone(),
                     supports_images: model.supports_images,
+                    provider: model.provider.clone(),
+                    reasoning_efforts: model.reasoning_efforts.clone(),
+                    supports_reasoning: model.supports_reasoning,
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_else(crate::provider_auth::active_provider_model_infos);
     UiEvent::Models {
         current: shown_model(current_model).to_string(),
         models,
@@ -1377,7 +1556,7 @@ fn question_notice(question: &UserQuestion) -> String {
 }
 
 /// The tokens counted between two session totals.
-fn usage_since(before: TokenUsage, after: TokenUsage) -> TokenUsage {
+pub(crate) fn usage_since(before: TokenUsage, after: TokenUsage) -> TokenUsage {
     TokenUsage {
         input_tokens: after.input_tokens.saturating_sub(before.input_tokens),
         output_tokens: after.output_tokens.saturating_sub(before.output_tokens),
@@ -1460,6 +1639,8 @@ struct Engine {
     presence: Option<SessionPresence>,
     /// The UI stopped listening.
     ui_closed: bool,
+    /// Full access may be picked from the status bar: the engine started with it.
+    full_access_allowed: bool,
 }
 
 impl Engine {
@@ -1470,6 +1651,7 @@ impl Engine {
         replies: Receiver<PermissionReply>,
         shared: &Arc<Shared>,
     ) -> Self {
+        let full_access_allowed = cli.permission_mode == PermissionMode::DangerFullAccess;
         let mut engine = Self {
             cli,
             output,
@@ -1482,6 +1664,7 @@ impl Engine {
             account_cache: SharedAccountCache::default(),
             presence: None,
             ui_closed: false,
+            full_access_allowed,
         };
         engine.open_checkpoints();
         engine
@@ -1516,31 +1699,55 @@ impl Engine {
 
     /// Runs queued commands until shutdown. A failure or panic in one command is reported
     /// and the engine keeps going, like the line REPL.
+    ///
+    /// While MCP servers start in the background, it also looks every
+    /// [`MCP_START_POLL`] whether they are up, and then sends the extensions again, so a UI
+    /// shows them ready without asking.
     fn serve(&mut self, queue: &Receiver<EngineCommand>) -> EngineExit {
-        while let Ok(command) = queue.recv() {
-            if self.shared.closing.load(Ordering::SeqCst) {
-                break;
-            }
-            let step = match panic::catch_unwind(AssertUnwindSafe(|| self.handle(command))) {
-                Ok(step) => step,
-                Err(payload) => {
-                    self.send(UiEvent::Error {
-                        message: format!(
-                            "internal error: {}",
-                            repl_loop::panic_message(payload.as_ref())
-                        ),
-                        detail: None,
-                    });
-                    self.finish_turn();
-                    self.persist();
-                    Step::Continue
+        let mut watching_mcp = background_mcp_starting();
+        loop {
+            let next = if watching_mcp {
+                match queue.recv_timeout(MCP_START_POLL) {
+                    Ok(command) => Some(command),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match queue.recv() {
+                    Ok(command) => Some(command),
+                    Err(_) => break,
                 }
             };
-            if repl_loop::force_quit_requested() {
-                return EngineExit::ForceQuit;
+            if let Some(command) = next {
+                if self.shared.closing.load(Ordering::SeqCst) {
+                    break;
+                }
+                let step = match panic::catch_unwind(AssertUnwindSafe(|| self.handle(command))) {
+                    Ok(step) => step,
+                    Err(payload) => {
+                        self.send(UiEvent::Error {
+                            message: format!(
+                                "internal error: {}",
+                                repl_loop::panic_message(payload.as_ref())
+                            ),
+                            detail: None,
+                        });
+                        self.finish_turn();
+                        self.persist();
+                        Step::Continue
+                    }
+                };
+                if repl_loop::force_quit_requested() {
+                    return EngineExit::ForceQuit;
+                }
+                if step == Step::Stop || self.ui_closed {
+                    break;
+                }
             }
-            if step == Step::Stop || self.ui_closed {
-                break;
+            let (watch, push) = mcp_start_watch(watching_mcp, background_mcp_starting());
+            watching_mcp = watch;
+            if push {
+                self.send(extensions_event());
             }
         }
         EngineExit::Shutdown
@@ -1597,6 +1804,20 @@ impl Engine {
                     self.send(event);
                 }
             }
+            EngineCommand::ListConnectorCatalog { query } => {
+                self.send(crate::engine_mcp::connector_catalog_event(&query));
+            }
+            command @ (EngineCommand::AddMcpServer { .. }
+            | EngineCommand::RemoveMcpServer { .. }
+            | EngineCommand::ApproveMcpServer { .. }) => {
+                let change = crate::engine_mcp::mcp_change_events(command);
+                for event in change.events {
+                    self.send(event);
+                }
+                if let Some(name) = change.sign_in {
+                    crate::engine_mcp::sign_in_in_background(name, self.events.clone());
+                }
+            }
             EngineCommand::RefreshAccount => {
                 if !self.read_account_in_background() {
                     self.send_account();
@@ -1623,8 +1844,177 @@ impl Engine {
                     .and_then(|mode| self.rewind(checkpoint, mode, dry_run));
                 self.finish_command(result);
             }
+            EngineCommand::SetReasoningEffort { effort } => {
+                match self.set_reasoning_effort(effort.as_deref()) {
+                    Ok(()) => self.send_status(),
+                    Err(message) => self.send(UiEvent::error(message)),
+                }
+            }
+            EngineCommand::SetPermissionMode { mode } => match self.set_permission_mode(&mode) {
+                Ok(()) => self.send_status(),
+                Err(message) => self.send(UiEvent::error(message)),
+            },
+            EngineCommand::ListBranches => self.send(branches_event()),
+            EngineCommand::SwitchBranch { name, create } => match self.switch_branch(&name, create)
+            {
+                Ok(report) => {
+                    self.notice(&report);
+                    self.send(branches_event());
+                    self.send_status();
+                }
+                Err(message) => self.send(UiEvent::error(message)),
+            },
         }
         Step::Continue
+    }
+
+    /// The thinking level of the next turns: one of the model's levels, or its default.
+    fn set_reasoning_effort(&mut self, effort: Option<&str>) -> Result<(), String> {
+        let fields = engine_status_bar::model_fields(&self.cli.model);
+        let effort = engine_status_bar::resolve_reasoning_effort(
+            effort,
+            fields.reasoning_efforts.as_deref(),
+        )?;
+        self.cli.set_reasoning_effort(effort);
+        Ok(())
+    }
+
+    /// The status bar's permission choice, without a notice: a mode (plan mode off), or
+    /// plan mode on or off.
+    fn set_permission_mode(&mut self, mode: &str) -> Result<(), String> {
+        let choice = engine_status_bar::parse_permission_choice(mode, self.full_access_allowed)?;
+        let wanted = match choice {
+            PermissionChoice::PlanOn => {
+                if !self.cli.plan_mode {
+                    self.cli.plan_mode = true;
+                    self.cli.permission_mode = plan_mode::enter_plan_mode(self.cli.permission_mode);
+                }
+                return Ok(());
+            }
+            PermissionChoice::PlanOff => {
+                if self.cli.plan_mode {
+                    self.cli.plan_mode = false;
+                    self.cli.plan_just_exited = true;
+                    self.cli.permission_mode = plan_mode::exit_plan_mode(self.cli.permission_mode);
+                }
+                return Ok(());
+            }
+            PermissionChoice::Mode(mode) => mode,
+        };
+        if self.cli.plan_mode {
+            // Leave plan mode first, so its saved mode is not restored over this one later.
+            self.cli.plan_mode = false;
+            self.cli.permission_mode = plan_mode::exit_plan_mode(self.cli.permission_mode);
+        }
+        if self.cli.permission_mode == wanted {
+            return Ok(());
+        }
+        self.cli.permission_mode = wanted;
+        let session = self.cli.runtime.session().clone();
+        let session_id = self.cli.session.id.clone();
+        self.rebuild_runtime(session, &session_id)
+            .map_err(|error| error.to_string())?;
+        self.persist();
+        Ok(())
+    }
+
+    /// Checks out a branch of the workspace's repository; refused while files have
+    /// uncommitted changes.
+    fn switch_branch(&mut self, name: &str, create: bool) -> Result<String, String> {
+        let repo = self.repository()?;
+        repo.switch_branch(name, create)
+    }
+
+    /// `/branch`: the local branches; `/branch <name>` switches, `/branch new <name>` (or
+    /// `-c <name>`) creates one. Refused while files have uncommitted changes.
+    fn branch_command(&mut self, args: &str) -> Result<(), String> {
+        let mut words = args.split_whitespace();
+        match (words.next(), words.next(), words.next()) {
+            (None, _, _) => {
+                let repo = self.repository()?;
+                let current = repo.branch();
+                let lines: Vec<String> = repo
+                    .branches()?
+                    .into_iter()
+                    .map(|branch| {
+                        let mark = if current.as_deref() == Some(branch.name.as_str()) {
+                            "* "
+                        } else {
+                            "  "
+                        };
+                        format!("{mark}{}", branch.name)
+                    })
+                    .collect();
+                self.notice(&format!(
+                    "Branches:
+{}
+/branch <name> switches; /branch new <name> creates one.",
+                    lines.join(
+                        "
+"
+                    )
+                ));
+                Ok(())
+            }
+            (Some("new" | "-c" | "--create"), Some(name), None) => {
+                let report = self.switch_branch(name, true)?;
+                self.notice(&report);
+                Ok(())
+            }
+            (Some(name), None, _) if !matches!(name, "new" | "-c" | "--create") => {
+                let report = self.switch_branch(name, false)?;
+                self.notice(&report);
+                Ok(())
+            }
+            _ => Err("Usage: /branch, /branch <name>, or /branch new <name>.".to_string()),
+        }
+    }
+
+    /// `/effort [level]`: shows the thinking level and the model's levels, or sets one.
+    fn effort_command(&mut self, args: &str) -> Result<(), String> {
+        let fields = engine_status_bar::model_fields(&self.cli.model);
+        if args.trim().is_empty() {
+            let current = self
+                .cli
+                .runtime
+                .api_client()
+                .reasoning_effort()
+                .unwrap_or("default")
+                .to_string();
+            let levels = match fields.reasoning_efforts.as_deref() {
+                Some([]) => "This model has no thinking levels.".to_string(),
+                Some(levels) => format!("Levels: {}, or default.", levels.join(", ")),
+                None => format!(
+                    "Levels: {}, or default.",
+                    engine_status_bar::DEFAULT_REASONING_EFFORTS.join(", ")
+                ),
+            };
+            self.notice(&format!(
+                "Thinking level: {current}. {levels} Usage: /effort <level>"
+            ));
+            return Ok(());
+        }
+        self.set_reasoning_effort(Some(args))?;
+        let now = self
+            .cli
+            .runtime
+            .api_client()
+            .reasoning_effort()
+            .unwrap_or("default (the model's own)")
+            .to_string();
+        self.notice(&format!("Thinking level: {now}."));
+        Ok(())
+    }
+
+    /// What fills the context window now.
+    fn context_breakdown(&self) -> neuron_tui::protocol::ContextBreakdown {
+        let runtime = &self.cli.runtime;
+        engine_status_bar::context_breakdown(
+            &runtime.context_snapshot(),
+            runtime.system_prompt(),
+            &runtime.session().messages,
+            runtime.api_client().tool_count(),
+        )
     }
 
     /// Ends a command: its error, if it failed, then `TurnFinished` and the footer.
@@ -1785,6 +2175,9 @@ impl Engine {
         if engine_account::apply_quota_headers(&self.account_cache) {
             self.send_account();
         }
+        if let Some(warning) = crate::plan_window::near_limit_notice() {
+            self.notice(&warning);
+        }
     }
 
     /// Runs `/<command> <args>` and ends it with [`UiEvent::TurnFinished`]. Commands that
@@ -1796,10 +2189,23 @@ impl Engine {
             return Step::Stop;
         }
         let result = match name {
+            "context" if self.shared.report_panels.load(Ordering::SeqCst) => {
+                crate::repl_loop::check_context_argument(args)
+                    .map(|()| {
+                        let report = engine_status_bar::context_report(
+                            &self.cli.model,
+                            &self.context_breakdown(),
+                        );
+                        self.show_report(report);
+                    })
+                    .map_err(Into::into)
+            }
             "context" => self
                 .cli
                 .context_command(args)
                 .map(|report| self.notice(&report)),
+            "effort" | "reasoning" => self.effort_command(args).map_err(Into::into),
+            "branch" => self.branch_command(args).map_err(Into::into),
             "diff" => self.diff(args).map_err(Into::into),
             "commit" if args.is_empty() => self.propose_commit().map_err(Into::into),
             "commit" => self.commit(args).map_err(Into::into),
@@ -1863,6 +2269,10 @@ impl Engine {
                 self.notice(&format_cost_report(usage));
             }
             SlashCommand::Compact => self.compact()?,
+            SlashCommand::Hooks { args } => {
+                let report = self.cli.hooks_report(args.as_deref());
+                self.notice(&report);
+            }
             SlashCommand::Model { model: None } => self.model_report(),
             SlashCommand::Model { model: Some(model) } => {
                 self.switch_model(&model)?;
@@ -1882,6 +2292,7 @@ impl Engine {
                 self.resume(&reference)?;
                 self.persist();
                 self.send_transcript();
+                self.cli.run_session_start_hooks("resume");
             }
             SlashCommand::Plan { mode } => self.plan(mode.as_deref())?,
             SlashCommand::Login => self.login()?,
@@ -1907,6 +2318,7 @@ impl Engine {
                 let report = engine_reports::doctor(&render_doctor_report()?);
                 self.show_report(report);
             }
+            SlashCommand::Providers => self.notice(&crate::provider_auth::providers_report()),
             SlashCommand::Unknown(name) => return Err(format_unknown_slash_command(&name).into()),
             other => {
                 return Err(format!(
@@ -1977,6 +2389,17 @@ impl Engine {
         // A session on the gateway needs the login; other providers do not.
         let sign_in_required = !self.account.signed_in
             && active_provider().is_some_and(|active| active.id == ProviderId::ZeroX);
+        let bar = StatusBarFields {
+            model: engine_status_bar::model_fields(&self.cli.model),
+            reasoning_effort: self
+                .cli
+                .runtime
+                .api_client()
+                .reasoning_effort()
+                .map(ToOwned::to_owned),
+            full_access_allowed: self.full_access_allowed,
+            context: Some(self.context_breakdown()),
+        };
         let status = status_event(
             &self.cli.model,
             self.cli.permission_mode,
@@ -1986,6 +2409,8 @@ impl Engine {
             &self.account,
             sign_in_required,
             self.cli.runtime.served_model(),
+            Some(self.cli.runtime.request_tokens_estimate()),
+            bar,
         );
         *lock(&self.shared.last_status) = Some(status.clone());
         self.send(status);
@@ -2077,7 +2502,37 @@ impl Engine {
         }
         let report = format_model_switch_report(&previous, &self.cli.model, message_count);
         self.notice(&report);
+        self.carry_reasoning_effort();
         Ok(())
+    }
+
+    /// After a model switch: keeps the thinking level only when the new model takes it,
+    /// else goes back to the model's default, so no request sends a level it does not know.
+    fn carry_reasoning_effort(&mut self) {
+        let Some(kept) = self
+            .cli
+            .runtime
+            .api_client()
+            .reasoning_effort()
+            .map(ToOwned::to_owned)
+        else {
+            return;
+        };
+        let fields = engine_status_bar::model_fields(&self.cli.model);
+        let carried = engine_status_bar::carried_reasoning_effort(
+            Some(&kept),
+            fields.reasoning_efforts.as_deref(),
+        );
+        if carried.as_deref() == Some(kept.as_str()) {
+            return;
+        }
+        let dropped = carried.is_none();
+        self.cli.set_reasoning_effort(carried);
+        if dropped {
+            self.notice(&format!(
+                "Thinking level: default. This model does not take `{kept}`."
+            ));
+        }
     }
 
     fn permissions(&mut self, mode: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
@@ -2107,6 +2562,7 @@ impl Engine {
     }
 
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.cli.run_manual_pre_compact_hooks();
         let result = self.cli.runtime.compact(CompactionConfig::default());
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
@@ -2114,6 +2570,9 @@ impl Engine {
         self.rebuild_runtime(result.compacted_session, &session_id)?;
         self.cli.persist_session()?;
         self.notice(&format_compact_report(removed, kept, removed == 0));
+        if removed > 0 {
+            self.cli.run_session_start_hooks("compact");
+        }
         Ok(())
     }
 
@@ -2137,6 +2596,7 @@ impl Engine {
         let report = self.cli.session_cleared_report(&previous);
         self.notice(&report);
         self.persist();
+        self.cli.run_session_start_hooks("clear");
         Ok(())
     }
 
@@ -2520,21 +2980,10 @@ impl Engine {
 
     /// `/rewind`: the checkpoints; `/rewind <id> [code|chat|both]`: goes back to one.
     fn rewind_command(&mut self, args: &str) -> Result<(), String> {
-        let mut words = args.split_whitespace();
-        let Some(id) = words.next() else {
+        let Some((id, mode)) = parse_rewind_args(args)? else {
             self.list_checkpoints();
             return Ok(());
         };
-        let id = id
-            .trim_start_matches('#')
-            .parse::<u64>()
-            .map_err(|_| format!("`{id}` is not a checkpoint number. {REWIND_USAGE}"))?;
-        let mode = words
-            .next()
-            .map_or(Ok(RewindMode::CodeAndChat), parse_rewind_mode)?;
-        if words.next().is_some() {
-            return Err(REWIND_USAGE.to_string());
-        }
         self.rewind(id, mode, false)
     }
 
@@ -2607,6 +3056,26 @@ impl Engine {
 
 const REWIND_USAGE: &str = "Usage: /rewind [<id> [code|chat|both]]";
 
+/// The arguments of `/rewind`, here and in the line REPL: `None` for none (list the
+/// checkpoints), else the checkpoint and what to put back (both by default).
+pub(crate) fn parse_rewind_args(args: &str) -> Result<Option<(u64, RewindMode)>, String> {
+    let mut words = args.split_whitespace();
+    let Some(id) = words.next() else {
+        return Ok(None);
+    };
+    let id = id
+        .trim_start_matches('#')
+        .parse::<u64>()
+        .map_err(|_| format!("`{id}` is not a checkpoint number. {REWIND_USAGE}"))?;
+    let mode = words
+        .next()
+        .map_or(Ok(RewindMode::CodeAndChat), parse_rewind_mode)?;
+    if words.next().is_some() {
+        return Err(REWIND_USAGE.to_string());
+    }
+    Ok(Some((id, mode)))
+}
+
 /// A rewind mode as the protocol or `/rewind` names it.
 fn parse_rewind_mode(mode: &str) -> Result<RewindMode, String> {
     RewindMode::parse(mode).ok_or_else(|| {
@@ -2617,10 +3086,12 @@ fn parse_rewind_mode(mode: &str) -> Result<RewindMode, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        definitions, forward_commands, git_status, mcp_server_status, plain_notice,
-        question_notice, shorten, shorten_json_strings, spawn, transcript_event, EngineExit,
+        definitions, forward_commands, git_status, hosted_needs_connect, mcp_server_status,
+        mcp_start_watch, mcp_tool_tiers, mcp_transport_id, plain_notice, question_notice, shorten,
+        shorten_json_strings, spawn, status_event, transcript_event, AccountState, EngineExit,
         EngineHandle, EngineOptions, McpRuntimeView, RunningTurn, Shared,
     };
+    use crate::engine_status_bar::StatusBarFields;
     use crate::repl_loop::InterruptPresses;
     use crate::tests::{env_lock, with_current_dir};
     use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
@@ -2841,6 +3312,53 @@ mod tests {
             }
         }
         contents
+    }
+
+    /// The status names the model that answered by name, never by the gateway's route to
+    /// it; the raw id stays beside it.
+    #[test]
+    fn the_status_names_the_served_model_without_its_route() {
+        let status = |served: Option<&str>| {
+            status_event(
+                "openai/auto",
+                PermissionMode::WorkspaceWrite,
+                "s",
+                false,
+                0,
+                &AccountState::default(),
+                false,
+                served,
+                None,
+                StatusBarFields::default(),
+            )
+        };
+        match status(Some("openai/unit-maker/unit-flash:free")) {
+            UiEvent::Status {
+                model,
+                served_model,
+                served_model_display_name,
+                ..
+            } => {
+                assert_eq!(model, "auto");
+                assert_eq!(served_model.as_deref(), Some("unit-maker/unit-flash:free"));
+                assert_eq!(served_model_display_name.as_deref(), Some("unit-flash"));
+            }
+            other => panic!("not a status: {other:?}"),
+        }
+        // Nothing to name when `auto` itself (or nothing yet) answered.
+        for served in [None, Some("openai/auto")] {
+            match status(served) {
+                UiEvent::Status {
+                    served_model,
+                    served_model_display_name,
+                    ..
+                } => {
+                    assert_eq!(served_model, None);
+                    assert_eq!(served_model_display_name, None);
+                }
+                other => panic!("not a status: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -3190,7 +3708,10 @@ mod tests {
             .replies
             .send(PermissionReply {
                 id: denied,
-                decision: PermissionDecision::Deny { note: None },
+                decision: PermissionDecision::Deny {
+                    note: None,
+                    session: false,
+                },
             })
             .unwrap();
         let turn = turn_events(&engine.events);
@@ -3204,10 +3725,13 @@ mod tests {
                 turn, cumulative, ..
             }, UiEvent::TurnFinished] => {
                 assert_eq!(id, "toolu_bash_prompt_deny");
-                assert_eq!(output, "tool 'bash' denied by user approval prompt");
+                assert_eq!(
+                    output,
+                    "The user declined `printf 'should not run' | tee denied.txt`. Do not retry it or a variant; choose another approach or ask the user."
+                );
                 assert!(
                     text.starts_with("bash denied as expected: ")
-                        && text.contains("denied by user approval prompt"),
+                        && text.contains("The user declined"),
                     "{text}"
                 );
                 assert_eq!(turn, cumulative, "a cleared session counts afresh");
@@ -3343,6 +3867,25 @@ mod tests {
             })
             .unwrap();
 
+        // A thinking level for the next turns, kept across a switch to a model that
+        // takes it (without a catalog, every model takes low, medium and high).
+        engine
+            .commands
+            .send(EngineCommand::SetReasoningEffort {
+                effort: Some("HIGH".into()),
+            })
+            .unwrap();
+        match events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Status { .. })
+        })
+        .pop()
+        {
+            Some(UiEvent::Status {
+                reasoning_effort, ..
+            }) => assert_eq!(reasoning_effort.as_deref(), Some("high")),
+            other => panic!("expected the footer status, got {other:?}"),
+        }
+
         // SetModel switches for the next turn.
         engine
             .commands
@@ -3357,9 +3900,23 @@ mod tests {
         })
         .pop()
         {
-            Some(UiEvent::Status { model, .. }) => assert!(model.contains("claude-opus")),
+            Some(UiEvent::Status {
+                model,
+                reasoning_effort,
+                ..
+            }) => {
+                assert!(model.contains("claude-opus"));
+                assert_eq!(reasoning_effort.as_deref(), Some("high"));
+            }
             other => panic!("expected the footer status, got {other:?}"),
         }
+        engine
+            .commands
+            .send(EngineCommand::SetReasoningEffort { effort: None })
+            .unwrap();
+        events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Status { .. })
+        });
 
         // Only the Zero-X gateway publishes a model catalog.
         engine.commands.send(EngineCommand::ListModels).unwrap();
@@ -3472,7 +4029,13 @@ mod tests {
         }
         fs::remove_file(&settings).expect("settings removed");
 
-        // Trust the workspace: recorded, and the footer says so; settings load on restart.
+        // Trust the workspace after its screen is drawn again from the files as they are now
+        // (what was shown is what is trusted): recorded, and the footer says so; settings
+        // load on restart.
+        engine.commands.send(EngineCommand::TrustPreview).unwrap();
+        events_until(&engine.events, |event| {
+            matches!(event, UiEvent::TrustPreview { .. })
+        });
         engine.commands.send(EngineCommand::TrustWorkspace).unwrap();
         let trusted = events_until(&engine.events, |event| {
             matches!(event, UiEvent::Status { .. })
@@ -3546,6 +4109,15 @@ mod tests {
             }
             other => panic!("expected the model list, got {other:?}"),
         }
+        // Nor do the branches for the status bar's picker.
+        engine.commands.send(EngineCommand::ListBranches).unwrap();
+        let listed = events_until(&engine.events, |event| {
+            matches!(event, UiEvent::Branches { .. })
+        });
+        assert!(
+            !listed.contains(&UiEvent::TurnFinished),
+            "answered during the turn: {listed:?}"
+        );
         engine.commands.send(EngineCommand::Shutdown).unwrap();
         let turn = turn_events(&engine.events);
         assert!(
@@ -3712,7 +4284,17 @@ mod tests {
                 signed_out: None,
             })
             .expect("the engine starts");
-            assert!(matches!(next_event(&engine.events), UiEvent::Ready { .. }));
+            // Notices may come first: the notice hook is the process's, and a test that
+            // loads deprecated settings at the same time warns through it.
+            let before_ready = events_until(&engine.events, |event| {
+                matches!(event, UiEvent::Ready { .. })
+            });
+            assert!(
+                before_ready
+                    .iter()
+                    .all(|event| matches!(event, UiEvent::Ready { .. } | UiEvent::Notice { .. })),
+                "{before_ready:?}"
+            );
             events_until(&engine.events, |event| {
                 matches!(event, UiEvent::Status { .. })
             });
@@ -3918,6 +4500,173 @@ mod tests {
             mcp_server_status("docs", None),
             ("not_started", Vec::new(), None)
         );
+    }
+
+    #[test]
+    fn hosted_and_catalog_connectors_list_their_tool_tiers_and_others_none() {
+        let hosted = runtime::ScopedMcpServerConfig {
+            scope: runtime::ConfigSource::Managed,
+            config: runtime::McpServerConfig::ManagedProxy(runtime::McpManagedProxyServerConfig {
+                url: String::new(),
+                id: "github".to_string(),
+            }),
+        };
+        let tools = vec![
+            "get_me".to_string(),
+            "merge_pull_request".to_string(),
+            "brand_new_tool".to_string(),
+        ];
+        let tiers = mcp_tool_tiers(&hosted, &tools);
+        assert_eq!(tiers.get("get_me").map(String::as_str), Some("read"));
+        assert_eq!(
+            tiers.get("merge_pull_request").map(String::as_str),
+            Some("destructive")
+        );
+        // A tool the entry does not list gets its default tier, as its prompts do.
+        let github = runtime::McpCatalog::builtin().get("github").unwrap();
+        assert_eq!(
+            tiers.get("brand_new_tool").map(String::as_str),
+            Some(github.default_tier.as_str())
+        );
+
+        let local = runtime::ScopedMcpServerConfig {
+            scope: runtime::ConfigSource::User,
+            config: runtime::McpServerConfig::Stdio(runtime::McpStdioServerConfig {
+                command: "notes".to_string(),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                tool_call_timeout_ms: None,
+                sandbox: None,
+            }),
+        };
+        assert!(mcp_tool_tiers(&local, &tools).is_empty());
+    }
+
+    #[test]
+    fn the_extensions_go_out_again_once_a_watched_mcp_start_ends() {
+        // Nothing starting: nothing to watch or send.
+        assert_eq!(mcp_start_watch(false, false), (false, false));
+        // A start is seen, and watched while it lasts.
+        assert_eq!(mcp_start_watch(false, true), (true, false));
+        assert_eq!(mcp_start_watch(true, true), (true, false));
+        // It ended: the extensions go out once, and the watch stops.
+        assert_eq!(mcp_start_watch(true, false), (false, true));
+    }
+
+    /// The engine itself: while an MCP server starts in the background, the idle engine
+    /// looks every `MCP_START_POLL` and sends the extensions once the start ended, with
+    /// no `ListExtensions` asked.
+    #[test]
+    fn an_idle_engine_sends_the_extensions_once_a_background_mcp_start_ends() {
+        /// Puts the process's MCP startup back to the default on drop.
+        struct WaitAgain;
+        impl Drop for WaitAgain {
+            fn drop(&mut self) {
+                crate::progress::set_mcp_startup(crate::progress::McpStartup::Wait);
+            }
+        }
+
+        let _env = env_lock();
+        let workspace = unique_dir("mcp-watch");
+        let config_home = unique_dir("mcp-watch-config");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&config_home).expect("config home");
+        // A server that says nothing for a few seconds, then exits: its start ends,
+        // failed, after the engine is serving.
+        let (command, args) = if cfg!(windows) {
+            ("cmd", vec!["/c", "ping -n 4 127.0.0.1 >nul"])
+        } else {
+            ("sh", vec!["-c", "sleep 3"])
+        };
+        fs::write(
+            config_home.join("settings.json"),
+            serde_json::json!({
+                "defaultMcpServers": false,
+                "mcpServers": {"slow": {"command": command, "args": args}}
+            })
+            .to_string(),
+        )
+        .expect("settings");
+        let vars = EnvVars::set(&[
+            ("ANTHROPIC_API_KEY", Some(OsStr::new("test-engine-key"))),
+            ("ANTHROPIC_AUTH_TOKEN", None),
+            // No turn runs: nothing is sent here.
+            ("ANTHROPIC_BASE_URL", Some(OsStr::new("http://127.0.0.1:9"))),
+            ("NEURON_CONFIG_HOME", Some(config_home.as_os_str())),
+            ("NEURON_HOME", Some(config_home.as_os_str())),
+            ("NEURON_CREDENTIAL_STORE", Some(OsStr::new("file"))),
+            ("NEURON_TOKEN", None),
+        ]);
+        // As `neuron engine` starts them (engine_stdio.rs).
+        crate::progress::set_mcp_startup(crate::progress::McpStartup::Background);
+        let wait_again = WaitAgain;
+
+        with_current_dir(&workspace, || {
+            let engine = spawn(EngineOptions {
+                model: "claude-sonnet-4-6".to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::WorkspaceWrite,
+                reasoning_effort: None,
+                resume: None,
+                signed_out: None,
+            })
+            .expect("the engine starts");
+            // No command is sent: the server list arrives on its own once the start ended.
+            let slow_status = |event: &UiEvent| match event {
+                UiEvent::Extensions { mcp_servers, .. } => mcp_servers
+                    .iter()
+                    .find(|server| server.name == "slow")
+                    .map(|server| server.status.clone()),
+                _ => None,
+            };
+            let seen = events_until(&engine.events, |event| {
+                slow_status(event).is_some_and(|status| status != "starting")
+            });
+            let ended = slow_status(seen.last().expect("an event")).expect("the slow server");
+            assert_eq!(ended, "failed", "{seen:?}");
+            assert_eq!(engine.finish(), EngineExit::Shutdown);
+        });
+
+        drop(wait_again);
+        drop(vars);
+        let _ = fs::remove_dir_all(&workspace);
+        let _ = fs::remove_dir_all(&config_home);
+    }
+
+    #[test]
+    fn a_hosted_connector_needs_connect_while_the_gateway_says_it_is_not_linked() {
+        let hosted = runtime::ScopedMcpServerConfig {
+            scope: runtime::ConfigSource::Managed,
+            config: runtime::McpServerConfig::ManagedProxy(runtime::McpManagedProxyServerConfig {
+                url: String::new(),
+                id: "github".to_string(),
+            }),
+        };
+        let local = runtime::ScopedMcpServerConfig {
+            scope: runtime::ConfigSource::User,
+            config: runtime::McpServerConfig::Stdio(runtime::McpStdioServerConfig {
+                command: "notes".to_string(),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                tool_call_timeout_ms: None,
+                sandbox: None,
+            }),
+        };
+        let url = "https://zero-x.live/dashboard#connectors";
+        assert_eq!(hosted_needs_connect("engine-hosted", &hosted), None);
+        runtime::mcp_zerox::note_needs_connect("engine-hosted", url);
+        runtime::mcp_zerox::note_needs_connect("engine-local", url);
+        let (why, connect_url) = hosted_needs_connect("engine-hosted", &hosted).expect("waiting");
+        assert_eq!(connect_url, url);
+        assert!(why.contains("/mcp connect engine-hosted"), "{why}");
+        assert_eq!(
+            hosted_needs_connect("engine-local", &local),
+            None,
+            "not hosted"
+        );
+        runtime::mcp_zerox::note_connected("engine-hosted");
+        assert_eq!(hosted_needs_connect("engine-hosted", &hosted), None);
+        assert_eq!(mcp_transport_id(hosted.transport()), "zerox");
     }
 
     #[test]

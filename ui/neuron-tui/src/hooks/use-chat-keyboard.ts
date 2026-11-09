@@ -14,6 +14,7 @@ import {
   resolveChatKeyboardAction,
   type ChatKeyboardState,
   type ChatKeyboardAction,
+  type StatusPickerKey,
 } from '../utils/keyboard-actions'
 import { markReturnKeySeenForKey } from '../utils/terminal-enter-detection'
 
@@ -86,6 +87,10 @@ export type ChatKeyboardHandlers = {
 
   // Toggle all handler
   onToggleAll: () => void
+
+  // Status bar: Shift+Tab and Alt+M/T/W/P/C (optional: surfaces without the bar ignore them)
+  onCyclePermission?: () => void
+  onOpenStatusPicker?: (picker: StatusPickerKey) => void
 }
 
 /**
@@ -251,6 +256,14 @@ function dispatchAction(
       return true
     case 'scroll-down':
       handlers.onScrollDown()
+      return true
+    case 'cycle-permission':
+      if (!handlers.onCyclePermission) return false
+      handlers.onCyclePermission()
+      return true
+    case 'open-status-picker':
+      if (!handlers.onOpenStatusPicker) return false
+      handlers.onOpenStatusPicker(action.picker)
       return true
     case 'toggle-all':
       handlers.onToggleAll()

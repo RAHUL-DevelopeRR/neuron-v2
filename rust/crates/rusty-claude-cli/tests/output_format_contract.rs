@@ -1,9 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
 use runtime::Session;
 use serde_json::Value;
 
@@ -380,6 +381,75 @@ fn resumed_version_and_init_emit_structured_json_when_requested() {
     );
     assert_eq!(init["kind"], "init");
     assert!(root.join("NEURON.md").exists());
+}
+
+/// `--resume X -p` in JSON: `usage` and `estimated_cost` are this run's, not the totals
+/// of the session it continued, which are in `session_usage`.
+#[test]
+fn a_resumed_prompt_reports_its_own_usage_and_the_session_total() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let root = unique_temp_dir("resume-prompt-usage");
+    let home = root.join("home");
+    fs::create_dir_all(&home).expect("home");
+    fs::write(root.join("settings.json"), r#"{"defaultMcpServers":false}"#).expect("settings");
+    let prompt = format!("{SCENARIO_PREFIX}token_cost_reporting");
+    let run = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_neuron"));
+        command
+            .current_dir(&root)
+            .env_clear()
+            .env("ANTHROPIC_API_KEY", "test-parity-key")
+            .env("ANTHROPIC_BASE_URL", server.base_url())
+            .env("CLAW_CONFIG_HOME", &root)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("NO_COLOR", "1")
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .args(["--model", "sonnet", "--output-format", "json"])
+            .args(args)
+            .stdin(Stdio::null());
+        // Windows networking needs SystemRoot even in a cleared environment.
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
+        let output = command.output().expect("neuron should run");
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\n\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).expect("stdout should be valid json")
+    };
+
+    // Each turn of the scenario costs 1,000 input and 500 output tokens.
+    let first = run(&["prompt", &prompt]);
+    assert_eq!(first["usage"]["input_tokens"], 1_000, "{first}");
+    assert_eq!(first["session_usage"]["input_tokens"], 1_000, "{first}");
+    let session_id = first["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+
+    let resumed = run(&["--resume", &session_id, "-p", &prompt]);
+    assert_eq!(resumed["session_id"], session_id, "{resumed}");
+    assert_eq!(resumed["usage"]["input_tokens"], 1_000, "{resumed}");
+    assert_eq!(resumed["usage"]["output_tokens"], 500, "{resumed}");
+    assert_eq!(resumed["session_usage"]["input_tokens"], 2_000, "{resumed}");
+    assert_eq!(
+        resumed["session_usage"]["output_tokens"], 1_000,
+        "{resumed}"
+    );
+    // The cost of this run alone, the same as the first run's.
+    assert_eq!(resumed["estimated_cost_known"], true, "{resumed}");
+    assert_eq!(
+        resumed["estimated_cost"], first["estimated_cost"],
+        "{resumed}"
+    );
+    let _ = fs::remove_dir_all(&root);
 }
 
 fn assert_json_command(current_dir: &Path, args: &[&str]) -> Value {

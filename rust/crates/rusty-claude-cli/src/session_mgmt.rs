@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use runtime::Session;
+use sha2::{Digest, Sha256};
 
 use crate::brand::*;
 use crate::tool_ui::display_clean_path;
@@ -168,41 +169,79 @@ pub fn load_session_reference_in_store(
 /// a second run that would continue the same session is refused instead of overwriting
 /// the first one's turns: each run saves its whole session when a turn ends.
 ///
-/// An OS lock on `<session file>.lock`, released when this is dropped or the process ends,
-/// however it ends. The lock file stays: removing it while another run is opening it
-/// could leave two runs holding locks on two different files.
+/// An OS lock on the session's lock file under `<NEURON_HOME>/locks` ([`session_lock_path`]),
+/// released when this is dropped or the process ends, however it ends. Lock files are kept
+/// there, not beside the session file, so `--resume <file>` leaves nothing next to a file
+/// it was given. A lock file stays: removing it while another run is opening it could
+/// leave two runs holding locks on two different files.
+///
+/// Releases before 7.0.0-alpha.4 locked `<session file>.lock` beside the file. For one
+/// release that lock is honoured too: when it is there it is locked as well, so a session
+/// a run of an older release is continuing is still refused. It is never created.
 #[derive(Debug)]
 pub struct SessionLock {
     file: fs::File,
     path: PathBuf,
+    legacy: Option<(fs::File, PathBuf)>,
 }
 
 impl SessionLock {
     /// Locks the session file at `session_path` (which need not exist yet), or says
     /// that another run holds it.
     pub fn acquire(session_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let path = session_lock_path(session_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let path = prepare_lock_path(session_path)?;
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&path)?;
         match file.try_lock() {
-            Ok(()) => Ok(Self { file, path }),
-            Err(fs::TryLockError::WouldBlock) => Err(session_in_use(session_path).into()),
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => return Err(session_in_use(session_path).into()),
+            Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        let legacy = lock_legacy(session_path)?;
+        Ok(Self { file, path, legacy })
+    }
+
+    /// Locks the file of a new session, which must not exist yet. `None` when its id is
+    /// taken: the session file is there, or its lock file is (another run picked the same
+    /// id and holds it, or held it). The lock file is created with `create_new`, so two
+    /// runs that picked the same id can't both get it.
+    pub fn claim_new(session_path: &Path) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        if session_path.exists() || legacy_session_lock_path(session_path).exists() {
+            return Ok(None);
+        }
+        let path = prepare_lock_path(session_path)?;
+        let file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self {
+                file,
+                path,
+                legacy: None,
+            })),
+            Err(fs::TryLockError::WouldBlock) => Ok(None),
             Err(fs::TryLockError::Error(error)) => Err(error.into()),
         }
     }
 
-    /// Lets go of the session and removes the lock file, for a session file that was
+    /// Lets go of the session and removes its lock files, for a session file that was
     /// removed too.
     pub fn remove(self) {
-        let path = self.path.clone();
+        let mut paths = vec![self.path.clone()];
+        paths.extend(self.legacy.as_ref().map(|(_, path)| path.clone()));
         drop(self);
-        let _ = fs::remove_file(path);
+        for path in paths {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -210,12 +249,86 @@ impl Drop for SessionLock {
     fn drop(&mut self) {
         // Closing the file unlocks it too, but Windows may take a moment to do so.
         let _ = self.file.unlock();
+        if let Some((legacy, _)) = &self.legacy {
+            let _ = legacy.unlock();
+        }
     }
 }
 
-/// The lock file of the session file at `session_path`: `<name>.jsonl.lock` beside it,
-/// which session listings skip.
+/// The lock file of the session file at `session_path`, with its folders made: the
+/// session's own folder first, so the path it is named by is the one it will have
+/// once saved.
+fn prepare_lock_path(session_path: &Path) -> io::Result<PathBuf> {
+    if let Some(parent) = session_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let path = session_lock_path(session_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(path)
+}
+
+/// The lock of an older release beside the session file, locked when it is there.
+fn lock_legacy(
+    session_path: &Path,
+) -> Result<Option<(fs::File, PathBuf)>, Box<dyn std::error::Error>> {
+    let path = legacy_session_lock_path(session_path);
+    // Not there (the usual case), or not ours to open: nothing to honour.
+    let Ok(file) = fs::OpenOptions::new().write(true).open(&path) else {
+        return Ok(None);
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(Some((file, path))),
+        Err(fs::TryLockError::WouldBlock) => Err(session_in_use(session_path).into()),
+        Err(fs::TryLockError::Error(error)) => Err(error.into()),
+    }
+}
+
+/// Where run locks live: `<NEURON_HOME>/locks`.
+fn locks_dir() -> PathBuf {
+    // Unit tests never write to the developer's own Neuron home, and a test that points
+    // NEURON_HOME elsewhere must not move the lock of a session another test holds.
+    if cfg!(test) {
+        return env::temp_dir().join(format!("neuron-test-locks-{}", std::process::id()));
+    }
+    crate::credentials::neuron_home().join("locks")
+}
+
+/// The lock file of the session file at `session_path`:
+/// `<NEURON_HOME>/locks/<sha256 of its canonical path>.lock`, the same file however the
+/// session is named (an id, `latest`, a relative or absolute path).
 pub fn session_lock_path(session_path: &Path) -> PathBuf {
+    let canonical = canonical_session_path(session_path);
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    locks_dir().join(format!("{}.lock", hex::encode(digest)))
+}
+
+/// `session_path` with links and `.` resolved. A new session's file does not exist yet,
+/// so its folder is resolved and its name added: the path it will have once saved.
+fn canonical_session_path(session_path: &Path) -> PathBuf {
+    if let Ok(path) = fs::canonicalize(session_path) {
+        return path;
+    }
+    let absolute = if session_path.is_absolute() {
+        session_path.to_path_buf()
+    } else {
+        env::current_dir().map_or_else(|_| session_path.to_path_buf(), |cwd| cwd.join(session_path))
+    };
+    match (absolute.parent(), absolute.file_name()) {
+        (Some(parent), Some(name)) => {
+            fs::canonicalize(parent).map_or_else(|_| absolute.clone(), |parent| parent.join(name))
+        }
+        _ => absolute,
+    }
+}
+
+/// Where releases before 7.0.0-alpha.4 kept the lock: `<name>.jsonl.lock` beside the
+/// session file.
+fn legacy_session_lock_path(session_path: &Path) -> PathBuf {
     let mut name = session_path
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
@@ -244,27 +357,66 @@ pub struct OpenSession {
     pub lock: SessionLock,
 }
 
+/// How many ids a new session tries before giving up. Ids differ by process and carry
+/// random bits, so even a second try is rare.
+const NEW_SESSION_ATTEMPTS: usize = 8;
+
 /// A new session for this run, locked, not saved yet.
 pub fn new_open_session() -> Result<OpenSession, Box<dyn std::error::Error>> {
-    let session = new_cli_session()?;
-    let handle = create_managed_session_handle(&session.session_id)?;
-    let lock = SessionLock::acquire(&handle.path)?;
-    Ok(OpenSession {
-        session: session.with_persistence_path(handle.path.clone()),
-        handle,
-        lock,
-    })
+    let store = current_session_store()?;
+    crate::session_presence::record_project(store.workspace_root());
+    open_new_session_in(&store, new_cli_session)
+}
+
+/// A new session in `store` with the first id from `fresh` that no other run has taken:
+/// two runs started at once must each get a session of their own, not be refused as
+/// sharing one.
+fn open_new_session_in(
+    store: &runtime::SessionStore,
+    mut fresh: impl FnMut() -> Result<Session, Box<dyn std::error::Error>>,
+) -> Result<OpenSession, Box<dyn std::error::Error>> {
+    for _ in 0..NEW_SESSION_ATTEMPTS {
+        let session = fresh()?;
+        let handle = store.create_handle(&session.session_id);
+        if let Some(lock) = SessionLock::claim_new(&handle.path)? {
+            return Ok(OpenSession {
+                session: session.with_persistence_path(handle.path.clone()),
+                handle: SessionHandle {
+                    id: handle.id,
+                    path: handle.path,
+                },
+                lock,
+            });
+        }
+    }
+    Err(format!(
+        "could not start a new session: {NEW_SESSION_ATTEMPTS} new session ids in a row were \
+already taken in {}",
+        store.sessions_dir().display()
+    )
+    .into())
 }
 
 /// The saved session `reference` names, opened for this run to continue. It is locked
 /// before it is read, so what loads is what the last run saved, and no other run writes
-/// it until the lock is dropped.
+/// it until the lock is dropped. A file outside the sessions folder (`--resume
+/// ./README.md`) is read as a session before it is locked, so a file that is not one
+/// gets no lock.
 pub fn open_session_reference(reference: &str) -> Result<OpenSession, Box<dyn std::error::Error>> {
-    let store = current_session_store()?;
-    let resolved = resolve_session_reference_in_store(&store, reference)?;
+    open_session_reference_in_store(&current_session_store()?, reference)
+}
+
+fn open_session_reference_in_store(
+    store: &runtime::SessionStore,
+    reference: &str,
+) -> Result<OpenSession, Box<dyn std::error::Error>> {
+    let resolved = resolve_session_reference_in_store(store, reference)?;
+    let path = resolved.path.display().to_string();
+    if !resolved.path.starts_with(store.sessions_dir()) {
+        load_session_reference_in_store(store, &path)?;
+    }
     let lock = SessionLock::acquire(&resolved.path)?;
-    let (handle, session) =
-        load_session_reference_in_store(&store, &resolved.path.display().to_string())?;
+    let (handle, session) = load_session_reference_in_store(store, &path)?;
     Ok(OpenSession {
         handle,
         session,
@@ -412,7 +564,11 @@ pub fn session_clear_backup_path(session_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{same_session_file, session_lock_path, SessionLock};
+    use super::{
+        locks_dir, open_new_session_in, open_session_reference_in_store, same_session_file,
+        session_lock_path, SessionLock,
+    };
+    use sha2::{Digest, Sha256};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -442,13 +598,149 @@ mod tests {
         drop(held);
         let again = SessionLock::acquire(&session).expect("free once the first run let go");
 
-        // Beside the session file, with an extension session listings skip.
+        // Under the locks folder, named by the session's canonical path; nothing beside
+        // the session file.
         let lock = session_lock_path(&session);
-        assert_eq!(lock, session.with_file_name("session-1.jsonl.lock"));
+        assert_eq!(lock.parent(), Some(locks_dir().as_path()));
+        let canonical = fs::canonicalize(session.parent().expect("temp dir"))
+            .expect("session folder")
+            .join("session-1.jsonl");
+        let name = format!(
+            "{}.lock",
+            hex::encode(Sha256::digest(canonical.to_string_lossy().as_bytes()))
+        );
+        assert_eq!(
+            lock.file_name().and_then(|name| name.to_str()),
+            Some(&*name)
+        );
         assert!(lock.is_file());
+        assert!(!session.with_file_name("session-1.jsonl.lock").exists());
+        // The same lock however the session is named.
+        let roundabout = session
+            .parent()
+            .expect("temp dir")
+            .join(".")
+            .join("session-1.jsonl");
+        assert_eq!(session_lock_path(&roundabout), lock);
         again.remove();
         assert!(!lock.exists());
         let _ = fs::remove_dir_all(session.parent().expect("temp dir"));
+    }
+
+    /// A run of an older release locks `<session>.jsonl.lock` beside the file; while it
+    /// holds it, the session is in use for this release too.
+    #[test]
+    fn the_lock_of_an_older_release_is_honoured() {
+        let session = temp_session("legacy");
+        fs::create_dir_all(session.parent().expect("temp dir")).expect("temp dir");
+        let legacy_path = session.with_file_name("session-1.jsonl.lock");
+        let legacy = fs::File::create(&legacy_path).expect("legacy lock");
+        legacy.try_lock().expect("the older run holds the session");
+
+        let error = SessionLock::acquire(&session).expect_err("the older run holds it");
+        assert!(
+            error
+                .to_string()
+                .contains("is in use by another neuron run"),
+            "{error}"
+        );
+        assert!(SessionLock::claim_new(&session).expect("claim").is_none());
+
+        // Once it is free, this release locks both, so the older release is refused.
+        drop(legacy);
+        let held = SessionLock::acquire(&session).expect("free once the older run let go");
+        let older = fs::OpenOptions::new()
+            .write(true)
+            .open(&legacy_path)
+            .expect("legacy lock");
+        assert!(matches!(
+            older.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        drop(older);
+        held.remove();
+        assert!(!legacy_path.exists());
+        let _ = fs::remove_dir_all(session.parent().expect("temp dir"));
+    }
+
+    /// `--resume README.md`: not a session, refused before any lock file is made.
+    #[test]
+    fn a_file_that_is_not_a_session_gets_no_lock() {
+        let session = temp_session("not-a-session");
+        let workspace = session.parent().expect("temp dir").to_path_buf();
+        fs::create_dir_all(&workspace).expect("workspace");
+        let store = runtime::SessionStore::from_cwd(&workspace).expect("store");
+        let readme = workspace.join("README.md");
+        fs::write(&readme, "# Notes\n\nNot a session.\n").expect("readme");
+
+        let error = open_session_reference_in_store(&store, &readme.display().to_string())
+            .expect_err("not a session");
+        assert!(error.to_string().contains("no valid records"), "{error}");
+        assert!(!session_lock_path(&readme).exists());
+        assert!(!workspace.join("README.md.lock").exists());
+
+        // A session saved outside the sessions folder is read, then locked.
+        let exported = workspace.join("exported.jsonl");
+        let mut saved = runtime::Session::new()
+            .with_workspace_root(workspace.clone())
+            .with_persistence_path(exported.clone());
+        saved.push_user_text("hello").expect("saved session");
+        let opened = open_session_reference_in_store(&store, &exported.display().to_string())
+            .expect("a session");
+        assert_eq!(opened.session.messages.len(), 1);
+        assert!(session_lock_path(&exported).is_file());
+        assert!(!workspace.join("exported.jsonl.lock").exists());
+        opened.lock.remove();
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn a_new_session_id_another_run_took_is_skipped() {
+        let session = temp_session("claim");
+        let workspace = session.parent().expect("temp dir").to_path_buf();
+        fs::create_dir_all(&workspace).expect("workspace");
+        let store = runtime::SessionStore::from_cwd(&workspace).expect("store");
+
+        // Another run started in the same millisecond with the same id and holds it.
+        let taken = store.create_handle("session-taken");
+        let held = SessionLock::claim_new(&taken.path)
+            .expect("claim")
+            .expect("the first run gets the id");
+        assert!(SessionLock::claim_new(&taken.path)
+            .expect("claim")
+            .is_none());
+        // An id whose session file was saved is taken too.
+        let saved = store.create_handle("session-saved");
+        fs::create_dir_all(saved.path.parent().expect("sessions dir")).expect("sessions dir");
+        fs::write(&saved.path, "").expect("session file");
+
+        let mut ids = ["session-taken", "session-saved", "session-free"].into_iter();
+        let opened = open_new_session_in(&store, || {
+            let mut session = runtime::Session::new();
+            session.session_id = ids.next().expect("an id").to_string();
+            Ok(session)
+        })
+        .expect("a session of its own");
+        assert_eq!(opened.handle.id, "session-free");
+        assert_eq!(opened.session.session_id, "session-free");
+        assert_eq!(opened.handle.path, store.create_handle("session-free").path);
+
+        // Every id taken: an error, not a shared session.
+        let error = open_new_session_in(&store, || {
+            let mut session = runtime::Session::new();
+            session.session_id = "session-taken".to_string();
+            Ok(session)
+        })
+        .expect_err("no free id");
+        assert!(
+            error
+                .to_string()
+                .starts_with("could not start a new session"),
+            "{error}"
+        );
+        drop(held);
+        drop(opened);
+        let _ = fs::remove_dir_all(&workspace);
     }
 
     #[test]

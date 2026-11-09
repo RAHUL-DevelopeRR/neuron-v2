@@ -4,9 +4,10 @@
  * tool renderers draw a Neuron turn the way they drew a Codebuff run.
  *
  * Events outside the transcript (status, usage, permission requests, notices)
- * are handled once, globally, by ./engine-session.ts. Two notices also change
- * the turn's message: an AskUserQuestion is drawn in it (./questions.ts), and
- * a retry of the model call drops what the failed attempt streamed.
+ * are handled once, globally, by ./engine-session.ts. A question and a notice
+ * also change the turn's message: an AskUserQuestion (a `question` event, or
+ * an older engine's notice) is drawn in it (./questions.ts), and a retry of
+ * the model call drops what the failed attempt streamed.
  *
  * Every event also goes to the live view of the turn (./live-turn.ts): the
  * status line, the todo strip and the footer's running totals. With
@@ -40,11 +41,12 @@ import {
   engineQuestionBlock,
   insertQuestionBlock,
   markUnansweredQuestions,
+  questionEventBlock,
 } from './questions'
 import { NO_RESULT_MESSAGE, mapToolCall, mapToolResult } from './tool-mapping'
 
 import type { ContentBlock } from '../types/chat'
-import type { UiEvent } from './protocol'
+import type { QuestionEvent, UiEvent } from './protocol'
 
 /** The session's workspace as the engine last reported it. */
 const sessionCwd = (): string | null => useEngineStore.getState().status?.cwd ?? null
@@ -141,14 +143,18 @@ export function createTurnEventSink(
     })
 
   let questionCount = 0
-  const showQuestion = (message: string) => {
+  /** A notice's text (older engines) or a `question` event. */
+  const showQuestion = (question: string | QuestionEvent) => {
     separateTextBlocks()
     // In place of the AskUserQuestion row: the question comes from the call
     // that is running, the last one still open.
     const asking = open[open.length - 1]
     questionCount += 1
     const toolCallId = asking?.id ?? `question-${questionCount}`
-    const block = engineQuestionBlock(message, toolCallId)
+    const block =
+      typeof question === 'string'
+        ? engineQuestionBlock(question, toolCallId)
+        : questionEventBlock(question, toolCallId)
     updater.updateAiMessageBlocks((blocks) =>
       insertQuestionBlock(closeNativeReasoningBlock(blocks), block),
     )
@@ -397,6 +403,10 @@ export function createTurnEventSink(
           if (open.length === 0) markAttemptStart()
           return
         }
+        case 'question':
+          if (state.isActive?.() === false) return
+          showQuestion(event)
+          return
         case 'notice': {
           if (state.isActive?.() === false) return
           if (event.kind === 'refusal') {

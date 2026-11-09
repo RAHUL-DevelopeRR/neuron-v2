@@ -65,6 +65,7 @@ import {
   type UiEvent,
   type UiEventType,
   type UsageAmounts,
+  type UsageWindow,
 } from '../src/protocol'
 
 const rustCrate = path.resolve(import.meta.dir, '../../../rust/crates/neuron-tui')
@@ -190,7 +191,9 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'pricing_url',
     'usage_updated_at',
     'usage_error',
+    'usage_window',
   ]),
+  UsageWindow: fieldsOf<UsageWindow>()(['tokens', 'limit_tokens', 'remaining_tokens', 'resets_at', 'window_seconds']),
   ErrorDetail: fieldsOf<ErrorDetail>()(['code', 'status', 'upgrade_url', 'resets_at', 'retry_after_seconds']),
   HookPreview: fieldsOf<HookPreview>()(['event', 'command', 'source']),
   McpServerPreview: fieldsOf<McpServerPreview>()(['name', 'transport', 'target', 'source']),
@@ -234,6 +237,7 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
     'account',
     'supports_images',
     'served_model',
+    'request_tokens_estimate',
   ]),
   session_starting: eventFields('session_starting')([]),
   sign_in_code: eventFields('sign_in_code')(['url', 'url_complete', 'user_code', 'expires_in_secs', 'browser_opened']),

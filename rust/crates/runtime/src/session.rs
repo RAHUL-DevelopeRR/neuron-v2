@@ -1220,10 +1220,16 @@ fn current_time_millis() -> u64 {
     }
 }
 
+/// A new session id, `session-<millis>-<pid>-<rand>`. The milliseconds never repeat in
+/// one process ([`current_time_millis`]); the process id keeps two runs started in the
+/// same millisecond apart, and four random hex digits two machines sharing a folder.
+/// A caller that claims the id's file still checks it is free (`create_new`).
 fn generate_session_id() -> String {
-    let millis = current_time_millis();
-    let counter = SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("session-{millis}-{counter}")
+    session_id_for(current_time_millis(), std::process::id(), rand::random())
+}
+
+fn session_id_for(millis: u64, pid: u32, random: u16) -> String {
+    format!("session-{millis}-{pid}-{random:04x}")
 }
 
 /// Opens a JSONL file for appending one record. When the file does not end
@@ -1326,8 +1332,8 @@ fn cleanup_rotated_logs(path: &Path) -> Result<(), SessionError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_rotated_logs, current_time_millis, rotate_session_file_if_needed, ContentBlock,
-        ConversationMessage, MessageRole, Session, SessionFork,
+        cleanup_rotated_logs, current_time_millis, rotate_session_file_if_needed, session_id_for,
+        ContentBlock, ConversationMessage, MessageRole, Session, SessionFork,
     };
     use crate::json::JsonValue;
     use crate::usage::TokenUsage;
@@ -1344,6 +1350,31 @@ mod tests {
 
         assert!(first < second);
         assert!(second < third);
+    }
+
+    #[test]
+    fn session_ids_carry_the_process_and_random_bits() {
+        assert_eq!(
+            session_id_for(1_700, 4_242, 0x0a1f),
+            "session-1700-4242-0a1f"
+        );
+        // Two runs started in the same millisecond get different ids.
+        assert_ne!(
+            session_id_for(1_700, 4_242, 7),
+            session_id_for(1_700, 4_243, 7)
+        );
+
+        let id = Session::new().session_id;
+        let parts = id.split('-').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 4, "{id}");
+        assert_eq!(parts[0], "session");
+        assert!(parts[1].parse::<u64>().is_ok(), "{id}");
+        assert_eq!(parts[2], std::process::id().to_string(), "{id}");
+        assert!(
+            parts[3].len() == 4 && parts[3].chars().all(|c| c.is_ascii_hexdigit()),
+            "{id}"
+        );
+        assert_ne!(Session::new().session_id, Session::new().session_id);
     }
 
     #[test]

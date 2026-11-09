@@ -196,6 +196,18 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     description: 'What fills the context window',
   },
   {
+    id: 'effort',
+    label: 'effort',
+    engineCommand: true,
+    description: 'Thinking level (/effort <level>, or default)',
+  },
+  {
+    id: 'branch',
+    label: 'branch',
+    engineCommand: true,
+    description: 'Git branches (/branch <name> switches, /branch new <name> creates)',
+  },
+  {
     id: 'compact',
     label: 'compact',
     engineCommand: true,
@@ -206,6 +218,12 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     label: 'permissions',
     engineCommand: true,
     description: 'Show or change the permission mode',
+  },
+  {
+    id: 'hooks',
+    label: 'hooks',
+    engineCommand: true,
+    description: 'List configured hooks by event, with matcher and source',
   },
   ...MODE_COMMANDS,
   {

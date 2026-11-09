@@ -1,14 +1,31 @@
-import { describe, expect, test } from 'bun:test'
+import { AskUserBridge } from '@neuron-tui/common/utils/ask-user-bridge'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
+import { useChatStore } from '../../state/chat-store'
+import { useEngineStore } from '../../state/engine-store'
+import { handleEngineEvent } from '../engine-session'
+import {
+  setNeuronEngineClientForTesting,
+  type NeuronEngineClient,
+} from '../neuron-engine-client'
+import {
+  answerEngineQuestion,
+  closeQuestionForm,
+  formAnswerText,
+  questionFormId,
+} from '../question-form'
 import {
   engineQuestionBlock,
   insertQuestionBlock,
   markUnansweredQuestions,
   parseEngineQuestion,
   questionAnswer,
+  questionEventBlock,
+  questionNoticeText,
   withQuestionAnswer,
 } from '../questions'
 
+import type { EngineCommand } from '../protocol'
 import type { ChatMessage, ContentBlock } from '../../types/chat'
 
 describe('parseEngineQuestion', () => {
@@ -84,5 +101,129 @@ describe('answers', () => {
       { ...block, skipped: true },
     ])
     expect(markUnansweredQuestions([answered])).toEqual([answered])
+  })
+})
+
+describe('question events (the questions capability)', () => {
+  const event = {
+    type: 'question' as const,
+    id: 7,
+    question: 'Which branch?',
+    options: ['main', 'dev'],
+  }
+
+  /** A client that records what is sent. */
+  function recordingClient() {
+    const sent: EngineCommand[] = []
+    const submitted: string[] = []
+    const client = {
+      send: (command: EngineCommand) => void sent.push(command),
+      submit: (text: string) => void submitted.push(text),
+    }
+    return { sent, submitted, client }
+  }
+
+  const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+  beforeEach(() => {
+    useEngineStore.getState().reset()
+    useChatStore.getState().setMessages([])
+    closeQuestionForm()
+  })
+
+  afterEach(() => {
+    closeQuestionForm()
+    setNeuronEngineClientForTesting(null)
+    useEngineStore.getState().reset()
+  })
+
+  test('the block and the chat line read as the older notice did', () => {
+    const notice = 'Question: Which branch?\n  1. main\n  2. dev\nAnswer with 1-2 or in your own words.'
+    expect(questionEventBlock(event, 'toolu_q')).toEqual(engineQuestionBlock(notice, 'toolu_q'))
+    expect(questionNoticeText(event)).toBe(notice)
+    expect(questionEventBlock({ question: 'Name?', options: [] }, 'q').hint).toBe('')
+    expect(questionNoticeText({ question: 'Name?', options: [] })).toBe('Question: Name?')
+  })
+
+  test("the form's response becomes the answer's text; a skip is none", () => {
+    expect(formAnswerText({ answers: [{ questionIndex: 0, selectedOption: 'dev' }] })).toBe('dev')
+    expect(formAnswerText({ answers: [{ questionIndex: 0, otherText: ' release ' }] })).toBe('release')
+    expect(
+      formAnswerText({ answers: [{ questionIndex: 0, selectedOptions: ['main', 'dev'] }] }),
+    ).toBe('main, dev')
+    expect(formAnswerText({ answers: [{ questionIndex: 0 }] })).toBeNull()
+    expect(formAnswerText({ skipped: true })).toBeNull()
+    expect(formAnswerText(undefined)).toBeNull()
+  })
+
+  test('an answer to a question event is the answer command with its id; to a notice, a submit', () => {
+    const { sent, submitted, client } = recordingClient()
+    useEngineStore.getState().setPendingQuestion('Which branch?', 7)
+    expect(answerEngineQuestion('main', client)).toBe(true)
+    expect(sent).toEqual([{ type: 'answer', id: 7, text: 'main' }])
+    expect(submitted).toEqual([])
+    expect(useEngineStore.getState().pendingQuestion).toBeNull()
+    expect(useChatStore.getState().messages.at(-1)).toMatchObject({
+      content: 'main',
+      metadata: { answersQuestion: true, sentToEngine: false },
+    })
+
+    useEngineStore.getState().setPendingQuestion('Question: Ship it?')
+    expect(answerEngineQuestion('yes', client)).toBe(true)
+    expect(submitted).toEqual(['yes'])
+    expect(answerEngineQuestion('again', client)).toBe(false)
+  })
+
+  test('the session takes the event: it waits for the answer and opens the form', async () => {
+    const { sent, client } = recordingClient()
+    setNeuronEngineClientForTesting(client as unknown as NeuronEngineClient)
+    handleEngineEvent(event)
+    expect(useEngineStore.getState()).toMatchObject({
+      pendingQuestion: 'Which branch?',
+      pendingQuestionId: 7,
+    })
+    const request = AskUserBridge.getPendingRequest()
+    expect(request?.toolCallId).toBe(questionFormId(7))
+    expect(request?.questions[0]).toMatchObject({
+      question: 'Which branch?',
+      options: [{ label: 'main' }, { label: 'dev' }],
+      multiSelect: false,
+    })
+    // Outside a turn the question is a chat line too.
+    expect(useChatStore.getState().messages.at(-1)?.content).toContain('Question: Which branch?')
+
+    AskUserBridge.submit({ answers: [{ questionIndex: 0, selectedOption: 'dev' }] })
+    await flush()
+    expect(sent).toEqual([{ type: 'answer', id: 7, text: 'dev' }])
+    expect(useEngineStore.getState().pendingQuestion).toBeNull()
+  })
+
+  test('a skipped form leaves the question to the input', async () => {
+    const { sent, client } = recordingClient()
+    setNeuronEngineClientForTesting(client as unknown as NeuronEngineClient)
+    handleEngineEvent(event)
+    AskUserBridge.submit({ skipped: true })
+    await flush()
+    expect(sent).toEqual([])
+    expect(useEngineStore.getState().pendingQuestionId).toBe(7)
+  })
+
+  test('the turn ending closes the form, and nothing is sent for it', async () => {
+    const { sent, client } = recordingClient()
+    setNeuronEngineClientForTesting(client as unknown as NeuronEngineClient)
+    handleEngineEvent(event)
+    handleEngineEvent({ type: 'turn_finished' })
+    expect(AskUserBridge.getPendingRequest()).toBeNull()
+    await flush()
+    expect(sent).toEqual([])
+    expect(useEngineStore.getState().pendingQuestion).toBeNull()
+  })
+
+  test('a question without options has no form: it is answered in the input', () => {
+    const { client } = recordingClient()
+    setNeuronEngineClientForTesting(client as unknown as NeuronEngineClient)
+    handleEngineEvent({ ...event, options: [] })
+    expect(AskUserBridge.getPendingRequest()).toBeNull()
+    expect(useEngineStore.getState().pendingQuestionId).toBe(7)
   })
 })

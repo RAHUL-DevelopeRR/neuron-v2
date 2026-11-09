@@ -6,8 +6,10 @@
 //! - Windows: a kill-on-close Job Object with an active-process limit and an
 //!   optional memory limit (`winjob`). The child is spawned suspended, put in
 //!   the job, then resumed, so nothing it starts escapes the job. A restricted
-//!   token / low integrity level is not applied (std cannot spawn with a
-//!   token; see the lane notes).
+//!   token / low integrity level is not applied: `std::process::Command` spawns
+//!   with `CreateProcessW` and has no way to pass a token, so that would need
+//!   a separate `CreateProcessAsUserW` spawn path with its own pipe and
+//!   output handling.
 //! - All: with `sandbox.network.allow` set, commands get proxy variables for
 //!   the loopback allowlist proxy ([`crate::net_proxy`]).
 

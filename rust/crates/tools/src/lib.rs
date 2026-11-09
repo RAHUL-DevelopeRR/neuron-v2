@@ -349,6 +349,12 @@ impl GlobalToolRegistry {
         self.runtime_tools.iter().any(|tool| tool.name == name)
     }
 
+    /// The runtime tools' definitions, as [`Self::with_runtime_tools`] took them.
+    #[must_use]
+    pub fn runtime_tools(&self) -> &[RuntimeToolDefinition] {
+        &self.runtime_tools
+    }
+
     /// The names of the runtime tools (MCP servers' `mcp__<server>__<tool>`).
     #[must_use]
     pub fn runtime_tool_names(&self) -> Vec<String> {
@@ -463,9 +469,9 @@ fn permission_mode_from_plugin(value: &str) -> Result<PermissionMode, String> {
 
 /// Description of the `bash` tool, naming the shell that actually runs.
 #[cfg(windows)]
-const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with Windows cmd.exe (`cmd.exe /D /S /C`): use cmd syntax (`dir`, `type`, `set`, `%VAR%`, `&&`); POSIX tools work only if they are on PATH, and the PowerShell tool runs PowerShell syntax. Read-only commands run directly; anything else (writes, builds, installs, network) asks the user for approval in workspace-write mode, is denied in read-only mode, and runs directly in danger-full-access mode. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
+const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with Windows cmd.exe (`cmd.exe /D /S /C`): use cmd syntax (`dir`, `type`, `set`, `%VAR%`, `&&`); POSIX tools work only if they are on PATH, and the PowerShell tool runs PowerShell syntax. Read-only commands run directly. In workspace-write mode, build, test, run and package-install commands that stay inside the workspace (npm/pnpm/yarn/bun, npx, node, cargo, python, pip/uv, go, make) also run directly; anything else (sudo, global installs, writes outside the workspace, network tools, git push) asks the user for approval. Read-only mode denies everything but read-only commands; danger-full-access runs everything directly. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
 #[cfg(not(windows))]
-const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with POSIX sh (`sh -lc`). Read-only commands run directly; anything else (writes, builds, installs, network) asks the user for approval in workspace-write mode, is denied in read-only mode, and runs directly in danger-full-access mode. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
+const BASH_TOOL_DESCRIPTION: &str = "Execute a command in the current workspace with POSIX sh (`sh -lc`). Read-only commands run directly. In workspace-write mode, build, test, run and package-install commands that stay inside the workspace (npm/pnpm/yarn/bun, npx, node, cargo, python, pip/uv, go, make) also run directly; anything else (sudo, global installs, writes outside the workspace, network tools, git push) asks the user for approval. Read-only mode denies everything but read-only commands; danger-full-access runs everything directly. stdin is empty. Default timeout 120000 ms (max 600000); on timeout the whole process tree is killed.";
 
 /// Tools that exist but are not advertised to the model by default: they
 /// only keep in-memory bookkeeping (tasks, teams, crons, workers), are
@@ -789,7 +795,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "WebSearch",
-            description: "Search the web for current information and return cited results. The query is sent to an external search service, so web searches need user approval (once per session) unless the session runs in danger-full-access mode.",
+            description: "Search the web for current information and return cited results. When signed in to Zero-X the search runs through the Zero-X gateway and the remaining daily search quota is shown; otherwise (or if the gateway is unavailable) it falls back to a local DuckDuckGo search, marked as a local fallback. The query is sent to an external search service, so web searches need user approval (once per session) unless the session runs in danger-full-access mode.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -801,6 +807,11 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "blocked_domains": {
                         "type": "array",
                         "items": { "type": "string" }
+                    },
+                    "freshness": {
+                        "type": "string",
+                        "enum": ["day", "week", "month", "year"],
+                        "description": "Only results from the past day, week, month or year (Zero-X gateway search only; the local fallback cannot filter by date)."
                     }
                 },
                 "required": ["query"],
@@ -904,6 +915,16 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
+            name: "neuron_status",
+            description: "Read-only live status of this Neuron session: today's date and time, whether the user is signed in (display name only), plan, requests and tokens used versus limits, the rolling token window and when it resets, the current model and context size, workspace trust, permission mode and the tools registered. Call it for any question about usage, limits, plan, username, date or your own capabilities. Takes no arguments.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
             name: "Sleep",
             description: "Wait for a specified duration without holding a shell process.",
             input_schema: json!({
@@ -999,7 +1020,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "PowerShell",
-            description: "Execute a PowerShell command (pwsh when installed, otherwise Windows PowerShell; -NoProfile -NonInteractive). Read-only cmdlets such as Get-Content, Get-ChildItem and Select-String run directly; anything else asks the user for approval in workspace-write mode and is denied in read-only mode. Default timeout 120000 ms (max 600000); on timeout the process tree is killed.",
+            description: "Execute a PowerShell command (pwsh when installed, otherwise Windows PowerShell; -NoProfile -NonInteractive). Read-only cmdlets such as Get-Content, Get-ChildItem and Select-String run directly, and so do in-workspace build, test and package commands (npm, node, cargo, python, pip, go, make) in workspace-write mode; anything else asks the user for approval in workspace-write mode and is denied in read-only mode. Default timeout 120000 ms (max 600000); on timeout the process tree is killed.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1497,6 +1518,40 @@ fn change_watcher_slot() -> &'static std::sync::RwLock<Option<ChangeWatcher>> {
     SLOT.get_or_init(|| std::sync::RwLock::new(None))
 }
 
+/// Produces the text of the read-only `neuron_status` tool.
+pub type StatusProvider = fn() -> String;
+
+fn status_provider_slot() -> &'static std::sync::RwLock<Option<StatusProvider>> {
+    static SLOT: std::sync::OnceLock<std::sync::RwLock<Option<StatusProvider>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Installs what answers `neuron_status`: the account and session live in the CLI, which
+/// registers its reader here.
+pub fn set_status_provider(provider: StatusProvider) {
+    *status_provider_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(provider);
+}
+
+/// Removes the status provider.
+pub fn clear_status_provider() {
+    *status_provider_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+fn run_neuron_status() -> String {
+    let provider = *status_provider_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    provider.map_or_else(
+        || "Neuron status is not available in this context (no account or session reader is installed).".to_string(),
+        |provider| provider(),
+    )
+}
+
 /// Tells `watcher` before every built-in tool call that may change files runs, once its
 /// permission check passed: the agent's own calls and its sub-agents' alike, on whichever
 /// thread runs them. The full-screen engine saves its checkpoints from here. MCP and
@@ -1598,6 +1653,7 @@ fn execute_tool_with_enforcer_and_cancel(
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
+        "neuron_status" => Ok(run_neuron_status()),
         "NotebookEdit" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
             let edit = from_value::<NotebookEditInput>(input)?;
@@ -2151,6 +2207,29 @@ fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
     }
 }
 
+/// Longest `RemoteTrigger` response body, in bytes, returned to the model.
+const REMOTE_TRIGGER_MAX_BODY_BYTES: usize = 8192;
+
+/// Cut a `RemoteTrigger` response body to [`REMOTE_TRIGGER_MAX_BODY_BYTES`],
+/// backing off to the previous char boundary so a multi-byte character that
+/// straddles the limit cannot panic the slice.
+///
+/// Ported from Claw Code (MIT), upstream commit a289024.
+fn truncate_remote_trigger_body(body: String) -> String {
+    if body.len() <= REMOTE_TRIGGER_MAX_BODY_BYTES {
+        return body;
+    }
+    let mut end = REMOTE_TRIGGER_MAX_BODY_BYTES;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[response truncated — {} bytes total]",
+        &body[..end],
+        body.len()
+    )
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
     let method = input.method.unwrap_or_else(|| "GET".to_string());
@@ -2189,15 +2268,7 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
         Ok(response) => {
             let status = response.status().as_u16();
             let body = response.text().unwrap_or_default();
-            let truncated_body = if body.len() > 8192 {
-                format!(
-                    "{}\n\n[response truncated — {} bytes total]",
-                    &body[..8192],
-                    body.len()
-                )
-            } else {
-                body
-            };
+            let truncated_body = truncate_remote_trigger_body(body);
             to_pretty_json(json!({
                 "url": input.url,
                 "method": method,
@@ -2318,8 +2389,10 @@ fn from_value<T: for<'de> Deserialize<'de>>(input: &Value) -> Result<T, String> 
 
 /// Permission a `bash` command line needs, judged over every simple command
 /// it contains: `ReadOnly` only when each one is an allowlisted read-only
-/// program with safe arguments that stays inside the workspace, otherwise
-/// `DangerFullAccess` (which prompts in workspace-write mode).
+/// program with safe arguments that stays inside the workspace,
+/// `WorkspaceWrite` when the others are in-workspace build, test, run or
+/// package commands, otherwise `DangerFullAccess` (which prompts in
+/// workspace-write mode).
 fn classify_bash_permission(command: &str) -> PermissionMode {
     let workspace = runtime::workdir::current_dir().ok();
     classify_shell_command(command, ShellDialect::host(), workspace.as_deref()).required_mode()
@@ -2645,11 +2718,12 @@ struct WebFetchInput {
     prompt: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct WebSearchInput {
     query: String,
     allowed_domains: Option<Vec<String>>,
     blocked_domains: Option<Vec<String>>,
+    freshness: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2935,6 +3009,8 @@ struct WebFetchOutput {
 #[derive(Debug, Serialize)]
 struct WebSearchOutput {
     query: String,
+    /// `"zero-x gateway"` or `"local fallback"`.
+    source: &'static str,
     results: Vec<WebSearchResultItem>,
     #[serde(rename = "durationSeconds")]
     duration_seconds: f64,
@@ -3131,6 +3207,10 @@ enum WebSearchResultItem {
 struct SearchHit {
     title: String,
     url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    published: Option<String>,
 }
 
 fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
@@ -3160,49 +3240,220 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     })
 }
 
-fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
-    let started = Instant::now();
-    let client = build_http_client()?;
-    let search_url = build_search_url(&input.query)?;
-    let response = client
-        .get(search_url)
-        .send()
-        .map_err(|error| error.to_string())?;
+/// Most results shown to the model.
+const WEB_SEARCH_MAX_HITS: usize = 8;
 
-    let final_url = response.url().clone();
-    let html = response.text().map_err(|error| error.to_string())?;
-    let mut hits = extract_search_hits(&html);
-
-    if hits.is_empty() && final_url.host_str().is_some() {
-        hits = extract_search_hits_from_generic_links(&html);
+/// Trims the query and enforces the gateway's 1-400 character limit. Returns the usable query
+/// and a note when it had to be cut (on a character boundary).
+fn normalize_search_query(query: &str) -> Result<(String, Option<String>), String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err("WebSearch needs a non-empty query".to_string());
     }
+    let total = trimmed.chars().count();
+    if total <= gateway_search::MAX_QUERY_CHARS {
+        return Ok((trimmed.to_string(), None));
+    }
+    let cut = trimmed
+        .char_indices()
+        .nth(gateway_search::MAX_QUERY_CHARS)
+        .map_or(trimmed.len(), |(index, _)| index);
+    Ok((
+        trimmed[..cut].to_string(),
+        Some(format!(
+            "Note: the query was {total} characters and was truncated to {} characters.",
+            gateway_search::MAX_QUERY_CHARS
+        )),
+    ))
+}
 
+fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
+    let (query, truncation) = crate::normalize_search_query(&input.query)?;
+    let mut input = input.clone();
+    input.query = query;
+    let mut output = execute_web_search_checked(&input)?;
+    if let Some(note) = truncation {
+        for item in &mut output.results {
+            if let WebSearchResultItem::Commentary(text) = item {
+                text.push('\n');
+                text.push_str(&note);
+                break;
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn execute_web_search_checked(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
+    let started = Instant::now();
+    if let Some(freshness) = input.freshness.as_deref() {
+        if !gateway_search::FRESHNESS_VALUES.contains(&freshness) {
+            return Err(format!(
+                "freshness must be one of {}, got {freshness:?}",
+                gateway_search::FRESHNESS_VALUES.join(", ")
+            ));
+        }
+    }
+    let client = build_http_client()?;
+
+    // Domain filters are applied here after the gateway answers, so ask for the most results
+    // when filtering to leave something after the cut.
+    let filtering = input.allowed_domains.is_some() || input.blocked_domains.is_some();
+    let count = if filtering { 10 } else { 8 };
+    let fallback_reason =
+        match gateway_search::search(&input.query, input.freshness.as_deref(), count) {
+            gateway_search::GatewayOutcome::Answer(answer) => {
+                return Ok(gateway_web_search_output(input, answer, started));
+            }
+            gateway_search::GatewayOutcome::Refused(message) => return Err(message),
+            gateway_search::GatewayOutcome::Fallback(reason) => reason,
+        };
+    execute_local_web_search(input, &client, started, &fallback_reason)
+}
+
+fn filter_search_hits(hits: &mut Vec<SearchHit>, input: &WebSearchInput) {
     if let Some(allowed) = input.allowed_domains.as_ref() {
         hits.retain(|hit| host_matches_list(&hit.url, allowed));
     }
     if let Some(blocked) = input.blocked_domains.as_ref() {
         hits.retain(|hit| !host_matches_list(&hit.url, blocked));
     }
+    dedupe_hits(hits);
+    hits.truncate(WEB_SEARCH_MAX_HITS);
+}
 
-    dedupe_hits(&mut hits);
-    hits.truncate(8);
+fn render_search_hits(hits: &[SearchHit]) -> String {
+    hits.iter()
+        .map(|hit| {
+            let mut line = format!("- [{}]({})", hit.title, hit.url);
+            if let Some(published) = &hit.published {
+                line = format!("{line} ({published})");
+            }
+            if let Some(snippet) = &hit.snippet {
+                line = format!("{line}: {snippet}");
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        )
+}
 
-    let summary = if hits.is_empty() {
-        format!("No web search results matched the query {:?}.", input.query)
+fn gateway_web_search_output(
+    input: &WebSearchInput,
+    answer: gateway_search::GatewayAnswer,
+    started: Instant,
+) -> WebSearchOutput {
+    let mut hits = answer
+        .hits
+        .into_iter()
+        .map(|hit| SearchHit {
+            title: hit.title,
+            url: hit.url,
+            snippet: hit.snippet,
+            published: hit.published,
+        })
+        .collect::<Vec<_>>();
+    filter_search_hits(&mut hits, input);
+
+    let mut lines = Vec::new();
+    if hits.is_empty() {
+        lines.push(format!(
+            "No web search results matched the query {:?}.",
+            input.query
+        ));
     } else {
-        let rendered_hits = hits
-            .iter()
-            .map(|hit| format!("- [{}]({})", hit.title, hit.url))
-            .collect::<Vec<_>>()
-            .join("\n");
+        lines.push(format!(
+            "Search results for {:?}. Include a Sources section in the final answer.",
+            input.query
+        ));
+        lines.push(render_search_hits(&hits));
+    }
+    let via = match (&answer.provider, answer.cached) {
+        (Some(provider), true) => format!("Source: Zero-X gateway ({provider}, cached)."),
+        (Some(provider), false) => format!("Source: Zero-X gateway ({provider})."),
+        (None, _) => "Source: Zero-X gateway.".to_string(),
+    };
+    lines.push(via);
+    if let Some(quota) = &answer.quota {
+        lines.push(quota.describe());
+    }
+
+    WebSearchOutput {
+        query: input.query.clone(),
+        source: "zero-x gateway",
+        results: vec![
+            WebSearchResultItem::Commentary(lines.join(
+                "
+",
+            )),
+            WebSearchResultItem::SearchResult {
+                tool_use_id: String::from("web_search_1"),
+                content: hits,
+            },
+        ],
+        duration_seconds: started.elapsed().as_secs_f64(),
+    }
+}
+
+fn execute_local_web_search(
+    input: &WebSearchInput,
+    client: &Client,
+    started: Instant,
+    fallback_reason: &str,
+) -> Result<WebSearchOutput, String> {
+    let search_url = build_search_url(&input.query)?;
+    let response = client
+        .get(search_url.as_str())
+        .send()
+        .map_err(|error| error.to_string())?;
+
+    // DuckDuckGo answers its bot challenge with HTTP 202 and a page without
+    // results, so anything but 200 is an unusable results page (ported from
+    // Claw Code, upstream commit fd8527f).
+    let status = response.status();
+    if status != reqwest::StatusCode::OK {
+        return Err(format!(
+            "Web search unavailable (HTTP {}) - the search provider is blocked or unreachable",
+            status.as_u16()
+        ));
+    }
+
+    let final_url = response.url().clone();
+    let html = response.text().map_err(|error| error.to_string())?;
+    let mut hits = extract_search_hits(&html);
+
+    if hits.is_empty() && final_url.host_str().is_some() {
+        hits = extract_search_hits_from_generic_links(&html, search_url.host_str());
+    }
+
+    filter_search_hits(&mut hits, input);
+
+    let mut note = format!("Source: local fallback (DuckDuckGo); {fallback_reason}.");
+    if input.freshness.is_some() {
+        note.push_str(" The freshness filter was not applied.");
+    }
+    let summary = if hits.is_empty() {
         format!(
-            "Search results for {:?}. Include a Sources section in the final answer.\n{}",
-            input.query, rendered_hits
+            "No web search results matched the query {:?}.
+{note}",
+            input.query
+        )
+    } else {
+        format!(
+            "Search results for {:?}. Include a Sources section in the final answer.
+{}
+{note}",
+            input.query,
+            render_search_hits(&hits)
         )
     };
 
     Ok(WebSearchOutput {
         query: input.query.clone(),
+        source: "local fallback",
         results: vec![
             WebSearchResultItem::Commentary(summary),
             WebSearchResultItem::SearchResult {
@@ -3408,6 +3659,8 @@ fn extract_search_hits(html: &str) -> Vec<SearchHit> {
             hits.push(SearchHit {
                 title: title.trim().to_string(),
                 url: decoded_url,
+                snippet: None,
+                published: None,
             });
         }
         remaining = &after_tag[end_anchor_idx + 4..];
@@ -3416,7 +3669,7 @@ fn extract_search_hits(html: &str) -> Vec<SearchHit> {
     hits
 }
 
-fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
+fn extract_search_hits_from_generic_links(html: &str, search_host: Option<&str>) -> Vec<SearchHit> {
     let mut hits = Vec::new();
     let mut remaining = html;
 
@@ -3446,16 +3699,36 @@ fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
             continue;
         }
         let decoded_url = decode_duckduckgo_redirect(&url).unwrap_or(url);
-        if decoded_url.starts_with("http://") || decoded_url.starts_with("https://") {
+        if (decoded_url.starts_with("http://") || decoded_url.starts_with("https://"))
+            && !is_search_engine_link(&decoded_url, search_host)
+        {
             hits.push(SearchHit {
                 title: title.trim().to_string(),
                 url: decoded_url,
+                snippet: None,
+                published: None,
             });
         }
         remaining = &after_tag[end_anchor_idx + 4..];
     }
 
     hits
+}
+
+/// A generic-fallback link that points back at `DuckDuckGo` or at the configured
+/// search host is page chrome (home, settings, challenge), never a result.
+///
+/// Ported from Claw Code (MIT), upstream commit fd8527f.
+fn is_search_engine_link(url: &str, search_host: Option<&str>) -> bool {
+    let Some(host) = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+    else {
+        return false;
+    };
+    host == "duckduckgo.com"
+        || host.ends_with(".duckduckgo.com")
+        || search_host.is_some_and(|search_host| host.eq_ignore_ascii_case(search_host))
 }
 
 fn extract_quoted_value(input: &str) -> Option<(String, &str)> {
@@ -3556,6 +3829,11 @@ fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> 
         serde_json::to_string_pretty(&persisted).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
+    // The store holds the list now, so the one an earlier release left in the
+    // workspace has done its job.
+    if let Some(legacy) = legacy_path.as_deref() {
+        remove_legacy_todos(legacy);
+    }
 
     let verification_nudge_needed = (all_done
         && input.todos.len() >= 3
@@ -3640,6 +3918,48 @@ fn previous_todos(store: &Path, legacy: Option<&Path>) -> Result<Vec<TodoItem>, 
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default())
+}
+
+/// Removes the task list an earlier release left in the workspace at `legacy`, unless git
+/// tracks it: someone committed it, and deleting it would be a change to commit. An
+/// untracked or ignored one goes, as does one outside a repository; when git can't be
+/// run to ask, or fails inside a repository (a corrupt index, a folder git refuses as
+/// of dubious ownership), it stays.
+fn remove_legacy_todos(legacy: &Path) {
+    let (Some(folder), Some(name)) = (legacy.parent(), legacy.file_name()) else {
+        return;
+    };
+    if !legacy.is_file() {
+        return;
+    }
+    let tracked = Command::new("git")
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(name)
+        .current_dir(folder)
+        .output();
+    let Ok(output) = tracked else {
+        return;
+    };
+    if legacy_todos_removable(output.status.code(), || inside_repository(folder)) {
+        let _ = std::fs::remove_file(legacy);
+    }
+}
+
+/// Whether `git ls-files --error-unmatch` exiting with `code` lets the legacy task list
+/// go: 1 is git's answer "not tracked"; any other failure (128, "fatal") says so too
+/// only when `in_repository` says the folder is not in one.
+fn legacy_todos_removable(code: Option<i32>, in_repository: impl FnOnce() -> bool) -> bool {
+    match code {
+        Some(0) => false,
+        Some(1) => true,
+        _ => !in_repository(),
+    }
+}
+
+/// Whether `folder` or a folder above it has a `.git`: git's own failure there is not
+/// "not a git repository".
+fn inside_repository(folder: &Path) -> bool {
+    folder.ancestors().any(|dir| dir.join(".git").exists())
 }
 
 fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
@@ -3923,6 +4243,12 @@ const SUBAGENT_UNKNOWN_MODEL_OUTPUT: u32 = 8_192;
 pub type SubagentClientFactory =
     std::sync::Arc<dyn Fn(&str) -> Result<ProviderClient, String> + Send + Sync>;
 
+/// Builds a sub-agent's [`runtime::RequestGuard`] for the client its requests go to
+/// first (the plan's token window: a working set, and a stop before a request the
+/// window does not cover); `None` for no guard.
+pub type SubagentGuardFactory =
+    std::sync::Arc<dyn Fn(&ProviderClient) -> Option<Box<dyn runtime::RequestGuard>> + Send + Sync>;
+
 /// What a sub-agent inherits from the session that spawned it. A sub-agent
 /// never runs with more than its parent: the same permission mode, the same
 /// allow/deny/ask rules, the same tool hooks, and at most the parent's tools.
@@ -3948,6 +4274,8 @@ pub struct SubagentParentContext {
     /// The model sub-agents run on when the `Agent` call names none
     /// (`subagentModel`); the parent's model when `None`.
     pub subagent_model: Option<String>,
+    /// Gives each sub-agent the parent's request guard; `None` for none.
+    pub request_guard: Option<SubagentGuardFactory>,
 }
 
 impl SubagentParentContext {
@@ -3964,6 +4292,7 @@ impl SubagentParentContext {
             client_factory: None,
             context_sections: Vec::new(),
             subagent_model: None,
+            request_guard: None,
         }
     }
 }
@@ -3979,6 +4308,7 @@ impl std::fmt::Debug for SubagentParentContext {
             .field("client_factory", &self.client_factory.is_some())
             .field("context_sections", &self.context_sections.len())
             .field("subagent_model", &self.subagent_model)
+            .field("request_guard", &self.request_guard.is_some())
             .finish()
     }
 }
@@ -4403,9 +4733,29 @@ fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<
     let mut runtime = build_agent_runtime(job)?
         .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS)
         .with_cancellation_token(cancel.clone());
-    let summary = runtime
+    let mut summary = runtime
         .run_turn(job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
+    // The parent's SubagentStop hooks may ask the sub-agent to keep going, a few times.
+    let mut continuations = 0;
+    while matches!(
+        summary.outcome,
+        runtime::TurnOutcome::Completed | runtime::TurnOutcome::OutputTruncated
+    ) && continuations < runtime::lifecycle_hooks::MAX_STOP_HOOK_CONTINUATIONS
+    {
+        let Some(reason) = subagent_stop_hook_reason(
+            &job.manifest.agent_id,
+            job.manifest.subagent_type.as_deref(),
+            &final_assistant_text(&summary),
+            continuations > 0,
+        ) else {
+            break;
+        };
+        continuations += 1;
+        summary = runtime
+            .run_turn(reason, None)
+            .map_err(|error| error.to_string())?;
+    }
     let final_text = final_assistant_text(&summary);
     match &summary.outcome {
         runtime::TurnOutcome::Cancelled { .. } => Err(AGENT_CANCELLED.to_string()),
@@ -4416,6 +4766,10 @@ fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<
             "sub-agent stopped: {}",
             runtime::refusal_line(note.as_deref())
         )),
+        runtime::TurnOutcome::BudgetStopped { .. } => Err(
+            "sub-agent stopped: the plan's token window does not cover its next request"
+                .to_string(),
+        ),
         runtime::TurnOutcome::Completed | runtime::TurnOutcome::OutputTruncated => {
             persist_agent_terminal_state(
                 &job.manifest,
@@ -4428,26 +4782,69 @@ fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<
     }
 }
 
+/// Runs the parent's `SubagentStop` hooks for a sub-agent that finished; the message
+/// that keeps it going when one blocked.
+fn subagent_stop_hook_reason(
+    agent_id: &str,
+    agent_type: Option<&str>,
+    final_text: &str,
+    active: bool,
+) -> Option<String> {
+    let hooks = subagent_parent_context().map(|context| context.hooks)?;
+    let runner = runtime::HookRunner::new(hooks);
+    if !runner.has_hooks(runtime::HookEvent::SubagentStop) {
+        return None;
+    }
+    let result = runner.run_lifecycle(
+        runtime::HookEvent::SubagentStop,
+        runtime::LifecycleHookInput::subagent_stop(
+            agent_id,
+            agent_type.unwrap_or("general-purpose"),
+            "completed",
+            final_text,
+        )
+        .field("stop_hook_active", active),
+        None,
+        None,
+    );
+    result.is_denied().then(|| {
+        runtime::lifecycle_hooks::stop_continuation_message(result.messages()).replacen(
+            "A Stop hook",
+            "A SubagentStop hook",
+            1,
+        )
+    })
+}
+
 fn build_agent_runtime(
     job: &AgentJob,
 ) -> Result<ConversationRuntime<SubagentApiClient, SubagentToolExecutor>, String> {
     let model = job.model.clone();
     let api_client = SubagentApiClient::new(&model, job.allowed_tools.clone())?;
+    let request_guard = subagent_request_guard(&api_client);
     Ok(assemble_agent_runtime(
         api_client,
         &model,
         job.allowed_tools.clone(),
         job.system_prompt.clone(),
+        request_guard,
     ))
 }
 
+/// The parent's request guard for a sub-agent whose requests go to `client` first.
+fn subagent_request_guard(client: &SubagentApiClient) -> Option<Box<dyn runtime::RequestGuard>> {
+    let factory = subagent_parent_context()?.request_guard?;
+    factory(&client.inner.chain.first()?.client)
+}
+
 /// Wires a sub-agent runtime around `api_client` with the inherited
-/// permission policy, hooks and tool set.
+/// permission policy, hooks, tool set and request guard.
 fn assemble_agent_runtime<C: ApiClient>(
     api_client: C,
     model: &str,
     allowed_tools: BTreeSet<String>,
     system_prompt: Vec<String>,
+    request_guard: Option<Box<dyn runtime::RequestGuard>>,
 ) -> ConversationRuntime<C, SubagentToolExecutor> {
     let tool_schema_tokens = subagent_tool_schema_tokens(&allowed_tools);
     let writes_files = ["write_file", "edit_file", "NotebookEdit"]
@@ -4464,7 +4861,7 @@ fn assemble_agent_runtime<C: ApiClient>(
         ),
         runtime::context_manager::ContextPolicy::from_env(),
     );
-    ConversationRuntime::new_with_features(
+    let mut runtime = ConversationRuntime::new_with_features(
         Session::new(),
         api_client,
         tool_executor,
@@ -4479,7 +4876,9 @@ fn assemble_agent_runtime<C: ApiClient>(
         // files in chat; its client follows `providerFallbacks` itself.
         agent_mode: writes_files,
         ..runtime::ModelRouting::default()
-    })
+    });
+    runtime.set_request_guard(request_guard);
+    runtime
 }
 
 /// `1` turns on the completion check's reviewer (see [`SubagentReviewer`]).
@@ -4571,10 +4970,16 @@ impl runtime::ChangeReviewer for SubagentReviewer {
         );
         system_prompt.push(REVIEWER_INSTRUCTIONS.to_string());
         let api_client = SubagentApiClient::new(&self.model, allowed_tools.clone())?;
-        let mut reviewer =
-            assemble_agent_runtime(api_client, &self.model, allowed_tools, system_prompt)
-                .with_max_iterations(REVIEW_MAX_ITERATIONS)
-                .with_cancellation_token(cancel.clone());
+        let request_guard = subagent_request_guard(&api_client);
+        let mut reviewer = assemble_agent_runtime(
+            api_client,
+            &self.model,
+            allowed_tools,
+            system_prompt,
+            request_guard,
+        )
+        .with_max_iterations(REVIEW_MAX_ITERATIONS)
+        .with_cancellation_token(cancel.clone());
         let summary = reviewer
             .run_turn(review_prompt(request), None)
             .map_err(|error| error.to_string())?;
@@ -4621,7 +5026,7 @@ fn review_findings(answer: &str) -> Result<Option<String>, String> {
 fn subagent_feature_config() -> runtime::RuntimeFeatureConfig {
     runtime::RuntimeFeatureConfig::default().with_hooks(
         subagent_parent_context()
-            .map(|context| context.hooks)
+            .map(|context| context.hooks.tool_hooks())
             .unwrap_or_default(),
     )
 }
@@ -5038,6 +5443,7 @@ mod subagent_inheritance_tests {
             "openai/auto",
             tools(&[tool]),
             vec!["system".to_string()],
+            None,
         );
         let summary = runtime.run_turn("delegated", None).expect("child turn");
         let ContentBlock::ToolResult {
@@ -5047,6 +5453,81 @@ mod subagent_inheritance_tests {
             panic!("expected a tool result");
         };
         (output.clone(), *is_error)
+    }
+
+    /// The plan's token window as a sub-agent's guard sees it: a working set, and only
+    /// requests of at most `window_left` input tokens go out.
+    struct WindowGuard {
+        working_set: Option<usize>,
+        window_left: usize,
+    }
+
+    impl runtime::RequestGuard for WindowGuard {
+        fn working_set_tokens(&self) -> Option<usize> {
+            self.working_set
+        }
+
+        fn allow_request(&mut self, request: &runtime::RequestEstimate) -> bool {
+            request.input_tokens <= self.window_left
+        }
+    }
+
+    /// Counts the requests that reached the provider.
+    struct CountingApi(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ApiClient for CountingApi {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![
+                AssistantEvent::TextDelta("done".to_string()),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    #[test]
+    fn a_subagent_keeps_the_parents_working_set_and_stops_at_the_window() {
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut child = assemble_agent_runtime(
+            CountingApi(sent.clone()),
+            "openai/auto",
+            tools(&["read_file"]),
+            vec!["system".to_string()],
+            Some(Box::new(WindowGuard {
+                working_set: Some(2_000),
+                window_left: 0,
+            })),
+        );
+        let summary = child.run_turn("delegated", None).expect("child turn");
+        assert!(
+            matches!(summary.outcome, runtime::TurnOutcome::BudgetStopped { .. }),
+            "{:?}",
+            summary.outcome
+        );
+        assert_eq!(
+            sent.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing sent"
+        );
+        assert_eq!(
+            child.context_manager().policy().working_set_tokens,
+            Some(2_000)
+        );
+
+        // A window that covers the request: it goes out as before.
+        let mut child = assemble_agent_runtime(
+            CountingApi(sent.clone()),
+            "openai/auto",
+            tools(&["read_file"]),
+            vec!["system".to_string()],
+            Some(Box::new(WindowGuard {
+                working_set: None,
+                window_left: usize::MAX,
+            })),
+        );
+        let summary = child.run_turn("delegated", None).expect("child turn");
+        assert_eq!(summary.outcome, runtime::TurnOutcome::Completed);
+        assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -5106,6 +5587,45 @@ mod subagent_inheritance_tests {
         assert!(
             map < role,
             "context comes before the sub-agent's instructions"
+        );
+    }
+
+    #[test]
+    fn subagents_inherit_only_tool_hooks_and_subagent_stop_can_ask_for_more() {
+        let _guard = parent_context_lock();
+        let block = if cfg!(windows) {
+            "echo cite your sources& exit /b 2"
+        } else {
+            "echo 'cite your sources'; exit 2"
+        };
+        let hooks = RuntimeHookConfig::new(vec!["guard".to_string()], Vec::new(), Vec::new())
+            .with(
+                runtime::HookEvent::Stop,
+                runtime::HookCommand::new("main-only", runtime::HookSource::User),
+            )
+            .with(
+                runtime::HookEvent::SubagentStop,
+                runtime::HookCommand::new(block, runtime::HookSource::User),
+            );
+        set_subagent_parent_context(SubagentParentContext {
+            hooks,
+            ..SubagentParentContext::new("openai/auto", PermissionMode::DangerFullAccess)
+        });
+        let inherited = subagent_feature_config();
+        let reason = crate::subagent_stop_hook_reason("agent-1", Some("Explore"), "done", false);
+        clear_subagent_parent_context();
+
+        assert_eq!(inherited.hooks().pre_tool_use(), ["guard"]);
+        assert!(!inherited.hooks().has(runtime::HookEvent::Stop));
+        assert!(!inherited.hooks().has(runtime::HookEvent::SubagentStop));
+        assert_eq!(
+            reason.as_deref(),
+            Some("A SubagentStop hook asked you to continue: cite your sources")
+        );
+        assert_eq!(
+            crate::subagent_stop_hook_reason("agent-1", None, "done", false),
+            None,
+            "no parent, no hooks"
         );
     }
 
@@ -5440,7 +5960,7 @@ mod subagent_inheritance_tests {
         let result = wait_for_agent(
             running,
             &done_rx,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             Some(&parent),
             &child,
         );
@@ -7837,6 +8357,7 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 }
 
 mod agent_worktree;
+mod gateway_search;
 pub mod lane_completion;
 pub mod pdf_extract;
 mod powershell;
@@ -8032,6 +8553,31 @@ mod tests {
                 .contains("requires 'danger-full-access' permission"),
             "denial should come from dynamic bash classification"
         );
+    }
+
+    #[test]
+    fn neuron_status_is_read_only_default_advertised_and_provider_backed() {
+        let spec = mvp_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "neuron_status")
+            .expect("neuron_status is a built-in tool");
+        assert_eq!(spec.required_permission, PermissionMode::ReadOnly);
+        assert_eq!(
+            crate::tool_advertisement("neuron_status"),
+            crate::ToolAdvertisement::Default
+        );
+        assert!(GlobalToolRegistry::builtin()
+            .definitions(None)
+            .iter()
+            .any(|tool| tool.name == "neuron_status"));
+        // One test: the provider slot is process-wide.
+        crate::clear_status_provider();
+        let without = execute_tool("neuron_status", &json!({})).expect("answers without a reader");
+        assert!(without.contains("not available"));
+        crate::set_status_provider(|| "Neuron status\n- Account: not signed in".to_string());
+        let with = execute_tool("neuron_status", &json!({})).expect("answers with a reader");
+        assert!(with.contains("not signed in"));
+        crate::clear_status_provider();
     }
 
     #[test]
@@ -9041,6 +9587,155 @@ mod tests {
         assert!(error.contains("relative URL without a base") || error.contains("empty host"));
     }
 
+    // Ported from Claw Code (MIT), upstream commit fd8527f.
+    #[test]
+    fn web_search_returns_error_on_non_2xx_response() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /search?q=test"));
+            HttpResponse::html(
+                429,
+                "Too Many Requests",
+                "<html><body><p>Too many requests.</p></body></html>",
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/search", server.addr()),
+        );
+        let error = execute_tool("WebSearch", &json!({ "query": "test" }))
+            .expect_err("non-2xx response should fail");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        assert!(error.contains("Web search unavailable"), "{error}");
+        assert!(error.contains("429"), "{error}");
+    }
+
+    // Ported from Claw Code (MIT), upstream commit fd8527f.
+    #[test]
+    fn web_search_rejects_duckduckgo_202_challenge_page() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /html/?q=challenge "));
+            HttpResponse::html(
+                202,
+                "Accepted",
+                r#"
+                <html><body>
+                  <a href="/html/">DuckDuckGo</a>
+                  <a href="https://duckduckgo.com/">Home</a>
+                  <p>Please verify you are not a bot.</p>
+                </body></html>
+                "#,
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", server.addr()),
+        );
+        let error = execute_tool("WebSearch", &json!({ "query": "challenge" }))
+            .expect_err("a 202 challenge page must not produce results");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        assert!(
+            error.contains("Web search unavailable (HTTP 202)"),
+            "{error}"
+        );
+    }
+
+    // Ported from Claw Code (MIT), upstream commit fd8527f.
+    #[test]
+    fn web_search_generic_fallback_drops_search_engine_links() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /search?q=chrome+links "));
+            HttpResponse::html(
+                200,
+                "OK",
+                r#"
+                <html><body>
+                  <a href="/html/">DuckDuckGo</a>
+                  <a href="https://html.duckduckgo.com/html/?q=x">Next page</a>
+                  <a href="https://duckduckgo.com/settings">Settings</a>
+                  <a href="https://docs.rs/serde">Serde Docs</a>
+                  <a href="https://tokio.rs/">Tokio</a>
+                </body></html>
+                "#,
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/search", server.addr()),
+        );
+        let result = execute_tool("WebSearch", &json!({ "query": "chrome links" }))
+            .expect("WebSearch fallback parsing should succeed");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let content = output["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .find_map(|item| item.get("content"))
+            .and_then(serde_json::Value::as_array)
+            .expect("search result block present");
+        let urls: Vec<&str> = content
+            .iter()
+            .map(|hit| hit["url"].as_str().expect("url"))
+            .collect();
+        assert_eq!(urls, ["https://docs.rs/serde", "https://tokio.rs/"]);
+    }
+
+    // Ported from Claw Code (MIT), upstream commit a289024.
+    #[test]
+    fn remote_trigger_body_truncates_on_a_char_boundary() {
+        // 8189 ASCII bytes, then a 4-byte character spanning byte 8192.
+        let mut body = "a".repeat(8189);
+        body.push('\u{1F980}');
+        body.push_str("tail_after_the_limit");
+        let total = body.len();
+
+        let truncated = super::truncate_remote_trigger_body(body);
+
+        assert!(truncated.starts_with(&"a".repeat(8189)));
+        assert!(!truncated.contains('\u{1F980}'));
+        assert!(!truncated.contains("tail_after_the_limit"));
+        assert!(truncated.contains(&format!("[response truncated — {total} bytes total]")));
+
+        let short = "short body".to_string();
+        assert_eq!(super::truncate_remote_trigger_body(short.clone()), short);
+    }
+
+    // Ported from Claw Code (MIT), upstream commit a289024.
+    #[test]
+    fn remote_trigger_truncates_a_multibyte_body_end_to_end() {
+        let server = TestServer::spawn(Arc::new(|_request_line: &str| {
+            let mut body = "a".repeat(8189);
+            body.push('\u{1F980}');
+            body.push_str("extra_content_after_boundary");
+            HttpResponse::text(200, "OK", &body)
+        }));
+
+        let result = execute_tool(
+            "RemoteTrigger",
+            &json!({ "url": format!("http://{}/test", server.addr()), "method": "GET" }),
+        )
+        .expect("RemoteTrigger should succeed");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let body = output["body"].as_str().expect("body string");
+        assert!(body.contains("[response truncated"));
+        assert!(!body.contains("extra_content_after_boundary"));
+    }
+
     #[test]
     fn pending_tools_preserve_multiple_streaming_tool_calls_by_index() {
         let mut events = Vec::new();
@@ -9180,9 +9875,8 @@ mod tests {
         assert!(store.starts_with(home.join("todos")), "{}", store.display());
         assert!(store.exists(), "{}", store.display());
         assert!(!store.starts_with(&cwd));
-        assert_eq!(
-            legacy.exists(),
-            legacy_existed,
+        assert!(
+            legacy_existed || !legacy.exists(),
             "nothing written to the workspace"
         );
         let _ = fs::remove_dir_all(&home);
@@ -9217,6 +9911,69 @@ mod tests {
             Vec::<super::TodoItem>::new()
         );
         let _ = fs::remove_dir_all(&workspace);
+    }
+
+    /// Once the store has the list, the one an earlier release left in the workspace is
+    /// removed when git does not track it, and kept when it does.
+    #[test]
+    fn the_legacy_todo_list_is_removed_unless_git_tracks_it() {
+        let list = r#"[{"content":"Old","activeForm":"Doing old","status":"pending"}]"#;
+
+        // Outside a repository.
+        let plain = temp_path("todo-legacy-plain");
+        fs::create_dir_all(&plain).expect("workspace");
+        let old = plain.join(super::LEGACY_TODO_FILE);
+        fs::write(&old, list).expect("legacy list");
+        super::remove_legacy_todos(&old);
+        assert!(!old.exists());
+        let _ = fs::remove_dir_all(&plain);
+
+        // In a repository: untracked, then ignored, then committed.
+        let repo = temp_path("todo-legacy-repo");
+        init_git_repo(&repo);
+        let old = repo.join(super::LEGACY_TODO_FILE);
+        fs::write(&old, list).expect("legacy list");
+        super::remove_legacy_todos(&old);
+        assert!(!old.exists(), "untracked");
+
+        fs::write(
+            repo.join(".gitignore"),
+            ".clawd-todos.json
+",
+        )
+        .expect("ignore");
+        fs::write(&old, list).expect("legacy list");
+        super::remove_legacy_todos(&old);
+        assert!(!old.exists(), "ignored");
+
+        fs::write(repo.join(".gitignore"), "").expect("ignore");
+        fs::write(&old, list).expect("legacy list");
+        run_git(&repo, &["add", super::LEGACY_TODO_FILE]);
+        run_git(&repo, &["commit", "--quiet", "-m", "todos"]);
+        super::remove_legacy_todos(&old);
+        assert!(old.exists(), "committed");
+
+        // Git fails inside the repository (exit 128): the committed list stays.
+        fs::write(repo.join(".git").join("index"), "garbage").expect("corrupt index");
+        let status = Command::new("git")
+            .args(["ls-files", "--error-unmatch", "--", super::LEGACY_TODO_FILE])
+            .current_dir(&repo)
+            .output()
+            .expect("git runs")
+            .status;
+        assert_eq!(status.code(), Some(128), "a corrupt index is a fatal error");
+        super::remove_legacy_todos(&old);
+        assert!(old.exists(), "git failed in a repository");
+        assert!(super::inside_repository(&repo.join("sub")));
+        let _ = fs::remove_dir_all(&repo);
+
+        // "Not a git repository" (128) outside one still lets it go; git's answers
+        // stand on their own.
+        assert!(super::legacy_todos_removable(Some(128), || false));
+        assert!(!super::legacy_todos_removable(Some(128), || true));
+        assert!(!super::legacy_todos_removable(None, || true));
+        assert!(super::legacy_todos_removable(Some(1), || true));
+        assert!(!super::legacy_todos_removable(Some(0), || false));
     }
 
     #[test]
@@ -11865,6 +12622,467 @@ printf 'pwsh:%s' "$1"
         );
     }
 
+    /// A fake Zero-X gateway: answers every request with one canned response and keeps
+    /// each full request (head and body) for the assertions.
+    struct FakeGateway {
+        addr: SocketAddr,
+        requests: Arc<Mutex<Vec<String>>>,
+        shutdown: Option<std::sync::mpsc::Sender<()>>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl FakeGateway {
+        fn spawn(status: u16, reason: &'static str, body: &str) -> Self {
+            Self::spawn_with_headers(status, reason, "", body)
+        }
+
+        fn spawn_with_headers(
+            status: u16,
+            reason: &'static str,
+            headers: &str,
+            body: &str,
+        ) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake gateway");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("addr");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&requests);
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let response = HttpResponse {
+                status,
+                reason,
+                content_type: "application/json",
+                headers: headers.to_string(),
+                body: body.to_string(),
+            };
+            let handle = thread::spawn(move || loop {
+                if rx.try_recv().is_ok() {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).expect("blocking");
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(20)))
+                            .expect("read timeout");
+                        let mut data = Vec::new();
+                        let mut chunk = [0_u8; 4096];
+                        loop {
+                            let size = stream.read(&mut chunk).expect("read request");
+                            data.extend_from_slice(&chunk[..size]);
+                            let text = String::from_utf8_lossy(&data).into_owned();
+                            if let Some(head_end) = text.find("\r\n\r\n") {
+                                let length = text[..head_end]
+                                    .lines()
+                                    .find_map(|line| {
+                                        line.to_ascii_lowercase()
+                                            .strip_prefix("content-length:")
+                                            .and_then(|value| value.trim().parse::<usize>().ok())
+                                    })
+                                    .unwrap_or(0);
+                                if data.len() >= head_end + 4 + length || size == 0 {
+                                    break;
+                                }
+                            } else if size == 0 {
+                                break;
+                            }
+                        }
+                        seen.lock()
+                            .expect("requests")
+                            .push(String::from_utf8_lossy(&data).into_owned());
+                        stream
+                            .write_all(response.to_bytes().as_slice())
+                            .expect("write response");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("gateway accept failed: {error}"),
+                }
+            });
+            Self {
+                addr,
+                requests,
+                shutdown: Some(tx),
+                handle: Some(handle),
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().expect("requests").clone()
+        }
+    }
+
+    impl Drop for FakeGateway {
+        fn drop(&mut self) {
+            if let Some(tx) = self.shutdown.take() {
+                let _ = tx.send(());
+            }
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// Points the gateway origin at a fake and (optionally) signs in; undone on drop.
+    struct GatewayEnv;
+
+    impl GatewayEnv {
+        fn new(addr: SocketAddr, signed_in: bool) -> Self {
+            std::env::set_var("NEURON_API_BASE", format!("http://{addr}/v1"));
+            runtime::set_zerox_token_provider(if signed_in {
+                Some(Arc::new(|| Ok("ses_secret_test_token".to_string())))
+            } else {
+                None
+            });
+            Self
+        }
+    }
+
+    impl Drop for GatewayEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("NEURON_API_BASE");
+            std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+            runtime::set_zerox_token_provider(None);
+        }
+    }
+
+    const GATEWAY_OK: &str = r#"{"results":[
+        {"title":"Reqwest docs","url":"https://docs.rs/reqwest","snippet":"HTTP client","published":"2026-11-01T00:00:00.000Z"},
+        {"title":"Blocked","url":"https://example.com/x","snippet":"nope"},
+        {"title":"Tokio","url":"https://tokio.rs/","snippet":"runtime"}],
+        "provider":"searxng","cached":false,
+        "quota":{"remaining":37,"limit":40,"resets_at":"2026-11-08T00:00:00.000Z","research":{"remaining":3,"limit":3}}}"#;
+
+    const DDG_PAGE: &str = r#"<html><body>
+        <a class="result__a" href="https://docs.rs/local">Local result</a>
+        <a class="result__a" href="https://example.com/local">Blocked local</a></body></html>"#;
+
+    fn search_output(result: &str) -> serde_json::Value {
+        serde_json::from_str(result).expect("valid json")
+    }
+
+    fn commentary(output: &serde_json::Value) -> String {
+        output["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .find_map(|item| item.as_str())
+            .expect("commentary")
+            .to_string()
+    }
+
+    fn hits(output: &serde_json::Value) -> Vec<serde_json::Value> {
+        output["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .find(|item| item.get("content").is_some())
+            .expect("hits block")["content"]
+            .as_array()
+            .expect("content")
+            .clone()
+    }
+
+    #[test]
+    fn signed_in_web_search_uses_the_gateway_with_the_session_bearer() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let _env = GatewayEnv::new(gateway.addr, true);
+
+        let result = execute_tool(
+            "WebSearch",
+            &json!({"query": "rust http", "freshness": "week"}),
+        )
+        .expect("gateway search succeeds");
+        let output = search_output(&result);
+
+        assert_eq!(output["source"], "zero-x gateway");
+        let found = hits(&output);
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0]["snippet"], "HTTP client");
+        let note = commentary(&output);
+        assert!(note.contains("37 of 40 searches left today"), "{note}");
+        assert!(note.contains("2026-11-08"), "{note}");
+        assert!(!note.contains("local fallback"), "{note}");
+        assert!(!result.contains("ses_secret_test_token"));
+
+        let requests = gateway.requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(request.starts_with("POST /v1/search "), "{request}");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer ses_secret_test_token"),
+            "{request}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+        assert_eq!(body["query"], "rust http");
+        assert_eq!(body["freshness"], "week");
+        assert_eq!(body["count"], 8);
+    }
+
+    #[test]
+    fn gateway_results_honour_allowed_and_blocked_domains() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let _env = GatewayEnv::new(gateway.addr, true);
+
+        let allowed = execute_tool(
+            "WebSearch",
+            &json!({"query": "rust http", "allowed_domains": ["https://DOCS.rs/"]}),
+        )
+        .expect("allowed filter");
+        let found = hits(&search_output(&allowed));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["url"], "https://docs.rs/reqwest");
+
+        let blocked = execute_tool(
+            "WebSearch",
+            &json!({"query": "rust http", "blocked_domains": ["EXAMPLE.com"]}),
+        )
+        .expect("blocked filter");
+        let urls = hits(&search_output(&blocked))
+            .iter()
+            .map(|hit| hit["url"].as_str().expect("url").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(urls, ["https://docs.rs/reqwest", "https://tokio.rs/"]);
+
+        // Filtering asks for the most results so the cut leaves something.
+        assert!(gateway
+            .requests()
+            .iter()
+            .all(|request| request.contains("\"count\":10")));
+    }
+
+    #[test]
+    fn an_invalid_freshness_is_rejected_before_any_request() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let _env = GatewayEnv::new(gateway.addr, true);
+
+        let error = execute_tool(
+            "WebSearch",
+            &json!({"query": "rust http", "freshness": "decade"}),
+        )
+        .expect_err("bad freshness");
+        assert!(error.contains("freshness"), "{error}");
+        assert_eq!(gateway.requests().len(), 0);
+    }
+
+    #[test]
+    fn exhausted_gateway_quota_is_reported_and_never_scraped() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(
+            429,
+            "Too Many Requests",
+            r#"{"error":"search_quota_exhausted","message":"x","exhausted":"searches","resets_at":"2026-11-08T00:00:00.000Z"}"#,
+        );
+        let local_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&local_hits);
+        let local = TestServer::spawn(Arc::new(move |_: &str| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            HttpResponse::html(200, "OK", DDG_PAGE)
+        }));
+        let _env = GatewayEnv::new(gateway.addr, true);
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", local.addr()),
+        );
+
+        let error = execute_tool("WebSearch", &json!({"query": "rust http"}))
+            .expect_err("an exhausted quota is an error");
+        assert!(error.contains("quota exhausted"), "{error}");
+        assert!(error.contains("2026-11-08"), "{error}");
+        assert!(error.contains("Not falling back"), "{error}");
+        assert!(!error.contains("ses_secret_test_token"));
+        assert_eq!(gateway.requests().len(), 1);
+        assert_eq!(local_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_503_from_the_gateway_falls_back_to_the_marked_local_search() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(
+            503,
+            "Service Unavailable",
+            r#"{"error":"search_unavailable","message":"later"}"#,
+        );
+        let local = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(
+                request_line.contains("GET /html/?q=rust+http "),
+                "{request_line}"
+            );
+            HttpResponse::html(200, "OK", DDG_PAGE)
+        }));
+        let _env = GatewayEnv::new(gateway.addr, true);
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", local.addr()),
+        );
+
+        let result = execute_tool(
+            "WebSearch",
+            &json!({"query": "rust http", "blocked_domains": ["example.com"], "freshness": "day"}),
+        )
+        .expect("the local search answers");
+        let output = search_output(&result);
+
+        assert_eq!(gateway.requests().len(), 1);
+        assert_eq!(output["source"], "local fallback");
+        let note = commentary(&output);
+        assert!(note.contains("local fallback"), "{note}");
+        assert!(note.contains("unavailable (503)"), "{note}");
+        assert!(note.contains("freshness filter was not applied"), "{note}");
+        let found = hits(&output);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["url"], "https://docs.rs/local");
+    }
+
+    #[test]
+    fn signed_out_web_search_goes_straight_to_the_local_search() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let local = TestServer::spawn(Arc::new(|_: &str| HttpResponse::html(200, "OK", DDG_PAGE)));
+        let _env = GatewayEnv::new(gateway.addr, false);
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", local.addr()),
+        );
+
+        let result =
+            execute_tool("WebSearch", &json!({"query": "rust http"})).expect("local search");
+        let output = search_output(&result);
+
+        assert!(gateway.requests().is_empty(), "no sign-in, no gateway call");
+        assert_eq!(output["source"], "local fallback");
+        assert!(commentary(&output).contains("not signed in to Zero-X"));
+        assert_eq!(hits(&output).len(), 2);
+    }
+
+    #[test]
+    fn an_unreachable_gateway_falls_back_to_the_local_search() {
+        let _guard = env_guard();
+        // A port that was just free and has no listener.
+        let dead = TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr");
+        let local = TestServer::spawn(Arc::new(|_: &str| HttpResponse::html(200, "OK", DDG_PAGE)));
+        let _env = GatewayEnv::new(dead, true);
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", local.addr()),
+        );
+
+        let result = execute_tool("WebSearch", &json!({"query": "rust http"})).expect("fallback");
+        let output = search_output(&result);
+        assert_eq!(output["source"], "local fallback");
+        assert!(commentary(&output).contains("could not be reached"));
+        assert!(!result.contains("ses_secret_test_token"));
+    }
+
+    #[test]
+    fn a_gateway_redirect_is_never_followed_and_falls_back() {
+        let _guard = env_guard();
+        let target = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let gateway = FakeGateway::spawn_with_headers(
+            307,
+            "Temporary Redirect",
+            &format!("Location: http://{}/v1/search\r\n", target.addr),
+            "",
+        );
+        let local = TestServer::spawn(Arc::new(|_: &str| HttpResponse::html(200, "OK", DDG_PAGE)));
+        let _env = GatewayEnv::new(gateway.addr, true);
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", local.addr()),
+        );
+
+        let result = execute_tool("WebSearch", &json!({"query": "rust http"})).expect("fallback");
+        let output = search_output(&result);
+        assert_eq!(output["source"], "local fallback");
+        assert!(commentary(&output).contains("redirect"), "{result}");
+        assert_eq!(gateway.requests().len(), 1);
+        assert!(
+            target.requests().is_empty(),
+            "the redirect target got a request"
+        );
+        assert!(!result.contains("ses_secret_test_token"));
+    }
+
+    #[test]
+    fn empty_and_whitespace_queries_are_rejected_before_any_request() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let _env = GatewayEnv::new(gateway.addr, true);
+        for query in ["", "   \t\n "] {
+            let error =
+                execute_tool("WebSearch", &json!({ "query": query })).expect_err("empty query");
+            assert!(error.contains("non-empty query"), "{error}");
+        }
+        assert_eq!(gateway.requests().len(), 0);
+    }
+
+    #[test]
+    fn a_long_query_is_trimmed_truncated_and_noted() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(200, "OK", GATEWAY_OK);
+        let _env = GatewayEnv::new(gateway.addr, true);
+        let query = format!("  {}  ", "a".repeat(450));
+
+        let result = execute_tool("WebSearch", &json!({ "query": query })).expect("search");
+        let note = commentary(&search_output(&result));
+        assert!(note.contains("450 characters"), "{note}");
+        assert!(note.contains("truncated to 400"), "{note}");
+        let requests = gateway.requests();
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).expect("body"))
+                .expect("json");
+        assert_eq!(body["query"].as_str().expect("query"), "a".repeat(400));
+    }
+
+    #[test]
+    fn a_multibyte_query_is_cut_on_a_character_boundary() {
+        let (cut, note) = crate::normalize_search_query(&"é".repeat(401)).expect("ok");
+        assert_eq!(cut, "é".repeat(400));
+        assert!(note.is_some());
+        let (same, note) = crate::normalize_search_query(&"é".repeat(400)).expect("ok");
+        assert_eq!(same.chars().count(), 400);
+        assert!(note.is_none());
+        let (mixed, _) =
+            crate::normalize_search_query(&format!("{}日本", "x".repeat(399))).expect("ok");
+        assert_eq!(mixed, format!("{}日", "x".repeat(399)));
+    }
+
+    #[test]
+    fn a_gateway_400_is_a_clear_error_and_not_scraped() {
+        let _guard = env_guard();
+        let gateway = FakeGateway::spawn(
+            400,
+            "Bad Request",
+            r#"{"error":"invalid_request","message":"bad"}"#,
+        );
+        let local_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&local_hits);
+        let local = TestServer::spawn(Arc::new(move |_: &str| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            HttpResponse::html(200, "OK", DDG_PAGE)
+        }));
+        let _env = GatewayEnv::new(gateway.addr, true);
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/html/", local.addr()),
+        );
+
+        let error = execute_tool("WebSearch", &json!({"query": "rust http"})).expect_err("400");
+        assert!(error.contains("invalid"), "{error}");
+        assert!(error.contains("Not falling back"), "{error}");
+        assert_eq!(local_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     struct TestServer {
         addr: SocketAddr,
         shutdown: Option<std::sync::mpsc::Sender<()>>,
@@ -11941,6 +13159,7 @@ printf 'pwsh:%s' "$1"
         status: u16,
         reason: &'static str,
         content_type: &'static str,
+        headers: String,
         body: String,
     }
 
@@ -11950,6 +13169,7 @@ printf 'pwsh:%s' "$1"
                 status,
                 reason,
                 content_type: "text/html; charset=utf-8",
+                headers: String::new(),
                 body: body.to_string(),
             }
         }
@@ -11959,16 +13179,18 @@ printf 'pwsh:%s' "$1"
                 status,
                 reason,
                 content_type: "text/plain; charset=utf-8",
+                headers: String::new(),
                 body: body.to_string(),
             }
         }
 
         fn to_bytes(&self) -> Vec<u8> {
             format!(
-                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
                 self.status,
                 self.reason,
                 self.content_type,
+                self.headers,
                 self.body.len(),
                 self.body
             )

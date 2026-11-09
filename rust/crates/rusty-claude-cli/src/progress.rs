@@ -360,6 +360,7 @@ pub(crate) fn build_runtime(
     progress_reporter: Option<InternalPromptProgressReporter>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let shared = shared_runtime_plugin_state()?;
+    let shared_generation = shared.generation;
     let plugin_registry = shared.state.plugin_registry.clone();
     let mcp_state = shared.state.mcp_state.clone();
     let runtime = assemble_conversation_runtime(
@@ -374,6 +375,7 @@ pub(crate) fn build_runtime(
         progress_reporter,
         shared.state,
         shared.max_iterations_setting,
+        shared.working_set_setting,
     )?;
     Ok(BuiltRuntime {
         runtime: Some(runtime),
@@ -381,6 +383,7 @@ pub(crate) fn build_runtime(
         plugins_active: false,
         mcp_state,
         mcp_active: false,
+        shared_generation,
     })
 }
 
@@ -415,6 +418,7 @@ pub(crate) fn build_runtime_with_plugin_state(
         progress_reporter,
         runtime_plugin_state,
         None,
+        None,
     )?;
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
 }
@@ -433,6 +437,7 @@ fn assemble_conversation_runtime(
     progress_reporter: Option<InternalPromptProgressReporter>,
     runtime_plugin_state: RuntimePluginState,
     max_iterations_setting: Option<usize>,
+    working_set_setting: Option<usize>,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     // The model the session runs on, kept in its metadata so a resumed session reports
@@ -450,11 +455,45 @@ fn assemble_conversation_runtime(
         plugin_registry: _,
         mcp_state,
     } = runtime_plugin_state;
+    // A hosted connector's destructive tools ask for every call: the gateway runs one
+    // only when told the user approved it.
+    let confirmed_tools = mcp_state
+        .as_ref()
+        .map(|mcp| {
+            mcp.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .confirmed_tools()
+        })
+        .unwrap_or_default();
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
-        .map_err(std::io::Error::other)?;
+        .map_err(std::io::Error::other)?
+        .with_confirmed_tools(confirmed_tools);
     tool_registry.set_enforcer(runtime::permission_enforcer::PermissionEnforcer::new(
         policy.clone(),
     ));
+    // What the model is told about its own session and account (no network call), and
+    // what the `neuron_status` tool reports.
+    crate::awareness::apply(
+        &mut system_prompt,
+        crate::awareness::SessionFacts {
+            model: crate::gateway_catalog::prompt_model_name(&model)
+                .unwrap_or_else(|| "auto".to_string()),
+            context_tokens: api::model_token_limit(crate::provider::shown_model(&model))
+                .map(|limit| u64::from(limit.context_window_tokens)),
+            permission_mode: permission_mode.as_str().to_string(),
+            trusted: std::env::current_dir()
+                .ok()
+                .map(|cwd| runtime::ConfigLoader::default_for(&cwd).workspace_is_trusted()),
+            tools: if enable_tools {
+                filter_tool_specs(&tool_registry, allowed_tools.as_ref())
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        },
+    );
     let tool_schema_tokens = if enable_tools {
         estimate_tool_schema_tokens(&filter_tool_specs(&tool_registry, allowed_tools.as_ref()))
     } else {
@@ -485,11 +524,13 @@ fn assemble_conversation_runtime(
     );
     let summary_model = crate::model_routing::summary_model(routing_settings, &model);
     let request_model = crate::model_routing::request_model(routing_settings, &model, enable_tools);
+    let working_set = crate::plan_window::configured_working_set(working_set_setting);
     register_subagent_parent(
         &model,
         permission_mode,
         &feature_config,
         allowed_tools.as_ref(),
+        working_set,
     );
     let mut api_client = AnthropicRuntimeClient::new(
         session_id,
@@ -501,6 +542,10 @@ fn assemble_conversation_runtime(
         progress_reporter,
     )?;
     api_client.set_summary_model(summary_model);
+    // The plan's token window: a smaller working set, and a question before a request
+    // would need more than the window has left (see `plan_window`).
+    let request_guard =
+        crate::plan_window::WindowGuard::new(api_client.uses_gateway(), working_set);
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         api_client,
@@ -517,7 +562,14 @@ fn assemble_conversation_runtime(
     .with_context_manager(context_manager)
     .with_max_iterations(runtime::resolve_max_iterations(max_iterations_setting))
     .with_harness_config(harness)
-    .with_model_routing(routing);
+    .with_model_routing(routing)
+    .with_request_guard(Box::new(request_guard))
+    // Every MCP call, refused ones too, is recorded (metadata only) in the config home.
+    .with_mcp_audit(runtime::McpAuditLog::new(
+        &runtime::default_config_home(),
+        session_id,
+        feature_config.mcp(),
+    ));
     if let Some(reviewer) = reviewer {
         runtime = runtime.with_change_reviewer(Box::new(reviewer));
     }
@@ -531,8 +583,8 @@ fn assemble_conversation_runtime(
             runtime = runtime.with_artifact_store(store);
         }
     }
-    if output.is_visible() {
-        runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
+    if let Some(reporter) = output.hook_reporter() {
+        runtime = runtime.with_hook_progress_reporter(reporter);
     }
     Ok(runtime)
 }
@@ -546,18 +598,21 @@ pub(crate) fn estimate_tool_schema_tokens(definitions: &[ToolDefinition]) -> usi
 
 /// Lets sub-agents spawned by the `Agent` tool inherit the parent's resolved
 /// model and provider credentials, and never more authority than the parent:
-/// its permission mode, permission rules, tool hooks and tool allow-list.
+/// its permission mode, permission rules, tool hooks and tool allow-list. They
+/// keep to the plan's token window too (`working_set` is the configured one).
 fn register_subagent_parent(
     model: &str,
     permission_mode: PermissionMode,
     feature_config: &runtime::RuntimeFeatureConfig,
     allowed_tools: Option<&AllowedToolSet>,
+    working_set: Option<usize>,
 ) {
     tools::set_subagent_parent_context(subagent_parent_context_for(
         model,
         permission_mode,
         feature_config,
         allowed_tools,
+        working_set,
     ));
 }
 
@@ -566,6 +621,7 @@ fn subagent_parent_context_for(
     permission_mode: PermissionMode,
     feature_config: &runtime::RuntimeFeatureConfig,
     allowed_tools: Option<&AllowedToolSet>,
+    working_set: Option<usize>,
 ) -> tools::SubagentParentContext {
     let factory: tools::SubagentClientFactory = Arc::new(|model: &str| {
         crate::api_client::build_provider_client(model, None).map_err(|error| error.to_string())
@@ -587,6 +643,7 @@ fn subagent_parent_context_for(
         allowed_tools: allowed_tools.cloned(),
         client_factory: Some(factory),
         context_sections,
+        request_guard: Some(crate::plan_window::subagent_guard_factory(working_set)),
         ..tools::SubagentParentContext::new(model, permission_mode)
     }
 }
@@ -598,6 +655,16 @@ fn subagent_parent_context_for(
 fn max_iterations_setting(runtime_config: &runtime::RuntimeConfig) -> Option<usize> {
     runtime_config
         .get("maxIterations")
+        .and_then(|value| value.as_i64())
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+/// Reads the `workingSetTokens` setting (`0` turns the working set off);
+/// `NEURON_WORKING_SET_TOKENS` overrides it (see `plan_window`).
+#[allow(clippy::redundant_closure_for_method_calls)]
+fn working_set_setting(runtime_config: &runtime::RuntimeConfig) -> Option<usize> {
+    runtime_config
+        .get("workingSetTokens")
         .and_then(|value| value.as_i64())
         .and_then(|value| usize::try_from(value).ok())
 }
@@ -623,6 +690,7 @@ struct SharedRuntimePluginState {
     /// The MCP servers while they start in the background; `mcp_state` is a stand-in.
     background_mcp: Option<BackgroundMcp>,
     max_iterations_setting: Option<usize>,
+    working_set_setting: Option<usize>,
 }
 
 /// When the MCP servers start (see [`set_mcp_startup`]).
@@ -728,6 +796,42 @@ impl SharedRuntimePluginState {
         }
     }
 
+    /// Starts again the hosted connectors that failed because they were not linked, and
+    /// adds the tools of those the user linked since: runtimes built before no longer
+    /// count as current, so the next turn offers them.
+    fn connect_linked_hosted(&mut self) {
+        if self.background_mcp.is_some() {
+            return;
+        }
+        let Some(mcp) = &self.mcp_state else {
+            return;
+        };
+        let tools = mcp
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retry_unlinked_hosted();
+        if tools.is_empty() {
+            return;
+        }
+        let servers = self.key.config.mcp().servers();
+        let mut runtime_tools = self.tool_registry.runtime_tools().to_vec();
+        for tool in &tools {
+            if !runtime_tools
+                .iter()
+                .any(|known| known.name == tool.qualified_name)
+            {
+                runtime_tools.push(crate::mcp_runtime_tool_definition(tool, servers));
+            }
+        }
+        match self.tool_registry.clone().with_runtime_tools(runtime_tools) {
+            Ok(registry) => self.tool_registry = registry,
+            Err(error) => {
+                runtime::ui_hooks::notice(&format!("warning: MCP tools left out: {error}"));
+            }
+        }
+        self.generation = next_shared_plugin_generation();
+    }
+
     fn handle(&self) -> SharedPluginStateHandle {
         SharedPluginStateHandle {
             generation: self.generation,
@@ -738,6 +842,7 @@ impl SharedRuntimePluginState {
                 mcp_state: self.mcp_state.clone(),
             },
             max_iterations_setting: self.max_iterations_setting,
+            working_set_setting: self.working_set_setting,
         }
     }
 
@@ -765,6 +870,7 @@ struct SharedPluginStateHandle {
     generation: u64,
     state: RuntimePluginState,
     max_iterations_setting: Option<usize>,
+    working_set_setting: Option<usize>,
 }
 
 thread_local! {
@@ -823,6 +929,7 @@ fn shared_runtime_plugin_state_starting(
             mcp_state: state.mcp_state,
             background_mcp,
             max_iterations_setting: max_iterations_setting(&runtime_config),
+            working_set_setting: working_set_setting(&runtime_config),
         };
         let handle = shared.handle();
         *slot.borrow_mut() = Some(shared);
@@ -850,6 +957,19 @@ pub(crate) struct ExtensionsSnapshot {
     pub(crate) plugins: Vec<plugins::PluginSummary>,
 }
 
+/// Whether this thread's shared MCP servers are still starting in the background. It only
+/// looks: the started servers join through [`extensions_snapshot`] or the next turn.
+pub(crate) fn background_mcp_starting() -> bool {
+    SHARED_PLUGIN_STATE.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|state| {
+            state
+                .background_mcp
+                .as_ref()
+                .is_some_and(BackgroundMcp::is_starting)
+        })
+    })
+}
+
 /// The shared state's MCP servers and plugins as they are now, taking servers that
 /// finished starting in the background. `None` before any runtime was built on this
 /// thread.
@@ -858,6 +978,7 @@ pub(crate) fn extensions_snapshot() -> Option<ExtensionsSnapshot> {
         let mut slot = slot.borrow_mut();
         let state = slot.as_mut()?;
         state.adopt_started_mcp();
+        state.connect_linked_hosted();
         let mcp = state.mcp_state.as_ref().map(|mcp| {
             let mcp = mcp
                 .lock()
@@ -923,12 +1044,15 @@ pub(crate) fn runtime_uses_current_shared_state(runtime: &BuiltRuntime) -> bool 
             return false;
         };
         shared.adopt_started_mcp();
+        shared.connect_linked_hosted();
         let same_mcp = match (&shared.mcp_state, &runtime.mcp_state) {
             (Some(current), Some(mine)) => Arc::ptr_eq(current, mine),
             (None, None) => true,
             _ => false,
         };
-        same_mcp && shared.plugin_registry == runtime.plugin_registry
+        same_mcp
+            && shared.plugin_registry == runtime.plugin_registry
+            && shared.generation == runtime.shared_generation
     })
 }
 
@@ -944,6 +1068,7 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 event,
                 tool_name,
                 command,
+                ..
             } => runtime::ui_hooks::notice(&format!(
                 "[hook {event_name}] {tool_name}: {command}",
                 event_name = event.as_str()
@@ -952,6 +1077,7 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 event,
                 tool_name,
                 command,
+                ..
             } => runtime::ui_hooks::notice(&format!(
                 "[hook done {event_name}] {tool_name}: {command}",
                 event_name = event.as_str()
@@ -960,6 +1086,7 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
                 event,
                 tool_name,
                 command,
+                ..
             } => runtime::ui_hooks::notice(&format!(
                 "[hook cancelled {event_name}] {tool_name}: {command}",
                 event_name = event.as_str()
@@ -971,14 +1098,189 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
 #[cfg(test)]
 mod shared_state_tests {
     use super::{
-        estimate_tool_schema_tokens, runtime_uses_current_shared_state,
+        estimate_tool_schema_tokens, extensions_snapshot, runtime_uses_current_shared_state,
         shared_runtime_plugin_state_starting, shared_runtime_plugin_state_with,
         shutdown_shared_runtime_state, McpStartup, SHARED_PLUGIN_STATE,
     };
     use runtime::ConfigLoader;
     use std::fs;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    /// A gateway's `/mcp/<id>` on loopback: it answers `needs_connect` until `linked`
+    /// is set, then serves one read and one destructive GitHub tool. One request per
+    /// connection.
+    fn hosted_gateway(linked: Arc<AtomicBool>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let connect_url = format!("{origin}/dashboard#connectors");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                let message: serde_json::Value =
+                    serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                let reply = if linked.load(Ordering::SeqCst) {
+                    let id = message["id"].clone();
+                    let tool = |name: &str| serde_json::json!({"name": name, "inputSchema": {"type": "object"}});
+                    match message["method"].as_str() {
+                        Some("initialize") => Some((
+                            200,
+                            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+                                "protocolVersion": "2025-06-18",
+                                "capabilities": {"tools": {}},
+                                "serverInfo": {"name": "github", "version": "1"}
+                            }}),
+                        )),
+                        Some("tools/list") => Some((
+                            200,
+                            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {
+                                "tools": [tool("get_me"), tool("delete_repository")]
+                            }}),
+                        )),
+                        _ => None,
+                    }
+                } else {
+                    Some((
+                        403,
+                        serde_json::json!({"error": "needs_connect", "connect_url": connect_url}),
+                    ))
+                };
+                let response = match reply {
+                    Some((status, body)) => {
+                        let body = body.to_string();
+                        format!(
+                            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    None => {
+                        "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                };
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        origin
+    }
+
+    /// Linking a hosted connector on the dashboard needs no restart: the next turn starts
+    /// it again and offers its tools (its destructive one asks for every call), and the
+    /// MCP panel shows it ready.
+    #[test]
+    fn a_hosted_connector_linked_during_the_session_joins_the_next_turn() {
+        let _env = crate::tests::env_lock();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "neuron-hosted-linked-{}-{nanos}",
+            std::process::id()
+        ));
+        let workspace = root.join("workspace");
+        let config_home = root.join("config");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultMcpServers":false,"mcpServers":{"gh-later":{"type":"zerox","id":"github"}}}"#,
+        )
+        .expect("settings");
+        let linked = Arc::new(AtomicBool::new(false));
+        let origin = hosted_gateway(Arc::clone(&linked));
+        let previous_base = std::env::var_os("NEURON_API_BASE");
+        let previous_hosted = std::env::var_os(runtime::ZEROX_HOSTED_CONNECTORS_ENV);
+        std::env::set_var("NEURON_API_BASE", &origin);
+        std::env::set_var(runtime::ZEROX_HOSTED_CONNECTORS_ENV, "1");
+        runtime::set_zerox_token_provider(Some(Arc::new(|| Ok("ses_test".to_string()))));
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let knows = |handle: &super::SharedPluginStateHandle, tool: &str| {
+            handle
+                .state
+                .tool_registry
+                .normalize_allowed_tools(&[tool.to_string()])
+                .is_ok()
+        };
+        let built_on = |handle: &super::SharedPluginStateHandle| crate::BuiltRuntime {
+            runtime: None,
+            plugin_registry: handle.state.plugin_registry.clone(),
+            plugins_active: false,
+            mcp_state: handle.state.mcp_state.clone(),
+            mcp_active: false,
+            shared_generation: handle.generation,
+        };
+        let failed_in_panel = || {
+            let snapshot = extensions_snapshot().expect("a shared state");
+            let mcp = snapshot.mcp.expect("MCP servers");
+            mcp.failed.iter().any(|(server, _)| server == "gh-later")
+        };
+
+        let first = shared_runtime_plugin_state_starting(&workspace, &loader, McpStartup::Wait)
+            .expect("builds");
+        assert!(!knows(&first, "mcp__gh-later__get_me"));
+        assert!(runtime::zerox_needs_connect("gh-later").is_some());
+        let runtime_before = built_on(&first);
+
+        // Not linked yet: the next turn asks again, and nothing changes.
+        assert!(runtime_uses_current_shared_state(&runtime_before));
+        assert!(runtime::zerox_needs_connect("gh-later").is_some());
+        assert!(failed_in_panel());
+
+        linked.store(true, Ordering::SeqCst);
+        assert!(
+            !runtime_uses_current_shared_state(&runtime_before),
+            "the next turn rebuilds its runtime"
+        );
+        let next = shared_runtime_plugin_state_starting(&workspace, &loader, McpStartup::Wait)
+            .expect("same configuration");
+        assert!(next.generation > first.generation);
+        assert!(knows(&next, "mcp__gh-later__get_me"));
+        assert!(knows(&next, "mcp__gh-later__delete_repository"));
+        assert_eq!(runtime::zerox_needs_connect("gh-later"), None);
+        assert!(!failed_in_panel(), "ready in the MCP panel");
+        let confirmed = next
+            .state
+            .mcp_state
+            .as_ref()
+            .expect("MCP state")
+            .lock()
+            .unwrap()
+            .confirmed_tools();
+        assert_eq!(confirmed, vec!["mcp__gh-later__delete_repository"]);
+        assert!(runtime_uses_current_shared_state(&built_on(&next)));
+
+        shutdown_shared_runtime_state();
+        runtime::set_zerox_token_provider(None);
+        match previous_base {
+            Some(value) => std::env::set_var("NEURON_API_BASE", value),
+            None => std::env::remove_var("NEURON_API_BASE"),
+        }
+        match previous_hosted {
+            Some(value) => std::env::set_var(runtime::ZEROX_HOSTED_CONNECTORS_ENV, value),
+            None => std::env::remove_var(runtime::ZEROX_HOSTED_CONNECTORS_ENV),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn mcp_servers_started_in_the_background_replace_the_stand_in_with_their_tools() {
@@ -1119,6 +1421,7 @@ mod shared_state_tests {
             plugins_active: false,
             mcp_state: third.state.mcp_state.clone(),
             mcp_active: false,
+            shared_generation: third.generation,
         };
         assert!(runtime_uses_current_shared_state(&built));
 
@@ -1168,6 +1471,7 @@ mod shared_state_tests {
             runtime::PermissionMode::DangerFullAccess,
             config.feature_config(),
             Some(&allowed),
+            Some(30_000),
         );
 
         assert_eq!(context.model, "openai/groq/openai/gpt-oss-120b");
@@ -1180,6 +1484,14 @@ mod shared_state_tests {
         assert_eq!(context.hooks.pre_tool_use(), ["audit-hook"]);
         assert_eq!(context.allowed_tools.as_ref(), Some(&allowed));
         assert!(context.client_factory.is_some());
+        // Sub-agents keep the conversation's working set (on any provider, once set).
+        let client = api::ProviderClient::OpenAi(api::OpenAiCompatClient::new(
+            "test-key",
+            api::OpenAiCompatConfig::openai(),
+        ));
+        let guard =
+            context.request_guard.as_ref().expect("a guard factory")(&client).expect("a guard");
+        assert_eq!(guard.working_set_tokens(), Some(30_000));
         let _ = fs::remove_dir_all(root);
     }
 

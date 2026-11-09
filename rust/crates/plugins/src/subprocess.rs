@@ -33,21 +33,57 @@ pub const CREDENTIAL_ENV_VARS: &[&str] = &[
     "GROK_API_KEY",
     "DASHSCOPE_API_KEY",
     "OPENROUTER_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "PGPASSWORD",
+    "MYSQL_PWD",
+    "KUBECONFIG",
 ];
 
 /// Name suffixes that mark any other variable as a secret (`GITHUB_TOKEN`,
 /// `STRIPE_SECRET`, `MISTRAL_API_KEY`); matched after a `_` or as the whole
 /// name, ignoring case.
-pub const CREDENTIAL_ENV_SUFFIXES: &[&str] = &["API_KEY", "TOKEN", "SECRET"];
+pub const CREDENTIAL_ENV_SUFFIXES: &[&str] = &[
+    "API_KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIALS",
+    "SECRET_KEY",
+    "ACCESS_KEY",
+    "PRIVATE_KEY",
+    "SECRET_ACCESS_KEY",
+    "CONNECTION_STRING",
+    "DSN",
+    "URI",
+];
 
 /// Value prefixes of Zero-X credentials (`ses_` CLI sessions, `nzx_` API keys).
 pub const CREDENTIAL_VALUE_PREFIXES: &[&str] = &["ses_", "nzx_"];
 
+/// Value prefixes of common provider keys (`sk-`, GitHub `ghp_`/`gho_`/`ghs_`/
+/// `github_pat_`, AWS `AKIA`/`ASIA`, Slack `xox`). They mark an inherited variable
+/// as a secret for the scrubber; a variable an MCP profile names on purpose is
+/// still passed on.
+pub const PROVIDER_SECRET_VALUE_PREFIXES: &[&str] = &[
+    "sk-",
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "github_pat_",
+    "AKIA",
+    "ASIA",
+    "xoxb-",
+    "xoxp-",
+];
+
 /// Default timeout for hook commands.
-pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Default timeout for plugin tool commands.
-pub const DEFAULT_PLUGIN_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+pub const DEFAULT_PLUGIN_TOOL_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Maximum bytes captured per output stream; the remainder is drained and dropped.
 pub const MAX_CAPTURED_BYTES: usize = 8 * 1024 * 1024;
@@ -106,6 +142,7 @@ pub fn is_credential_env(key: &OsStr, value: &OsStr) -> bool {
     let value = value.to_string_lossy();
     CREDENTIAL_VALUE_PREFIXES
         .iter()
+        .chain(PROVIDER_SECRET_VALUE_PREFIXES)
         .any(|prefix| value.starts_with(prefix))
 }
 
@@ -741,6 +778,76 @@ mod tests {
     }
 
     #[test]
+    fn detects_more_secret_names_and_provider_value_prefixes() {
+        for key in [
+            "DB_PASSWORD",
+            "POSTGRES_PASSWD",
+            "GOOGLE_CREDENTIALS",
+            "DJANGO_SECRET_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "SIGNING_PRIVATE_KEY",
+            "DATABASE_URL",
+            "AZURE_STORAGE_CONNECTION_STRING",
+        ] {
+            assert!(
+                is_credential_env(OsStr::new(key), OsStr::new("plain-value")),
+                "{key}"
+            );
+        }
+        for value in [
+            "sk-live-abc",
+            "ghp_abc",
+            "github_pat_abc",
+            "AKIAABCDEFG",
+            "xoxb-1-2",
+        ] {
+            assert!(
+                is_credential_env(OsStr::new("SOME_VAR"), OsStr::new(value)),
+                "{value}"
+            );
+        }
+        assert!(!is_credential_env(
+            OsStr::new("PASSWORD_POLICY"),
+            OsStr::new("strict")
+        ));
+    }
+
+    #[test]
+    fn detects_database_and_cluster_credentials_by_name() {
+        for key in [
+            "PGPASSWORD",
+            "MYSQL_PWD",
+            "MONGO_URI",
+            "SENTRY_DSN",
+            "REDIS_URL",
+            "KUBECONFIG",
+            "pgpassword",
+            "ANALYTICS_DSN",
+            "CACHE_URI",
+            "DSN",
+            "REDIS_URL",
+        ] {
+            assert!(
+                is_credential_env(OsStr::new(key), OsStr::new("plain-value")),
+                "{key}"
+            );
+        }
+        for key in [
+            "DSNAME",
+            "MYURI",
+            "PURI",
+            "CURL_CA_BUNDLE",
+            "REDIS_URL_FILE_NOT",
+        ] {
+            assert!(
+                !is_credential_env(OsStr::new(key), OsStr::new("plain-value")),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
     fn detects_provider_keys_and_secret_looking_names() {
         for key in [
             "ANTHROPIC_API_KEY",
@@ -851,7 +958,7 @@ mod tests {
             "i=0; while [ $i -lt 3000 ]; do echo stdout-line-$i; echo stderr-line-$i >&2; i=$((i+1)); done"
         };
         let mut command = shell(script);
-        let output = run_bounded(&mut command, None, Some(Duration::from_secs(60)), &|| false)
+        let output = run_bounded(&mut command, None, Some(Duration::from_mins(1)), &|| false)
             .expect("child should run");
         assert_eq!(output.termination, Termination::Exited);
         assert!(output.stdout.len() > 30_000);
@@ -988,7 +1095,7 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .spawn()
             .expect("the shell starts");
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         let grandchild = loop {
             if let Some(pid) = std::fs::read_to_string(&pid_file)
                 .ok()

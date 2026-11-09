@@ -64,6 +64,36 @@ export const FEATURE_CHECKPOINTS = 'checkpoints'
 export const FEATURE_MCP_TOGGLE = 'mcp_toggle'
 /** `tool_output_delta` events: a running shell command's output. */
 export const FEATURE_LIVE_OUTPUT = 'live_output'
+/** `hook_started` and `hook_finished` events while hook commands run. */
+export const FEATURE_HOOK_PROGRESS = 'hook_progress'
+/**
+ * The connector catalog: the `list_connector_catalog` command (answered with a
+ * `connector_catalog` event), `add_mcp_server`, `remove_mcp_server` and
+ * `approve_mcp_server` (each answered with a notice and a fresh `extensions`
+ * event, or an error), and `catalog` on MCP servers.
+ */
+export const FEATURE_MCP_CATALOG = 'mcp_catalog'
+/**
+ * The connector policy (managed settings and the Zero-X plan): MCP servers
+ * with scope `managed`, status `blocked` with the policy's reason in `error`,
+ * and `required` on servers that cannot be turned off.
+ */
+export const FEATURE_MCP_POLICY = 'mcp_policy'
+/**
+ * Hosted connectors through Zero-X: MCP servers with transport `zerox`, status
+ * `needs_connect` while the connector is not linked to the Zero-X account, and
+ * `connect_url`, the page that links it.
+ */
+export const FEATURE_MCP_HOSTED = 'mcp_hosted'
+/**
+ * The prompt status bar's engine side: `provider`, `model_display_name`,
+ * `reasoning_effort(s)`, `full_access_allowed` and `context` on `status`;
+ * `provider`, `reasoning_efforts` and `supports_reasoning` on models; the
+ * `set_reasoning_effort`, `set_permission_mode`, `list_branches` and
+ * `switch_branch` commands and the `branches` event; `/effort` and a
+ * `/context` report.
+ */
+export const FEATURE_STATUS_BAR = 'status_bar'
 
 /** A UI capability: questions come as `question` events, not "Question:" notices. */
 export const CAPABILITY_QUESTIONS = 'questions'
@@ -85,6 +115,12 @@ export const CAPABILITY_GIT_VIEWS = 'git_views'
  * `tool_output_delta` events. Without it the output comes only with the result.
  */
 export const CAPABILITY_LIVE_OUTPUT = 'live_output'
+
+/**
+ * A UI capability: `hook_started` and `hook_finished` events. Without it the
+ * engine sends neither.
+ */
+export const CAPABILITY_HOOK_PROGRESS = 'hook_progress'
 
 /** Token counts as the provider reported them (or estimated before it did). */
 export interface TokenCounts {
@@ -108,6 +144,12 @@ export interface PermissionView {
    * approval is possible.
    */
   session_prefixes: string[]
+  /**
+   * The `permissions.allow` rules "always allow in this project" would save to
+   * the project's `.neuron/settings.local.json`. Added after protocol 1: older
+   * engines leave it out, and the choice is offered only when it is not empty.
+   */
+  project_rules?: string[]
 }
 
 /** The workspace's git state, for the footer. */
@@ -149,6 +191,15 @@ export interface ModelInfo {
   available_again_at?: string | null
   /** The catalog says the model reads images; absent when it does not say. */
   supports_images?: boolean | null
+  /**
+   * Who serves it (the gateway's `owned_by`/`provider`: `gemini`, `groq`,
+   * `zero-x` for `auto`, ...), feature `status_bar`. Drawn as a monogram.
+   */
+  provider?: string | null
+  /** The thinking levels it takes, lowest first (feature `status_bar`). */
+  reasoning_efforts?: string[] | null
+  /** The catalog says it reasons; absent or `null` when it does not say. */
+  supports_reasoning?: boolean | null
 }
 
 /** The Zero-X login, as the UI may show it. Never carries the token. */
@@ -221,11 +272,24 @@ export interface TodoItem {
 /** One configured MCP server and what it is doing now. */
 export interface McpServerInfo {
   name: string
-  /** `bundled`, `user`, `project` or `local`. */
+  /**
+   * `bundled`, `user`, `project`, `local` or `managed` (the machine's managed
+   * settings, or a server the connector policy requires).
+   */
   scope: string
-  /** `stdio`, `http`, `sse`, `ws`, `sdk` or `managed_proxy`. */
+  /**
+   * `stdio`, `http`, `sse`, `ws`, `sdk` or `zerox` (a hosted connector through
+   * Zero-X; older engines said `managed_proxy`).
+   */
   transport: string
-  /** `starting`, `ready`, `failed`, `pending`, `unsupported`, `not_started` or `disabled`. */
+  /**
+   * `starting`, `ready`, `failed`, `pending`, `unsupported`, `not_started`,
+   * `disabled`, `needs_approval` (a new or changed workspace server, started once
+   * approved with `/mcp approve <name>`), `blocked` (a deny rule or the
+   * connector policy refuses it) or `needs_connect` (a hosted connector not
+   * linked to the Zero-X account yet; see `connect_url`). `error` says why for
+   * the last three; older engines send none of them.
+   */
   status: string
   /** Its tools, without the `mcp__<server>__` prefix. */
   tools: string[]
@@ -233,6 +297,71 @@ export interface McpServerInfo {
   error: string | null
   /** Turned on (feature `mcp_toggle`); an older engine leaves it out: on. */
   enabled?: boolean
+  /**
+   * The catalog connector it was added from, when its launch spec is exactly
+   * that entry's (feature `mcp_catalog`); left out otherwise.
+   */
+  catalog?: string
+  /**
+   * The connector policy requires it (feature `mcp_policy`): it is on and
+   * cannot be turned off. Older engines leave it out.
+   */
+  required?: boolean
+  /**
+   * A stdio server that is not a catalog connector and whose version and
+   * hashes are not recorded (`/mcp pin <name>` records them). Older engines
+   * leave it out.
+   */
+  unpinned?: boolean
+  /**
+   * The page on the Zero-X gateway that links this hosted connector, while its
+   * status is `needs_connect` (feature `mcp_hosted`). Older engines leave it out.
+   */
+  connect_url?: string
+  /**
+   * The permission tier of each of its tools (`read`, `write`, `destructive`
+   * or `external`) as the connector catalog pins it, for a catalog or hosted
+   * connector (feature `mcp_catalog`); shown on the tool's calls. Other
+   * servers, and older engines, leave it out.
+   */
+  tool_tiers?: Record<string, string>
+}
+
+/** A variable a catalog connector needs. */
+export interface ConnectorVariable {
+  /** The environment variable or `${secret:NAME}` name. */
+  name: string
+  label: string
+  /** Kept in the OS keychain: mask its field, never log it. */
+  secret: boolean
+  required: boolean
+  default: string | null
+  /** Where to get it (a token page). */
+  help_url: string | null
+}
+
+/** One connector of the catalog (`connector_catalog` event). */
+export interface ConnectorInfo {
+  id: string
+  name: string
+  description: string
+  publisher: string
+  /** Published by the service's vendor or the MCP project. */
+  official: boolean
+  licence: string
+  /** Its source repository. */
+  source: string
+  /** `stdio` (runs locally) or `http` (a remote server). */
+  transport: string
+  /** `<package>@<version>`, or the URL of a remote server. */
+  pinned: string
+  /** Signs in with OAuth once added (`neuron mcp login <server>`). */
+  oauth: boolean
+  /** `user`, `project` or `local`. */
+  default_scope: string
+  variables: ConnectorVariable[]
+  /** The configured servers added from it. */
+  added: string[]
 }
 
 /** One installed plugin. */
@@ -310,6 +439,55 @@ export interface AccountDetails {
   usage_updated_at: number | null
   /** Why the plan and usage could not be read, when they could not. */
   usage_error: string | null
+  /**
+   * The plan's rolling token window (Zero-X Free: 1M tokens per 5 hours),
+   * which refuses requests before the daily figures do, kept current from the
+   * quota headers of each reply. Absent for a plan without one, before the
+   * account is read, and from older engines.
+   */
+  usage_window?: UsageWindow | null
+}
+
+/**
+ * A rolling usage window (`usage_window` in `/api/account`). Every part may be
+ * missing; `tokens` and `remaining_tokens` are `null` while not known (also
+ * once `resets_at` has passed, until the account is read again).
+ */
+export interface UsageWindow {
+  /** Tokens used in the window. */
+  tokens: number | null
+  limit_tokens: number | null
+  remaining_tokens: number | null
+  /** When the oldest usage leaves the window (ISO 8601, UTC). */
+  resets_at: string | null
+  /** The window's length: 18000 for five hours. */
+  window_seconds: number | null
+}
+
+/**
+ * What fills the context window (feature `status_bar`). Token counts are the
+ * engine's estimates. `used_tokens` is what is sent with each request
+ * (system prompt, tool schemas, instructions and the conversation);
+ * `context_window - output_reserve` is what it may use.
+ */
+export interface ContextBreakdown {
+  context_window: number
+  /** Kept free for the reply (`max_tokens`). */
+  output_reserve: number
+  /** The system prompt without the project instructions. */
+  system_tokens: number
+  tool_schema_tokens: number
+  tool_count: number
+  /** NEURON.md and other instruction files and memory. */
+  instruction_tokens: number
+  instruction_files: string[]
+  /** Prompts, replies and tool calls. */
+  conversation_tokens: number
+  /** Tool results. */
+  tool_output_tokens: number
+  used_tokens: number
+  /** Auto-compaction starts when `used_tokens` reaches this. */
+  threshold_tokens: number
 }
 
 /**
@@ -337,10 +515,12 @@ export interface ErrorDetail {
 export interface HookPreview {
   /** `PreToolUse`, `PostToolUse` or `PostToolUseFailure`. */
   event: string
-  /** The command it runs (shortened when long). */
+  /** The command it runs, in full (cut only past a very long length). */
   command: string
   /** The settings file it comes from. */
   source: string
+  /** The tool name the hook is limited to; absent when it runs for every tool. */
+  matcher?: string
 }
 
 /** An MCP server a workspace's settings would start. */
@@ -353,6 +533,19 @@ export interface McpServerPreview {
    */
   target: string | null
   source: string
+  /**
+   * What runs, for the user to read before approving: the program and its
+   * arguments, or the URL without credentials or query, with secret-looking
+   * values shown as `[REDACTED]`; never environment or headers. Older engines
+   * leave it out.
+   */
+  command?: string
+  /**
+   * The digest of the launch spec as previewed. Approving from the preview
+   * sends it back (`approve_mcp_server`), and the engine refuses the approval
+   * if the config changed since. Older engines leave it out.
+   */
+  fingerprint?: string
 }
 
 /** A permission rule a workspace's settings would add. */
@@ -458,6 +651,38 @@ export interface StatusEvent {
    * answer, for providers that do not name it, and from older engines.
    */
   served_model?: string | null
+  /**
+   * Estimated input tokens of each model request the next turn sends (system
+   * prompt, tool definitions and the conversation): the same figure as
+   * `ContextBreakdown.used_tokens` where an engine sends both. A turn sends
+   * one request per step. Absent from older engines. The plan's token window
+   * is `AccountDetails.usage_window`.
+   */
+  request_tokens_estimate?: number | null
+  /**
+   * How a person reads `served_model`: its catalog name without the
+   * gateway's route to it (`GLM-4.7 Flash`, not `GLM-4.7 Flash (OpenRouter,
+   * free)` or the id). Sent with `served_model`; absent from older engines.
+   */
+  served_model_display_name?: string | null
+  /** Who serves the model (feature `status_bar`), as on {@link ModelInfo}. */
+  provider?: string | null
+  /**
+   * The catalog's name for the model (feature `status_bar`), without the
+   * gateway's route to it from engines after 7.0.0-alpha.4.
+   */
+  model_display_name?: string | null
+  /** The thinking level the next turn asks for; `null` for the model's default. */
+  reasoning_effort?: string | null
+  /** The levels the model takes; `null` when unknown, empty when it does not reason. */
+  reasoning_efforts?: string[] | null
+  /**
+   * Full access may be picked: the engine started with it (or with
+   * `--dangerously-skip-permissions`). Absent from older engines.
+   */
+  full_access_allowed?: boolean
+  /** What fills the context window; absent from older engines. */
+  context?: ContextBreakdown | null
 }
 
 /**
@@ -677,6 +902,16 @@ export interface ExtensionsEvent {
 }
 
 /**
+ * Answer to `list_connector_catalog` (feature `mcp_catalog`): the catalog's
+ * version and the connectors that match the query.
+ */
+export interface ConnectorCatalogEvent {
+  type: 'connector_catalog'
+  version: string
+  connectors: ConnectorInfo[]
+}
+
+/**
  * What a report command (`/usage`, `/init`, `/memory`, `/doctor`) found, for
  * a scrollable panel, with the `reports` capability; `turn_finished` follows.
  */
@@ -716,6 +951,17 @@ export interface TrustPreviewEvent {
   session_only: boolean
   /** The workspace is trusted already. */
   trusted: boolean
+  /**
+   * The workspace was trusted before, but its hooks, MCP servers or allow
+   * rules changed since: the screen says so and lists them again.
+   */
+  changed_since_trust?: boolean
+  /**
+   * With `changed_since_trust`: the settings keys (`env`, `model`, `hooks`, ...)
+   * that differ from what was trusted, sorted. Empty when there was nothing to
+   * compare. Engines before it leave it out.
+   */
+  changed_settings?: string[]
   /** The workspace's settings files. */
   settings_files: string[]
   hooks: HookPreview[]
@@ -785,6 +1031,34 @@ export interface ToolOutputDeltaEvent {
 }
 
 /**
+ * A hook command started. `event` is its settings name (`PreToolUse`, `Stop`,
+ * ...); `command` is shortened, with anything that looks like a secret hidden;
+ * `tool_use_id` is the tool call it runs for.
+ */
+export interface HookStartedEvent {
+  type: 'hook_started'
+  event: string
+  matcher?: string | null
+  command: string
+  tool_use_id?: string | null
+}
+
+/** How a hook command ended. */
+export type HookOutcome = 'ok' | 'blocked' | 'error' | 'cancelled'
+
+/** A hook command ended; `message` is the start of what it said. */
+export interface HookFinishedEvent {
+  type: 'hook_finished'
+  event: string
+  matcher?: string | null
+  command: string
+  tool_use_id?: string | null
+  outcome: HookOutcome
+  duration_ms: number
+  message?: string | null
+}
+
+/**
  * Every file the agent created, changed or deleted in this session, with lines
  * added and removed since the session first touched it.
  */
@@ -848,6 +1122,28 @@ export interface RewoundEvent {
   prompt: string | null
 }
 
+/** One local branch, for the branch picker (feature `status_bar`). */
+export interface BranchInfo {
+  name: string
+  /** Its upstream (`origin/main`), when it has one. */
+  upstream: string | null
+  /** Commits ahead of and behind the upstream; `null` without one. */
+  ahead: number | null
+  behind: number | null
+  /** Its last commit (Unix milliseconds). */
+  last_commit_ms: number | null
+}
+
+/** Answer to `list_branches`: the local branches, newest commit first. */
+export interface BranchesEvent {
+  type: 'branches'
+  /** The checked-out branch; `null` on a detached HEAD. */
+  current: string | null
+  branches: BranchInfo[]
+  /** The working tree has uncommitted changes (switching is refused then). */
+  dirty: boolean
+}
+
 /** Engine → UI. `UiEvent` in protocol.rs (`#[serde(tag = "type")]`). */
 export type UiEvent =
   | ReadyEvent
@@ -871,6 +1167,8 @@ export type UiEvent =
   | OutputProgressEvent
   | RequestUsageEvent
   | ToolOutputDeltaEvent
+  | HookStartedEvent
+  | HookFinishedEvent
   | ChangesEvent
   | DiffEvent
   | CommitProposalEvent
@@ -884,9 +1182,11 @@ export type UiEvent =
   | SubagentStartedEvent
   | SubagentFinishedEvent
   | ExtensionsEvent
+  | ConnectorCatalogEvent
   | ReportEvent
   | AccountEvent
   | TrustPreviewEvent
+  | BranchesEvent
 
 export type UiEventType = UiEvent['type']
 
@@ -913,6 +1213,8 @@ export const UI_EVENT_TYPES: readonly UiEventType[] = [
   'output_progress',
   'request_usage',
   'tool_output_delta',
+  'hook_started',
+  'hook_finished',
   'changes',
   'diff',
   'commit_proposal',
@@ -926,9 +1228,11 @@ export const UI_EVENT_TYPES: readonly UiEventType[] = [
   'subagent_started',
   'subagent_finished',
   'extensions',
+  'connector_catalog',
   'report',
   'account',
   'trust_preview',
+  'branches',
 ]
 
 // ---------------------------------------------------------------- UI → engine
@@ -978,6 +1282,41 @@ export type EngineCommand =
    * settings: a notice and a fresh `extensions` event follow.
    */
   | { type: 'set_mcp_server_enabled'; name: string; enabled: boolean }
+  /**
+   * The catalog connectors whose id, name, publisher or description contain
+   * every word of `query` (all when empty), as a `connector_catalog` event
+   * (feature `mcp_catalog`).
+   */
+  | { type: 'list_connector_catalog'; query?: string }
+  /**
+   * Add the catalog connector `id` as the server `name` (the id when null) to
+   * the settings of `scope` (`user`, `project` or `local`; the connector's
+   * default when null). `secrets` holds what the user typed for its variables:
+   * secrets go to the OS keychain, never into a settings file, and must never be
+   * logged. A notice and a fresh `extensions` event follow, or an error. A
+   * connector that signs in with OAuth (`oauth`) then opens the browser: a notice
+   * with the sign-in link, later one with the result (and, once signed in,
+   * another `extensions` event).
+   */
+  | {
+      type: 'add_mcp_server'
+      id: string
+      name?: string | null
+      scope?: string | null
+      secrets?: Record<string, string>
+    }
+  /**
+   * Remove the server `name` (from the settings of `scope` when given), with its
+   * keychain secrets and sign-in. A notice and a fresh `extensions` event follow.
+   */
+  | { type: 'remove_mcp_server'; name: string; scope?: string | null }
+  /**
+   * Approve the workspace server `name` (status `needs_approval`) as configured
+   * now; with `fingerprint` (from the trust preview), only if it is still
+   * configured as the preview showed it. A notice and a fresh `extensions`
+   * event follow, or an error.
+   */
+  | { type: 'approve_mcp_server'; name: string; fingerprint?: string }
   /** What trusting the workspace would turn on (feature `trust_preview`). */
   | { type: 'trust_preview' }
   /** Read the plan and usage again, as an `account` event (feature `account`). */
@@ -986,6 +1325,26 @@ export type EngineCommand =
   | { type: 'commit'; message: string }
   /** Go back to a checkpoint from a `checkpoints` event. */
   | { type: 'rewind'; checkpoint: number; mode: RewindMode; dry_run?: boolean }
+  /**
+   * The thinking level of the next turns (feature `status_bar`); `null` for
+   * the model's default. A `status` follows, or an `error`.
+   */
+  | { type: 'set_reasoning_effort'; effort: string | null }
+  /**
+   * `read-only`, `workspace-write`, `danger-full-access` (only when
+   * `full_access_allowed`), or `plan` / `plan-off` for plan mode (feature
+   * `status_bar`). No notice and no `turn_finished`: a `status` follows, or
+   * an `error`.
+   */
+  | { type: 'set_permission_mode'; mode: string }
+  /** The local branches, as a `branches` event (feature `status_bar`). */
+  | { type: 'list_branches' }
+  /**
+   * Check out `name` (`create`: a new branch from HEAD). Refused while a
+   * turn runs or the tree has changes. A notice and a `status` follow, or an
+   * `error`.
+   */
+  | { type: 'switch_branch'; name: string; create: boolean }
 
 /** Every `EngineCommand` tag. */
 export const ENGINE_COMMAND_TYPES: readonly EngineCommand['type'][] = [
@@ -1002,10 +1361,18 @@ export const ENGINE_COMMAND_TYPES: readonly EngineCommand['type'][] = [
   'trust_workspace',
   'list_extensions',
   'set_mcp_server_enabled',
+  'list_connector_catalog',
+  'add_mcp_server',
+  'remove_mcp_server',
+  'approve_mcp_server',
   'trust_preview',
   'refresh_account',
   'commit',
   'rewind',
+  'set_reasoning_effort',
+  'set_permission_mode',
+  'list_branches',
+  'switch_branch',
 ]
 
 /** The user's answer to a permission request (`#[serde(tag = "kind")]`). */
@@ -1014,8 +1381,17 @@ export type PermissionDecision =
   | { kind: 'allow_once' }
   /** Run this call and similar ones for the rest of the session. */
   | { kind: 'allow_for_session' }
-  /** Do not run it; `note` is passed to the model. */
-  | { kind: 'deny'; note: string | null }
+  /**
+   * Run this call and save `project_rules` so matching calls run in this
+   * project from now on. Send only when the request offered `project_rules`.
+   */
+  | { kind: 'allow_for_project' }
+  /**
+   * Do not run it; `note` is passed to the model. With `session`, matching
+   * calls are refused for the rest of the session without asking (an older
+   * engine ignores it and denies this call only).
+   */
+  | { kind: 'deny'; note: string | null; session?: boolean }
 
 /** Answer to `permission_requested` with the same `id`. */
 export interface PermissionReply {

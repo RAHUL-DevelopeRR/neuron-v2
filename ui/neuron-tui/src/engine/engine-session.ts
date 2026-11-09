@@ -13,6 +13,7 @@ import { resetLiveTurnStore } from '../state/live-turn-store'
 import { useStartGate } from '../state/start-gate'
 import { consoleSafeText } from '../utils/glyphs'
 import { logger } from '../utils/logger'
+import { formatTimestamp } from '../utils/helpers'
 import { getSystemMessage } from '../utils/message-history'
 import {
   existingCurrentChatDir,
@@ -31,18 +32,28 @@ import {
   type TurnOutcome,
 } from './neuron-engine-client'
 import { handleGitViewsEvent, resetGitViews } from './git-views'
-import { handleMcpPanelEvent, resetMcpPanel } from './mcp-panel'
-import { FEATURE_TRUST_PREVIEW } from './protocol'
-import { QUESTION_PREFIX } from './questions'
+import { handleMcpPanelEvent, requestExtensions, resetMcpPanel } from './mcp-panel'
+import { hookFinishedLine } from './hook-progress'
+import { FEATURE_MCP_CATALOG, FEATURE_TRUST_PREVIEW } from './protocol'
+import { closeQuestionForm, openQuestionForm } from './question-form'
+import { QUESTION_PREFIX, questionNoticeText } from './questions'
 import { engineSessionOf, withEngineSession } from './session-run-state'
 import { StdioEngineClient } from './stdio-engine-client'
 
-import type { StatusEvent, UiEvent, WorkspaceTrustedEvent } from './protocol'
+import type { ChatMessage } from '../types/chat'
+import type {
+  StatusEvent,
+  TranscriptEvent,
+  UiEvent,
+  WorkspaceTrustedEvent,
+} from './protocol'
 import type { StdioEngineClientOptions } from './stdio-engine-client'
 
 export { QUESTION_PREFIX }
 
 let turnActive = false
+/** Launched with `--resume`: the engine's first `transcript` fills the empty chat. */
+let showNextTranscript = false
 /** The running turn's AI message, when it has one. */
 let turnMessageId: string | null = null
 
@@ -55,6 +66,47 @@ export function setEngineTurnActive(active: boolean, messageId?: string): void {
   turnMessageId = active ? (messageId ?? null) : null
   // A new turn has neither retried nor failed yet.
   if (active) forgetTurnRetries()
+}
+
+/**
+ * `neuron --resume <session>` opened the UI: the chat starts empty, so the
+ * session's conversation, which the engine sends once it has continued it,
+ * is shown there. Chats the UI saved itself (`--continue`, /history) bring
+ * their own messages and are left alone.
+ */
+export function showConversationOfResumedSession(): void {
+  showNextTranscript = true
+}
+
+/**
+ * The chat messages for a resumed session's conversation: each prompt, and
+ * each answer with the tools it called named under it. Tool output is left
+ * out; it is in the session, not needed to follow the conversation.
+ */
+export function transcriptMessages(event: TranscriptEvent): ChatMessage[] {
+  const timestamp = formatTimestamp()
+  const messages: ChatMessage[] = []
+  const add = (variant: ChatMessage['variant'], content: string) =>
+    messages.push({
+      id: `transcript-${event.session_id}-${messages.length}`,
+      variant,
+      content: consoleSafeText(content),
+      timestamp,
+    })
+  if (event.truncated) add('ai', 'Earlier messages of this session are not shown.')
+  for (const entry of event.entries) {
+    const last = messages[messages.length - 1]
+    if (entry.kind === 'user') {
+      add('user', entry.text)
+    } else if (entry.kind === 'assistant') {
+      if (entry.text.trim()) add('ai', entry.text)
+    } else if (entry.kind === 'tool_call') {
+      const line = `\u2192 ${entry.name}`
+      if (last?.variant === 'ai') last.content = `${last.content}\n${line}`
+      else add('ai', line)
+    }
+  }
+  return messages
 }
 
 /**
@@ -217,6 +269,10 @@ export function handleEngineEvent(event: UiEvent): void {
       engine.setReady(event.version, event.features ?? [])
       // What this UI draws, for engines that ask (./capabilities.ts).
       declareUiCapabilities(getNeuronEngineClient(), event)
+      // The MCP servers ticked on the trust screen, then all of them for the
+      // status bar's connectors chip (./mcp-panel.ts).
+      approveTrustedMcpServers(getNeuronEngineClient(), event.features ?? [])
+      requestExtensions(getNeuronEngineClient(), event)
       noteEngineFeatures(event.features ?? [])
       return
     case 'status':
@@ -269,9 +325,25 @@ export function handleEngineEvent(event: UiEvent): void {
       }
       showNotice(engineNotice(event.message))
       return
+    case 'question':
+      // With the `questions` capability: answered with `answer` and this id.
+      engine.setPendingQuestion(event.question, event.id)
+      // A turn's question goes into its message (turn-events.ts); anywhere
+      // else it is a chat line.
+      if (!(turnActive && turnMessageId)) showSystemMessage(questionNoticeText(event))
+      // Options are picked in the question form (./question-form.ts).
+      openQuestionForm(event, (error) =>
+        showSystemMessage(error instanceof Error ? error.message : String(error)),
+      )
+      return
     case 'error':
+      // A refused permission choice leaves nothing pending: the next
+      // Shift+Tab cycles from what the status shows. A turn's own error is
+      // not that answer; a choice queued behind the turn still comes.
+      if (!turnActive) engine.setPendingPermission(null)
       // `trust_workspace` failed: the trust screen shows why.
       if (useStartGate.getState().trustStep.kind === 'saving') {
+        approveAfterTrust = null
         useStartGate.getState().setTrustStep({ kind: 'failed', error: inUiWording(event.message) })
         return
       }
@@ -294,6 +366,7 @@ export function handleEngineEvent(event: UiEvent): void {
       afterConsoleCommand()
       engine.clearPermissions()
       engine.setPendingQuestion(null)
+      closeQuestionForm()
       engine.setSignIn(null)
       dropTurnScopedNotices()
       forgetTurnRetries()
@@ -301,13 +374,33 @@ export function handleEngineEvent(event: UiEvent): void {
     case 'trust_preview':
       engine.setTrustPreview(event)
       return
+    case 'transcript':
+      if (showNextTranscript) {
+        showNextTranscript = false
+        const chat = useChatStore.getState()
+        if (chat.messages.length === 0) chat.setMessages(transcriptMessages(event))
+      }
+      return
     case 'workspace_trusted':
       void restartWithTrust(event)
       return
+    case 'hook_finished': {
+      // A hook that blocked or failed gets a line; one that passed stays quiet.
+      const line = hookFinishedLine(event)
+      if (line) showNotice({ kind: 'show', text: consoleSafeText(line), untilTurnEnd: false })
+      return
+    }
     case 'report':
       // A scrollable panel above the input, closed with Esc (report-panel.tsx).
       engine.setReport(event)
       useChatStore.getState().setInputMode('report')
+      return
+    case 'account':
+      // The plan, limits and usage for the status bar and its context popover.
+      engine.setAccount(event.account)
+      return
+    case 'branches':
+      engine.setBranches(event)
       return
     default:
       return
@@ -332,17 +425,81 @@ function requestTrustPreview(status: StatusEvent): void {
   }
 }
 
+/** An MCP server ticked on the trust screen, with the preview's fingerprint. */
+export interface TrustedMcpApproval {
+  name: string
+  /** From the trust preview: the engine refuses the approval if the config changed since. */
+  fingerprint?: string
+}
+
+/**
+ * The project's MCP servers ticked on the trust screen, with the folder they
+ * were shown for: approved once the engine restarted with the folder's
+ * settings (they are only known to it then), by the next `ready` of an engine
+ * in that folder. A failed restart, or a start in another folder, drops them.
+ */
+let approveAfterTrust: { cwd: string; servers: TrustedMcpApproval[] } | null = null
+
+/** The folder an engine of `launch` runs in. */
+function launchFolder(launch: EngineLaunchOptions | null): string {
+  return launch?.cwd ?? process.cwd()
+}
+
+/** Said when the ticked servers could not be approved from the trust screen. */
+export function trustApprovalsNotSentNotice(names: readonly string[]): string {
+  return (
+    `Not approved yet: ${names.join(', ')}. This engine cannot approve MCP servers from the ` +
+    `trust screen; they wait for approval (/mcp approve ${names[0]}).`
+  )
+}
+
+/**
+ * Sends `approve_mcp_server` for the servers ticked on the trust screen, once
+ * an engine with the catalog commands is ready in the folder they were shown
+ * for. `true` when any were sent; an engine without the commands gets none,
+ * and the chat says the servers still wait.
+ */
+export function approveTrustedMcpServers(
+  engine: Pick<NeuronEngineClient, 'send'>,
+  features: readonly string[],
+): boolean {
+  const pending = approveAfterTrust
+  approveAfterTrust = null
+  if (!pending || pending.servers.length === 0) return false
+  // Same-named servers in another folder were never shown to the user.
+  if (pending.cwd !== launchFolder(lastLaunch)) return false
+  if (!features.includes(FEATURE_MCP_CATALOG)) {
+    showSystemMessage(trustApprovalsNotSentNotice(pending.servers.map((server) => server.name)))
+    return false
+  }
+  try {
+    for (const { name, fingerprint } of pending.servers) {
+      engine.send(
+        fingerprint
+          ? { type: 'approve_mcp_server', name, fingerprint }
+          : { type: 'approve_mcp_server', name },
+      )
+    }
+    return true
+  } catch (error) {
+    logger.debug({ error }, '[engine] MCP approvals not sent')
+    return false
+  }
+}
+
 /**
  * "Allow Neuron in this folder": the engine records trust for the folder (its
  * git root), or for this session only in the home folder, and answers with
  * `workspace_trusted` ({@link restartWithTrust}) or an `error`.
  */
-export function trustWorkspace(): void {
+export function trustWorkspace(approvedMcpServers: readonly TrustedMcpApproval[] = []): void {
   const gate = useStartGate.getState()
   gate.setTrustStep({ kind: 'saving' })
+  approveAfterTrust = { cwd: launchFolder(lastLaunch), servers: [...approvedMcpServers] }
   try {
     getNeuronEngineClient().send({ type: 'trust_workspace' })
   } catch (error) {
+    approveAfterTrust = null
     gate.setTrustStep({
       kind: 'failed',
       error: error instanceof Error ? error.message : String(error),
@@ -366,6 +523,8 @@ async function restartWithTrust(event: WorkspaceTrustedEvent): Promise<void> {
   const gate = useStartGate.getState()
   if (!event.restart_required || !lastLaunch) {
     gate.setTrustStep({ kind: 'asking' })
+    // No restart: this engine has the folder's servers now.
+    approveTrustedMcpServers(getNeuronEngineClient(), useEngineStore.getState().features)
     return
   }
   gate.setTrustStep({ kind: 'restarting' })
@@ -377,6 +536,9 @@ async function restartWithTrust(event: WorkspaceTrustedEvent): Promise<void> {
     ? { ...launch.env, NEURON_TRUST_WORKSPACE: '1' }
     : launch.env
   await startEngineSession({ ...launch, resume, env })
+  // A restarted engine took them at its `ready`; one that failed to start
+  // never will, and a later engine must not get them.
+  approveAfterTrust = null
   useStartGate.getState().setTrustStep({ kind: 'asking' })
 }
 
@@ -404,6 +566,7 @@ let clientOptionsForTesting: StdioEngineClientOptions = {}
 export function setEngineClientOptionsForTesting(options: StdioEngineClientOptions): void {
   clientOptionsForTesting = options
   lastLaunch = null
+  approveAfterTrust = null
 }
 
 /**
@@ -411,6 +574,8 @@ export function setEngineClientOptionsForTesting(options: StdioEngineClientOptio
  * start is recorded in the engine store and shown in the chat.
  */
 export function startEngineSession(launch: EngineLaunchOptions): Promise<void> {
+  // Servers ticked for one folder are never approved in another.
+  if (approveAfterTrust && approveAfterTrust.cwd !== launchFolder(launch)) approveAfterTrust = null
   lastLaunch = launch
   const start = launchEngineSession(launch)
   pendingStart = start
@@ -510,6 +675,7 @@ export function handleEngineExit(
   if (unexpected && exit.code !== FORCED_QUIT_EXIT_CODE) engineCrashed = true
   const shownInChat = unexpected && !turnShowsIt
   engine.setConnection('exited', reason, unexpected)
+  closeQuestionForm()
   if (shownInChat) showSystemMessage(reason)
 }
 

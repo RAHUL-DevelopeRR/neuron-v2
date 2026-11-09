@@ -35,6 +35,11 @@ pub fn sensitive_path_reason(path: &str) -> Option<String> {
         .map(str::to_ascii_lowercase)
         .collect();
     let (file_name, parents) = components.split_last()?;
+    if file_name == "environ" && parents.first().is_some_and(|first| first == "proc") {
+        return Some(format!(
+            "`{path}` is a process environment, which can hold credentials"
+        ));
+    }
     if is_env_file(file_name) {
         return Some(format!(
             "`{path}` is an environment file, which can hold credentials"
@@ -211,6 +216,19 @@ mod tests {
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn proc_environ_is_sensitive() {
+        for path in [
+            "/proc/self/environ",
+            "/proc/1234/environ",
+            "proc/self/environ",
+        ] {
+            assert!(sensitive_path_reason(path).is_some(), "{path}");
+        }
+        assert!(sensitive_path_reason("/proc/cpuinfo").is_none());
+        assert!(sensitive_path_reason("docs/environ").is_none());
+    }
 
     #[test]
     fn env_files_and_neuron_settings_are_sensitive() {

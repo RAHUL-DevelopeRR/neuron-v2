@@ -347,6 +347,31 @@ describe('AskUserQuestion', () => {
     expect((blocks()[2] as { content: string }).content).toBe('You said no, so I did not run it.')
   })
 
+  test('a question event (the questions capability) is drawn the same way', () => {
+    const { sink, blocks } = turn()
+    sink.handle({
+      type: 'tool_call_started',
+      id: 'toolu_q',
+      name: 'AskUserQuestion',
+      input: '{"question":"May I run the command?","options":["Yes","No"]}',
+      cut_off: false,
+    })
+    useEngineStore.getState().setPendingQuestion('May I run the command?', 3)
+    sink.handle({ type: 'question', id: 3, question: 'May I run the command?', options: ['Yes', 'No'] })
+    expect(useEngineStore.getState().pendingQuestionTarget).toEqual({
+      messageId: 'ai-1',
+      toolCallId: 'toolu_q',
+    })
+    expect(blocks()).toEqual([
+      {
+        type: 'ask-user',
+        toolCallId: 'toolu_q',
+        questions: [{ question: 'May I run the command?', options: [{ label: 'Yes' }, { label: 'No' }] }],
+        hint: 'Answer with 1-2 or in your own words.',
+      },
+    ])
+  })
+
   test('a question still waiting when the turn ends was not answered', () => {
     const { sink, blocks } = turn()
     sink.handle({ type: 'notice', message: QUESTION })
