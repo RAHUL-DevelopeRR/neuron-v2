@@ -193,7 +193,8 @@ describe('the status bar names models without their route', () => {
     cleanup()
     const { container } = render(<StatusBar state={initialSession()} onPane={() => {}} />)
     expect(container.querySelector('.model-tag')?.textContent).toBe('')
-    expect(container.querySelector('.served-model')).toBeNull()
+    // A count, not the node: a failing assertion on a DOM node makes bun print the whole happy-dom tree.
+    expect(container.querySelectorAll('.served-model').length).toBe(0)
   })
 })
 
