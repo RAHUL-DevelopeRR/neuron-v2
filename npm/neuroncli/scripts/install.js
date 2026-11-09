@@ -8,7 +8,7 @@
 // again when a terminal session wants it. Set NEURON_SKIP_DOWNLOAD=1 to skip
 // both downloads here, or NEURON_NO_TUI=1 to skip the UI's.
 
-import {LauncherError, ensureBinary} from '../lib/binary.js';
+import {DEFAULT_DOWNLOAD_BASE, LauncherError, ensureBinary, packageVersion} from '../lib/binary.js';
 import {isTruthy} from '../lib/full-screen.js';
 
 const log = (line) => process.stderr.write(`neuron: ${line}\n`);
@@ -36,4 +36,16 @@ if (process.env.NEURON_SKIP_DOWNLOAD === '1') {
       log(`The full-screen UI was not installed (${message}). neuron uses its line REPL until it is.`);
     }
   }
+}
+
+// npm's `neuron.ps1` shim, which PowerShell prefers, cannot run under the default "Restricted"
+// execution policy. npm only shows this with --foreground-scripts or in its log; the README says it
+// too. The shim itself is npm's, so it is left alone.
+if (process.platform === 'win32') {
+  log(
+    'On Windows PowerShell, if `neuron` (or `npm`) says "running scripts is disabled on this system", ' +
+      'run `neuron.cmd` (and `npm.cmd`) instead, or use Command Prompt. ' +
+      'Or install with the PowerShell installer, which needs no scripts enabled: ' +
+      `irm ${DEFAULT_DOWNLOAD_BASE}/v${packageVersion()}/install.ps1 | iex`,
+  );
 }

@@ -8,7 +8,8 @@ Used by the unit tests and by .github/workflows/packaging-ci.yml:
 ``stage`` writes ``DIR/v<version>/<asset>`` (a dummy binary for this machine)
 and ``<asset>.sha256`` in the release format ``<sha256>  <asset>``. ``serve``
 serves DIR over HTTP on 127.0.0.1 until it is killed, answering
-``/releases/latest`` with ``{"tag_name": "v<newest staged version>"}``.
+``/releases/latest`` with ``{"tag_name": "v<newest staged version>"}`` and ``/releases``
+with the staged releases as a list, newest first, after any ``draft_tags`` (``"draft": true``).
 
 The dummy binary prints ``neuron-dummy <version>`` for ``--version`` (or the real
 binary's ``Neuron`` / ``Version`` report when ``$NEURON_DUMMY_VERSION_REPORT`` is
@@ -176,6 +177,7 @@ class FakeReleaseServer:
     def __init__(self, root: Path, latest_tag: Optional[str] = None) -> None:
         self.root = Path(root)
         self.latest_tag = latest_tag
+        self.draft_tags: List[str] = []
         self.requests: List[Tuple[str, str]] = []
         self.authorization: List[Optional[str]] = []  # Authorization header of each request
         self._lock = threading.Lock()
@@ -197,6 +199,11 @@ class FakeReleaseServer:
                     else:
                         body = json.dumps({"tag_name": tag, "name": tag}).encode()
                         self._send(200, body, "application/json", include_body)
+                    return
+                if path.endswith("/releases"):
+                    listing = [{"tag_name": tag, "draft": True, "prerelease": False} for tag in server.draft_tags]
+                    listing += [{"tag_name": tag, "draft": False, "prerelease": "-" in tag} for tag in server.tags_newest_first()]
+                    self._send(200, json.dumps(listing).encode(), "application/json", include_body)
                     return
                 target = (server.root / path.lstrip("/")).resolve()
                 if server.root.resolve() not in target.parents or not target.is_file():
@@ -229,11 +236,13 @@ class FakeReleaseServer:
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
-    def newest_tag(self) -> Optional[str]:
+    def tags_newest_first(self) -> List[str]:
         versions = [entry.name for entry in self.root.glob("v*") if entry.is_dir()]
-        if not versions:
-            return None
-        return max(versions, key=lambda name: [int(part) if part.isdigit() else 0 for part in name[1:].split(".")])
+        return sorted(versions, key=lambda name: [int(part) if part.isdigit() else 0 for part in name[1:].split(".")], reverse=True)
+
+    def newest_tag(self) -> Optional[str]:
+        tags = self.tags_newest_first()
+        return tags[0] if tags else None
 
     def paths(self) -> List[str]:
         with self._lock:
