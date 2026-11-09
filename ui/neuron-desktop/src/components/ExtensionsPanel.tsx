@@ -26,6 +26,9 @@ const REASON_STATUSES: ReadonlySet<string> = new Set(['needs_approval', 'blocked
 const HOSTED_TRANSPORTS: ReadonlySet<string> = new Set(['zerox', 'managed_proxy'])
 const transportLabel = (transport: string) => (HOSTED_TRANSPORTS.has(transport) ? 'hosted' : transport)
 
+/** How a server that waits for approval is approved. The engine's own reason usually says it already. */
+const APPROVE_COMMAND = '/mcp approve'
+
 /** A padlock (U+1F512) followed by the text variation selector (U+FE0E), which asks for a plain glyph like the window's others. */
 const LOCK = String.fromCodePoint(0x1f512, 0xfe0e)
 
@@ -54,6 +57,8 @@ function McpServerRow({ server, toggle }: { server: McpServerInfo; toggle: Toggl
   const toolList = server.tools.length ? server.tools.join(', ') : null
   const detailError = reason ? null : server.error
   const detail = detailError ?? toolList
+  // Said once: the hint is for a reason that does not already tell how to approve.
+  const approveHint = !off && server.status === 'needs_approval' && !server.error?.includes(APPROVE_COMMAND)
   return (
     <li className="extension-row">
       <button className="tree-row extension-head" onClick={() => detail && setOpen(!open)} aria-expanded={detail ? open : undefined}>
@@ -96,9 +101,9 @@ function McpServerRow({ server, toggle }: { server: McpServerInfo; toggle: Toggl
         </div>
       )}
       {reason && <div className={`${server.status === 'blocked' ? 'error-line' : 'muted'} small extension-detail`}>{reason}</div>}
-      {!off && server.status === 'needs_approval' && (
+      {approveHint && (
         // Typed in the chat, which sends it to the engine as a slash command: the panel has no command of its own for it.
-        <div className="muted small extension-detail">{`Approve it with /mcp approve ${server.name} in the chat`}</div>
+        <div className="muted small extension-detail">{`Approve it with ${APPROVE_COMMAND} ${server.name} in the chat`}</div>
       )}
       {open && detail && <div className={detailError ? 'error-line small extension-detail' : 'muted small extension-detail'}>{detail}</div>}
     </li>

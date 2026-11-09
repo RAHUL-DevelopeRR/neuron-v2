@@ -154,7 +154,10 @@ describe('MCP rows on an alpha.5 engine', () => {
   const APPROVAL_WHY = 'a workspace server: run /mcp approve docs to start it'
   const REFUSED_WHY = "your organization's connector policy does not allow shell-tools"
   const UNLINKED_WHY = 'not linked to your Zero-X account; connect it at https://zero-x.live/connect/github (/mcp connect github)'
+  // A reason that does not say how to approve (an older engine's, or a policy's), which the hint is for.
+  const WAITING_WHY = 'a workspace server that is new or changed'
   const approval = server('docs', { scope: 'project', status: 'needs_approval', tools: [], error: APPROVAL_WHY })
+  const waiting = server('cache', { scope: 'project', status: 'needs_approval', tools: [], error: WAITING_WHY })
   const refused = server('shell-tools', { scope: 'managed', status: 'blocked', tools: [], error: REFUSED_WHY })
   const unlinked = server('github', {
     transport: 'zerox',
@@ -218,17 +221,17 @@ describe('MCP rows on an alpha.5 engine', () => {
 
   test('a server that needs approval says how to approve it, as a quiet hint with no command of its own', () => {
     const calls: string[] = []
-    panel([approval, refused, unlinked, server('ok')], (name, enabled) => calls.push(`${name}:${enabled}`))
-    const hint = within(rowOf('docs')).getByText('Approve it with /mcp approve docs in the chat')
+    panel([approval, waiting, refused, unlinked, server('ok')], (name, enabled) => calls.push(`${name}:${enabled}`))
+    const hint = within(rowOf('cache')).getByText('Approve it with /mcp approve cache in the chat')
     expect(hint.className).toContain('muted')
     // Text only: no button or link to press, so nothing new is sent to the engine.
     expect(hint.closest('button, a')?.tagName ?? null).toBeNull()
     fireEvent.click(hint)
     expect(calls).toEqual([])
-    expect(within(rowOf('docs')).queryAllByRole('button', { name: /approve/i }).length).toBe(0)
-    // Only that status gets it, and it names its own server.
+    expect(within(rowOf('cache')).queryAllByRole('button', { name: /approve/i }).length).toBe(0)
+    // Only that row gets it, and it names its own server: not the one whose reason says it, nor other statuses.
     expect(screen.getAllByText(/Approve it with/)).toHaveLength(1)
-    for (const name of ['shell-tools', 'github', 'ok']) expect(within(rowOf(name)).queryAllByText(/Approve it with/).length).toBe(0)
+    for (const name of ['docs', 'shell-tools', 'github', 'ok']) expect(within(rowOf(name)).queryAllByText(/Approve it with/).length).toBe(0)
   })
 
   test('the hint names the server it is about', () => {
@@ -236,11 +239,38 @@ describe('MCP rows on an alpha.5 engine', () => {
     expect(screen.getByText('Approve it with /mcp approve team_db-2 in the chat')).toBeTruthy()
   })
 
-  test('a server that waits for approval but was turned off reads off, with no reason and no hint', () => {
-    panel([{ ...approval, enabled: false }])
-    expect(statusOf('docs')).toBe('off')
+  test("the hint is left out when the engine's own reason already says how to approve", () => {
+    panel([approval])
+    // The engine's reason has the command, once; the hint would say it a second time.
+    expect(within(rowOf('docs')).getByText(APPROVAL_WHY)).toBeTruthy()
     expect(screen.queryAllByText(/Approve it with/).length).toBe(0)
-    expect(screen.queryAllByText(APPROVAL_WHY).length).toBe(0)
+    expect((rowOf('docs').textContent?.match(/\/mcp approve/g) ?? []).length).toBe(1)
+    cleanup()
+    // Whichever server it names, and wherever in the reason it is.
+    panel([server('docs', { status: 'needs_approval', tools: [], error: 'run /mcp approve to start it' })])
+    expect(screen.queryAllByText(/Approve it with/).length).toBe(0)
+  })
+
+  test('the hint stays when the reason does not say how to approve', () => {
+    for (const error of [WAITING_WHY, null, '', 'see /mcp list for the servers']) {
+      panel([server('docs', { status: 'needs_approval', tools: [], error })])
+      expect(within(rowOf('docs')).getAllByText('Approve it with /mcp approve docs in the chat')).toHaveLength(1)
+      cleanup()
+    }
+  })
+
+  test('a server that waits for approval but was turned off reads off, with no reason and no hint', () => {
+    // Whether or not its reason says how to approve: it is the switch that hides the hint.
+    for (const [row, why] of [
+      [waiting, WAITING_WHY],
+      [approval, APPROVAL_WHY],
+    ] as const) {
+      panel([{ ...row, enabled: false }])
+      expect(statusOf(row.name)).toBe('off')
+      expect(screen.queryAllByText(/Approve it with/).length).toBe(0)
+      expect(screen.queryAllByText(why).length).toBe(0)
+      cleanup()
+    }
   })
 
   test('a hosted connector is "hosted", whichever name the engine gives its transport', () => {
@@ -293,14 +323,17 @@ describe('MCP rows on an alpha.5 engine', () => {
     openExtensions()
     await emit(
       engine,
-      extensions(approval, refused, unlinked, server('policy-docs', { scope: 'managed', transport: 'zerox', required: true }), server('legacy', { transport: 'managed_proxy' })),
+      extensions(approval, waiting, refused, unlinked, server('policy-docs', { scope: 'managed', transport: 'zerox', required: true }), server('legacy', { transport: 'managed_proxy' })),
     )
     const rows = within(screen.getByRole('list', { name: 'MCP servers' }))
-    expect(rows.getByText('needs approval')).toBeTruthy()
+    expect(rows.getAllByText('needs approval')).toHaveLength(2)
     expect(rows.getByText('blocked')).toBeTruthy()
     expect(rows.getByText('not connected')).toBeTruthy()
     expect(rows.getByText(APPROVAL_WHY)).toBeTruthy()
-    expect(rows.getByText('Approve it with /mcp approve docs in the chat')).toBeTruthy()
+    expect(rows.getByText(WAITING_WHY)).toBeTruthy()
+    // The hint only where the reason does not already say how.
+    expect(rows.getByText('Approve it with /mcp approve cache in the chat')).toBeTruthy()
+    expect(rows.queryAllByText('Approve it with /mcp approve docs in the chat').length).toBe(0)
     expect(rows.getByText('Required')).toBeTruthy()
     expect(rows.queryAllByRole('switch', { name: 'policy-docs' }).length).toBe(0)
     expect(rows.getByRole('switch', { name: 'legacy' })).toBeTruthy()
