@@ -5,10 +5,12 @@
 //! It offers one-time pairing codes, answers pairings (checking the phone's proof), accepts
 //! encrypted channels from paired phones and bridges each one to the session's local
 //! remote-protocol-1 host. The bridge lets through only what a phone may do: `hello` (with the
-//! local host's token put in), `send` (but not trusting the workspace or stopping the engine),
+//! local host's peer token put in), `send` (but not trusting the workspace or stopping the engine),
 //! `ping`, and the read-only `rpc` methods. Terminals and engine restarts stay with clients on the
-//! computer itself. It also keeps each session's sealed presence current and sends a contentless
-//! `notify` when a session needs the user or finishes; the relay decides whether to push.
+//! computer itself. The host does not rely on that filter: it tells a phone from its owner by
+//! credential, and the peer token this bridge holds never makes an owner (`crate::run` refuses a
+//! host that does not say so). It also keeps each session's sealed presence current and sends a
+//! contentless `notify` when a session needs the user or finishes; the relay decides whether to push.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -28,7 +30,8 @@ use crate::presence::{Presence, ShareStatus};
 /// The read-only methods a phone may call on the local host.
 pub const PHONE_RPC: [&str; 5] = ["fs.list", "fs.read", "fs.search", "git.status", "git.diff"];
 /// Engine commands that stay with the computer: trusting the workspace loads its hooks and MCP
-/// servers, and the computer's own clients decide when the engine stops.
+/// servers, and the computer's own clients decide when the engine stops. The local host refuses
+/// them to a peer as well; this is the bridge's own wall, not the only one.
 pub const COMPUTER_ONLY_COMMANDS: [&str; 3] = ["trust_workspace", "shutdown", "capabilities"];
 const CLIENT_KINDS: [&str; 4] = ["desktop", "mobile", "web", "cli"];
 
@@ -63,7 +66,8 @@ struct Bridge {
 }
 
 struct Share {
-    /// The local host's token, put into the phone's `hello`. Never leaves the computer.
+    /// The local host's peer token, put into the phone's `hello`. Never leaves the computer, and is
+    /// never the host's owner token: the phone behind it must be a peer.
     token: String,
     presence: Option<Presence>,
     last: String,
@@ -798,7 +802,7 @@ mod tests {
     fn pairs_and_bridges_only_what_a_phone_may_send() {
         let (mut host, phone) = paired_host();
         assert!(
-            frames(&host.share("share-0001", "local-token")).is_empty(),
+            frames(&host.share("share-0001", "peer-token")).is_empty(),
             "no presence yet"
         );
         let shared = frames(&host.update_presence("share-0001", presence(ShareStatus::Running)));
@@ -843,7 +847,7 @@ mod tests {
             panic!("{opened:?}")
         };
         let hello: Value = serde_json::from_str(text).unwrap();
-        assert_eq!(hello["token"], "local-token", "the local token is put in");
+        assert_eq!(hello["token"], "peer-token", "the peer token is put in");
         assert_eq!(hello["client"]["kind"], "mobile");
 
         let local = |actions: Vec<Action>| -> Vec<Value> {

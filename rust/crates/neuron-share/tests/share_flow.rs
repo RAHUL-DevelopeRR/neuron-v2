@@ -1,8 +1,9 @@
 //! `run()` over real sockets: this test is the relay (and the phone behind it) and the session's
 //! local host, and checks what the share sends each of them: the session in the Authorization
 //! header and the relay subprotocol, `join`, a pairing with proofs, sealed presence, `notify`, an
-//! encrypted channel whose `hello` reaches the local host with its token, a refused terminal, and
-//! `unshare` on the way out.
+//! encrypted channel whose `hello` reaches the local host with the host's peer token (never its
+//! owner's), a refused terminal, and `unshare` on the way out. A second test checks that the share
+//! stops, and shares nothing, when the host does not call its token a peer's.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,7 +25,10 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-const LOCAL_TOKEN: &str = "local-host-secret";
+/// The local host's peer token: the only credential the share holds.
+const PEER_TOKEN: &str = "peer-token-secret";
+/// The local host's owner token: a share given this one by mistake must refuse to run.
+const OWNER_TOKEN: &str = "owner-token-secret";
 const SESSION: &str = "ses_test_session_token";
 
 enum Said {
@@ -91,11 +95,12 @@ async fn local_host(
             let hello = next_json(&mut socket).await;
             assert_eq!(hello["t"], "hello");
             assert_eq!(
-                hello["token"], LOCAL_TOKEN,
-                "every client brings the local token"
+                hello["token"], PEER_TOKEN,
+                "every client brings the peer token, never the owner's"
             );
             let observer = hello["client"]["kind"] == "cli";
-            say(&mut socket, json!({ "t": "welcome", "protocol": 1, "host": { "name": "Dev", "version": null, "cwd": "/work/demo" }, "clients": 1 })).await;
+            // What the Neuron host answers its peer token with.
+            say(&mut socket, json!({ "t": "welcome", "protocol": 1, "host": { "name": "Dev", "version": null, "cwd": "/work/demo" }, "clients": 1, "role": "peer" })).await;
             say(&mut socket, json!({ "t": "snapshot", "seq": 3, "state": {
                 "connection": "ready", "busy": true, "sessionStarting": false,
                 "status": { "cwd": "/work/demo", "model": "glm-5.2", "session_id": "s1", "git": { "branch": "main" } },
@@ -156,7 +161,7 @@ async fn shares_pairs_and_bridges_over_sockets() {
             name: "Dev laptop".into(),
             platform: "test".into(),
             local_url,
-            local_token: LOCAL_TOKEN.into(),
+            peer_token: PEER_TOKEN.into(),
             pair_ttl_s: 600,
             offer_at_start: true,
             read_stdin: false,
@@ -366,4 +371,108 @@ async fn shares_pairs_and_bridges_over_sockets() {
         "the share id is kept for the project"
     );
     std::fs::remove_dir_all(home).unwrap();
+}
+
+/// A local host that answers each client's `hello` with a `welcome` that says `role`, or says nothing
+/// about one, as a host older than the credential check does. The token the share holds is
+/// `OWNER_TOKEN`: the mistake to catch.
+async fn host_saying(listener: TcpListener, role: Option<&'static str>) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = next_json(&mut socket).await;
+            assert_eq!(hello["t"], "hello");
+            assert_eq!(hello["token"], OWNER_TOKEN);
+            let mut welcome = json!({ "t": "welcome", "protocol": 1, "host": { "name": "Dev", "version": null, "cwd": "/work/demo" }, "clients": 1 });
+            if let Some(role) = role {
+                welcome["role"] = json!(role);
+            }
+            say(&mut socket, welcome).await;
+            while socket.next().await.is_some() {}
+        });
+    }
+}
+
+/// The relay's side of a share's handshake: accepts the socket and echoes the relay subprotocol.
+#[allow(clippy::result_large_err)] // the handshake callback's type is tungstenite's
+async fn accept_relay(stream: TcpStream) -> WebSocketStream<TcpStream> {
+    tokio_tungstenite::accept_hdr_async(stream, |_: &Request, mut response: Response| {
+        response.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_static("neuron-relay.v1"),
+        );
+        Ok(response)
+    })
+    .await
+    .unwrap()
+}
+
+/// Runs a share that holds `OWNER_TOKEN` against a local host whose `welcome` says `role`, with a relay
+/// that welcomes it. Returns why the share stopped and what the relay heard after `joined`.
+async fn share_that_is_refused(role: Option<&'static str>) -> (String, Vec<Value>) {
+    let home = std::env::temp_dir().join(format!(
+        "neuron-share-role-{}",
+        neuron_share::crypto::random_id()
+    ));
+    let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_url = format!("ws://{}/neuron", local.local_addr().unwrap());
+    tokio::spawn(host_saying(local, role));
+    let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("ws://{}/v1/relay", relay.local_addr().unwrap());
+    let (said_tx, _said) = mpsc::unbounded_channel();
+    let share = tokio::spawn(neuron_share::run(
+        ShareOptions {
+            relay_url,
+            token: SESSION.into(),
+            config_dir: home.clone(),
+            name: "Dev laptop".into(),
+            platform: "test".into(),
+            local_url,
+            peer_token: OWNER_TOKEN.into(),
+            pair_ttl_s: 600,
+            offer_at_start: false,
+            read_stdin: false,
+            stop: None,
+        },
+        Box::new(TestReporter(said_tx)),
+    ));
+    let (stream, _) = relay.accept().await.unwrap();
+    let mut socket = accept_relay(stream).await;
+    let join = next_json(&mut socket).await;
+    assert_eq!(join["t"], "join");
+    let host_id = join["device"]["id"].as_str().unwrap().to_string();
+    say(
+        &mut socket,
+        json!({ "t": "joined", "relay": 1, "role": "host", "device_id": host_id }),
+    )
+    .await;
+    let error = timeout(Duration::from_secs(10), share)
+        .await
+        .expect("the share stops")
+        .unwrap()
+        .expect_err("a share the host does not call a peer's is an error");
+    let mut heard = Vec::new();
+    while let Ok(Some(Ok(Message::Text(text)))) =
+        timeout(Duration::from_millis(300), socket.next()).await
+    {
+        heard.push(serde_json::from_str::<Value>(text.as_str()).unwrap());
+    }
+    let _ = std::fs::remove_dir_all(home);
+    (error.to_string(), heard)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refuses_to_share_unless_the_host_calls_the_token_a_peers() {
+    // The owner's token by mistake, a role nobody knows, and a host that predates roles.
+    for role in [Some("owner"), Some("admin"), None] {
+        let (message, heard) = share_that_is_refused(role).await;
+        assert!(message.contains("peer token"), "{role:?}: {message}");
+        assert!(
+            heard.iter().all(|frame| frame["t"] != "share"),
+            "{role:?}: a refused share shares nothing, the relay heard {heard:?}"
+        );
+    }
 }

@@ -57,8 +57,12 @@ pub struct ShareOptions {
     pub platform: String,
     /// The session's local remote-protocol-1 host (`ws://127.0.0.1:<port>/neuron`).
     pub local_url: String,
-    /// The local host's pairing token: put into each phone's `hello`, never sent to the relay.
-    pub local_token: String,
+    /// The local host's PEER token, never its owner token: put into each phone's `hello` and used by
+    /// the observer, never sent to the relay. The host tells a phone from its owner by credential,
+    /// since both reach it from this machine's address, so the phones behind this share are peers
+    /// because of the token they are given here. [`run`] refuses a host that does not say it took
+    /// this one for a peer's.
+    pub peer_token: String,
     pub pair_ttl_s: u64,
     /// Offer a pairing code as soon as the relay is joined.
     pub offer_at_start: bool,
@@ -210,7 +214,7 @@ pub async fn run(mut options: ShareOptions, reporter: Box<dyn Reporter>) -> Resu
     ));
     let observer = tokio::spawn(observer_task(
         options.local_url.clone(),
-        options.local_token.clone(),
+        options.peer_token.clone(),
         events_tx.clone(),
     ));
     if options.read_stdin {
@@ -328,7 +332,7 @@ impl Driver {
                         self.share_id = Some(share_id.clone());
                         self.reporter
                             .status(&format!("Found the session in {project}."));
-                        host.share(&share_id, &self.options.local_token)
+                        host.share(&share_id, &self.options.peer_token)
                     }
                 }
                 Event::Presence(presence) => match self.share_id.clone() {
@@ -338,7 +342,7 @@ impl Driver {
                 Event::LocalRefused(message) => return Err(ShareError::Refused(message)),
                 Event::LocalUnreachable => {
                     self.reporter.status(&format!(
-                        "Waiting for the Neuron host at {} (in ui/neuron-client: bun run host).",
+                        "Waiting for the Neuron host at {} (in ui/neuron-client: bun run host --peer-token-file FILE).",
                         self.options.local_url
                     ));
                     Vec::new()
@@ -591,6 +595,16 @@ async fn observer_task(url: String, token: String, events: Events) {
                             let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
                             match frame.get("t").and_then(Value::as_str) {
                                 Some("welcome") => {
+                                    // What the host made of this token. Phones go behind a peer and only a peer: the
+                                    // owner may trust the workspace, open a terminal, restart the engine and use every
+                                    // slash command, and a host that predates roles says nothing. The session is not
+                                    // shared (no phone can attach) until this passes.
+                                    if frame.get("role").and_then(Value::as_str) != Some("peer") {
+                                        let _ = events.send(Event::LocalRefused(format!(
+                                            "The Neuron host at {url} does not call this token a peer's. Share with the host's peer token (`bun run host --peer-token-file FILE`, then `neuron engine --share --peer-token-file FILE`), not its owner token. A host that predates peer tokens cannot be shared."
+                                        )));
+                                        return;
+                                    }
                                     let cwd = frame.pointer("/host/cwd").and_then(Value::as_str).unwrap_or("session").to_string();
                                     tracker = Some(PresenceTracker::new(&cwd));
                                     if events.send(Event::SessionFound(cwd)).is_err() {

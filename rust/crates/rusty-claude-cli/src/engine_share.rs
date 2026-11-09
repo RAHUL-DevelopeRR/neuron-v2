@@ -1,7 +1,10 @@
 //! `neuron engine --share`: shares a Neuron session with the user's phone through the Zero-X relay
 //! (the `neuron-share` crate). The session keeps running here, in a local Neuron host that serves
-//! it over remote protocol 1 (`bun run host` in `ui/neuron-client` today); this command bridges
-//! that host to the relay, end-to-end encrypted, and shows the pairing QR code.
+//! it over remote protocol 1 (`bun run host --peer-token-file FILE` in `ui/neuron-client` today);
+//! this command bridges that host to the relay, end-to-end encrypted, and shows the pairing QR code.
+//! The phone reaches the host from this machine's own address, so the host tells it from you by
+//! credential: the share holds the host's *peer* token, never its owner token, and refuses a host
+//! that does not call that token a peer's.
 //!
 //! The relay needs the user's Zero-X sign-in (a `ses_` session from `neuron login`, or
 //! `NEURON_TOKEN`); API keys cannot share sessions.
@@ -20,10 +23,11 @@ use neuron_share::{Reporter, ShareOptions};
 use crate::credentials::TokenKind;
 
 const USAGE: &str =
-    "usage: neuron engine --share --host ws://127.0.0.1:<port>/neuron --host-token-file FILE \
+    "usage: neuron engine --share --host ws://127.0.0.1:<port>/neuron --peer-token-file FILE \
 [--relay wss://relay.zero-x.live/v1/relay] [--name NAME] [--no-pair]\n\
-The host and its token file come from `bun run host` in ui/neuron-client (or NEURON_HOST_URL and \
-NEURON_HOST_TOKEN_FILE). Press Enter while sharing for a new pairing code.";
+The host and its peer token file come from `bun run host --peer-token-file FILE` in ui/neuron-client \
+(or NEURON_HOST_URL and NEURON_HOST_PEER_TOKEN_FILE). Never pass the host's own (owner) token file: \
+the host tells your phone from you by the token. Press Enter while sharing for a new pairing code.";
 /// How long a pairing code works.
 const PAIR_TTL_S: u64 = 600;
 
@@ -43,7 +47,7 @@ pub(crate) fn share_engine_args(args: &[String]) -> Option<Vec<String>> {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ShareArgs {
     host: Option<String>,
-    token_file: Option<PathBuf>,
+    peer_token_file: Option<PathBuf>,
     relay: Option<String>,
     name: Option<String>,
     no_pair: bool,
@@ -68,7 +72,14 @@ fn parse_share_args(args: &[String]) -> Result<ShareArgs, String> {
             "--share" if switch => {}
             "--no-pair" if switch => parsed.no_pair = true,
             "--host" => parsed.host = Some(value()?),
-            "--host-token-file" => parsed.token_file = Some(PathBuf::from(value()?)),
+            "--peer-token-file" => parsed.peer_token_file = Some(PathBuf::from(value()?)),
+            // The old flag took whichever token file it was given, the host's owner token included.
+            "--host-token-file" => {
+                return Err(format!(
+                    "`--host-token-file` is gone: a share presents the host's peer token, never its owner token. \
+Start the host with `--peer-token-file FILE` and pass that file here as `--peer-token-file FILE`.\n{USAGE}"
+                ))
+            }
             "--relay" => parsed.relay = Some(value()?),
             "--name" => parsed.name = Some(value()?),
             _ => {
@@ -110,25 +121,30 @@ pub(crate) fn run_share_command(args: &[String]) -> Result<(), Box<dyn Error>> {
         .ok_or_else(|| {
             format!("`neuron engine --share` needs the Neuron host to share (--host).\n{USAGE}")
         })?;
+    // Not `NEURON_HOST_TOKEN_FILE`: the desktop app's dev setup uses that name for the host's owner token.
     let token_file = args
-        .token_file
-        .or_else(|| non_empty_env("NEURON_HOST_TOKEN_FILE").map(PathBuf::from))
+        .peer_token_file
+        .or_else(|| non_empty_env("NEURON_HOST_PEER_TOKEN_FILE").map(PathBuf::from))
         .ok_or_else(|| {
             format!(
-                "`neuron engine --share` needs the host's token file (--host-token-file).\n{USAGE}"
+                "`neuron engine --share` needs the host's peer token file (--peer-token-file).\n{USAGE}"
             )
         })?;
-    let local_token = fs::read_to_string(&token_file)
+    let peer_token = fs::read_to_string(&token_file)
         .map_err(|error| {
             format!(
-                "Could not read the host's token file {}: {error}",
+                "Could not read the host's peer token file {}: {error}",
                 token_file.display()
             )
         })?
         .trim()
         .to_string();
-    if local_token.is_empty() {
-        return Err(format!("The host's token file {} is empty.", token_file.display()).into());
+    if peer_token.is_empty() {
+        return Err(format!(
+            "The host's peer token file {} is empty.",
+            token_file.display()
+        )
+        .into());
     }
     let relay_url = args
         .relay
@@ -149,7 +165,7 @@ pub(crate) fn run_share_command(args: &[String]) -> Result<(), Box<dyn Error>> {
         name: args.name.unwrap_or_else(computer_name),
         platform: env::consts::OS.to_string(),
         local_url: host,
-        local_token,
+        peer_token,
         pair_ttl_s: PAIR_TTL_S,
         offer_at_start: !args.no_pair,
         read_stdin: true,
@@ -218,16 +234,27 @@ mod tests {
         assert_eq!(parsed.name.as_deref(), Some("Desk"));
         assert!(!parsed.no_pair);
         let parsed = parse_share_args(&args(
-            "--share --relay=ws://127.0.0.1:8790/v1/relay --no-pair --host-token-file t",
+            "--share --relay=ws://127.0.0.1:8790/v1/relay --no-pair --peer-token-file t",
         ))
         .unwrap();
         assert_eq!(
             parsed.relay.as_deref(),
             Some("ws://127.0.0.1:8790/v1/relay")
         );
-        assert_eq!(parsed.token_file, Some(PathBuf::from("t")));
+        assert_eq!(parsed.peer_token_file, Some(PathBuf::from("t")));
         assert!(parsed.no_pair);
         assert!(parse_share_args(&args("--share --term")).is_err());
         assert!(parse_share_args(&args("--share --host")).is_err());
+    }
+
+    #[test]
+    fn the_old_token_flag_points_to_the_peer_token_flag() {
+        // A share must present the host's peer token, never its owner token, so the old flag (which
+        // took whichever token file it was given) is refused with the way forward.
+        for spelling in ["--share --host-token-file t", "--share --host-token-file=t"] {
+            let error = parse_share_args(&args(spelling)).unwrap_err();
+            assert!(error.contains("--peer-token-file"), "{spelling}: {error}");
+            assert!(error.contains("owner"), "{spelling}: {error}");
+        }
     }
 }
