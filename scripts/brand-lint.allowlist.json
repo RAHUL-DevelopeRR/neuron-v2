@@ -54,6 +54,33 @@
         "rust/crates/plugins/src/**",
         "rust/crates/tools/src/**"
       ]
+    },
+    {
+      "name": "ui-route",
+      "rule": "route",
+      "description": "The same strings and text as `ui`, for the providers a model is routed through (Groq, OpenRouter, NVIDIA, Z.ai): Neuron never shows them. The two model-name cleaners name them to take them off a catalog's names, so they are left out here; tests and fixtures are left out of every scope (`exclude` below)",
+      "include": [
+        "ui/neuron-desktop/index.html",
+        "ui/neuron-desktop/src/**",
+        "ui/neuron-desktop/src-tauri/src/**",
+        "ui/neuron-desktop/src-tauri/tauri.conf.json",
+        "ui/neuron-desktop/src-tauri/tauri.release.conf.json",
+        "ui/neuron-mobile/App.tsx",
+        "ui/neuron-mobile/index.ts",
+        "ui/neuron-mobile/app.json",
+        "ui/neuron-mobile/src/**",
+        "ui/neuron-client/src/**",
+        "ui/neuron-tui/src/**"
+      ],
+      "exclude": ["ui/neuron-client/src/copy/model-name.ts", "ui/neuron-tui/src/utils/model-name.ts"]
+    },
+    {
+      "name": "engine-route",
+      "rule": "route",
+      "report": true,
+      "description": "The engine's strings, for the same names. Report only: a provider the user brings their own key for (OpenRouter sign-in, provider setup and its hints) names itself on purpose, and which of these strings the owner's rule covers is the owner's to decide; then drop `report`. The Rust model-name cleaner names providers to take them off a catalog's names, so it is left out",
+      "include": ["rust/crates/*/src/**"],
+      "exclude": ["rust/crates/rusty-claude-cli/src/gateway_catalog.rs"]
     }
   ],
   "exclude": [
@@ -98,6 +125,10 @@
     {
       "pattern": "\\banthropic-(?:version|beta)\\b|\\bapi\\.anthropic\\.com\\b",
       "reason": "The provider's protocol header names and API host, for the Anthropic bring-your-own-key provider."
+    },
+    {
+      "pattern": "\\b(?:groq|openrouter|nvidia|z-ai|zai)/[\\w.:@-]+(?:/[\\w.:@-]+)*",
+      "reason": "Model IDs exactly as the gateway's catalog returns them (groq/openai/gpt-oss-120b, z-ai/glm-5.2, nvidia/nvidia/nemotron-…): identifiers a program sends, not names a person reads. A display name such as \"GPT-OSS 120B (Groq)\" is not an ID and still fails."
     }
   ],
   "exact": [

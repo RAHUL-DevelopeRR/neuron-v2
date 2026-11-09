@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 // Brand lint: Neuron's UI, help text, command summaries and system prompt must
-// not name the reference product or its maker (plan guardrail 2, T6).
+// not name the reference product or its maker (plan guardrail 2, T6). Its UI
+// must not name the provider a model is routed through (Groq, OpenRouter,
+// NVIDIA, Z.ai) either: the owner's rule, so a person is told which model
+// answered and never which provider served it.
 //
 // It reads only string literals and UI text, never comments or tests:
 // - TypeScript/TSX through the TypeScript compiler (string and template
@@ -11,10 +14,13 @@
 //
 // What it scans, what it allows and the known leaks still being fixed live in
 // scripts/brand-lint.allowlist.json:
-// - `scopes`: which files, and which rule (`brand` or `product-name`). A scope
-//   with `"report": true` only warns: it shows leaks someone still has to
-//   decide on, without failing the run. A file belongs to the first scope
-//   that includes it.
+// - `scopes`: which files, and which rule (`brand`, `product-name` or `route`).
+//   A scope with `"report": true` only warns: it shows leaks someone still has
+//   to decide on, without failing the run. A file belongs to the first scope of
+//   each rule that includes it, so the same files are read for two rules. A
+//   scope's own `exclude` leaves files out of that scope only (the model-name
+//   cleaners name providers to take them off a catalog's names); the top-level
+//   `exclude` leaves files out of every scope (tests and fixtures).
 // - `allow`: patterns masked out before matching (model IDs, compatibility
 //   paths and names, internal crate names). `exact`: whole literals allowed.
 // - `accepted`: one literal in one file, allowed with a reason.
@@ -46,6 +52,10 @@ export const RULES = {
   // The reference products' own names, for request identity (app name, beta
   // headers): model IDs and the provider's protocol names are fine there.
   'product-name': /claude[\s_-]?(?:code|cli|desktop)/gi,
+  // The providers a model is routed through. The owner's rule is that a person
+  // is told which model answered, never which provider served it. Z.ai in the
+  // spellings a catalog uses; whole words only, so "Zaire" is no match.
+  route: /\b(?:groq|openrouter|nvidia|z\.ai|zai|z-ai)\b/gi,
 }
 
 // ---------------------------------------------------------------------------
@@ -58,7 +68,13 @@ export function loadConfig(configPath = DEFAULT_CONFIG) {
     if (!RULES[scope.rule]) throw new Error(`brand-lint: scope ${scope.name} has unknown rule ${scope.rule}`)
   }
   return {
-    scopes: raw.scopes.map((scope) => ({ ...scope, include: scope.include.map(globToRegExp) })),
+    scopes: raw.scopes.map((scope) => ({
+      ...scope,
+      include: scope.include.map(globToRegExp),
+      // Files this scope alone leaves out (the top-level `exclude` leaves files out of every scope).
+      exclude: (scope.exclude ?? []).map(globToRegExp),
+      excludeSource: scope.exclude ?? [],
+    })),
     exclude: raw.exclude.map(globToRegExp),
     allow: raw.allow.map((entry) => ({ ...entry, regex: compile(entry) })),
     exact: new Set(raw.exact.map((entry) => entry.text)),
@@ -368,22 +384,28 @@ function globBase(regex) {
 }
 
 export function lint({ root = REPO_ROOT, config = loadConfig() } = {}) {
-  const files = new Map() // file -> scope
+  // file -> the scopes that read it: for each rule, the first scope that includes it.
+  const files = new Map()
   for (const scope of config.scopes) {
     for (const include of scope.include) {
       for (const file of walk(root, globBase(include))) {
-        if (include.test(file) && !config.exclude.some((ex) => ex.test(file)) && !files.has(file)) files.set(file, scope)
+        if (!include.test(file) || config.exclude.some((ex) => ex.test(file)) || scope.exclude.some((ex) => ex.test(file))) continue
+        const scopes = files.get(file) ?? []
+        if (!scopes.some((read) => read.rule === scope.rule)) files.set(file, [...scopes, scope])
       }
     }
   }
 
   const hits = []
-  for (const [file, scope] of [...files].sort(([a], [b]) => a.localeCompare(b))) {
+  for (const [file, scopes] of [...files].sort(([a], [b]) => a.localeCompare(b))) {
     const source = fs.readFileSync(path.join(root, file), 'utf8')
-    for (const { start, end } of extractStrings(source, file)) {
-      const literal = source.slice(start, end)
-      for (const { index, term } of findTerms(literal, scope.rule, config)) {
-        hits.push({ file, scope: scope.name, report: Boolean(scope.report), ...lineAndColumn(source, start + index), term, literal, excerpt: excerpt(literal, index) })
+    const literals = extractStrings(source, file)
+    for (const scope of scopes) {
+      for (const { start, end } of literals) {
+        const literal = source.slice(start, end)
+        for (const { index, term } of findTerms(literal, scope.rule, config)) {
+          hits.push({ file, scope: scope.name, report: Boolean(scope.report), ...lineAndColumn(source, start + index), term, literal, excerpt: excerpt(literal, index) })
+        }
       }
     }
   }

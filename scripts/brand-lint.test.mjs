@@ -202,3 +202,107 @@ test('globs', () => {
   assert.ok(globToRegExp('**/*.test.*').test('a/b/c.test.ts'))
   assert.ok(!globToRegExp('ui/*/scripts/**').test('ui/neuron-tui/src/scripts.ts'))
 })
+
+// The owner's rule: Neuron never shows the provider a model is routed through (Groq, OpenRouter, NVIDIA,
+// Z.ai). The `route` rule reads the same literals as `brand`, in its own scopes.
+const CLIENT_CLEANER = 'ui/neuron-client/src/copy/model-name.ts'
+const TUI_CLEANER = 'ui/neuron-tui/src/utils/model-name.ts'
+const ENGINE = 'rust/crates/rusty-claude-cli/src/gateway_repl.rs'
+const FIXTURE = 'rust/crates/rusty-claude-cli/tests/fixtures/model-names.json'
+const CLIENT_TEST = 'ui/neuron-client/test/model-name.test.ts'
+
+const everyHit = (result) => [...result.failures, ...result.baselined, ...result.reported, ...result.accepted]
+
+test('a UI string that names a provider fails; comments, model IDs, tests, fixtures and the model-name cleaners pass', () => {
+  const root = copyTree([UI, CLIENT_CLEANER, TUI_CLEANER, FIXTURE, CLIENT_TEST])
+  try {
+    edit(
+      root,
+      UI,
+      (source) => `${source}
+export function PlantedChip() {
+  // Groq in a comment
+  return <span title="Served by NVIDIA">GLM 5.2 (Z.ai)</span>
+}
+export const plantedTemplate = (name: string) => \`\${name} runs on OpenRouter\`
+/* OpenRouter in a block comment */
+export const plantedBoth = 'Claude on Groq'
+export const plantedFine = ['groq/openai/gpt-oss-120b', 'z-ai/glm-5.2', 'nvidia/nvidia/nemotron-3-super-120b-a12b', /groq/i, 'Zaire 7B', 'Lazai', 'zero-x']
+`,
+    )
+    // A test that names providers, and a model-name case, as the real ones do.
+    edit(root, CLIENT_TEST, (source) => `${source}\nexport const plantedCase = 'GPT-OSS 120B (Groq)'\n`)
+
+    const result = lint({ root, config })
+    const found = (scope) =>
+      result.failures
+        .filter((hit) => hit.scope === scope)
+        .map((hit) => `${hit.file} ${hit.term} ${hit.excerpt}`)
+        .sort()
+    assert.deepEqual(found('ui-route'), [
+      `${UI} Groq Claude on Groq`,
+      `${UI} NVIDIA Served by NVIDIA`,
+      `${UI} OpenRouter runs on OpenRouter`,
+      `${UI} Z.ai GLM 5.2 (Z.ai)`,
+    ])
+    // The same string is read for the other rule too: one literal, two kinds of leak.
+    assert.deepEqual(found('ui'), [`${UI} Claude Claude on Groq`])
+
+    // The cleaners name providers to take them off a catalog's names, and tests and fixtures carry them as data.
+    for (const file of [CLIENT_CLEANER, TUI_CLEANER, FIXTURE, CLIENT_TEST]) {
+      assert.deepEqual(
+        everyHit(result).filter((hit) => hit.file === file && hit.scope.endsWith('-route')),
+        [],
+        file,
+      )
+    }
+    assert.equal(run('--root', root).status, 1)
+    assert.equal(run('--root', root, '--report').status, 0)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("a provider named in the engine is reported, not failed: a provider on the user's own key names itself on purpose", () => {
+  const root = copyTree([ENGINE])
+  try {
+    edit(
+      root,
+      ENGINE,
+      (source) => `${source}
+pub const PLANTED_HINT: &str = "Models served by Groq";
+pub const PLANTED_ID: &str = "groq/openai/gpt-oss-120b";
+#[cfg(test)]
+mod planted_tests {
+    const IN_A_TEST: &str = "Groq in a test";
+}
+`,
+    )
+    const result = lint({ root, config })
+    assert.deepEqual(result.failures.filter((hit) => hit.file === ENGINE), [])
+    assert.deepEqual(
+      result.reported.filter((hit) => hit.file === ENGINE).map((hit) => `${hit.scope} ${hit.term} ${hit.excerpt}`),
+      ['engine-route Groq Models served by Groq'],
+    )
+    assert.equal(run('--root', root).status, 0)
+    // Still only a report with --strict: it is not a baseline.
+    assert.equal(run('--root', root, '--strict').status, 0)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a file is read once for each rule that includes it, and a scope can leave files out', () => {
+  assert.ok(config.scopes.some((scope) => scope.rule === 'route'))
+  // brand and route are two scopes on the same UI files.
+  const ui = config.scopes.filter((scope) => scope.include.some((include) => include.test('ui/neuron-desktop/src/App.tsx')))
+  assert.deepEqual(ui.map((scope) => scope.rule).sort(), ['brand', 'route'])
+  // What a scope leaves out by its own list has to be there: a renamed cleaner must not leave a stale exemption.
+  for (const scope of config.scopes) {
+    for (const exclude of scope.excludeSource) {
+      if (!/[*?]/.test(exclude)) assert.ok(fs.existsSync(path.join(REPO_ROOT, exclude)), `${scope.name} leaves out ${exclude}, which is not there`)
+    }
+  }
+  const route = config.scopes.find((scope) => scope.name === 'ui-route')
+  assert.deepEqual(route.excludeSource.sort(), [CLIENT_CLEANER, TUI_CLEANER].sort())
+})
