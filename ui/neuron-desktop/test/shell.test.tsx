@@ -8,12 +8,22 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import axe from 'axe-core'
 
-import { accountView, type AccountDetails, type ClientMessage, type ErrorDetail, type UiEvent } from '@neuron/client'
+import {
+  accountView,
+  trustChangedKeysLine,
+  trustCopy,
+  type AccountDetails,
+  type ClientMessage,
+  type ErrorDetail,
+  type TrustPreviewEvent,
+  type UiEvent,
+} from '@neuron/client'
 
 import { App } from '../src/App'
 import { UsagePanel } from '../src/components/SettingsPage'
+import { TrustModal } from '../src/components/TrustModal'
 import { LINKS } from '../src/links'
-import { FakeEngine, fakePlatform, type FakePlatformOptions } from './fake-platform'
+import { ALL_FEATURES, FakeEngine, fakePlatform, type FakePlatformOptions } from './fake-platform'
 
 afterEach(() => {
   cleanup()
@@ -559,5 +569,234 @@ describe('protocol v2: the account event and the trust preview', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Allow Neuron in this folder' }))
     await emit(engine, { type: 'workspace_trusted', cwd: '/home/rahul', restart_required: true, session_only: true, root: '/home/rahul' })
     await waitFor(() => expect(platform.trustedOnce).toEqual([null]))
+  })
+
+  // The trust dialog, and what the engine's `trust_preview` says for /work/app.
+  const trustDialog = () => screen.getByRole('dialog', { name: 'Before Neuron works here' })
+  const preview = (commands: string[], over: Record<string, unknown> = {}): UiEvent =>
+    ({
+      type: 'trust_preview',
+      cwd: '/work/app',
+      root: '/work/app',
+      is_git_root: true,
+      session_only: false,
+      trusted: false,
+      settings_files: ['/work/app/.neuron/settings.json'],
+      hooks: commands.map((command) => ({ event: 'PreToolUse', command, source: '/work/app/.neuron/settings.json' })),
+      mcp_servers: [],
+      permission_rules: [],
+      other_settings: [],
+      ...over,
+    }) as UiEvent
+  const listed = () =>
+    within(within(trustDialog()).getByRole('list', { name: 'What this folder turns on' }))
+      .getAllByRole('listitem')
+      .map((item) => item.textContent)
+
+  // From 7.0.0-alpha.5 the engine asks for trust again when a trusted folder's hooks, MCP launch specs or
+  // allow rules change: the same folder is untrusted once more, and the dialog needs a fresh preview.
+  describe('a trusted folder that asks for trust again', () => {
+    test('trusted, then untrusted again, asks what the folder turns on a second time', async () => {
+      const { engine } = await start({ workspace_trusted: false })
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+      await emit(engine, preview(['lint']))
+      expect(listed()).toEqual(['1 hook that runs commands around tool calls'])
+
+      // Every status says the folder is untrusted: that is not a new question.
+      await emit(engine, engine.status({ workspace_trusted: false }))
+      expect(sent(engine, 'trust_preview')).toHaveLength(1)
+
+      // Trusted: the dialog is gone.
+      await emit(engine, engine.status({ workspace_trusted: true }))
+      expect(screen.queryAllByRole('dialog', { name: 'Before Neuron works here' }).length).toBe(0)
+      expect(sent(engine, 'trust_preview')).toHaveLength(1)
+
+      // Its hooks changed and the engine wants trust again: the preview is asked for again, and replaces the old one.
+      await emit(engine, engine.status({ workspace_trusted: false }))
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(2))
+      await emit(engine, preview(['lint', 'deploy'], { changed_since_trust: true, changed_settings: ['hooks'] }))
+      expect(listed()).toEqual(['2 hooks that run commands around tool calls'])
+
+      // And once more only, for as long as it stays untrusted.
+      await emit(engine, engine.status({ workspace_trusted: false }))
+      expect(sent(engine, 'trust_preview')).toHaveLength(2)
+    })
+
+    test('allowed, the engine restarted, and a later change asks again', async () => {
+      const { engine, platform } = await start({ workspace_trusted: false })
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+      await emit(engine, preview(['lint']))
+      fireEvent.click(within(trustDialog()).getByRole('button', { name: 'Allow Neuron in this folder' }))
+      await emit(engine, { type: 'workspace_trusted', cwd: '/work/app', restart_required: true })
+      await waitFor(() => expect(platform.restarts).toEqual([null]))
+      // The fresh engine says it is ready and that the folder is trusted.
+      await emit(engine, { type: 'ready', protocol: 1, version: '6.3.0', features: ALL_FEATURES }, engine.status({ workspace_trusted: true }))
+      expect(screen.queryAllByRole('dialog', { name: 'Before Neuron works here' }).length).toBe(0)
+      expect(sent(engine, 'trust_preview')).toHaveLength(1)
+
+      // Later, an MCP launch spec changes.
+      await emit(engine, engine.status({ workspace_trusted: false }))
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(2))
+      await emit(engine, preview([], { mcp_servers: [{ name: 'postgres-tools', transport: 'stdio', target: 'pg-mcp --new', source: '/work/app/.neuron/settings.json' }] }))
+      expect(listed()).toEqual(['1 MCP server: postgres-tools'])
+    })
+
+    test('a folder that stays untrusted is asked about once', async () => {
+      const { engine } = await start({ workspace_trusted: false })
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+      for (let round = 0; round < 3; round++) await emit(engine, engine.status({ workspace_trusted: false }))
+      expect(sent(engine, 'trust_preview')).toHaveLength(1)
+    })
+  })
+
+  // A fresh engine's `ready` clears the preview the dialog had, so an engine that goes away and comes
+  // back while the folder stays untrusted has to be asked again, or the dialog opens without its list.
+  describe('an engine that restarts while the folder stays untrusted', () => {
+    /** The engine process ends, as a crash or a stop does. */
+    const exits = (engine: FakeEngine) =>
+      act(async () => {
+        for (const listener of engine.closeListeners) listener({ code: 1, error: 'The Neuron engine stopped (exit code 1).' })
+      })
+    /** A fresh engine says it is ready, and what it makes of the folder. */
+    const comesBack = (engine: FakeEngine, trusted: boolean) =>
+      emit(engine, { type: 'ready', protocol: 1, version: '6.3.0', features: ALL_FEATURES }, engine.status({ workspace_trusted: trusted }))
+
+    test('one that exits and comes back is asked for the preview again, once', async () => {
+      const { engine } = await start({ workspace_trusted: false })
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+      await emit(engine, preview(['lint']))
+      expect(listed()).toEqual(['1 hook that runs commands around tool calls'])
+
+      await exits(engine)
+      expect(sent(engine, 'trust_preview')).toHaveLength(1)
+
+      // The fresh engine has no preview to show, so the dialog is asked to be filled in again.
+      await comesBack(engine, false)
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(2))
+      await emit(engine, preview(['lint']))
+      expect(listed()).toEqual(['1 hook that runs commands around tool calls'])
+
+      // And that engine is asked once: more statuses of the same untrusted folder are not new questions.
+      for (let round = 0; round < 2; round++) await emit(engine, engine.status({ workspace_trusted: false }))
+      expect(sent(engine, 'trust_preview')).toHaveLength(2)
+    })
+
+    test('one that restarts through `connecting` is asked for the preview again', async () => {
+      const { engine, platform } = await start({ workspace_trusted: false })
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+      const controller = await platform.connect()
+      await act(async () => controller.apply({ type: 'local/connecting' }))
+      expect(sent(engine, 'trust_preview')).toHaveLength(1)
+      await comesBack(engine, false)
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(2))
+    })
+
+    test('a folder that is trusted when the engine comes back is not asked about', async () => {
+      const { engine } = await start({ workspace_trusted: false })
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+      await emit(engine, engine.status({ workspace_trusted: true }))
+      await exits(engine)
+      await comesBack(engine, true)
+      expect(screen.queryAllByRole('dialog', { name: 'Before Neuron works here' }).length).toBe(0)
+      expect(sent(engine, 'trust_preview')).toHaveLength(1)
+    })
+  })
+
+  // Trusted before, and what the folder asks for changed since: the dialog says so in the client's own
+  // words (`trustCopy.changed`, then `trustChangedKeysLine`), above what the folder turns on.
+  describe('the trust dialog says why a folder is asked again', () => {
+    const CHANGED = { changed_since_trust: true, changed_settings: ['hooks', 'env'] }
+    /** The dialog for a preview made of `over` (a hook, unless it says otherwise); `null` is no preview yet. */
+    const modal = (over: Record<string, unknown> | null) =>
+      render(
+        <TrustModal
+          folder="/work/app"
+          preview={over === null ? null : (preview(['lint'], over) as TrustPreviewEvent)}
+          working={false}
+          canPickFolder
+          onAllow={() => {}}
+          onElsewhere={() => {}}
+          onOpenLink={() => {}}
+        />,
+      )
+    const follows = (first: Element, second: Element) => (first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0
+
+    test("shows the client's wording above what the folder turns on: why, then which settings", () => {
+      modal(CHANGED)
+      const dialog = trustDialog()
+      const why = within(dialog).getByText(trustCopy.changed)
+      const keysLine = trustChangedKeysLine(CHANGED)
+      const keys = within(dialog).getByText(keysLine)
+      expect(keysLine).toContain('hooks, env')
+      const heading = within(dialog).getByText(trustCopy.turnsOnHeading)
+      const list = within(dialog).getByRole('list', { name: 'What this folder turns on' })
+      expect(follows(why, keys)).toBe(true)
+      expect(follows(keys, heading)).toBe(true)
+      expect(follows(heading, list)).toBe(true)
+    })
+
+    test('and above the note that the folder turns nothing on', () => {
+      modal({ ...CHANGED, hooks: [] })
+      const dialog = trustDialog()
+      const why = within(dialog).getByText(trustCopy.changed)
+      expect(follows(why, within(dialog).getByText(trustCopy.turnsOnNothing))).toBe(true)
+    })
+
+    test('is absent unless the preview says the folder changed since it was trusted', () => {
+      for (const over of [null, {}, { changed_since_trust: false }, { changed_since_trust: false, changed_settings: ['hooks'] }, { changed_settings: ['hooks'] }]) {
+        modal(over)
+        const dialog = trustDialog()
+        expect(dialog.textContent).not.toContain(trustCopy.changed)
+        expect(dialog.textContent).not.toContain(trustCopy.changedKeys)
+        expect(dialog.getAttribute('aria-describedby')).toBe('trust-access')
+        cleanup()
+      }
+    })
+
+    test('says so without a settings line when the engine names no keys', () => {
+      for (const over of [{ changed_since_trust: true }, { changed_since_trust: true, changed_settings: [] }]) {
+        modal(over)
+        const dialog = trustDialog()
+        expect(within(dialog).getByText(trustCopy.changed)).toBeTruthy()
+        expect(dialog.textContent).not.toContain(trustCopy.changedKeys)
+        cleanup()
+      }
+    })
+
+    test('shows the keys as text, however they are spelled', () => {
+      modal({ changed_since_trust: true, changed_settings: ['<b>env</b>', 'a&b'] })
+      const dialog = trustDialog()
+      expect(dialog.querySelectorAll('b').length).toBe(0)
+      expect(dialog.textContent).toContain('<b>env</b>, a&b')
+    })
+
+    test('describes the dialog too, so it is read out with the folder access', () => {
+      modal(CHANGED)
+      const ids = (trustDialog().getAttribute('aria-describedby') ?? '').split(' ')
+      expect(ids).toEqual(['trust-access', 'trust-changed'])
+      expect(ids.map((id) => document.getElementById(id)?.textContent)).toEqual([trustCopy.access, trustCopy.changed])
+    })
+
+    test('leaves nothing for axe to find', async () => {
+      modal(CHANGED)
+      await expectAccessible()
+    })
+
+    test('in the app, a folder that asks again says what changed, and the first time it does not', async () => {
+      const { engine } = await start({ workspace_trusted: false })
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+      await emit(engine, preview(['lint']))
+      expect(trustDialog().textContent).not.toContain(trustCopy.changed)
+
+      await emit(engine, engine.status({ workspace_trusted: true }))
+      await emit(engine, engine.status({ workspace_trusted: false }))
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(2))
+      await emit(engine, preview(['lint', 'deploy'], CHANGED))
+      const dialog = trustDialog()
+      expect(within(dialog).getByText(trustCopy.changed)).toBeTruthy()
+      expect(within(dialog).getByText(trustChangedKeysLine(CHANGED))).toBeTruthy()
+      expect(listed()).toEqual(['2 hooks that run commands around tool calls'])
+      await expectAccessible()
+    })
   })
 })

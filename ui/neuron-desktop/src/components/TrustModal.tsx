@@ -1,6 +1,6 @@
 import { useRef } from 'react'
 
-import { TRUST_DOCS_URL, trustCopy, trustPreviewLines, trustRootNote, type TrustPreviewEvent } from '@neuron/client'
+import { TRUST_DOCS_URL, trustChangedKeysLine, trustCopy, trustPreviewLines, trustRootNote, type TrustPreviewEvent } from '@neuron/client'
 
 import { useFocusTrap } from '../a11y'
 
@@ -8,7 +8,8 @@ import { useFocusTrap } from '../a11y'
  * Before the agent works in a folder it hasn't been allowed in: blocks the
  * window until the user allows it or opens another folder. The wording is the
  * terminal's too (`trustCopy`); `preview`, when the engine sends one, lists
- * what the folder's own settings would turn on.
+ * what the folder's own settings would turn on, and says when the folder was
+ * trusted before and what it asks for has changed since.
  */
 export function TrustModal({
   folder,
@@ -32,15 +33,31 @@ export function TrustModal({
   useFocusTrap(dialog)
   const lines = preview ? trustPreviewLines(preview) : []
   const note = preview ? trustRootNote(preview) : ''
+  // Trusted before and changed since: why the dialog is back, then which settings (the client's words).
+  const changed = !!preview?.changed_since_trust
+  const changedKeys = preview ? trustChangedKeysLine(preview) : ''
   return (
     <div className="dialog-backdrop trust-backdrop">
-      <div className="dialog trust-dialog" role="dialog" aria-modal="true" aria-labelledby="trust-title" aria-describedby="trust-access" ref={dialog}>
+      <div
+        className="dialog trust-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="trust-title"
+        aria-describedby={changed ? 'trust-access trust-changed' : 'trust-access'}
+        ref={dialog}
+      >
         <h2 id="trust-title">{trustCopy.title}</h2>
         <div className="trust-folder">
           <code>{folder}</code>
           {note && <span className="muted small"> {note}</span>}
         </div>
         <p id="trust-access">{trustCopy.access}</p>
+        {changed && (
+          <p id="trust-changed" className="trust-changed">
+            {trustCopy.changed}
+          </p>
+        )}
+        {changedKeys && <p className="muted small">{changedKeys}</p>}
         {preview &&
           (lines.length > 0 ? (
             <>

@@ -1442,11 +1442,14 @@ h2 {
   color: var(--success);
 }
 .status-starting,
-.status-pending {
+.status-pending,
+.status-needs_approval,
+.status-needs_connect {
   color: var(--orange);
 }
 .status-failed,
-.status-unsupported {
+.status-unsupported,
+.status-blocked {
   color: var(--danger);
 }
 .extension-description {
@@ -1618,6 +1621,9 @@ h2 {
 .trust-folder {
   margin: 6px 0 10px;
   word-break: break-all;
+}
+.trust-changed {
+  font-weight: 600;
 }
 .trust-preview {
   margin: 0 0 8px;
@@ -1964,6 +1970,13 @@ h2 {
 .extension-toggle[disabled] {
   cursor: progress;
   opacity: 0.7;
+}
+/* The connector policy keeps the server on: where the switch would be, but not a control. */
+.extension-required {
+  display: inline-block;
+  margin: 0 12px 4px 78px;
+  padding: 2px 4px;
+  cursor: default;
 }
 .switch-track {
   display: inline-block;
