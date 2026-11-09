@@ -8,10 +8,20 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import axe from 'axe-core'
 
-import { accountView, type AccountDetails, type ClientMessage, type ErrorDetail, type UiEvent } from '@neuron/client'
+import {
+  accountView,
+  trustChangedKeysLine,
+  trustCopy,
+  type AccountDetails,
+  type ClientMessage,
+  type ErrorDetail,
+  type TrustPreviewEvent,
+  type UiEvent,
+} from '@neuron/client'
 
 import { App } from '../src/App'
 import { UsagePanel } from '../src/components/SettingsPage'
+import { TrustModal } from '../src/components/TrustModal'
 import { LINKS } from '../src/links'
 import { ALL_FEATURES, FakeEngine, fakePlatform, type FakePlatformOptions } from './fake-platform'
 
@@ -689,6 +699,104 @@ describe('protocol v2: the account event and the trust preview', () => {
       await comesBack(engine, true)
       expect(screen.queryAllByRole('dialog', { name: 'Before Neuron works here' }).length).toBe(0)
       expect(sent(engine, 'trust_preview')).toHaveLength(1)
+    })
+  })
+
+  // Trusted before, and what the folder asks for changed since: the dialog says so in the client's own
+  // words (`trustCopy.changed`, then `trustChangedKeysLine`), above what the folder turns on.
+  describe('the trust dialog says why a folder is asked again', () => {
+    const CHANGED = { changed_since_trust: true, changed_settings: ['hooks', 'env'] }
+    /** The dialog for a preview made of `over` (a hook, unless it says otherwise); `null` is no preview yet. */
+    const modal = (over: Record<string, unknown> | null) =>
+      render(
+        <TrustModal
+          folder="/work/app"
+          preview={over === null ? null : (preview(['lint'], over) as TrustPreviewEvent)}
+          working={false}
+          canPickFolder
+          onAllow={() => {}}
+          onElsewhere={() => {}}
+          onOpenLink={() => {}}
+        />,
+      )
+    const follows = (first: Element, second: Element) => (first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0
+
+    test("shows the client's wording above what the folder turns on: why, then which settings", () => {
+      modal(CHANGED)
+      const dialog = trustDialog()
+      const why = within(dialog).getByText(trustCopy.changed)
+      const keysLine = trustChangedKeysLine(CHANGED)
+      const keys = within(dialog).getByText(keysLine)
+      expect(keysLine).toContain('hooks, env')
+      const heading = within(dialog).getByText(trustCopy.turnsOnHeading)
+      const list = within(dialog).getByRole('list', { name: 'What this folder turns on' })
+      expect(follows(why, keys)).toBe(true)
+      expect(follows(keys, heading)).toBe(true)
+      expect(follows(heading, list)).toBe(true)
+    })
+
+    test('and above the note that the folder turns nothing on', () => {
+      modal({ ...CHANGED, hooks: [] })
+      const dialog = trustDialog()
+      const why = within(dialog).getByText(trustCopy.changed)
+      expect(follows(why, within(dialog).getByText(trustCopy.turnsOnNothing))).toBe(true)
+    })
+
+    test('is absent unless the preview says the folder changed since it was trusted', () => {
+      for (const over of [null, {}, { changed_since_trust: false }, { changed_since_trust: false, changed_settings: ['hooks'] }, { changed_settings: ['hooks'] }]) {
+        modal(over)
+        const dialog = trustDialog()
+        expect(dialog.textContent).not.toContain(trustCopy.changed)
+        expect(dialog.textContent).not.toContain(trustCopy.changedKeys)
+        expect(dialog.getAttribute('aria-describedby')).toBe('trust-access')
+        cleanup()
+      }
+    })
+
+    test('says so without a settings line when the engine names no keys', () => {
+      for (const over of [{ changed_since_trust: true }, { changed_since_trust: true, changed_settings: [] }]) {
+        modal(over)
+        const dialog = trustDialog()
+        expect(within(dialog).getByText(trustCopy.changed)).toBeTruthy()
+        expect(dialog.textContent).not.toContain(trustCopy.changedKeys)
+        cleanup()
+      }
+    })
+
+    test('shows the keys as text, however they are spelled', () => {
+      modal({ changed_since_trust: true, changed_settings: ['<b>env</b>', 'a&b'] })
+      const dialog = trustDialog()
+      expect(dialog.querySelectorAll('b').length).toBe(0)
+      expect(dialog.textContent).toContain('<b>env</b>, a&b')
+    })
+
+    test('describes the dialog too, so it is read out with the folder access', () => {
+      modal(CHANGED)
+      const ids = (trustDialog().getAttribute('aria-describedby') ?? '').split(' ')
+      expect(ids).toEqual(['trust-access', 'trust-changed'])
+      expect(ids.map((id) => document.getElementById(id)?.textContent)).toEqual([trustCopy.access, trustCopy.changed])
+    })
+
+    test('leaves nothing for axe to find', async () => {
+      modal(CHANGED)
+      await expectAccessible()
+    })
+
+    test('in the app, a folder that asks again says what changed, and the first time it does not', async () => {
+      const { engine } = await start({ workspace_trusted: false })
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+      await emit(engine, preview(['lint']))
+      expect(trustDialog().textContent).not.toContain(trustCopy.changed)
+
+      await emit(engine, engine.status({ workspace_trusted: true }))
+      await emit(engine, engine.status({ workspace_trusted: false }))
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(2))
+      await emit(engine, preview(['lint', 'deploy'], CHANGED))
+      const dialog = trustDialog()
+      expect(within(dialog).getByText(trustCopy.changed)).toBeTruthy()
+      expect(within(dialog).getByText(trustChangedKeysLine(CHANGED))).toBeTruthy()
+      expect(listed()).toEqual(['2 hooks that run commands around tool calls'])
+      await expectAccessible()
     })
   })
 })
