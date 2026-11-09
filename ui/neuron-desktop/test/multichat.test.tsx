@@ -413,3 +413,77 @@ describe('accessibility', () => {
     expect(await violations(dialog)).toEqual([])
   })
 })
+
+// Each chat has its own engine, so each one's trust dialog needs its own preview, even in one folder.
+describe('the trust dialog in several chats', () => {
+  const preview = (): UiEvent =>
+    ({
+      type: 'trust_preview',
+      cwd: '/work/app',
+      root: '/work/app',
+      is_git_root: true,
+      session_only: false,
+      trusted: false,
+      settings_files: ['/work/app/.neuron/settings.json'],
+      hooks: [{ event: 'PreToolUse', command: 'lint', source: '/work/app/.neuron/settings.json' }],
+      mcp_servers: [],
+      permission_rules: [],
+      other_settings: [],
+    }) as UiEvent
+  /** How many times this chat's engine was asked what its folder would turn on. */
+  const asked = (chats: NonNullable<FakePlatform['fakeChats']>, id: string) =>
+    chats.engines
+      .get(id)!
+      .commands()
+      .filter((command) => (command as { type?: string }).type === 'trust_preview').length
+  const untrusted = (chats: NonNullable<FakePlatform['fakeChats']>, id: string) => emitTo(chats, id, chats.engines.get(id)!.status({ workspace_trusted: false }))
+  const view = async (chats: NonNullable<FakePlatform['fakeChats']>, id: string) => {
+    fireEvent.click(rowOf(id))
+    await waitFor(() => expect(chats.activated.at(-1)).toBe(id))
+  }
+
+  test('a second chat in the same folder that is untrusted when it is brought into view is asked for its own preview', async () => {
+    const { platform, chats } = await start()
+    const [first] = chats.ids()
+    const second = await openSecond(platform)
+
+    // The first chat is in view when its folder turns untrusted: it asks, once.
+    await view(chats, first)
+    await untrusted(chats, first)
+    await waitFor(() => expect(asked(chats, first)).toBe(1))
+
+    // The second chat's engine turns untrusted meanwhile, out of view: nothing to ask for yet.
+    await untrusted(chats, second)
+    expect(asked(chats, second)).toBe(0)
+
+    // Brought into view, its own dialog asks, whatever the first chat's did: a blind Allow shows no list.
+    await view(chats, second)
+    await waitFor(() => expect(asked(chats, second)).toBe(1))
+    await emitTo(chats, second, preview())
+    const dialog = await screen.findByRole('dialog', { name: 'Before Neuron works here' })
+    const list = within(dialog).getByRole('list', { name: 'What this folder turns on' })
+    expect(within(list).getAllByRole('listitem').map((item) => item.textContent)).toEqual(['1 hook that runs commands around tool calls'])
+
+    // Back in the first chat, which already has its list: nothing is asked again, by either.
+    await view(chats, first)
+    expect(asked(chats, first)).toBe(1)
+    expect(asked(chats, second)).toBe(1)
+  })
+
+  test('each chat that turns untrusted in its own turn is asked once', async () => {
+    const { platform, chats } = await start()
+    const [first] = chats.ids()
+    const second = await openSecond(platform)
+    await view(chats, first)
+    await untrusted(chats, first)
+    await waitFor(() => expect(asked(chats, first)).toBe(1))
+    await view(chats, second)
+    await untrusted(chats, second)
+    await waitFor(() => expect(asked(chats, second)).toBe(1))
+    // More statuses of the same untrusted folders are not new questions.
+    await untrusted(chats, second)
+    await view(chats, first)
+    await untrusted(chats, first)
+    expect([asked(chats, first), asked(chats, second)]).toEqual([1, 1])
+  })
+})

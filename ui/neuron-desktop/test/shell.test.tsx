@@ -7,6 +7,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import axe from 'axe-core'
+import { StrictMode } from 'react'
 
 import {
   accountView,
@@ -643,6 +644,19 @@ describe('protocol v2: the account event and the trust preview', () => {
 
     test('a folder that stays untrusted is asked about once', async () => {
       const { engine } = await start({ workspace_trusted: false })
+      await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+      for (let round = 0; round < 3; round++) await emit(engine, engine.status({ workspace_trusted: false }))
+      expect(sent(engine, 'trust_preview')).toHaveLength(1)
+    })
+
+    test('under StrictMode, which runs every effect twice, exactly one preview is asked for', async () => {
+      const engine = new FakeEngine({ workspace_trusted: false })
+      render(
+        <StrictMode>
+          <App platform={fakePlatform(engine)} />
+        </StrictMode>,
+      )
+      await screen.findByLabelText('Message Neuron')
       await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
       for (let round = 0; round < 3; round++) await emit(engine, engine.status({ workspace_trusted: false }))
       expect(sent(engine, 'trust_preview')).toHaveLength(1)
