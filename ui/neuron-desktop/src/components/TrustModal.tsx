@@ -52,26 +52,33 @@ export function TrustModal({
           {note && <span className="muted small"> {note}</span>}
         </div>
         <p id="trust-access">{trustCopy.access}</p>
-        {changed && (
-          <p id="trust-changed" className="trust-changed">
-            {trustCopy.changed}
-          </p>
-        )}
-        {changedKeys && <p className="muted small">{changedKeys}</p>}
-        {preview &&
-          (lines.length > 0 ? (
-            <>
-              <p>{trustCopy.turnsOnHeading}</p>
-              <ul className="trust-preview" aria-label="What this folder turns on">
-                {lines.map((line) => (
-                  <li key={line}>{line}</li>
-                ))}
-              </ul>
-            </>
-          ) : (
-            <p className="muted">{trustCopy.turnsOnNothing}</p>
-          ))}
-        {preview?.session_only && <p className="muted">{trustCopy.sessionOnly}</p>}
+        {/*
+          What the preview makes. The dialog opens before the engine's preview arrives (it is cleared when the
+          engine becomes ready and when the folder is trusted), so this region is always there, empty at first:
+          a screen reader announces what is added to a live region that exists, not one that arrives with its text.
+        */}
+        <div aria-live="polite">
+          {changed && (
+            <p id="trust-changed" className="trust-changed">
+              {trustCopy.changed}
+            </p>
+          )}
+          {changedKeys && <p className="muted small">{changedKeys}</p>}
+          {preview &&
+            (lines.length > 0 ? (
+              <>
+                <p>{trustCopy.turnsOnHeading}</p>
+                <ul className="trust-preview" aria-label="What this folder turns on">
+                  {lines.map((line) => (
+                    <li key={line}>{line}</li>
+                  ))}
+                </ul>
+              </>
+            ) : (
+              <p className="muted">{trustCopy.turnsOnNothing}</p>
+            ))}
+          {preview?.session_only && <p className="muted">{trustCopy.sessionOnly}</p>}
+        </div>
         <p className="muted">
           {trustCopy.caution} {trustCopy.whyLabel}{' '}
           <a

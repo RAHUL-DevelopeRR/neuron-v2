@@ -817,18 +817,18 @@ describe('protocol v2: the account event and the trust preview', () => {
   describe('the trust dialog says why a folder is asked again', () => {
     const CHANGED = { changed_since_trust: true, changed_settings: ['hooks', 'env'] }
     /** The dialog for a preview made of `over` (a hook, unless it says otherwise); `null` is no preview yet. */
-    const modal = (over: Record<string, unknown> | null) =>
-      render(
-        <TrustModal
-          folder="/work/app"
-          preview={over === null ? null : (preview(['lint'], over) as TrustPreviewEvent)}
-          working={false}
-          canPickFolder
-          onAllow={() => {}}
-          onElsewhere={() => {}}
-          onOpenLink={() => {}}
-        />,
-      )
+    const element = (over: Record<string, unknown> | null) => (
+      <TrustModal
+        folder="/work/app"
+        preview={over === null ? null : (preview(['lint'], over) as TrustPreviewEvent)}
+        working={false}
+        canPickFolder
+        onAllow={() => {}}
+        onElsewhere={() => {}}
+        onOpenLink={() => {}}
+      />
+    )
+    const modal = (over: Record<string, unknown> | null) => render(element(over))
     const follows = (first: Element, second: Element) => (first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0
 
     test("shows the client's wording above what the folder turns on: why, then which settings", () => {
@@ -890,6 +890,64 @@ describe('protocol v2: the account event and the trust preview', () => {
     test('leaves nothing for axe to find', async () => {
       modal(CHANGED)
       await expectAccessible()
+    })
+
+    // The dialog mounts with no preview: the reducer clears it on `ready` and on `workspace_trusted`, and the
+    // engine's answer, with the reason the folder is asked again, comes later. A screen reader reads the dialog
+    // as it opens and announces what is added to a live region that was already there, not one added with its text.
+    describe('for a screen reader', () => {
+      const region = () => trustDialog().querySelector<HTMLElement>('[aria-live]')
+
+      test('what the preview makes is a polite live region, there from the start and empty until the preview arrives', () => {
+        const view = modal(null)
+        const before = region()
+        expect(before?.getAttribute('aria-live')).toBe('polite')
+        expect(before?.textContent).toBe('')
+
+        view.rerender(element(CHANGED))
+        const after = region()
+        // The same element, so the arrival is an addition to it and is announced.
+        expect(after === before).toBe(true)
+        expect(after?.textContent).toContain(trustCopy.changed)
+        expect(after?.textContent).toContain(trustChangedKeysLine(CHANGED))
+        expect(after?.textContent).toContain(trustCopy.turnsOnHeading)
+        expect(after?.textContent).toContain('1 hook that runs commands around tool calls')
+        // Only what the preview makes: what the dialog says on its own is read as it opens.
+        expect(after?.textContent).not.toContain(trustCopy.access)
+        expect(after?.textContent).not.toContain(trustCopy.caution)
+      })
+
+      test('it stays that element when a fresh preview replaces the first, and holds the note that nothing is turned on', () => {
+        const view = modal({})
+        const first = region()
+        expect(first?.textContent).toContain('1 hook that runs commands around tool calls')
+        view.rerender(element({ hooks: [], session_only: true }))
+        expect(region() === first).toBe(true)
+        expect(first?.textContent).toContain(trustCopy.turnsOnNothing)
+        expect(first?.textContent).toContain(trustCopy.sessionOnly)
+        expect(first?.textContent).not.toContain('1 hook that runs')
+      })
+
+      test('the dialog is described only by elements that exist, with the reason or without it', () => {
+        for (const over of [null, {}, CHANGED]) {
+          modal(over)
+          const ids = (trustDialog().getAttribute('aria-describedby') ?? '').split(' ')
+          expect(ids.length).toBeGreaterThan(0)
+          expect(ids.map((id) => document.getElementById(id) !== null)).toEqual(ids.map(() => true))
+          cleanup()
+        }
+      })
+
+      test('in the app, the dialog opens with the region empty and the engine\'s preview arrives in it', async () => {
+        const { engine } = await start({ workspace_trusted: false })
+        const before = region()
+        expect(before?.textContent).toBe('')
+        await waitFor(() => expect(sent(engine, 'trust_preview')).toHaveLength(1))
+        await emit(engine, preview(['lint'], CHANGED))
+        expect(region() === before).toBe(true)
+        expect(before?.textContent).toContain(trustCopy.changed)
+        expect(before?.textContent).toContain(trustChangedKeysLine(CHANGED))
+      })
     })
 
     test('in the app, a folder that asks again says what changed, and the first time it does not', async () => {
