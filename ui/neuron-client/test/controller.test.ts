@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import { SessionController, type EngineTransport, type TransportClose } from '../src/controller'
-import { DESKTOP_CAPABILITIES, type ClientMessage } from '../src/protocol'
+import { CAPABILITY_HOOK_PROGRESS, DESKTOP_CAPABILITIES, type ClientMessage } from '../src/protocol'
 import type { SessionAction } from '../src/session'
 
 /** A local engine that says nothing but what the test emits. */
@@ -130,5 +130,29 @@ describe('the new commands', () => {
     ])
     expect(controller.getState().items).toEqual([])
     expect(controller.getState().busy).toBe(false)
+  })
+})
+
+describe('alpha.5 events no screen shows yet', () => {
+  test('branches, the connector catalog and hook progress wake no subscriber and add nothing', () => {
+    const transport = new FakeTransport()
+    const controller = new SessionController(transport, { client: 'desktop', capabilities: DESKTOP_CAPABILITIES })
+    let woken = 0
+    controller.subscribe(() => woken++)
+    transport.emit({ type: 'branches', current: null, branches: [], dirty: false })
+    transport.emit({ type: 'connector_catalog', version: '2026-11-04.1', connectors: [] })
+    transport.emit({ type: 'hook_started', event: 'PreToolUse', command: './scripts/check-paths.sh' })
+    transport.emit({ type: 'hook_finished', event: 'PreToolUse', command: './scripts/check-paths.sh', outcome: 'blocked', duration_ms: 3, message: 'no' })
+    expect(woken).toBe(0)
+    expect(controller.getState().items).toEqual([])
+  })
+
+  test('the desktop asks for no hook events, so the engine sends it none', () => {
+    const transport = new FakeTransport()
+    new SessionController(transport, { client: 'desktop', capabilities: DESKTOP_CAPABILITIES })
+    transport.emit(ready)
+    const sent = transport.sent[0]
+    expect(sent).toMatchObject({ kind: 'command', type: 'capabilities', client: 'desktop' })
+    expect(sent.kind === 'command' && sent.type === 'capabilities' ? sent.features : []).not.toContain(CAPABILITY_HOOK_PROGRESS)
   })
 })

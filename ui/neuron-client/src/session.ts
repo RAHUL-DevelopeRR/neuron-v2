@@ -687,6 +687,13 @@ export function reduceSession(state: SessionState, action: SessionAction, now?: 
             }
       return { ...state, items: replaceAt(state.items, index, { ...item, subagent }) }
     }
+    // Answers and progress that no screen of the desktop or the phone shows yet, so nothing is kept.
+    // (An engine sends hook events only to a UI that declares `hook_progress`, and none does.)
+    case 'branches':
+    case 'connector_catalog':
+    case 'hook_started':
+    case 'hook_finished':
+      return state
     default:
       return state
   }
