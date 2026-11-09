@@ -729,22 +729,99 @@ class InstallPs1Tests(unittest.TestCase):
                 self.assertIn("Check your network", result.stdout)
                 self.assertNotIn("may not be published", result.stdout)
 
-    def test_ui_self_check_is_bounded_and_a_timeout_is_not_a_failure(self) -> None:
-        system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
-        # cmd.exe ignores --version and waits for commands on its (open, empty) stdin: a stand-in
-        # for a first start that Windows Defender holds up. where.exe rejects --version.
-        body = f"""
-$clock = [System.Diagnostics.Stopwatch]::StartNew()
-'cmd=' + (Test-NeuronUiRuns '{system / "cmd.exe"}' 2)
-'seconds=' + [int]$clock.Elapsed.TotalSeconds
-'where=' + (Test-NeuronUiRuns '{system / "where.exe"}' 20)
-"""
-        result = self.run_functions(["Test-NeuronUiRuns"], body)
+    def test_the_ui_is_verified_by_checksum_and_never_started(self) -> None:
+        # Starting a new unsigned program is when Windows Defender scans it, which can hold the
+        # install up for minutes; the checksums are the check. These bytes cannot run at all.
+        fake_release.stage_release(self.releases, VERSION, self.ASSET)
+        fake_release.stage_release(self.releases, VERSION, "neuron-tui-windows-x64.exe", data=b"MZ not a program")
+        result = self.run_installer("-Version", VERSION, NEURON_NO_TUI="")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        lines = result.stdout.splitlines()
-        self.assertIn("cmd=timeout", lines)
-        self.assertLess(int([line for line in lines if line.startswith("seconds=")][0].split("=")[1]), 10)
-        self.assertRegex(result.stdout, r"where=exit [1-9]")
+        self.assertNotIn("was not installed", result.stdout)
+        self.assertEqual((self.install_dir / "neuron-tui.exe").read_bytes(), b"MZ not a program")
+
+    def test_curl_that_cannot_start_falls_back_to_dotnet_once_for_the_whole_install(self) -> None:
+        # As when AppLocker or WDAC blocks curl.exe: Process.Start throws. The first download
+        # falls back to .NET with a message, and the later ones do not try curl.exe again.
+        fake_release.stage_release(self.releases, VERSION, self.ASSET)
+        body = f"""
+$Version = '{VERSION}'
+$InstallDir = ''
+$AddToPath = $false
+$NoPathChange = $true
+function Get-NeuronCurl {{ return '{self.root / "blocked" / "curl.exe"}' }}
+Install-Neuron
+"""
+        result = self.run_functions(self.INSTALL_FUNCTIONS, body, with_assignments=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("curl.exe could not download"), 1, result.stdout)
+        self.assertIn("curl.exe could not download SHA256SUMS (curl.exe could not start:", result.stdout)
+        self.assertIn("using .NET for it and the remaining downloads", result.stdout)
+        self.assertTrue(self.installed().is_file())
+        self.assertEqual(
+            self.server.paths(),
+            [f"/v{VERSION}/SHA256SUMS", f"/v{VERSION}/{self.ASSET}.sha256", f"/v{VERSION}/{self.ASSET}"],
+        )
+
+    def test_curl_is_not_given_a_proxy_for_loopback_or_when_one_is_set(self) -> None:
+        body = """
+'loopback=[' + (Get-NeuronSystemProxy 'http://127.0.0.1:8080/x') + ']'
+$env:HTTPS_PROXY = 'http://proxy.example:3128'
+'env=[' + (Get-NeuronSystemProxy 'https://github.com/x') + ']'
+"""
+        result = self.run_functions(["Get-NeuronSystemProxy"], body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["loopback=[]", "env=[]"])
+
+    def test_reinstall_works_while_the_previous_upgrade_is_still_running(self) -> None:
+        # neuron open in one terminal while the user upgrades twice from another: the running
+        # image is renamed to neuron.exe.old and cannot be deleted until it exits.
+        folder = self.root / "busy"
+        folder.mkdir()
+        destination = folder / "neuron.exe"
+        system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+        shutil.copyfile(system / "ping.exe", destination)
+        running = subprocess.Popen(
+            [str(destination), "-n", "60", "127.0.0.1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        try:
+            body = f"""
+foreach ($round in 'first', 'second') {{
+    Set-Content -LiteralPath '{folder / "download.exe"}' -Value $round -Encoding ascii
+    try {{ Install-NeuronBinary '{folder / "download.exe"}' '{destination}'; "$round ok" }} catch {{ "$round error: $($_.Exception.Message)" }}
+}}
+"""
+            result = self.run_functions(["Remove-StaleNeuronCopies", "Install-NeuronBinary"], body)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["first ok", "second ok"])
+            self.assertEqual(destination.read_text(encoding="ascii").strip(), "second")
+            self.assertTrue(Path(f"{destination}.old").exists(), "the running copy stays until it exits")
+        finally:
+            running.kill()
+            running.wait()
+        # The next install clears what the running copy left behind.
+        (folder / "download.exe").write_text("third", encoding="ascii")
+        result = self.run_functions(
+            ["Remove-StaleNeuronCopies", "Install-NeuronBinary"],
+            f"Install-NeuronBinary '{folder / 'download.exe'}' '{destination}'",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(sorted(entry.name for entry in folder.iterdir()), ["neuron.exe"])
+
+    def test_the_full_path_command_survives_an_apostrophe_in_the_install_path(self) -> None:
+        fake_release.stage_release(self.releases, VERSION, self.ASSET)
+        install_dir = self.root / "O'Brien" / "bin"
+        quoted = str(install_dir).replace("'", "''")
+        body = f"""
+$Version = '{VERSION}'
+$InstallDir = '{quoted}'
+$AddToPath = $false
+$NoPathChange = $true
+Install-Neuron
+"""
+        result = self.run_functions(self.INSTALL_FUNCTIONS, body, with_assignments=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"& '{quoted}\\neuron.exe' login", result.stdout)
+        self.assertTrue((install_dir / "neuron.exe").is_file())
 
     def test_release_lookup_accepts_a_list_or_a_single_release(self) -> None:
         body = """
@@ -810,7 +887,7 @@ function Move-Item {{
 }}
 try {{ Install-NeuronBinary '{source}' '{destination}'; 'no error' }} catch {{ "error: $($_.Exception.Message)" }}
 """
-        result = self.run_functions(["Install-NeuronBinary"], body)
+        result = self.run_functions(["Remove-StaleNeuronCopies", "Install-NeuronBinary"], body)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("error: could not install", result.stdout)
         self.assertIn("The previous version was kept.", result.stdout)

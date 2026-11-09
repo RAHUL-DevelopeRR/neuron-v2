@@ -11,17 +11,19 @@
     Works in Windows PowerShell 5.1 and PowerShell 7+, including under the default
     "Restricted" execution policy: everything it installs is an .exe, never a script.
 
-    Install the newest release and add it to your user PATH:
+    Install the release this script was published with and add it to your user PATH, with
+    <version> a release from 7.0.0-alpha.6 on (the install.ps1 of 7.0.0-alpha.5 and earlier
+    needs the script block form below, with -Version and -AddToPath):
 
-        irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1 | iex
+        irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v<version>/install.ps1 | iex
 
     From cmd.exe:
 
-        powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1 | iex"
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v<version>/install.ps1 | iex"
 
     To pass parameters when piping, create a script block:
 
-        & ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1))) -Version 7.0.0-alpha.5 -NoPathChange
+        & ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v<version>/install.ps1))) -Version <version> -NoPathChange
 
 .PARAMETER Version
     Release to install, for example 7.0.0-alpha.5. Defaults to $env:NEURON_VERSION, then the
@@ -167,22 +169,56 @@ function Get-NeuronCurl {
     return $null
 }
 
+# The proxy Windows itself uses for $Url (Internet Options, a PAC script or WPAD), or '' for a
+# direct connection. curl.exe reads only HTTPS_PROXY and friends, so without this it would try a
+# direct connection that a proxy-only network drops.
+function Get-NeuronSystemProxy([string]$Url) {
+    foreach ($name in @('HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy')) {
+        if ([System.Environment]::GetEnvironmentVariable($name)) { return '' }
+    }
+    try {
+        $uri = New-Object System.Uri $Url
+        if ($uri.IsLoopback) { return '' }
+        $proxy = [System.Net.WebRequest]::GetSystemWebProxy()
+        if ((-not $proxy) -or $proxy.IsBypassed($uri)) { return '' }
+        $address = $proxy.GetProxy($uri)
+        if ((-not $address) -or ($address.AbsoluteUri -eq $uri.AbsoluteUri)) { return '' }
+        if (@('http', 'https', 'socks4', 'socks5') -notcontains $address.Scheme) { return '' }
+        return $address.AbsoluteUri
+    } catch {
+        return ''
+    }
+}
+
 # Returns @{ Ok; Status (HTTP status, 0 when the server was never reached); Message }.
 function Invoke-CurlDownload([string]$Curl, [string]$Url, [string]$OutFile, [string]$Label) {
     $headers = "$OutFile.headers"
     $info = New-Object System.Diagnostics.ProcessStartInfo
     $info.FileName = $Curl
     # --retry covers timeouts and 408/429/5xx; --speed-limit/--speed-time turn a stalled
-    # connection (under 1 KB/s for a minute) into a timeout, which is retried too.
-    $info.Arguments = ('--fail --location --silent --show-error --retry 3 --retry-delay 2 --connect-timeout 30 ' +
-        '--speed-limit 1024 --speed-time 60 --proto-redir =https --dump-header "{0}" --output "{1}" ' +
-        '--write-out "%{{http_code}}" "{2}"') -f $headers, $OutFile, $Url
+    # connection (under 1 KB/s for a minute) into a timeout, which is retried too. A 10 s
+    # connect timeout keeps a network curl cannot reach to under a minute before .NET takes over.
+    # With a Windows proxy, "-U :" and --proxy-anyauth let curl answer a proxy that asks for
+    # Windows sign-in (NTLM or Negotiate) with the current user's credentials.
+    $proxyArgument = ''
+    $proxy = Get-NeuronSystemProxy $Url
+    if ($proxy) { $proxyArgument = '--proxy "{0}" --proxy-anyauth --proxy-user : ' -f $proxy }
+    $info.Arguments = ('--fail --location --silent --show-error --retry 3 --retry-delay 2 --connect-timeout 10 ' +
+        '--speed-limit 1024 --speed-time 60 --proto-redir =https {3}--dump-header "{0}" --output "{1}" ' +
+        '--write-out "%{{http_code}}" "{2}"') -f $headers, $OutFile, $Url, $proxyArgument
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
+    try {
+        $process = [System.Diagnostics.Process]::Start($info)
+    } catch {
+        # For example "This program is blocked by group policy" (AppLocker or WDAC): .NET takes over.
+        $inner = $_.Exception
+        while ($inner.InnerException) { $inner = $inner.InnerException }
+        return @{ Ok = $false; Status = 0; Message = "curl.exe could not start: $($inner.Message)" }
+    }
     $progress = New-DownloadProgress $Label
-    $process = [System.Diagnostics.Process]::Start($info)
     try {
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
@@ -269,13 +305,21 @@ function Invoke-DotNetDownload([string]$Url, [string]$OutFile, [string]$Label) {
 }
 
 # Downloads with curl.exe when Windows has it (fast, retries, resumes nothing it cannot verify),
-# else with .NET. Either way the result is only trusted after the SHA-256 checks.
+# else with .NET. Either way the result is only trusted after the SHA-256 checks. Once curl.exe
+# fails without reaching the server, the remaining downloads of this install go straight to .NET,
+# so a network that curl cannot use costs that wait once, not once per file.
+# $NeuronDownloadState comes from Install-Neuron; a test that calls this function alone has none.
 function Get-NeuronDownload([string]$Url, [string]$OutFile, [string]$Version, [string]$Label = '') {
+    $state = $null
+    if (Test-Path variable:NeuronDownloadState) { $state = $NeuronDownloadState }
     $result = $null
     $curl = Get-NeuronCurl
-    if ($curl) { $result = Invoke-CurlDownload $curl $Url $OutFile $Label }
+    if ($curl -and -not ($state -and $state.DotNetOnly)) { $result = Invoke-CurlDownload $curl $Url $OutFile $Label }
     if ((-not $result) -or ((-not $result.Ok) -and ($result.Status -eq 0) -and ($env:NEURON_DOWNLOADER -ne 'curl'))) {
-        if ($result -and $Label) { Write-Detail "curl.exe could not download it ($($result.Message)); trying again with .NET ..." }
+        if ($result) {
+            Write-Detail "curl.exe could not download $(Split-Path -Leaf $OutFile) ($($result.Message)); using .NET for it and the remaining downloads ..."
+            if ($state) { $state.DotNetOnly = $true }
+        }
         $result = Invoke-DotNetDownload $Url $OutFile $Label
     }
     if ($result.Ok) { return }
@@ -405,13 +449,31 @@ function Add-UserPathEntry([string]$Directory) {
     return $true
 }
 
+# Removes neuron.exe.old* left by earlier upgrades. One that is still running (neuron open in
+# another terminal during that upgrade) cannot be deleted yet and is left for a later install.
+function Remove-StaleNeuronCopies([string]$Destination) {
+    $folder = Split-Path -Parent $Destination
+    $leaf = Split-Path -Leaf $Destination
+    try {
+        foreach ($stale in @(Get-ChildItem -LiteralPath $folder -Filter "$leaf.old*" -File -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
+}
+
 function Install-NeuronBinary([string]$Source, [string]$Destination) {
     # A running neuron.exe cannot be overwritten, but it can be renamed.
-    $previous = "$Destination.old"
     $hadPrevious = Test-Path -LiteralPath $Destination
+    $previous = "$Destination.old"
     if ($hadPrevious) {
-        Remove-Item -LiteralPath $previous -Force -ErrorAction SilentlyContinue
-        Move-Item -LiteralPath $Destination -Destination $previous -Force
+        Remove-StaleNeuronCopies $Destination
+        # A neuron.exe.old that is still running cannot be removed: set this one aside under its own name.
+        if (Test-Path -LiteralPath $previous) { $previous = "$Destination.old-$([System.Guid]::NewGuid().ToString('N'))" }
+        try {
+            Move-Item -LiteralPath $Destination -Destination $previous -Force
+        } catch {
+            throw "could not replace ${Destination}: $($_.Exception.Message). Close every terminal that is running neuron, then run the installer again."
+        }
     }
     try {
         Move-Item -LiteralPath $Source -Destination $Destination -Force
@@ -440,31 +502,6 @@ function Test-NeuronSums([string]$SumsFile, [string]$Asset, [string]$Hash) {
     return $false
 }
 
-# Starts `<exe> --version` and waits at most $TimeoutSeconds. Returns 'ok', 'timeout' or 'exit N'.
-function Test-NeuronUiRuns([string]$Path, [int]$TimeoutSeconds) {
-    $info = New-Object System.Diagnostics.ProcessStartInfo
-    $info.FileName = $Path
-    $info.Arguments = '--version'
-    $info.UseShellExecute = $false
-    $info.CreateNoWindow = $true
-    $info.RedirectStandardInput = $true
-    $info.RedirectStandardOutput = $true
-    $info.RedirectStandardError = $true
-    $process = [System.Diagnostics.Process]::Start($info)
-    try {
-        $null = $process.StandardOutput.ReadToEndAsync()
-        $null = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            try { $process.Kill(); [void]$process.WaitForExit(5000) } catch { }
-            return 'timeout'
-        }
-        if ($process.ExitCode -ne 0) { return "exit $($process.ExitCode)" }
-        return 'ok'
-    } finally {
-        $process.Dispose()
-    }
-}
-
 # The full-screen UI, verified like neuron.exe. Any failure is a warning: neuron runs its line
 # REPL without it.
 function Install-NeuronUi([string]$Base, [string]$Version, [string]$Work, [string]$Target, [string]$SumsFile) {
@@ -480,17 +517,10 @@ function Install-NeuronUi([string]$Base, [string]$Version, [string]$Work, [strin
         Get-NeuronDownload $url $download $Version 'neuron-tui.exe'
         if ((Get-NeuronSha256 $download) -ne $expected) { throw "checksum mismatch for $NeuronUiAsset" }
         if (-not (Test-NeuronSums $SumsFile $NeuronUiAsset $expected)) { throw "$NeuronUiAsset is not listed in the release SHA256SUMS with that checksum" }
-        # The two checksums already prove these are the release's bytes; the run only catches a
-        # UI that cannot start on this system. It is bounded because the first start of this
-        # large, unsigned executable is when Windows Defender scans it, which can take a while
-        # on a fresh machine. A timeout is not a failure: neuron starts the UI on demand and
-        # falls back to its line REPL if the UI ever fails to start.
-        $check = Test-NeuronUiRuns $download 20
-        if ($check -eq 'timeout') {
-            Write-Detail 'neuron-tui.exe took over 20 s to answer (Windows usually scans a new program on its first run); installing it anyway.'
-        } elseif ($check -ne 'ok') {
-            throw "neuron-tui.exe does not run on this system ($check)"
-        }
+        # Not run here: the two checksums already prove these are the release's bytes, and the
+        # first start of a new, large, unsigned program is when Windows Defender scans it. That
+        # scan can hold up process creation itself, which no timeout around the run would cover.
+        # neuron starts the UI on demand and falls back to its line REPL if it ever fails to start.
         $destination = Join-Path $Target 'neuron-tui.exe'
         Install-NeuronBinary $download $destination
         Write-Detail "installed $destination"
@@ -519,6 +549,8 @@ function Install-Neuron {
         [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
     }
     $changePath = -not ($NoPathChange -or (Test-Truthy $env:NEURON_NO_MODIFY_PATH))
+    # Read by Get-NeuronDownload, a child scope, so nothing is left behind in an `irm | iex` session.
+    $NeuronDownloadState = @{ DotNetOnly = $false }
 
     $base = $env:NEURON_DOWNLOAD_BASE
     if (-not $base) { $base = "https://github.com/$NeuronRepository/releases/download" }
@@ -620,7 +652,7 @@ function Install-Neuron {
     }
 
     $run = 'neuron'
-    if (-not ($onPath -or $changePath)) { $run = "& '$destination'" }
+    if (-not ($onPath -or $changePath)) { $run = "& '$($destination -replace "'", "''")'" }
 
     Write-Host ''
     Write-Host "Neuron $resolved is installed." -ForegroundColor Green

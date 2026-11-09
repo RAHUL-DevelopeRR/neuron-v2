@@ -10,10 +10,19 @@ The release workflow copies a version's section into its GitHub release notes.
   `NEURON_NO_MODIFY_PATH=1` opts out; `-AddToPath` is still accepted). Downloads use
   `curl.exe` when Windows has it (with retries) and fall back to .NET, and show their size,
   percentage, speed and time left instead of a frozen line. `neuron.exe` is installed and
-  announced before the 110 MB full-screen UI download starts, and the UI's start-up check
-  is limited to 20 seconds (a first run that Windows Defender holds up longer is not a
-  failure). Both checksum checks and the `neuron --version` check are unchanged. The final
-  message says to open a new terminal and run `neuron login`.
+  announced before the 110 MB full-screen UI download starts. The UI is no longer started
+  during the install: both checksums already verify it, and Windows Defender's scan of a
+  new program's first start could hold the install up for minutes. Both checksum checks
+  and the `neuron --version` check are unchanged. The final message says to open a new
+  terminal and run `neuron login`.
+- Windows installer on restricted networks: `curl.exe` now uses the proxy Windows is set
+  to use (Internet Options, PAC or WPAD), with a 10 second connect timeout; if it still
+  cannot connect, or cannot start at all (AppLocker or WDAC), that download and the rest go
+  through .NET, with a message, instead of every file waiting out curl's retries first.
+- Windows installer: upgrading while an earlier upgrade's `neuron.exe.old` is still running
+  no longer fails with "Cannot create a file when that file already exists"; a file that
+  cannot be moved aside gets a message to close running neuron windows. The printed
+  `& '<path>' login` command escapes an apostrophe in the install path.
 - `install.sh` and `install.ps1` no longer look up GitHub's `releases/latest`, which is a
   404 while every release is a prerelease: the release workflow stamps each release's
   version into its scripts, and an unstamped script takes the newest non-draft release

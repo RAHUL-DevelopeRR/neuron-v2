@@ -26,28 +26,29 @@ its SHA-256 checksum before using it.
 **Windows** (PowerShell as it comes with Windows; no Node.js or Python needed)
 
 ```powershell
-irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1 | iex
+& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1))) -Version 7.0.0-alpha.5 -AddToPath
 ```
 
 From Command Prompt (cmd.exe):
 
 ```bat
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1))) -Version 7.0.0-alpha.5 -AddToPath"
 ```
 
-The script installs `neuron.exe` into `%LOCALAPPDATA%\Programs\Neuron\bin`, adds that
-folder to your user `PATH` and shows the progress of each download. `neuron` is ready as
-soon as its own download (about 23 MB) is verified; the full-screen UI, `neuron-tui.exe`
-(about 110 MB), comes after it. Then open a new terminal and run `neuron login`.
-It works under PowerShell's default execution policy, because it installs only `.exe`
-files and no `.ps1` scripts. To pass options, use a script block:
+The script installs `neuron.exe` (about 23 MB) and the full-screen UI, `neuron-tui.exe`
+(about 115 MB), into `%LOCALAPPDATA%\Programs\Neuron\bin` and adds that folder to your
+user `PATH`. The 7.0.0-alpha.5 installer shows no download progress, so on a slow
+connection it can sit at "installing the full-screen UI" for several minutes; to install
+only `neuron` (which then uses its line REPL), run `$env:NEURON_NO_TUI = '1'` first. Then
+open a new terminal and run `neuron login`. It works under PowerShell's default execution
+policy, because it installs only `.exe` files and no `.ps1` scripts. `-InstallDir C:\Tools\Neuron`
+picks another folder, and leaving out `-AddToPath` leaves `PATH` alone.
 
-```powershell
-& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1))) -Version 7.0.0-alpha.5 -InstallDir C:\Tools\Neuron -NoPathChange
-```
-
-`-NoPathChange` (or `NEURON_NO_MODIFY_PATH=1`) leaves `PATH` alone, and `NEURON_NO_TUI=1`
-skips the full-screen UI.
+From 7.0.0-alpha.6 on, the release's installer adds itself to `PATH`, shows download
+progress and installs that release with the plain
+`irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v<version>/install.ps1 | iex`.
+The 7.0.0-alpha.5 installer needs the script block form above: without `-Version` it looks
+for a "latest" release, which GitHub never sets for a prerelease.
 
 **macOS and Linux**
 

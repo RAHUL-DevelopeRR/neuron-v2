@@ -31,7 +31,7 @@ Windows PowerShell's default execution policy blocks npm's PowerShell shims
   on your PATH and needs no scripts enabled:
 
   ```powershell
-  irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1 | iex
+  & ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1))) -Version 7.0.0-alpha.5 -AddToPath
   ```
 - or allow signed and local scripts for your account:
   `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.

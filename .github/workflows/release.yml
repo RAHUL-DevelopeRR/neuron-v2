@@ -515,6 +515,25 @@ jobs:
           Write-Host $ui
           if ($ui -ne $env:VERSION) { throw "neuron-tui --version reported '$ui', not $env:VERSION" }
 
+      # The command the README and the release notes give: no NEURON_VERSION, so the version
+      # stamped into the published install.ps1 picks the release, and the default PATH handling
+      # runs (this runner is discarded afterwards).
+      - name: Install with plain irm | iex (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Remove-Item Env:NEURON_VERSION -ErrorAction SilentlyContinue
+          $env:NEURON_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'neuron-plain'
+          $env:NEURON_NO_TUI = '1'
+          irm "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:TAG/install.ps1" | iex
+          $output = & (Join-Path $env:NEURON_INSTALL_DIR 'neuron.exe') --version | Out-String
+          Write-Host $output
+          if ($output -notmatch [regex]::Escape($env:VERSION)) { throw "plain irm | iex installed a build that does not report $env:VERSION" }
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if (-not (@($userPath -split ';') | Where-Object { $_.TrimEnd('\') -ieq $env:NEURON_INSTALL_DIR })) {
+            throw "plain irm | iex did not add $env:NEURON_INSTALL_DIR to the user PATH"
+          }
+
   promote:
     name: Mark the release as latest
     needs: [metadata, install-check]
