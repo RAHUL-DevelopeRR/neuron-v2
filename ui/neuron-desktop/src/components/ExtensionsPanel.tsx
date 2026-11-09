@@ -72,7 +72,7 @@ function McpServerRow({ server, toggle }: { server: McpServerInfo; toggle: Toggl
       {server.required === true ? (
         // The connector policy keeps it on: a marker, not a control, so nothing here can be pressed.
         <span className="extension-required muted small" title="Your connector policy requires this server, so it stays on">
-          <span aria-hidden>{LOCK}</span> Required
+          <span aria-hidden>{LOCK}</span> Required<span className="sr-only">: stays on</span>
         </span>
       ) : (
         toggle && (
@@ -103,7 +103,9 @@ function McpServerRow({ server, toggle }: { server: McpServerInfo; toggle: Toggl
       {reason && <div className={`${server.status === 'blocked' ? 'error-line' : 'muted'} small extension-detail`}>{reason}</div>}
       {approveHint && (
         // Typed in the chat, which sends it to the engine as a slash command: the panel has no command of its own for it.
-        <div className="muted small extension-detail">{`Approve it with ${APPROVE_COMMAND} ${server.name} in the chat`}</div>
+        <div className="muted small extension-detail">
+          Approve it with <code>{`${APPROVE_COMMAND} ${server.name}`}</code> in the chat
+        </div>
       )}
       {open && detail && <div className={detailError ? 'error-line small extension-detail' : 'muted small extension-detail'}>{detail}</div>}
     </li>

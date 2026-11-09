@@ -171,6 +171,9 @@ describe('MCP rows on an alpha.5 engine', () => {
     render(<ExtensionsPanel extensions={{ mcpServers: servers, plugins: [], skills: [], agents: [] } as never} onRefresh={() => {}} onSetEnabled={onSetEnabled} />)
   const rowOf = (name: string) => screen.getByText(name, { selector: '.extension-name' }).closest('li') as HTMLElement
   const statusOf = (name: string) => within(rowOf(name)).getByText(/./, { selector: '.extension-status' }).textContent
+  /** The hint for `name`, found by its whole text: the command has an element of its own, so no one text node has it all. */
+  const hintFor = (name: string) => (_content: string, element: Element | null) =>
+    element?.classList.contains('extension-detail') === true && element.textContent === `Approve it with /mcp approve ${name} in the chat`
 
   test('the new statuses read as words, not as their wire names', () => {
     panel([approval, refused, unlinked])
@@ -222,7 +225,7 @@ describe('MCP rows on an alpha.5 engine', () => {
   test('a server that needs approval says how to approve it, as a quiet hint with no command of its own', () => {
     const calls: string[] = []
     panel([approval, waiting, refused, unlinked, server('ok')], (name, enabled) => calls.push(`${name}:${enabled}`))
-    const hint = within(rowOf('cache')).getByText('Approve it with /mcp approve cache in the chat')
+    const hint = within(rowOf('cache')).getByText(hintFor('cache'))
     expect(hint.className).toContain('muted')
     // Text only: no button or link to press, so nothing new is sent to the engine.
     expect(hint.closest('button, a')?.tagName ?? null).toBeNull()
@@ -236,7 +239,19 @@ describe('MCP rows on an alpha.5 engine', () => {
 
   test('the hint names the server it is about', () => {
     panel([server('team_db-2', { status: 'needs_approval', tools: [], error: null })])
-    expect(screen.getByText('Approve it with /mcp approve team_db-2 in the chat')).toBeTruthy()
+    expect(screen.getByText(hintFor('team_db-2'))).toBeTruthy()
+  })
+
+  test('the command in the hint is code, and the words around it are text', () => {
+    panel([waiting, server('team_db-2', { status: 'needs_approval', tools: [], error: null })])
+    for (const name of ['cache', 'team_db-2']) {
+      const hint = within(rowOf(name)).getByText(hintFor(name))
+      expect(hint.querySelectorAll('code').length).toBe(1)
+      const command = hint.querySelector('code')?.textContent
+      expect(command).toBe(`/mcp approve ${name}`)
+      // What is not the command is not in it, and is still said.
+      expect(hint.textContent?.replace(command ?? '', '')).toBe('Approve it with  in the chat')
+    }
   })
 
   test("the hint is left out when the engine's own reason already says how to approve", () => {
@@ -254,7 +269,7 @@ describe('MCP rows on an alpha.5 engine', () => {
   test('the hint stays when the reason does not say how to approve', () => {
     for (const error of [WAITING_WHY, null, '', 'see /mcp list for the servers']) {
       panel([server('docs', { status: 'needs_approval', tools: [], error })])
-      expect(within(rowOf('docs')).getAllByText('Approve it with /mcp approve docs in the chat')).toHaveLength(1)
+      expect(within(rowOf('docs')).getAllByText(hintFor('docs'))).toHaveLength(1)
       cleanup()
     }
   })
@@ -311,6 +326,17 @@ describe('MCP rows on an alpha.5 engine', () => {
     expect(statusOf('policy-docs')).toBe('ready')
   })
 
+  test('the locked marker says in words that the server stays on, not only in a tooltip', () => {
+    panel([server('policy-docs', { required: true })])
+    const marker = within(rowOf('policy-docs')).getByText('Required')
+    // A screen reader reads "Required: stays on". The words are text, not only a `title`, which most do not read.
+    expect(marker.textContent?.endsWith('Required: stays on')).toBe(true)
+    expect(marker.querySelectorAll('.sr-only').length).toBe(1)
+    expect(marker.querySelector('.sr-only')?.textContent).toBe(': stays on')
+    // The tooltip is still there for a mouse.
+    expect(marker.getAttribute('title')).toMatch(/policy/i)
+  })
+
   test('a required server is marked even when the engine has no switches', () => {
     panel([server('policy-docs', { required: true }), server('docs')])
     expect(screen.queryAllByRole('switch').length).toBe(0)
@@ -332,8 +358,8 @@ describe('MCP rows on an alpha.5 engine', () => {
     expect(rows.getByText(APPROVAL_WHY)).toBeTruthy()
     expect(rows.getByText(WAITING_WHY)).toBeTruthy()
     // The hint only where the reason does not already say how.
-    expect(rows.getByText('Approve it with /mcp approve cache in the chat')).toBeTruthy()
-    expect(rows.queryAllByText('Approve it with /mcp approve docs in the chat').length).toBe(0)
+    expect(rows.getByText(hintFor('cache'))).toBeTruthy()
+    expect(rows.queryAllByText(hintFor('docs')).length).toBe(0)
     expect(rows.getByText('Required')).toBeTruthy()
     expect(rows.queryAllByRole('switch', { name: 'policy-docs' }).length).toBe(0)
     expect(rows.getByRole('switch', { name: 'legacy' })).toBeTruthy()
