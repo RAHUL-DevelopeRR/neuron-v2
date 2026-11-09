@@ -99,7 +99,7 @@ The tag push starts the release workflow:
 | `release` | Writes `SHA256SUMS`, creates a draft release with all assets, checks the uploaded list, then publishes the release without marking it "Latest" |
 | `readiness` | HEAD-checks every public asset URL and verifies the downloaded files against `SHA256SUMS` |
 | `install-check` | Installs from the public release with `install.sh` (Linux x64 and arm64, macOS) and with `irm \| iex` (Windows PowerShell 5.1), pinned to the release's version, then runs `neuron --version` and `neuron-tui --version` |
-| `promote` | Marks the release "Latest" once `install-check` passes, unless it is a prerelease, was withdrawn (marked as a prerelease) or a newer release is already latest. `install.sh`, `install.ps1` and the `releases/latest` links move to the new version only at this point |
+| `promote` | Marks the release "Latest" once `install-check` passes, unless it is a prerelease, was withdrawn (marked as a prerelease) or a newer release is already latest. `releases/latest` links move to the new version only at this point; the install scripts do not use them (each release's `install.sh` and `install.ps1` carry its version, stamped in by the `release` job) |
 | `package-npm`, `package-pypi` | Pack the npm tarball, or build the wheel and sdist, and install them against the live release. They have no OIDC token, and the npm install runs with `--ignore-scripts` followed by an `npm rebuild` of this package only |
 | `publish-npm`, `publish-pypi` | Hold the trusted-publishing OIDC token. They check out nothing and install nothing; they check that the files are the ones the package job tested (SHA-256) and upload them. They run only when enabled (see below) |
 
@@ -272,7 +272,9 @@ installable when pinned exactly, so existing pins keep working.
   version exist: the launchers download that exact version's assets.
 - Do not replace its assets either; the workflow refuses to. A checksum that changes
   after publication looks like tampering to everyone who verified the old one.
-- Mark it as a prerelease (`gh release edit vX.Y.Z --prerelease`) so `install.sh` and
-  `install.ps1`, which follow `releases/latest`, go back to the previous release; if
-  that one is not marked latest again, run `gh release edit vX.Y.W --latest` for it.
+- Mark it as a prerelease (`gh release edit vX.Y.Z --prerelease`) so `releases/latest` links
+  go back to the previous release; if that one is not marked latest again, run
+  `gh release edit vX.Y.W --latest` for it. Point the README and website install commands
+  back at the previous release too: each release's install scripts install that release, and
+  a script run without a stamped version takes the newest non-draft release from the API.
 - `npm deprecate` the bad version and yank it on PyPI, then ship a fixed patch release.

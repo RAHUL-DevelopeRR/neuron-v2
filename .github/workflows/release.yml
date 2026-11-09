@@ -356,6 +356,12 @@ jobs:
       - name: Assemble checksums and install scripts
         run: |
           cp install.sh install.ps1 dist/
+          # Stamp the release's version into both scripts, so `irm <release>/install.ps1 | iex` and
+          # `curl <release>/install.sh | sh` install this release without a GitHub API lookup.
+          sed -i "s/^\$NeuronReleaseVersion = ''\$/\$NeuronReleaseVersion = '$VERSION'/" dist/install.ps1
+          sed -i "s/^RELEASE_VERSION=\"\"\$/RELEASE_VERSION=\"$VERSION\"/" dist/install.sh
+          grep -qx "\$NeuronReleaseVersion = '$VERSION'" dist/install.ps1 || { echo "::error::install.ps1 was not stamped"; exit 1; }
+          grep -qx "RELEASE_VERSION=\"$VERSION\"" dist/install.sh || { echo "::error::install.sh was not stamped"; exit 1; }
           cd dist
           for asset in $RELEASE_ASSETS; do
             test -f "$asset" || { echo "::error::missing $asset"; exit 1; }
@@ -379,8 +385,11 @@ jobs:
 
           ## Install
 
-          - Linux / macOS: \`curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh | sh -s -- --version $VERSION\`
-          - Windows (PowerShell): \`& ([scriptblock]::Create((irm https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.ps1))) -Version $VERSION\`
+          - Windows (PowerShell): \`irm https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.ps1 | iex\`
+          - Windows (Command Prompt): \`powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.ps1 | iex"\`
+          - Linux / macOS: \`curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh | sh\`
+
+          The Windows installer adds Neuron to your user PATH; open a new terminal, then run \`neuron login\`.
 
           Every binary has a \`.sha256\` file; \`SHA256SUMS\` lists all assets. Verify provenance with
           \`gh attestation verify <file> --repo $GITHUB_REPOSITORY\`. Third-party licenses: THIRD_PARTY_NOTICES.md.

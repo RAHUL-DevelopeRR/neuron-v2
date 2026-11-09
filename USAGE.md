@@ -676,7 +676,8 @@ such a call is not run. Turn one off like any other server (`/mcp disable <serve
 | `NEURON_NO_TUI=1` | neuron | Use the line REPL instead of the full-screen UI |
 | `NEURON_TUI_ASCII` | neuron-tui | `1` draws with the classic-console character set everywhere, `0` with the Unicode one |
 | `NEURON_AMBIGUOUS_WIDE` | neuron-tui | `1`: the terminal draws East Asian ambiguous-width characters (`│ ● ○`) two columns wide, so the status bar measures them so; `0`: one column. Unset, a Chinese, Japanese or Korean locale counts as `1` |
-| `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: the latest release; a prerelease such as `7.0.0-alpha.5` must be named) |
+| `NEURON_VERSION` | install.sh, install.ps1 | Release to install (default: the release the script was published with, else the newest release on GitHub, prereleases included) |
+| `NEURON_NO_MODIFY_PATH=1` | install.ps1 | Do not add the install directory to the user `PATH` (same as `-NoPathChange`) |
 | `NEURON_INSTALL_DIR` | install.sh, install.ps1 | Install directory |
 | `NEURON_BINARY_PATH` | npm and pip launchers | Run this binary instead of the downloaded one |
 | `NEURON_CACHE_DIR` | npm and pip launchers | Where downloaded binaries are cached |
@@ -687,8 +688,8 @@ such a call is not run. Turn one off like any other server (`/mcp disable <serve
 
 | Installed with | Update | Uninstall |
 | --- | --- | --- |
-| `install.sh` | Run it again with the new version: that version's release URL and `--version` (or `NEURON_VERSION`). Without a version it installs the latest stable release, and there is none yet | `rm ~/.local/bin/neuron ~/.local/bin/neuron-tui` |
-| `install.ps1` | Run it again with the new version: that version's release URL and `-Version` (or `NEURON_VERSION`). Without a version it installs the latest stable release, and there is none yet | Delete `%LOCALAPPDATA%\Programs\Neuron\bin` and remove it from your user `PATH` if you added it |
+| `install.sh` | Run the new release's command: its release URL, which installs that release | `rm ~/.local/bin/neuron ~/.local/bin/neuron-tui` |
+| `install.ps1` | Run the new release's command (`irm <release URL>/install.ps1 \| iex`), which installs that release | Delete `%LOCALAPPDATA%\Programs\Neuron\bin` and remove it from your user `PATH` (the installer adds it unless you passed `-NoPathChange`) |
 | npm | `npm install --global @zero-x.live/neuron` (the alpha is published as npm's `latest`; `npm view @zero-x.live/neuron version` shows which version that is) | `npm uninstall --global @zero-x.live/neuron` |
 | pip | `pip install --upgrade --pre neuroncli` (the alpha is a pre-release on PyPI, so pip needs `--pre`) | `pipx uninstall neuroncli` or `pip uninstall neuroncli` |
 

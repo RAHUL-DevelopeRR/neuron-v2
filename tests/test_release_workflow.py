@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fake_release  # noqa: E402
+from test_install_scripts import stamp_release_version  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
@@ -287,6 +288,37 @@ class ReleaseWorkflowStepTests(unittest.TestCase):
             PRERELEASE="false",
             FAKE_GH_STATE=state,
         )
+
+    def test_install_scripts_are_stamped_with_the_release_version(self) -> None:
+        # The stamp lets `irm <release>/install.ps1 | iex` and `curl <release>/install.sh | sh`
+        # install that release without a GitHub API lookup (GitHub never marks a prerelease latest).
+        import hashlib
+
+        binary = "binary"
+        scripts = {name: (REPO_ROOT / name).read_text(encoding="utf-8") for name in ("install.sh", "install.ps1")}
+        work = self.root / "work"
+        work.mkdir()
+        for name, content in scripts.items():
+            (work / name).write_text(content, encoding="utf-8", newline="\n")  # as checked out on the Linux runner
+        files = {
+            "dist/neuron-linux-x64": binary,
+            "dist/neuron-linux-x64.sha256": f"{hashlib.sha256(binary.encode()).hexdigest()}  neuron-linux-x64\n",
+            "dist/THIRD_PARTY_NOTICES.md": "notices",
+        }
+        for name, content in files.items():
+            (work / name).parent.mkdir(parents=True, exist_ok=True)
+            (work / name).write_text(content, encoding="utf-8", newline="\n")  # sha256sum --strict rejects CRLF
+        result = self.run_step(
+            "release", "Assemble checksums and install scripts", VERSION="7.0.0-alpha.6", RELEASE_ASSETS="neuron-linux-x64"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        dist = self.root / "work" / "dist"
+        self.assertEqual((dist / "install.ps1").read_text(encoding="utf-8"), stamp_release_version(scripts["install.ps1"], "7.0.0-alpha.6"))
+        self.assertEqual((dist / "install.sh").read_text(encoding="utf-8"), stamp_release_version(scripts["install.sh"], "7.0.0-alpha.6"))
+        # SHA256SUMS lists the stamped scripts, the ones that are uploaded.
+        sums = (dist / "SHA256SUMS").read_text(encoding="utf-8")
+        stamped = hashlib.sha256((dist / "install.ps1").read_bytes()).hexdigest()
+        self.assertRegex(sums, rf"(?m)^{stamped} [ *]install\.ps1$")  # "*": binary mode, as on Windows
 
     def test_a_published_release_is_never_uploaded_to(self) -> None:
         result = self.run_upload("published")

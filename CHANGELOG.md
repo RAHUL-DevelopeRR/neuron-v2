@@ -3,6 +3,28 @@
 Notable changes to Neuron. Versions follow [semantic versioning](https://semver.org/).
 The release workflow copies a version's section into its GitHub release notes.
 
+## 7.0.0-alpha.6 (unreleased)
+
+- Windows installer: `irm <release>/install.ps1 | iex` now installs that release and adds
+  it to your user `PATH` with no extra parameters (`-NoPathChange` or
+  `NEURON_NO_MODIFY_PATH=1` opts out; `-AddToPath` is still accepted). Downloads use
+  `curl.exe` when Windows has it (with retries) and fall back to .NET, and show their size,
+  percentage, speed and time left instead of a frozen line. `neuron.exe` is installed and
+  announced before the 110 MB full-screen UI download starts, and the UI's start-up check
+  is limited to 20 seconds (a first run that Windows Defender holds up longer is not a
+  failure). Both checksum checks and the `neuron --version` check are unchanged. The final
+  message says to open a new terminal and run `neuron login`.
+- `install.sh` and `install.ps1` no longer look up GitHub's `releases/latest`, which is a
+  404 while every release is a prerelease: the release workflow stamps each release's
+  version into its scripts, and an unstamped script takes the newest non-draft release
+  from the release list. `install.sh` shows a progress bar on a terminal and treats a
+  `curl` exit status of 0 without a 2xx response as a failure (curl 8.14 does that after
+  `--retry`).
+- npm on Windows: the README and the postinstall output explain PowerShell's "running
+  scripts is disabled" error (use `npm.cmd` and `neuron.cmd`, Command Prompt, or the
+  PowerShell installer). The README says that Windows has no Python by default, and that
+  the pip package needs Python 3.9 or later.
+
 ## 7.0.0-alpha.5 (2026-11-07)
 
 - Trust hardening: the npm and PyPI launchers now check the downloaded binary against the

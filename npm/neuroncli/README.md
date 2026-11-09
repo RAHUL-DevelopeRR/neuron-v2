@@ -9,9 +9,32 @@ silicon, Intel) or Windows (x64).
 
 ```sh
 npm install --global @zero-x.live/neuron   # the 7.0.0 alpha
-neuron auth login
+neuron login
 neuron
 ```
+
+### Windows PowerShell: "running scripts is disabled on this system"
+
+Windows PowerShell's default execution policy blocks npm's PowerShell shims
+(`npm.ps1`, and `neuron.ps1` after the install). Either:
+
+- use the `.cmd` shims, which are not blocked:
+
+  ```powershell
+  npm.cmd install --global @zero-x.live/neuron
+  neuron.cmd login
+  neuron.cmd
+  ```
+
+  (In Command Prompt, plain `npm` and `neuron` work.)
+- or install without Node.js with the PowerShell installer, which puts `neuron.exe`
+  on your PATH and needs no scripts enabled:
+
+  ```powershell
+  irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1 | iex
+  ```
+- or allow signed and local scripts for your account:
+  `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
 
 ## How the binary is installed
 
