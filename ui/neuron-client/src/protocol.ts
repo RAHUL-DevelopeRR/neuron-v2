@@ -1304,7 +1304,8 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
     // Refused on purpose: each of these changes something (a connector to run, a server started or
     // removed, the permission mode, the branch checked out, how turns run), and a remote peer has no
     // business doing any of it. `default` refuses them too; the names are here so the decision is on
-    // record. `PEER_REFUSED` in test/protocol.test.ts lists them with the reasons.
+    // record. `node/host.ts` refuses them again, and `PEER_REFUSED` in test/protocol.test.ts lists
+    // them with the reasons.
     case 'add_mcp_server':
     case 'approve_mcp_server':
     case 'remove_mcp_server':

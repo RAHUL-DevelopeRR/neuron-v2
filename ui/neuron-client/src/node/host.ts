@@ -6,9 +6,12 @@
  *
  * Security: it binds to 127.0.0.1 unless told otherwise, every client must
  * open with the pairing token, browser origins other than local ones are
- * refused, and remote clients cannot shut the engine down. The `fs.*` methods
- * only read inside the workspace. Terminals (`term.open`) are only for clients
- * on this machine, since a shell would bypass the engine's permission prompts.
+ * refused, and remote clients cannot shut the engine down. Commands that
+ * change files, history, settings or what the agent may do are refused (see
+ * `OWNER_ONLY_COMMANDS`), after `parseClientMessage` has already dropped them.
+ * The `fs.*` methods only read inside the workspace. Terminals (`term.open`)
+ * are only for clients on this machine, since a shell would bypass the
+ * engine's permission prompts.
  */
 
 import { timingSafeEqual } from 'crypto'
@@ -16,7 +19,7 @@ import { promises as fs } from 'fs'
 import path from 'path'
 
 import type { EngineTransport } from '../controller'
-import { CAPABILITY_QUESTIONS, FEATURE_CAPABILITIES, commandMessage } from '../protocol'
+import { CAPABILITY_QUESTIONS, FEATURE_CAPABILITIES, commandMessage, type EngineCommand } from '../protocol'
 import {
   REMOTE_PROTOCOL,
   parseClientFrame,
@@ -77,7 +80,27 @@ const MAX_TERMINALS_PER_CLIENT = 4
 
 /** Slash commands that only read; remote peers may send nothing else. */
 const REMOTE_SLASH = new Set(['help', 'status', 'cost', 'context', 'usage', 'doctor', 'changes', 'diff', 'stats', 'memory', 'model'])
-const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+
+const OWNER_ONLY = 'Only the Neuron desktop app can change your files, history or settings.'
+
+/**
+ * Commands that change the workspace, the history, the user's settings or what the agent may do. The
+ * phone app has no screen for them, so no peer may send them through the host. (A rewind that is not a
+ * dry run is refused too, in `forward`.) `parseClientMessage` already drops the alpha.5 ones before they
+ * get here; this is the second wall, for the day the first has a hole.
+ */
+const OWNER_ONLY_COMMANDS: ReadonlySet<EngineCommand['type']> = new Set<EngineCommand['type']>([
+  'commit',
+  'set_mcp_server_enabled',
+  'add_mcp_server',
+  'approve_mcp_server',
+  'remove_mcp_server',
+  'set_permission_mode',
+  'switch_branch',
+  'set_reasoning_effort',
+])
+
+const SESSION_ID =/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const LOOPBACK_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$/i
 
 /** A session id or `latest`, never a path. */
@@ -283,6 +306,8 @@ export class NeuronHost {
     const refuse = (text: string) => this.send(socket, { t: 'error', message: text, fatal: false })
     if (this.state.connection !== 'ready') return refuse('The engine is not running.')
     if (message.kind === 'permission_reply') {
+      // "Always allow in this project" saves rules into the project's settings for good: the desktop app's call.
+      if (message.decision.kind === 'allow_for_project') return refuse(OWNER_ONLY)
       // The first answer wins; later ones (another client's) are dropped.
       if (!this.state.permissions.some((permission) => permission.id === message.id)) return
       this.transport.send(message)
@@ -291,16 +316,16 @@ export class NeuronHost {
     if (message.type === 'shutdown') return refuse('Only the machine running Neuron can stop the engine.')
     // The host speaks for all its clients.
     if (message.type === 'capabilities') return
-    // These change the workspace, the history or the user's settings, and the phone app has no screen for them yet.
-    if (message.type === 'commit' || message.type === 'set_mcp_server_enabled' || (message.type === 'rewind' && message.dry_run !== true)) {
-      return refuse('Only the Neuron desktop app can change your files, history or settings.')
+    // These change the workspace, the history, the user's settings or what the agent may do, and the phone app has no screen for them yet.
+    if (OWNER_ONLY_COMMANDS.has(message.type) || (message.type === 'rewind' && message.dry_run !== true)) {
+      return refuse(OWNER_ONLY)
     }
     if (!socket.data.local) {
       if (message.type === 'slash') {
         const name = message.command.trim().toLowerCase()
         const allowed =
           REMOTE_SLASH.has(name) || (name === 'resume' && isSessionRef(typeof message.args === 'string' ? message.args.trim() : ''))
-        if (!allowed) return refuse('Only the Neuron desktop app can change your files, history or settings.')
+        if (!allowed) return refuse(OWNER_ONLY)
       }
       if (message.type === 'resume' && !isSessionRef(message.session)) {
         return refuse('A remote client can only resume a session by its id.')

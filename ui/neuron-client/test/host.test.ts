@@ -528,6 +528,69 @@ describe('NeuronHost policy for the alpha.5 commands', () => {
       { kind: 'command', type: 'list_connector_catalog', query: 'git' },
     ])
   })
+
+  /** Commands that change something: a connector to run or remove, the permission mode, the branch, how turns run. */
+  const changes = [
+    { kind: 'command', type: 'add_mcp_server', id: 'github', name: null, scope: 'user', secrets: { EXAMPLE_TOKEN: 'not-a-real-token' } },
+    { kind: 'command', type: 'approve_mcp_server', name: 'postgres-tools', fingerprint: '4f1c0de5' },
+    { kind: 'command', type: 'remove_mcp_server', name: 'docs', scope: null },
+    { kind: 'command', type: 'set_permission_mode', mode: 'danger-full-access' },
+    { kind: 'command', type: 'switch_branch', name: 'main', create: false },
+    { kind: 'command', type: 'set_reasoning_effort', effort: 'high' },
+  ] as const satisfies readonly ClientMessage[]
+
+  test('a peer on another machine cannot add, approve or remove a server, change the mode, switch branch or set the effort', async () => {
+    await startHost({ remoteOnly: true })
+    const errors = await fromAnotherMachine([...changes, { kind: 'permission_reply', id: 7, decision: { kind: 'allow_for_project' } }])
+    expect(errors).toHaveLength(changes.length + 1)
+    expect(engine.sent).toEqual([])
+  })
+
+  /** Hands `message` to the host's forwarding step as if the gate before it had let it through, as a bug in the gate would. */
+  function forwardPastTheGate(message: ClientMessage, local: boolean): HostFrame[] {
+    const frames: HostFrame[] = []
+    const peer = {
+      data: { authed: true, name: 'raw', kind: 'cli', timer: null, local, terminals: new Map() },
+      send: (text: string) => frames.push(JSON.parse(text) as HostFrame),
+    }
+    ;(host as unknown as { forward(socket: unknown, message: ClientMessage): void }).forward(peer, message)
+    return frames
+  }
+
+  test('the host refuses those commands itself, to a peer on this machine as well', async () => {
+    await startHost()
+    for (const local of [false, true]) {
+      for (const message of changes) {
+        const frames = forwardPastTheGate(message, local)
+        expect({ type: message.type, local, frames }).toEqual({
+          type: message.type,
+          local,
+          frames: [{ t: 'error', message: 'Only the Neuron desktop app can change your files, history or settings.', fatal: false }],
+        })
+      }
+    }
+    expect(engine.sent).toEqual([])
+  })
+
+  test('the host will not save project rules for a peer, and the request stays open for a decision it may take', async () => {
+    await startHost()
+    const input = '{"command":"cargo test"}'
+    engine.emit({ type: 'tool_call_started', id: 't1', name: 'bash', input, cut_off: false })
+    engine.emit({
+      type: 'permission_requested',
+      id: 7,
+      request: { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: null, input, session_prefixes: [], project_rules: ['Bash(cargo test:*)'] },
+    })
+    for (const local of [false, true]) {
+      const frames = forwardPastTheGate({ kind: 'permission_reply', id: 7, decision: { kind: 'allow_for_project' } }, local)
+      expect(frames).toEqual([{ t: 'error', message: 'Only the Neuron desktop app can change your files, history or settings.', fatal: false }])
+    }
+    expect(engine.sent).toEqual([])
+    expect(host!.state.permissions.map((permission) => permission.id)).toEqual([7])
+    // A decision a peer may take still goes through.
+    expect(forwardPastTheGate({ kind: 'permission_reply', id: 7, decision: { kind: 'allow_once' } }, false)).toEqual([])
+    expect(engine.sent).toEqual([{ kind: 'permission_reply', id: 7, decision: { kind: 'allow_once' } }])
+  })
 })
 
 describe('NeuronHost origin check', () => {
