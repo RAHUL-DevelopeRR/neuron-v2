@@ -20,6 +20,8 @@
   --chip-text: #121220;
   --success: #3fae52;
   --danger: #e0483d;
+  /* Small text for a status that waits or is starting: the orange here, a darker amber in the light theme. */
+  --status-warn: var(--orange);
   --hover: rgba(65, 105, 195, 0.14);
   --selected: rgba(65, 105, 195, 0.28);
   --diff-add-bg: rgba(45, 140, 60, 0.22);
@@ -47,6 +49,8 @@
   --cyan: #1f7fb5;
   --success: #23843a;
   --danger: #c0352b;
+  /* The orange is about 2.0:1 on these backgrounds; this amber is over 4.5:1 on the page, a panel and a field. */
+  --status-warn: #8a5a00;
   --hover: rgba(65, 105, 195, 0.1);
   --selected: rgba(65, 105, 195, 0.2);
   --diff-add-bg: rgba(45, 140, 60, 0.14);
@@ -1445,12 +1449,15 @@ h2 {
 .status-pending,
 .status-needs_approval,
 .status-needs_connect {
-  color: var(--orange);
+  color: var(--status-warn);
 }
 .status-failed,
-.status-unsupported,
-.status-blocked {
+.status-unsupported {
   color: var(--danger);
+}
+/* Refused: the diff's red, as the dark theme's --danger is only about 4.2:1 on the page. */
+.status-blocked {
+  color: var(--diff-remove-text);
 }
 .extension-description {
   display: -webkit-box;
