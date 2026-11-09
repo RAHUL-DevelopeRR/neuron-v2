@@ -105,6 +105,18 @@ pub(crate) fn gateway_model_listing(current_model: &str) -> Option<String> {
     ))
 }
 
+/// What `/model` appends to its report for a UI that talks to the engine: the models of a
+/// provider on the user's own key, but not the Zero-X catalog. Every such UI has that catalog as
+/// the `models` event its picker shows, and a table in a notice would carry each model's id and
+/// display name as the catalog has them, route and all, into the transcript, `/copy` and exports.
+/// The line REPL keeps [`gateway_model_listing`], where the raw ids are for a power user.
+pub(crate) fn engine_model_listing(current_model: &str) -> Option<String> {
+    if active_provider().is_some_and(|active| active.id == ProviderId::ZeroX) {
+        return None;
+    }
+    crate::provider_auth::active_provider_model_listing(current_model)
+}
+
 /// Warning for `/model <id>` on Zero-X when the id is unknown, not available
 /// to the user, or out of capacity now.
 pub(crate) fn gateway_model_warning(model: &str) -> Option<String> {

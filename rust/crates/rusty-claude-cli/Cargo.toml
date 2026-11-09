@@ -37,6 +37,10 @@ zeroize = { version = "1.7", features = ["derive"] }
 constant_time_eq = "0.3"
 hex = "0.4"
 dirs = "6"
+# NFKC, so the model-name cleaner reads a full-width `Ｇｒｏｑ` as `Groq` the way the other two copies of
+# it do (`String.normalize`). Already in the tree: reqwest's URL parsing needs it. Only its built-in
+# data, as there: the default features would add crates nothing else uses.
+icu_normalizer = { version = "2.1", default-features = false, features = ["compiled_data"] }
 
 # OS credential stores only on platforms whose native backend needs no extra
 # system libraries. Linux (and anything else) uses the 0600 credentials file,

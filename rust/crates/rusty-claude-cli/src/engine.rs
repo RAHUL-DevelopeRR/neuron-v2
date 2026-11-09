@@ -2474,7 +2474,9 @@ impl Engine {
             self.cli.runtime.session().messages.len(),
             prompt_count(self.cli.runtime.session()),
         );
-        if let Some(listing) = gateway_repl::gateway_model_listing(&self.cli.model) {
+        // Not the gateway's catalog: the UI has it as the `models` event, and a notice is text for
+        // the transcript, `/copy` and exports, where the catalog's names would show as they are.
+        if let Some(listing) = gateway_repl::engine_model_listing(&self.cli.model) {
             report.push_str("\n\n");
             report.push_str(&listing);
         }

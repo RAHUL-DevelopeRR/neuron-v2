@@ -280,10 +280,18 @@ pub fn model_entry(model: &str) -> Option<CatalogModel> {
     current().and_then(|catalog| catalog.find(crate::provider::shown_model(model)).cloned())
 }
 
-/// What a catalog display name's last parenthesis holds when it names the way the
-/// gateway reaches the model, not the model: `North Mini Code (OpenRouter, free)`,
-/// `GPT-OSS 120B (Groq)`, `Llama 3.3 70B (Workers AI)`. Lower case. Mirrored in
-/// `ui/neuron-tui/src/utils/model-name.ts`.
+// How a person is told the name of a model: the catalog's `display_name` without the way the
+// gateway reaches it. Neuron never shows the provider a model is routed through (Groq, OpenRouter,
+// NVIDIA, Z.ai, ...), so the code below is the rule and `clean_model_name` is the one way in.
+//
+// The same rules are kept in three places: here, the terminal UI's
+// `ui/neuron-tui/src/utils/model-name.ts` and the shared client's
+// `ui/neuron-client/src/copy/model-name.ts`; the tests of all three read
+// `tests/fixtures/model-names.json`. Change a rule in all three, and add its case to that file.
+
+/// What a part of a group at the end of a display name is, whole and in lower case, when it names
+/// the route and not the model: `North Mini Code (OpenRouter, free)`, `GPT-OSS 120B (Groq)`,
+/// `Llama 3.3 70B (Workers AI)`, `GLM 5.2 (Z.ai)`.
 const ROUTE_WORDS: &[&str] = &[
     "openrouter",
     "groq",
@@ -310,49 +318,322 @@ const ROUTE_WORDS: &[&str] = &[
     "paid",
     "free tier",
     "paid tier",
+    // The owner's rule names Z.ai, in the spellings a catalog uses. A name that merely has these
+    // letters in it is not a match, as a part has to be exactly one of them.
+    "z.ai",
+    "zai",
+    "z-ai",
 ];
 
-/// `name` without the trailing parentheses that only name its route (see [`ROUTE_WORDS`],
-/// and `provider`, the catalog's `owned_by`).
-fn without_route(name: &str, provider: Option<&str>) -> String {
-    let mut kept = name.trim();
-    while let Some(open) = kept.rfind(" (").filter(|_| kept.ends_with(')')) {
-        let inside = &kept[open + 2..kept.len() - 1];
-        let only_route = inside.split(',').map(str::trim).all(|part| {
-            !part.is_empty()
-                && (ROUTE_WORDS.contains(&part.to_ascii_lowercase().as_str())
-                    || provider.is_some_and(|provider| provider.eq_ignore_ascii_case(part)))
-        });
-        if !only_route {
-            break;
+/// The providers' words. A part that is not one of [`ROUTE_WORDS`] is still a route when every
+/// word of it (lower case, with `-`, `_` and `·` as spaces) is a route word or one of
+/// [`ROUTE_EXTRAS`], and at least one is one of these: `Groq Cloud`, `OpenRouter free`, `Workers-AI`,
+/// `Together.ai`. The hyphenated spellings can only match whole, through [`ROUTE_WORDS`], as a
+/// hyphen is a space here.
+const PROVIDER_WORDS: &[&str] = &[
+    "openrouter",
+    "groq",
+    "nvidia",
+    "nim",
+    "workers",
+    "cloudflare",
+    "google",
+    "vertex",
+    "cerebras",
+    "together",
+    "fireworks",
+    "deepinfra",
+    "sambanova",
+    "hugging",
+    "huggingface",
+    "azure",
+    "zero-x",
+    "bedrock",
+    "novita",
+    "nebius",
+    "ollama",
+    "z.ai",
+    "zai",
+    "z-ai",
+    "together.ai",
+];
+
+/// What goes with a provider's word in a route (`free`, `Cloud`, `Inference`). Alone, a bare `(AI)`
+/// or `(Cloud)` is not a route, as it has no provider's word. `face` and `studio` only finish
+/// `Hugging Face` and `Google AI Studio` when something follows them (`Hugging Face free`).
+const ROUTE_EXTRAS: &[&str] = &[
+    "free",
+    "paid",
+    "tier",
+    "cloud",
+    "ai",
+    "inference",
+    "api",
+    "face",
+    "studio",
+];
+
+/// Brackets a group can be in, opening and closing, including the full-width parentheses. Any
+/// closer closes any opener.
+const OPENERS: &str = "([（";
+const CLOSERS: &str = ")]）";
+/// What separates the parts of a group.
+const SEPARATORS: &str = ",，·|";
+/// How deep groups inside groups are looked at: a name is not a tree, so more than this is left as
+/// it came.
+const MAX_GROUP_DEPTH: usize = 6;
+
+/// Characters that show nothing: a soft hyphen, zero-width spaces and joiners, a word joiner, a
+/// byte order mark.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{ad}' | '\u{200b}'..='\u{200d}' | '\u{2060}' | '\u{feff}'
+    )
+}
+
+/// What `\s` is in JavaScript, which the other two copies use: Unicode white space, but not
+/// U+0085, and with the byte order mark.
+fn is_js_space(c: char) -> bool {
+    (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}'
+}
+
+/// Whitespace of every kind (a no-break space, a tab, a full-width space) and the characters that
+/// show nothing.
+fn is_blank(c: char) -> bool {
+    is_js_space(c) || is_invisible(c)
+}
+
+fn trim_end_all(text: &str) -> &str {
+    text.trim_end_matches(is_blank)
+}
+
+fn trim_all(text: &str) -> &str {
+    text.trim_matches(is_blank)
+}
+
+/// `text` as route words are compared with: width folded (`Ｇｒｏｑ` is `Groq`, by NFKC), nothing
+/// invisible, lower case.
+fn folded(text: &str) -> String {
+    let normalized = icu_normalizer::ComposingNormalizerBorrowed::new_nfkc().normalize(text);
+    let visible = normalized
+        .chars()
+        .filter(|c| !is_invisible(*c))
+        .collect::<String>();
+    trim_all(&visible.to_lowercase()).to_string()
+}
+
+/// `key` with `-`, `_` and `·` as spaces, in single spaces.
+fn spaced(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    let mut space_before = false;
+    for c in key.chars() {
+        if matches!(c, '-' | '_' | '·') || is_js_space(c) {
+            space_before = true;
+        } else {
+            if space_before && !out.is_empty() {
+                out.push(' ');
+            }
+            space_before = false;
+            out.push(c);
         }
-        kept = kept[..open].trim_end();
+    }
+    out
+}
+
+/// Whether `part` (a whole part of a group, or a whole name) names a route; `provider` is the
+/// catalog's `owned_by`, which counts too.
+fn is_route(part: &str, provider: Option<&str>) -> bool {
+    let key = folded(part);
+    if key.is_empty() {
+        return false;
+    }
+    if ROUTE_WORDS.contains(&key.as_str()) {
+        return true;
+    }
+    let key = spaced(&key);
+    if provider
+        .filter(|provider| !provider.is_empty())
+        .is_some_and(|provider| spaced(&folded(provider)) == key)
+    {
+        return true;
+    }
+    let mut words = key.split(' ');
+    words
+        .clone()
+        .all(|word| PROVIDER_WORDS.contains(&word) || ROUTE_EXTRAS.contains(&word))
+        && words.any(|word| PROVIDER_WORDS.contains(&word))
+}
+
+/// A group of brackets at the end of a name.
+struct Group<'a> {
+    /// The blanks before its opener, as they came.
+    gap: &'a str,
+    open: char,
+    close: char,
+    /// What is between the brackets.
+    inner: &'a str,
+    /// The group as it came, brackets included.
+    text: &'a str,
+}
+
+/// The index of the opener that matches the closer at the end of `text`, if there is one.
+fn opener_of(text: &str) -> Option<usize> {
+    let mut depth = 0_i64;
+    for (index, c) in text.char_indices().rev() {
+        if CLOSERS.contains(c) {
+            depth += 1;
+        } else if OPENERS.contains(c) {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+/// `text` as what comes before the groups at its end, and those groups, in order.
+fn peel_groups(text: &str) -> (&str, Vec<Group<'_>>) {
+    let mut rest = trim_end_all(text);
+    let mut groups = Vec::new();
+    while let Some(close) = rest.chars().next_back().filter(|c| CLOSERS.contains(*c)) {
+        let Some(open_at) = opener_of(rest) else {
+            break;
+        };
+        let open = rest[open_at..]
+            .chars()
+            .next()
+            .expect("the opener is where it was found");
+        let before = &rest[..open_at];
+        let base = trim_end_all(before);
+        groups.push(Group {
+            gap: &before[base.len()..],
+            open,
+            close,
+            inner: &rest[open_at + open.len_utf8()..rest.len() - close.len_utf8()],
+            text: &rest[open_at..],
+        });
+        rest = base;
+    }
+    groups.reverse();
+    (rest, groups)
+}
+
+/// `inner` cut at its separators, outside any brackets inside it.
+fn split_parts(inner: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0_usize;
+    let mut start = 0;
+    for (index, c) in inner.char_indices() {
+        if OPENERS.contains(c) {
+            depth += 1;
+        } else if CLOSERS.contains(c) {
+            depth = depth.saturating_sub(1);
+        } else if depth == 0 && SEPARATORS.contains(c) {
+            parts.push(&inner[start..index]);
+            start = index + c.len_utf8();
+        }
+    }
+    parts.push(&inner[start..]);
+    parts
+}
+
+/// What is left of a group's `inner` once its route parts are off: `None` when nothing is,
+/// `inner` itself when none was a route, else what is kept, separated by commas.
+fn scrub_group(inner: &str, provider: Option<&str>, depth: usize) -> Option<String> {
+    let mut kept = Vec::new();
+    let mut changed = false;
+    for raw in split_parts(inner) {
+        let part = trim_all(raw);
+        let cleaned = scrub(part, provider, depth + 1);
+        if cleaned.is_empty() || is_route(&cleaned, provider) {
+            changed = true;
+            continue;
+        }
+        if cleaned != part {
+            changed = true;
+        }
+        kept.push(cleaned);
     }
     if kept.is_empty() {
-        name.trim().to_string()
+        None
+    } else if changed {
+        Some(kept.join(", "))
     } else {
-        kept.to_string()
+        Some(inner.to_string())
     }
 }
 
-/// How the UIs name model `id` to a person: its catalog `display_name` without the route
-/// the gateway takes to it (`GLM-4.7 Flash`, not `GLM-4.7 Flash (OpenRouter, free)`);
-/// without one, the model part of the id (`north-mini-code`, not
-/// `cohere/north-mini-code:free`). `Auto` for `auto`. The raw id stays in `/status`, the
-/// line REPL's `/model` list and JSON output. Mirrored in
-/// `ui/neuron-tui/src/utils/model-name.ts` (`cleanModelName`).
+/// `text` without the groups at its end that only name a route, and without the route in those
+/// that hold more. Empty when what is left is itself only a route. Returned as it came (trimmed)
+/// when nothing was taken off, so a name without a route keeps its spacing; a group that stays
+/// keeps its brackets and its gap.
+fn scrub(text: &str, provider: Option<&str>, depth: usize) -> String {
+    let whole = trim_all(text);
+    if depth > MAX_GROUP_DEPTH {
+        return whole.to_string();
+    }
+    let (base, groups) = peel_groups(whole);
+    let mut rest = base.to_string();
+    let mut changed = false;
+    for group in &groups {
+        match scrub_group(group.inner, provider, depth) {
+            None => changed = true,
+            Some(inner) if inner == group.inner => {
+                rest.push_str(group.gap);
+                rest.push_str(group.text);
+            }
+            Some(inner) => {
+                changed = true;
+                rest.push_str(group.gap);
+                rest.push(group.open);
+                rest.push_str(&inner);
+                rest.push(group.close);
+            }
+        }
+    }
+    let result = if changed { trim_all(&rest) } else { whole };
+    // A name that is only a route has nothing to show. The catalog's provider counts for parts of
+    // a group, not for a whole name: a model may be named like the provider that serves it.
+    if is_route(result, None) {
+        String::new()
+    } else {
+        result.to_string()
+    }
+}
+
+/// How the UIs name model `id` to a person: its catalog `display_name` without the route the
+/// gateway takes to it (`GLM-4.7 Flash`, not `GLM-4.7 Flash (OpenRouter, free)`); without one, or
+/// when nothing is left of it (it was only a route), or when it is the id (or has a `/`, so is
+/// one), the model part of the id (`north-mini-code`, not `cohere/north-mini-code:free`). `Auto`
+/// for `auto`. The raw id stays in `/status`, the line REPL's `/model` list and JSON output.
+/// The same rules as the terminal UI's and the client's `cleanModelName`, which answer the same
+/// cases (`tests/fixtures/model-names.json`).
 pub fn clean_model_name(id: &str, display_name: Option<&str>, provider: Option<&str>) -> String {
-    let id = crate::provider::shown_model(id).trim();
-    if id.eq_ignore_ascii_case(crate::provider::AUTO_MODEL) {
+    let full = id.trim_matches(is_js_space);
+    let shown = crate::provider::shown_model(full);
+    if shown.eq_ignore_ascii_case(crate::provider::AUTO_MODEL) {
         return "Auto".to_string();
     }
-    if let Some(name) = display_name.map(str::trim).filter(|name| !name.is_empty()) {
-        return without_route(name, provider);
+    if let Some(name) = display_name
+        .map(|name| name.trim_matches(is_js_space))
+        .filter(|name| !name.is_empty())
+    {
+        let cleaned = scrub(name, provider, 0);
+        let key = cleaned.to_lowercase();
+        if !cleaned.is_empty()
+            && !cleaned.contains('/')
+            && key != shown.to_lowercase()
+            && key != full.to_lowercase()
+        {
+            return cleaned;
+        }
     }
-    let leaf = id.rsplit('/').next().unwrap_or(id);
+    let leaf = shown.rsplit('/').next().unwrap_or(shown);
     let leaf = leaf.split(':').next().unwrap_or(leaf);
     if leaf.is_empty() {
-        id.to_string()
+        shown.to_string()
     } else {
         leaf.to_string()
     }
@@ -1685,11 +1966,11 @@ mod tests {
             ),
             "Step 5 Preview"
         );
-        // A parenthesis about the model itself stays.
+        // A parenthesis about the model itself stays; the route in a group that holds more goes.
         assert_eq!(name("x/qwen", Some("Qwen3 (32B)"), None), "Qwen3 (32B)");
         assert_eq!(
             name("x/m", Some("Model (Preview, Groq)"), None),
-            "Model (Preview, Groq)"
+            "Model (Preview)"
         );
         // The provider the catalog names counts as a route too.
         assert_eq!(name("x/m", Some("Fast (Acme)"), Some("acme")), "Fast");
@@ -1714,7 +1995,185 @@ mod tests {
         );
         assert_eq!(name("claude-sonnet-4-6", None, None), "claude-sonnet-4-6");
         assert_eq!(name("x", Some("  "), None), "x");
-        assert_eq!(name("x", Some("(Groq)"), None), "(Groq)");
+        // A name that is only a route has nothing to show: the model part of the id.
+        assert_eq!(name("x", Some("(Groq)"), None), "x");
+        // Z.ai is a route too, in every spelling a catalog has.
+        assert_eq!(
+            name("z-ai/glm-5.2", Some("GLM 5.2 (Z.ai)"), Some("openrouter")),
+            "GLM 5.2"
+        );
+    }
+
+    /// The cases every copy of the cleaner answers the same way: the shared client's, the terminal
+    /// UI's and this one read one file (its `$comment` says how it is built), so none can drift.
+    fn model_name_cases() -> Value {
+        serde_json::from_str(include_str!("../tests/fixtures/model-names.json"))
+            .expect("model-names.json is JSON")
+    }
+
+    /// A case's `[id, display_name, provider, expected]`: `null` is `None`.
+    fn case_parts(case: &Value) -> (&str, Option<&str>, Option<&str>, &str) {
+        let row = case.as_array().expect("a case is an array");
+        (
+            row[0].as_str().expect("an id"),
+            row[1].as_str(),
+            row[2].as_str(),
+            row[3].as_str().expect("what is expected"),
+        )
+    }
+
+    /// Every case of every section, with its section's name.
+    fn shared_cases(cases: &Value) -> Vec<(&str, &Value)> {
+        cases["sections"]
+            .as_array()
+            .expect("sections")
+            .iter()
+            .flat_map(|section| {
+                let heading = section["name"].as_str().expect("a section has a name");
+                section["cases"]
+                    .as_array()
+                    .expect("a section has cases")
+                    .iter()
+                    .map(move |case| (heading, case))
+            })
+            .collect()
+    }
+
+    fn strings<'a>(value: &'a Value, key: &str) -> Vec<&'a str> {
+        value[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key} is a list"))
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .unwrap_or_else(|| panic!("{key} holds strings"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_copy_of_the_cleaner_answers_the_shared_cases() {
+        let cases = model_name_cases();
+        let all = shared_cases(&cases);
+        for (heading, case) in &all {
+            let (id, display, provider, expected) = case_parts(case);
+            assert_eq!(
+                clean_model_name(id, display, provider),
+                expected,
+                "{heading}: {id:?} {display:?} {provider:?}"
+            );
+        }
+        // Guards the loop itself: an emptied or misread file would pass it with nothing tried.
+        assert!(all.len() > 150, "{} cases", all.len());
+    }
+
+    #[test]
+    fn every_provider_in_every_bracket_whitespace_and_case_is_left_out() {
+        let cases = model_name_cases();
+        let shapes = &cases["providerShapes"];
+        let providers = strings(shapes, "providers");
+        let gaps = strings(shapes, "gaps");
+        let brackets = shapes["brackets"].as_array().expect("brackets");
+        let prefix = shapes["prefix"].as_str().expect("a prefix");
+        let expected = shapes["expected"].as_str().expect("an expected name");
+        let mut tried = 0;
+        for provider in &providers {
+            for form in [
+                (*provider).to_string(),
+                provider.to_lowercase(),
+                provider.to_uppercase(),
+            ] {
+                for pair in brackets {
+                    let open = pair[0].as_str().expect("an opening bracket");
+                    let close = pair[1].as_str().expect("a closing bracket");
+                    for gap in &gaps {
+                        let name = format!("{prefix}{gap}{open}{form}{close}");
+                        assert_eq!(
+                            clean_model_name("x/model", Some(name.as_str()), None),
+                            expected,
+                            "{name:?}"
+                        );
+                        tried += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(tried, providers.len() * 3 * brackets.len() * gaps.len());
+    }
+
+    #[test]
+    fn a_provider_beside_free_paid_a_tier_or_the_cloud_in_one_part_is_still_a_route() {
+        let cases = model_name_cases();
+        let joined = &cases["joinedRoutes"];
+        let expected = joined["expected"].as_str().expect("an expected name");
+        for joiner in strings(joined, "joiners") {
+            for extra in strings(joined, "extras") {
+                let name = format!("Model (Groq{joiner}{extra})");
+                assert_eq!(
+                    clean_model_name("x/model", Some(name.as_str()), None),
+                    expected,
+                    "{name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn with_a_separator_each_part_is_judged_alone() {
+        let cases = model_name_cases();
+        let separated = &cases["separatedRoutes"];
+        for separator in strings(separated, "separators") {
+            for pair in separated["extras"].as_array().expect("extras") {
+                let extra = pair[0].as_str().expect("an extra");
+                let expected = pair[1].as_str().expect("what is read");
+                let name = format!("Model (Groq{separator}{extra})");
+                assert_eq!(
+                    clean_model_name("x/model", Some(name.as_str()), None),
+                    expected,
+                    "{name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cleaning_a_name_that_was_cleaned_changes_nothing() {
+        let cases = model_name_cases();
+        for (_, case) in shared_cases(&cases) {
+            let (id, display, provider, _) = case_parts(case);
+            let once = clean_model_name(id, display, provider);
+            assert_eq!(
+                clean_model_name(id, Some(once.as_str()), provider),
+                once,
+                "{id:?} {display:?} {provider:?}"
+            );
+            // The same names on a route id, the way the engine's own notices meet them.
+            let routed = clean_model_name("groq/openai/gpt-oss-120b", display, Some("groq"));
+            assert_eq!(
+                clean_model_name(
+                    "groq/openai/gpt-oss-120b",
+                    Some(routed.as_str()),
+                    Some("groq")
+                ),
+                routed,
+                "{display:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn groups_inside_groups_are_looked_at_only_so_deep_and_long_names_are_not_slow() {
+        let clean = |name: &str| clean_model_name("x/model", Some(name), None);
+        let deep = format!("Model {}Groq{}", "(".repeat(100_000), ")".repeat(100_000));
+        assert!(clean(&deep).starts_with("Model"));
+        let started = std::time::Instant::now();
+        clean(&format!("{}(Groq)", "word ".repeat(20_000)));
+        clean(&format!("Model{}(Groq)", "(a)".repeat(2_000)));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

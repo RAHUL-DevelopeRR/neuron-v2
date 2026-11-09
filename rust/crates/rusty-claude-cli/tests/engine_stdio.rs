@@ -391,19 +391,30 @@ impl FakeGateway {
 
     /// Model calls get `replies`, one each, then the recorded refusal.
     fn with_replies(replies: Vec<String>) -> Self {
+        Self::serving(replies, default_models())
+    }
+
+    /// `GET /v1/models` lists `models` (the `data` of the catalog).
+    fn with_models(models: Value) -> Self {
+        Self::serving(Vec::new(), models)
+    }
+
+    fn serving(replies: Vec<String>, models: Value) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
         let origin = format!("http://{}", listener.local_addr().expect("address"));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
         let page = format!("{origin}/device");
         let replies: Replies = Arc::new(Mutex::new(replies.into()));
+        let models = Arc::new(models);
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { return };
                 let seen = Arc::clone(&seen);
                 let page = page.clone();
                 let replies = Arc::clone(&replies);
-                thread::spawn(move || answer(stream, &seen, &page, &replies));
+                let models = Arc::clone(&models);
+                thread::spawn(move || answer(stream, &seen, &page, &replies, &models));
             }
         });
         Self {
@@ -418,11 +429,22 @@ impl FakeGateway {
     }
 }
 
+/// The catalog most tests need: a model any plan can use and one that needs Pro.
+fn default_models() -> Value {
+    json!([
+        {"id": "zx-fast", "display_name": "Fast", "context_window": 131_072,
+         "capabilities": {"tools": true}, "tiers": ["free"], "available": true},
+        {"id": "zx-big", "display_name": "Big", "context_window": 262_144,
+         "tiers": ["pro"], "available": false, "unavailable_reason": "Pro plan only"},
+    ])
+}
+
 fn answer(
     stream: TcpStream,
     seen: &Mutex<Vec<String>>,
     page: &str,
     replies: &Mutex<VecDeque<String>>,
+    models: &Value,
 ) {
     let mut reader = BufReader::new(stream.try_clone().expect("stream"));
     let mut request_line = String::new();
@@ -496,15 +518,7 @@ fn answer(
             200,
             json!({"plan": "pro", "email": EMAIL, "ttl_remaining_seconds": 86_400}),
         ),
-        ("GET", "/v1/models") if signed => (
-            200,
-            json!({"data": [
-                {"id": "zx-fast", "display_name": "Fast", "context_window": 131_072,
-                 "capabilities": {"tools": true}, "tiers": ["free"], "available": true},
-                {"id": "zx-big", "display_name": "Big", "context_window": 262_144,
-                 "tiers": ["pro"], "available": false, "unavailable_reason": "Pro plan only"},
-            ]}),
-        ),
+        ("GET", "/v1/models") if signed => (200, json!({ "data": models })),
         ("DELETE", "/auth/session") if signed => (204, Value::Null),
         _ => (
             404,
@@ -675,6 +689,107 @@ fn stdio_engine_signs_in_from_the_ui() {
             "{expected}: {requests:?}"
         );
     }
+    let _ = fs::remove_dir_all(&workspace);
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// Neuron never shows the provider a model is routed through (`Groq`, `OpenRouter`, `NVIDIA`, `Z.ai`).
+/// The gateway's catalog names its models with one ("GLM 5.2 (Z.ai)"), so the engine's own
+/// words about a model, `/model`'s notices and the footer's name for it, leave the route out.
+/// And the catalog reaches a client as the `models` event the pickers use, not as a table in a
+/// notice, which would land in the transcript, `/copy` and exports with the names as they are.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn stdio_engine_notices_never_name_the_route_to_a_model() {
+    let gateway = FakeGateway::with_models(json!([
+        {"id": "auto", "display_name": "Auto (best available model)", "owned_by": "zero-x",
+         "capabilities": {"tools": true}, "tiers": ["free"], "available": true},
+        {"id": "z-ai/glm-5.2", "display_name": "GLM 5.2 (Z.ai)", "provider": "openrouter",
+         "context_window": 131_072, "capabilities": {"tools": true}, "tiers": ["free"], "available": true},
+        {"id": "groq/openai/gpt-oss-120b", "display_name": "GPT-OSS 120B [Groq]", "provider": "groq",
+         "context_window": 131_072, "capabilities": {"tools": true}, "tiers": ["free"], "available": true},
+    ]));
+    let (workspace, home) = workspace_and_home("route-names");
+    let mut engine = StdioEngine::start(
+        &workspace,
+        &home,
+        &[
+            ("NEURON_API_BASE", &gateway.base),
+            ("NEURON_TOKEN", SESSION),
+        ],
+        &[],
+        Some(SESSION),
+    );
+    assert_eq!(engine.next()["type"], "ready");
+    assert_eq!(engine.next_of("status")["signed_in"], true);
+
+    // The catalog as data, for the pickers; it also loads the catalog the notices name models by.
+    engine.send(&json!({"kind": "command", "type": "list_models"}));
+    let models = engine.next_of("models");
+    assert_eq!(models["models"][1]["id"], "z-ai/glm-5.2", "{models}");
+
+    // What a notice must not hold: a provider's name, a model's id as the catalog has it, or the
+    // catalog's table.
+    let never = [
+        "Z.ai",
+        "Groq",
+        "OpenRouter",
+        "NVIDIA",
+        "z-ai/",
+        "gpt-oss-120b",
+        "Zero-X models",
+        "in catalog",
+    ];
+    let assert_never_names_a_route = |what: &str, events: &[Value]| {
+        for notice in notices(events) {
+            for needle in never {
+                assert!(!notice.contains(needle), "{what}: {needle:?} in {notice:?}");
+            }
+        }
+    };
+    let says =
+        |events: &[Value], text: &str| notices(events).iter().any(|notice| notice.contains(text));
+
+    // `/model` says which model the session is on, by name, and no more.
+    engine.slash("model");
+    let asked = engine.until("turn_finished");
+    assert_never_names_a_route("/model", &asked);
+    assert!(says(&asked, "Current model    Auto"), "{asked:?}");
+
+    // Typing the current model again says the same, and does not append the catalog.
+    engine.send(&json!({"kind": "command", "type": "slash", "command": "model", "args": "auto"}));
+    let again = engine.until("turn_finished");
+    assert_never_names_a_route("/model auto", &again);
+    assert!(says(&again, "Current model    Auto"), "{again:?}");
+
+    // A switch names the new model without its route, in the notice and in the footer.
+    engine.send(&json!({"kind": "command", "type": "set_model", "model": "z-ai/glm-5.2"}));
+    let mut switched = Vec::new();
+    loop {
+        let event = engine.next();
+        let done = event["type"] == "status"
+            && event["model"]
+                .as_str()
+                .is_some_and(|model| model.contains("glm-5.2"));
+        switched.push(event);
+        if done {
+            break;
+        }
+    }
+    assert_never_names_a_route("set_model", &switched);
+    assert!(says(&switched, "Current          GLM 5.2"), "{switched:?}");
+    let status = switched.last().expect("the footer");
+    assert_eq!(status["model_display_name"], "GLM 5.2", "{status}");
+
+    // And once more on the new model.
+    engine.send(
+        &json!({"kind": "command", "type": "slash", "command": "model", "args": "z-ai/glm-5.2"}),
+    );
+    let same = engine.until("turn_finished");
+    assert_never_names_a_route("/model z-ai/glm-5.2", &same);
+    assert!(says(&same, "Current model    GLM 5.2"), "{same:?}");
+
+    engine.end_input();
     let _ = fs::remove_dir_all(&workspace);
     let _ = fs::remove_dir_all(&home);
 }
