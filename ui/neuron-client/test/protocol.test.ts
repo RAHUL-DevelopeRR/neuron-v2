@@ -486,6 +486,8 @@ type CommandType = EngineCommand['type']
  * These pass the gate, rebuilt from their known fields. Passing is not permission: `host.ts` still
  * refuses some of them to every peer (`shutdown`, `commit`, `set_mcp_server_enabled`, a rewind that is
  * not a dry run) and some to a peer on another machine (`trust_workspace`, most slash commands).
+ * `list_branches` and `list_connector_catalog` are the alpha.5 commands that only read: the engine
+ * lists the local branches, or the connectors of its built-in catalog, and changes nothing.
  */
 const PEER_PASSES = [
   'submit',
@@ -505,6 +507,8 @@ const PEER_PASSES = [
   'set_mcp_server_enabled',
   'commit',
   'rewind',
+  'list_connector_catalog',
+  'list_branches',
 ] as const satisfies readonly CommandType[]
 
 /**
@@ -516,8 +520,6 @@ const PEER_PASSES = [
  * - `set_permission_mode` can raise what the agent may do without asking, up to full access;
  * - `switch_branch` checks out another branch, which rewrites the files of the workspace;
  * - `set_reasoning_effort` changes how every following turn runs, and what it costs.
- * `list_branches` and `list_connector_catalog` only read, and are opened by the next change; until
- * then they are refused like any command the gate has no case for.
  */
 const PEER_REFUSED = [
   'add_mcp_server',
@@ -526,8 +528,6 @@ const PEER_REFUSED = [
   'set_permission_mode',
   'switch_branch',
   'set_reasoning_effort',
-  'list_branches',
-  'list_connector_catalog',
 ] as const satisfies readonly CommandType[]
 
 type Undecided = Exclude<CommandType, (typeof PEER_PASSES)[number] | (typeof PEER_REFUSED)[number]>
@@ -775,6 +775,18 @@ describe('client messages from untrusted peers', () => {
       mode: 'code_only',
       dry_run: true,
     })
+    expect(parseClientMessage({ kind: 'command', type: 'list_branches', all: true })).toEqual({ kind: 'command', type: 'list_branches' })
+    expect(parseClientMessage({ kind: 'command', type: 'list_connector_catalog' })).toEqual({ kind: 'command', type: 'list_connector_catalog' })
+    expect(parseClientMessage({ kind: 'command', type: 'list_connector_catalog', query: 'git hub', x: 1 })).toEqual({
+      kind: 'command',
+      type: 'list_connector_catalog',
+      query: 'git hub',
+    })
+    expect(parseClientMessage({ kind: 'command', type: 'list_connector_catalog', query: '' })).toEqual({
+      kind: 'command',
+      type: 'list_connector_catalog',
+      query: '',
+    })
     expect(parseClientMessage({ kind: 'permission_reply', id: 4, decision: { kind: 'deny', note: 'no' } })).toEqual({
       kind: 'permission_reply',
       id: 4,
@@ -803,6 +815,9 @@ describe('client messages from untrusted peers', () => {
       { kind: 'command', type: 'rewind', checkpoint: 1, mode: 'everything' },
       { kind: 'command', type: 'rewind', checkpoint: 1 },
       { kind: 'command', type: 'rewind', checkpoint: 1, mode: 'chat_only', dry_run: 'true' },
+      { kind: 'command', type: 'list_connector_catalog', query: 7 },
+      { kind: 'command', type: 'list_connector_catalog', query: null },
+      { kind: 'command', type: 'list_connector_catalog', query: ['git'] },
       { kind: 'permission_reply', id: 'one', decision: { kind: 'allow_once' } },
       { kind: 'permission_reply', id: 1, decision: { kind: 'allow_forever' } },
       { kind: 'other' },
@@ -908,6 +923,7 @@ describe('untrusted peers: attachments and length caps', () => {
       ['slash', (n) => ({ command: 'm', args: 'x'.repeat(n) }), 64 * 1024],
       ['set_model', (n) => ({ model: 'x'.repeat(n) }), 256],
       ['resume', (n) => ({ session: 'x'.repeat(n) }), 512],
+      ['list_connector_catalog', (n) => ({ query: 'x'.repeat(n) }), 256],
     ]
     for (const [type, make, cap] of cases) {
       expect(cmd(type, make(cap))).not.toBeNull()

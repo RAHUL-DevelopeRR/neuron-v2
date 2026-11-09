@@ -498,6 +498,38 @@ describe('NeuronHost slash policy for remote peers', () => {
   })
 })
 
+describe('NeuronHost policy for the alpha.5 commands', () => {
+  /** Sends messages as a peer on another machine, then waits until each was either forwarded or refused. */
+  async function fromAnotherMachine(messages: unknown[]) {
+    const errors: string[] = []
+    const socket = new WebSocket(host!.url)
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ t: 'hello', protocol: 1, token: TOKEN, client: { name: 'raw', kind: 'cli' } }))
+      for (const message of messages) socket.send(JSON.stringify({ t: 'send', message }))
+    }
+    socket.onmessage = (event) => {
+      const frame = JSON.parse(String(event.data)) as HostFrame
+      if (frame.t === 'error') errors.push(frame.message)
+    }
+    await until('every message handled', () => errors.length + engine.sent.length >= messages.length)
+    socket.close()
+    return errors
+  }
+
+  test('a peer on another machine may list the branches and the connector catalog', async () => {
+    await startHost({ remoteOnly: true })
+    const errors = await fromAnotherMachine([
+      { kind: 'command', type: 'list_branches' },
+      { kind: 'command', type: 'list_connector_catalog', query: 'git' },
+    ])
+    expect(errors).toEqual([])
+    expect(engine.sent).toEqual([
+      { kind: 'command', type: 'list_branches' },
+      { kind: 'command', type: 'list_connector_catalog', query: 'git' },
+    ])
+  })
+})
+
 describe('NeuronHost origin check', () => {
   const allowed = (origin: string | null, hostHeader: string | null) =>
     (host as unknown as { originAllowed(o: string | null, h: string | null): boolean }).originAllowed(origin, hostHeader)

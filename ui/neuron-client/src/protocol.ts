@@ -1248,12 +1248,18 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
     case 'list_extensions':
     case 'trust_preview':
     case 'refresh_account':
+    // Read-only: the engine lists its local branches and changes nothing.
+    case 'list_branches':
       return { kind: 'command', type: message.type }
     case 'list_sessions':
       if (message.scope === undefined) return { kind: 'command', type: 'list_sessions' }
       return message.scope === 'project' || message.scope === 'all'
         ? { kind: 'command', type: 'list_sessions', scope: message.scope }
         : null
+    // Read-only: a search over the engine's built-in connector catalog.
+    case 'list_connector_catalog':
+      if (message.query === undefined) return { kind: 'command', type: 'list_connector_catalog' }
+      return isText(message.query, 256) ? { kind: 'command', type: 'list_connector_catalog', query: message.query } : null
     case 'capabilities': {
       if (
         !Array.isArray(message.features) ||
