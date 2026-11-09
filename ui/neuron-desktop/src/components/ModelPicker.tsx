@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 
 import { findCatalogModel, type ModelInfo } from '@neuron/client'
 
-import { modelLabel, modelRowName } from '../modelNames'
+import { isBlurred, modelDetail, modelLabel, modelRowName } from '../modelNames'
 
 /**
  * The model chip and its menu. The list comes from `list_models` (only the
@@ -53,6 +53,7 @@ export function ModelPicker({
   // The engine's id for the model is not always the catalog's: it strips `openai/`, and a saved session or
   // setting can hold a route id. Each still finds its family's row.
   const currentId = findCatalogModel(models, current)?.id
+  const now = Date.now()
 
   return (
     <div className="model-picker" ref={box}>
@@ -72,10 +73,9 @@ export function ModelPicker({
       {open && (
         <div className="menu up" role="listbox" aria-label="Models">
           {models.map((model) => {
-            const unusable = !model.available || model.status === 'blurred'
-            const why =
-              model.unavailable_reason ?? (model.status === 'blurred' ? `back ${model.available_again_at ?? 'soon'}` : null)
-            const detail = why ?? [model.status && model.status !== 'available' ? model.status : null, model.tiers.join(', ')].filter(Boolean).join(' · ')
+            // Out of rotation only until the gateway gives it back, as in the terminal UI.
+            const unusable = !model.available || isBlurred(model, now)
+            const detail = modelDetail(model, now)
             return (
               <button
                 key={model.id}
