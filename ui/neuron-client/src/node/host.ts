@@ -66,7 +66,11 @@ interface Peer {
   name: string
   kind: ClientKind
   timer: ReturnType<typeof setTimeout> | null
-  /** The client connected from this machine (loopback). */
+  /**
+   * The client connected from this machine (loopback). That says where the socket came from, not who is
+   * typing: a phone behind `neuron engine --share` is local too. It opens only `term.open`, `engine.restart`
+   * and `trust_workspace`; the slash and resume walls bind every peer.
+   */
   local: boolean
   terminals: Map<number, { process: ReturnType<typeof Bun.spawn>; terminal: Terminal }>
 }
@@ -78,7 +82,7 @@ const MAX_READ_BYTES = 512 * 1024
 const MAX_LIST_ENTRIES = 2_000
 const MAX_TERMINALS_PER_CLIENT = 4
 
-/** Slash commands that only read; remote peers may send nothing else. */
+/** Slash commands that only read. No peer, local or not, may send any other. */
 const REMOTE_SLASH = new Set(['help', 'status', 'cost', 'context', 'usage', 'doctor', 'changes', 'diff', 'stats', 'memory', 'model'])
 
 const OWNER_ONLY = 'Only the Neuron desktop app can change your files, history or settings.'
@@ -320,17 +324,18 @@ export class NeuronHost {
     if (OWNER_ONLY_COMMANDS.has(message.type) || (message.type === 'rewind' && message.dry_run !== true)) {
       return refuse(OWNER_ONLY)
     }
-    if (!socket.data.local) {
-      if (message.type === 'slash') {
-        const name = message.command.trim().toLowerCase()
-        const allowed =
-          REMOTE_SLASH.has(name) || (name === 'resume' && isSessionRef(typeof message.args === 'string' ? message.args.trim() : ''))
-        if (!allowed) return refuse(OWNER_ONLY)
-      }
-      if (message.type === 'resume' && !isSessionRef(message.session)) {
-        return refuse('A remote client can only resume a session by its id.')
-      }
+    // The next two walls hold for every peer, local or not. A phone behind `neuron engine --share` reaches this
+    // host from 127.0.0.1, so `local` says where a socket came from, not who is typing.
+    if (message.type === 'slash') {
+      const name = message.command.trim().toLowerCase()
+      const allowed =
+        REMOTE_SLASH.has(name) || (name === 'resume' && isSessionRef(typeof message.args === 'string' ? message.args.trim() : ''))
+      if (!allowed) return refuse(OWNER_ONLY)
     }
+    if (message.type === 'resume' && !isSessionRef(message.session)) {
+      return refuse('A remote client can only resume a session by its id.')
+    }
+    // `local` is only for this, `term.open` and `engine.restart`; the share bridge filters `trust_workspace` for its phone itself.
     if (message.type === 'trust_workspace' && !socket.data.local) {
       return refuse('Only the machine running Neuron can trust its workspace.')
     }

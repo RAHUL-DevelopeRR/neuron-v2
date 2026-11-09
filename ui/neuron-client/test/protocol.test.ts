@@ -484,8 +484,9 @@ type CommandType = EngineCommand['type']
  * decided whether a phone may send it.
  *
  * These pass the gate, rebuilt from their known fields. Passing is not permission: `host.ts` still
- * refuses some of them to every peer (`shutdown`, `commit`, `set_mcp_server_enabled`, a rewind that is
- * not a dry run) and some to a peer on another machine (`trust_workspace`, most slash commands).
+ * refuses some of them to every peer, local or not (`shutdown`, `commit`, `set_mcp_server_enabled`, a
+ * rewind that is not a dry run, a slash command outside its read-only list, a `resume` that names
+ * anything but a session id), and `trust_workspace` to a peer on another machine.
  * `list_branches` and `list_connector_catalog` are the alpha.5 commands that only read: the engine
  * lists the local branches, or the connectors of its built-in catalog, and changes nothing.
  */

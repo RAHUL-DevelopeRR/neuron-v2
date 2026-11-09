@@ -63,7 +63,7 @@ const controllers: SessionController[] = []
 /** Engines the host's restart made, with the session each was asked to continue. */
 let restarted: Array<{ engine: FakeEngine; resume: string | null }> = []
 
-async function startHost(options: { remoteOnly?: boolean; features?: string[]; trusted?: boolean } = {}) {
+async function startHost(options: { remoteOnly?: boolean; localOnly?: boolean; features?: string[]; trusted?: boolean } = {}) {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'neuron-host-test-'))
   fs.mkdirSync(path.join(root, 'src'))
   fs.writeFileSync(path.join(root, 'src', 'main.rs'), 'fn main() {}\n')
@@ -76,6 +76,7 @@ async function startHost(options: { remoteOnly?: boolean; features?: string[]; t
     root,
     name: 'test host',
     ...(options.remoteOnly && { isLocal: () => false }),
+    ...(options.localOnly && { isLocal: () => true }),
     restart: (resume) => {
       const next = new FakeEngine(options.features, true)
       restarted.push({ engine: next, resume })
@@ -100,6 +101,26 @@ const until = async (label: string, predicate: () => boolean, timeoutMs = 5_000)
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`)
     await Bun.sleep(10)
   }
+}
+
+/**
+ * Opens a raw socket, says hello with the token, sends each message as a `send` frame and waits until the
+ * host has forwarded or refused every one. Returns the messages of the error frames that came back, in order.
+ */
+async function sendAsPeer(messages: unknown[]): Promise<string[]> {
+  const errors: string[] = []
+  const socket = new WebSocket(host!.url)
+  socket.onopen = () => {
+    socket.send(JSON.stringify({ t: 'hello', protocol: 1, token: TOKEN, client: { name: 'raw', kind: 'cli' } }))
+    for (const message of messages) socket.send(JSON.stringify({ t: 'send', message }))
+  }
+  socket.onmessage = (event) => {
+    const frame = JSON.parse(String(event.data)) as HostFrame
+    if (frame.t === 'error') errors.push(frame.message)
+  }
+  await until('every message handled', () => errors.length + engine.sent.length >= messages.length)
+  socket.close()
+  return errors
 }
 
 afterEach(async () => {
@@ -155,9 +176,10 @@ describe('NeuronHost', () => {
       expect(client.controller.getState().items.filter((item) => item.kind === 'user')).toHaveLength(1)
       expect(client.controller.getState().busy).toBe(true)
     }
-    mobile.controller.send('/compact')
+    // A slash command goes out as one. `/status` only reads, so the host passes it to any peer.
+    mobile.controller.send('/status')
     await until('the slash command', () => engine.sent.length === 2)
-    expect(engine.sent[1]).toEqual({ kind: 'command', type: 'slash', command: 'compact', args: '' })
+    expect(engine.sent[1]).toEqual({ kind: 'command', type: 'slash', command: 'status', args: '' })
   })
 
   test('the first answer to a permission request wins', async () => {
@@ -473,13 +495,6 @@ describe('NeuronHost slash policy for remote peers', () => {
     expect(engine.sent).toEqual([])
   })
 
-  test('a local peer may still use any slash command', async () => {
-    await startHost()
-    const peer = await attach('desktop')
-    peer.transport.send(slash('commit', 'msg') as ClientMessage)
-    await until('forwarded', () => engine.sent.length === 1)
-  })
-
   test('remote resume names a session id or latest, never a path', async () => {
     await startHost({ remoteOnly: true })
     const bad = [
@@ -506,6 +521,67 @@ describe('NeuronHost slash policy for remote peers', () => {
     ])
     expect(errors).toEqual([])
     expect(engine.sent).toHaveLength(3)
+  })
+})
+
+/**
+ * A phone behind `neuron engine --share` reaches the host from 127.0.0.1, so the host counts it as local.
+ * "Local" says where a socket came from, not who is typing: the slash allow-list and the resume-by-id rule
+ * hold for every peer, and `local` only opens terminals, engine restarts and `trust_workspace`.
+ */
+describe('NeuronHost walls for a peer on this machine', () => {
+  const slash = (command: string, args = '') => ({ kind: 'command', type: 'slash', command, args })
+  const resume = (session: string) => ({ kind: 'command', type: 'resume', session })
+  const OWNER_ONLY = 'Only the Neuron desktop app can change your files, history or settings.'
+  const BY_ID = 'A remote client can only resume a session by its id.'
+
+  test('the slash twins of the refused commands, and resume by path, never reach the engine', async () => {
+    await startHost({ localOnly: true })
+    // The frames sent over a loopback socket that used to reach the engine.
+    const twins = [
+      slash('permissions', 'danger-full-access'),
+      slash('effort', 'max'),
+      slash('branch', 'x'),
+      slash('commit', 'x'),
+      slash('rewind', '1 code'),
+      slash('exit'),
+      slash('logout'),
+      slash('clear', '--confirm'),
+      slash('pr', 'create'),
+      slash('issue', 'create'),
+      // It rewrites the history, and a local peer could send it before.
+      slash('compact'),
+    ]
+    const errors = await sendAsPeer([...twins, resume('/etc/passwd')])
+    expect(engine.sent).toEqual([])
+    expect(errors).toEqual([...twins.map(() => OWNER_ONLY), BY_ID])
+  })
+
+  test('the read-only slash commands and resume by id still pass', async () => {
+    await startHost({ localOnly: true })
+    const names = ['help', 'status', 'cost', 'context', 'usage', 'doctor', 'changes', 'diff', 'stats', 'memory', 'model']
+    const messages = [...names.map((name) => slash(name)), resume('session-2026.11_07'), resume('latest'), slash('resume', 'abc123')]
+    expect(await sendAsPeer(messages)).toEqual([])
+    expect(engine.sent).toHaveLength(messages.length)
+  })
+
+  test('resume names a session id or latest, never a path, whoever sends it', async () => {
+    await startHost({ localOnly: true })
+    const paths = [
+      resume('/tmp/s'),
+      resume('C:\\Users\\x\\s.json'),
+      resume('../../etc/passwd'),
+      resume('..\\x'),
+      resume('-x'),
+      resume('.hidden'),
+      resume('a'.repeat(129)),
+      slash('resume', '../x'),
+      slash('Resume', '/abs/path'),
+      slash('resume', ''),
+    ]
+    const errors = await sendAsPeer(paths)
+    expect(engine.sent).toEqual([])
+    expect(errors).toHaveLength(paths.length)
   })
 })
 
