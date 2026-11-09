@@ -2,12 +2,17 @@ import { useEffect, useRef, useState } from 'react'
 
 import type { ModelInfo } from '@neuron/client'
 
+import { modelLabel, modelRowName } from '../modelNames'
+
 /**
  * The model chip and its menu. The list comes from `list_models` (only the
- * Zero-X gateway publishes one); a model id can always be typed.
+ * Zero-X gateway publishes one); a model id can always be typed. Models are
+ * named without the route the gateway takes to them; a pick still sends the id.
  */
 export function ModelPicker({
   current,
+  currentName,
+  currentProvider,
   models,
   disabled,
   onOpen,
@@ -15,6 +20,10 @@ export function ModelPicker({
   openSignal = 0,
 }: {
   current: string
+  /** The engine's own name for `current` (`status.model_display_name`), when it sent one. */
+  currentName?: string | null
+  /** Who serves `current` (`status.provider`). */
+  currentProvider?: string | null
   models: ModelInfo[]
   disabled: boolean
   onOpen: () => void
@@ -40,7 +49,7 @@ export function ModelPicker({
     // Only a new signal opens it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openSignal])
-  const shown = models.find((model) => model.id === current)?.display_name ?? current
+  const shown = modelLabel(current, models, { name: currentName, provider: currentProvider })
 
   return (
     <div className="model-picker" ref={box}>
@@ -76,7 +85,7 @@ export function ModelPicker({
                   setOpen(false)
                 }}
               >
-                <span>{model.display_name ?? model.id}</span>
+                <span>{modelRowName(models, model)}</span>
                 <span className="muted">{detail}</span>
               </button>
             )

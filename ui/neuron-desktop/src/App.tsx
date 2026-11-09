@@ -878,6 +878,8 @@ export function App({ platform }: { platform: Platform }) {
                   {platform.kind !== 'host' && <EffortPicker value={effort} pending={effortPending} disabled={!ready} onChange={changeEffort} />}
                   <ModelPicker
                     current={state.status?.model ?? ''}
+                    currentName={state.status?.model_display_name}
+                    currentProvider={state.status?.provider}
                     models={state.models}
                     disabled={!ready || state.busy}
                     openSignal={modelSignal}

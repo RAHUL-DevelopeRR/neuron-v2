@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { type AccountView, type ModelInfo } from '@neuron/client'
 
 import { LINKS } from '../links'
+import { modelRowName } from '../modelNames'
 import type { EngineInfo, UpdateInfo } from '../platform'
 import type { Settings } from '../settings'
 import { MODES } from './Composer'
@@ -328,7 +329,7 @@ export function SettingsPage({
                 <datalist id="model-ids">
                   {models.map((model) => (
                     <option key={model.id} value={model.id}>
-                      {model.display_name ?? model.id}
+                      {modelRowName(models, model)}
                     </option>
                   ))}
                 </datalist>

@@ -1,17 +1,10 @@
-import { formatTokens, sessionAccount, type ModelInfo, type SessionState } from '@neuron/client'
+import { formatTokens, sessionAccount, type SessionState } from '@neuron/client'
+
+import { modelLabel } from '../modelNames'
 
 /** The last part of a model or route id: `nvidia/nvidia/nemotron-3` is `nemotron-3`. */
 function modelPart(id: string): string {
   return id.split('/').filter(Boolean).pop() ?? id
-}
-
-/**
- * A model as people read it: its catalog name, or its id without the routing
- * prefix, which names the upstream provider and is never shown.
- */
-export function modelLabel(id: string, models: readonly ModelInfo[]): string {
-  const known = models.find((model) => model.id === id)
-  return known?.display_name || modelPart(id)
 }
 
 /** The same model, whichever route served it (`groq/openai/gpt-oss-120b` serves `openai/gpt-oss-120b`). */
@@ -107,8 +100,9 @@ function quotaNote(state: SessionState): { text: string; limit: boolean } | null
 export function StatusBar({ state, onPane }: { state: SessionState; onPane: (pane: 'terminal' | 'tasks') => void }) {
   const usage = state.usage
   const context = state.status?.context_percent ?? 0
-  const model = state.status?.model ?? ''
-  const served = state.status?.served_model
+  const status = state.status
+  const model = status?.model ?? ''
+  const served = status?.served_model
   const streaming = state.busy ? (state.turnProgress?.outputTokens ?? 0) : 0
   const quota = quotaNote(state)
   return (
@@ -139,10 +133,10 @@ export function StatusBar({ state, onPane }: { state: SessionState; onPane: (pan
       {state.busy && <span className="busy-label">working…</span>}
       {served && !sameModel(served, model) && (
         <span className="served-model status-low" title="The model that answered, when it is not the one you picked">
-          answered by {modelLabel(served, state.models)}
+          answered by {modelLabel(served, state.models, { name: status?.served_model_display_name })}
         </span>
       )}
-      <span className="model-tag">{modelLabel(model, state.models)}</span>
+      <span className="model-tag">{modelLabel(model, state.models, { name: status?.model_display_name, provider: status?.provider })}</span>
     </footer>
   )
 }
