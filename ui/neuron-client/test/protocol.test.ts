@@ -77,6 +77,7 @@ import {
   type UsageAmounts,
   type UsageWindow,
 } from '../src/protocol'
+import { HOST_POLICY } from '../src/node/host'
 
 const rustCrate = path.resolve(import.meta.dir, '../../../rust/crates/neuron-tui')
 const protocolRs = fs.readFileSync(path.join(rustCrate, 'src/protocol.rs'), 'utf8').replace(/\r\n/g, '\n')
@@ -818,6 +819,14 @@ describe('client messages from untrusted peers', () => {
   test('every command tag is decided once: it passes the check or is refused on purpose', () => {
     expect(peerClassification).toBe(true)
     expect(sorted([...PEER_PASSES, ...PEER_REFUSED])).toEqual(sorted(ENGINE_COMMAND_TYPES))
+  })
+
+  test('the host refuses what the gate refuses: every PEER_REFUSED tag is owner_only in HOST_POLICY', () => {
+    for (const type of PEER_REFUSED) expect({ type, policy: HOST_POLICY[type] }).toEqual({ type, policy: 'owner_only' })
+  })
+
+  test('the host policy decides every command tag, and no other', () => {
+    expect(sorted(Object.keys(HOST_POLICY))).toEqual(sorted(ENGINE_COMMAND_TYPES))
   })
 
   test('commands that change something are refused, however well formed', () => {

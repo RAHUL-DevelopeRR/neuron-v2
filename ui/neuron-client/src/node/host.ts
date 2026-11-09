@@ -19,7 +19,7 @@ import { promises as fs } from 'fs'
 import path from 'path'
 
 import type { EngineTransport } from '../controller'
-import { CAPABILITY_QUESTIONS, FEATURE_CAPABILITIES, commandMessage, type EngineCommand } from '../protocol'
+import { CAPABILITY_QUESTIONS, FEATURE_CAPABILITIES, commandMessage, type ClientMessage, type EngineCommand } from '../protocol'
 import {
   REMOTE_PROTOCOL,
   parseClientFrame,
@@ -88,21 +88,51 @@ const REMOTE_SLASH = new Set(['help', 'status', 'cost', 'context', 'usage', 'doc
 const OWNER_ONLY = 'Only the Neuron desktop app can change your files, history or settings.'
 
 /**
- * Commands that change the workspace, the history, the user's settings or what the agent may do. The
- * phone app has no screen for them, so no peer may send them through the host. (A rewind that is not a
- * dry run is refused too, in `forward`.) `parseClientMessage` already drops the alpha.5 ones before they
- * get here; this is the second wall, for the day the first has a hole.
+ * What the host does with each engine command a peer sends, local or not. Every `EngineCommand` tag is
+ * decided here, on purpose: a new one fails `bun run typecheck` until someone chooses.
+ * - `owner_only`: refused to every peer. These change the workspace, the history, the user's settings or
+ *   what the agent may do, or cost the engine real work, and the phone app has no screen for them.
+ *   `parseClientMessage` already drops all of them but `shutdown`, `commit` and `set_mcp_server_enabled`
+ *   before they get here; this is the second wall, for the day the first has a hole. (`forward` answers
+ *   `shutdown` first, with a message of its own.)
+ * - `forward`: goes on to the engine, after what `forward` still checks: `slash` only for `REMOTE_SLASH`
+ *   (and `/resume` with a session id), `resume` only by session id, `rewind` only as a dry run and
+ *   `trust_workspace` only for a peer on this machine. `capabilities` is dropped: the host speaks for all
+ *   its clients.
+ * Every `PEER_REFUSED` tag in test/protocol.test.ts is `owner_only` here.
  */
-const OWNER_ONLY_COMMANDS: ReadonlySet<EngineCommand['type']> = new Set<EngineCommand['type']>([
-  'commit',
-  'set_mcp_server_enabled',
-  'add_mcp_server',
-  'approve_mcp_server',
-  'remove_mcp_server',
-  'set_permission_mode',
-  'switch_branch',
-  'set_reasoning_effort',
-])
+export const HOST_POLICY: Record<EngineCommand['type'], 'forward' | 'owner_only'> = {
+  submit: 'forward',
+  slash: 'forward',
+  set_model: 'forward',
+  list_models: 'forward',
+  interrupt: 'forward',
+  shutdown: 'owner_only',
+  capabilities: 'forward',
+  answer: 'forward',
+  list_sessions: 'forward',
+  resume: 'forward',
+  trust_workspace: 'forward',
+  list_extensions: 'forward',
+  trust_preview: 'forward',
+  refresh_account: 'forward',
+  set_mcp_server_enabled: 'owner_only',
+  commit: 'owner_only',
+  rewind: 'forward',
+  list_connector_catalog: 'owner_only',
+  add_mcp_server: 'owner_only',
+  remove_mcp_server: 'owner_only',
+  approve_mcp_server: 'owner_only',
+  set_reasoning_effort: 'owner_only',
+  set_permission_mode: 'owner_only',
+  list_branches: 'owner_only',
+  switch_branch: 'owner_only',
+}
+
+/** The `owner_only` tags of {@link HOST_POLICY}, read from the table itself so the two cannot drift apart. */
+const OWNER_ONLY_COMMANDS: ReadonlySet<string> = new Set(
+  Object.entries(HOST_POLICY).flatMap(([type, policy]) => (policy === 'owner_only' ? [type] : [])),
+)
 
 const SESSION_ID =/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const LOOPBACK_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$/i
@@ -215,7 +245,8 @@ export class NeuronHost {
         },
         message(socket, message) {
           const text = typeof message === 'string' ? message : new TextDecoder().decode(message)
-          void host.receive(socket, text)
+          // Bun exits on an unhandled rejection, so nothing a frame sets off may escape: its peer is told, the host serves on.
+          host.receive(socket, text).catch(() => host.failed(socket))
         },
         close(socket) {
           if (socket.data.timer) clearTimeout(socket.data.timer)
@@ -248,6 +279,26 @@ export class NeuronHost {
 
   private send(socket: Socket, frame: HostFrame): void {
     socket.send(JSON.stringify(frame))
+  }
+
+  /** A frame made the host throw: tells that peer, without the details, and goes on serving. */
+  private failed(socket: Socket): void {
+    try {
+      this.send(socket, { t: 'error', message: 'The host could not handle that frame.', fatal: false })
+    } catch {
+      // The peer is gone: there is no one to tell, and nothing may escape from here either.
+    }
+  }
+
+  /** Hands `message` to the engine. When the engine has just died, the peer is told and this returns false. */
+  private toEngine(socket: Socket, message: ClientMessage): boolean {
+    try {
+      this.transport.send(message)
+      return true
+    } catch {
+      this.send(socket, { t: 'error', message: 'The engine is not running.', fatal: false })
+      return false
+    }
   }
 
   private broadcast(frame: HostFrame): void {
@@ -306,7 +357,7 @@ export class NeuronHost {
     this.broadcast({ t: 'clients', count: this.clientCount })
   }
 
-  private forward(socket: Socket, message: import('../protocol').ClientMessage): void {
+  private forward(socket: Socket, message: ClientMessage): void {
     const refuse = (text: string) => this.send(socket, { t: 'error', message: text, fatal: false })
     if (this.state.connection !== 'ready') return refuse('The engine is not running.')
     if (message.kind === 'permission_reply') {
@@ -314,13 +365,14 @@ export class NeuronHost {
       if (message.decision.kind === 'allow_for_project') return refuse(OWNER_ONLY)
       // The first answer wins; later ones (another client's) are dropped.
       if (!this.state.permissions.some((permission) => permission.id === message.id)) return
-      this.transport.send(message)
+      // Answered only once the engine has the answer: when it just died, the request stays open.
+      if (!this.toEngine(socket, message)) return
       return this.record({ type: 'local/permission_answered', id: message.id, decision: message.decision })
     }
     if (message.type === 'shutdown') return refuse('Only the machine running Neuron can stop the engine.')
     // The host speaks for all its clients.
     if (message.type === 'capabilities') return
-    // These change the workspace, the history, the user's settings or what the agent may do, and the phone app has no screen for them yet.
+    // What `HOST_POLICY` calls owner_only, and a rewind that is not a dry run.
     if (OWNER_ONLY_COMMANDS.has(message.type) || (message.type === 'rewind' && message.dry_run !== true)) {
       return refuse(OWNER_ONLY)
     }
@@ -339,7 +391,8 @@ export class NeuronHost {
     if (message.type === 'trust_workspace' && !socket.data.local) {
       return refuse('Only the machine running Neuron can trust its workspace.')
     }
-    this.transport.send(message)
+    // Nothing is recorded for a message the engine did not get.
+    if (!this.toEngine(socket, message)) return
     if (message.type === 'submit') this.record({ type: 'local/submitted', text: message.text, attachments: message.attachments })
     else if (message.type === 'slash') this.record({ type: 'local/slash', command: message.command, args: message.args })
     else if (message.type === 'answer') this.record({ type: 'local/answered', id: message.id, text: message.text })

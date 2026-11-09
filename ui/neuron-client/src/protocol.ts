@@ -1309,8 +1309,8 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
     case 'set_reasoning_effort':
     // These two only read, and are refused all the same: no phone screen uses either answer, and every
     // call costs the engine real work (`list_branches` runs git, `list_connector_catalog` reloads the
-    // config and answers kilobytes), which the host then broadcasts to every peer. Open them again only
-    // with a screen that needs them and a rate limit.
+    // config and answers kilobytes), which the host then broadcasts to every peer. `node/host.ts` refuses
+    // them as well. Open them again only with a screen that needs them and a rate limit.
     case 'list_branches':
     case 'list_connector_catalog':
       return null

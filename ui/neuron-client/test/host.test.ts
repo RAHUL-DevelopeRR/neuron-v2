@@ -4,7 +4,7 @@ import os from 'os'
 import path from 'path'
 
 import { SessionController, type EngineTransport, type TransportClose } from '../src/controller'
-import { NeuronHost } from '../src/node/host'
+import { HOST_POLICY, NeuronHost } from '../src/node/host'
 import type { ClientMessage, UiEvent } from '../src/protocol'
 import { WebSocketTransport, type HostFrame } from '../src/remote'
 import type { SessionAction } from '../src/session'
@@ -608,14 +608,14 @@ describe('NeuronHost policy for the alpha.5 commands', () => {
   const reads = [
     { kind: 'command', type: 'list_branches' },
     { kind: 'command', type: 'list_connector_catalog', query: 'git' },
-  ]
+  ] as const satisfies readonly ClientMessage[]
   for (const [where, options] of [
     ['another machine', { remoteOnly: true }],
     ['this machine', { localOnly: true }],
   ] as const) {
     test(`a peer on ${where} cannot list the branches or the connector catalog`, async () => {
       await startHost(options)
-      const errors = await sendAsPeer(reads)
+      const errors = await sendAsPeer([...reads])
       expect(engine.sent).toEqual([])
       expect(errors).toEqual(reads.map(() => 'Not a Neuron remote frame.'))
     })
@@ -664,6 +664,43 @@ describe('NeuronHost policy for the alpha.5 commands', () => {
     expect(engine.sent).toEqual([])
   })
 
+  test('the host refuses the two commands that only read as well, past the gate', async () => {
+    await startHost()
+    for (const local of [false, true]) {
+      for (const message of reads) {
+        const frames = forwardPastTheGate(message, local)
+        expect({ type: message.type, local, frames }).toEqual({
+          type: message.type,
+          local,
+          frames: [{ t: 'error', message: 'Only the Neuron desktop app can change your files, history or settings.', fatal: false }],
+        })
+      }
+    }
+    expect(engine.sent).toEqual([])
+  })
+
+  test('the host refuses every command its policy calls owner_only, past the gate, to every peer', async () => {
+    await startHost()
+    const samples: ClientMessage[] = [
+      ...changes,
+      ...reads,
+      { kind: 'command', type: 'commit', message: 'x' },
+      { kind: 'command', type: 'set_mcp_server_enabled', name: 'fs', enabled: false },
+      { kind: 'command', type: 'shutdown' },
+    ]
+    const tag = (message: ClientMessage): string => (message.kind === 'command' ? message.type : message.kind)
+    // A tag the policy calls owner_only fails here until it has a sample.
+    const ownerOnly = Object.entries(HOST_POLICY).flatMap(([type, policy]) => (policy === 'owner_only' ? [type] : []))
+    expect(samples.map(tag).sort()).toEqual(ownerOnly.sort())
+    for (const local of [false, true]) {
+      for (const message of samples) {
+        const refused = forwardPastTheGate(message, local).map((frame) => frame.t)
+        expect({ tag: tag(message), local, refused }).toEqual({ tag: tag(message), local, refused: ['error'] })
+      }
+    }
+    expect(engine.sent).toEqual([])
+  })
+
   test('the host will not save project rules for a peer, and the request stays open for a decision it may take', async () => {
     await startHost()
     const input = '{"command":"cargo test"}'
@@ -682,6 +719,87 @@ describe('NeuronHost policy for the alpha.5 commands', () => {
     // A decision a peer may take still goes through.
     expect(forwardPastTheGate({ kind: 'permission_reply', id: 7, decision: { kind: 'allow_once' } }, false)).toEqual([])
     expect(engine.sent).toEqual([{ kind: 'permission_reply', id: 7, decision: { kind: 'allow_once' } }])
+  })
+})
+
+/**
+ * Bun exits the process on an unhandled rejection, and a peer's frame can make the host throw: the engine
+ * has just died (`StdioTransport.send` throws then), or something else went wrong. The peer is told, and
+ * the host keeps serving.
+ */
+describe('NeuronHost when a frame makes it throw', () => {
+  /** A raw peer that has said hello. `frames` collects what the host sends it. */
+  async function connectRaw() {
+    const frames: HostFrame[] = []
+    const socket = new WebSocket(host!.url)
+    socket.onmessage = (event) => frames.push(JSON.parse(String(event.data)) as HostFrame)
+    await new Promise<void>((resolve) => (socket.onopen = () => resolve()))
+    socket.send(JSON.stringify({ t: 'hello', protocol: 1, token: TOKEN, client: { name: 'raw', kind: 'cli' } }))
+    await until('the snapshot', () => frames.some((frame) => frame.t === 'snapshot'))
+    return {
+      frames,
+      errors: () => frames.flatMap((frame) => (frame.t === 'error' ? [frame.message] : [])),
+      send: (frame: unknown) => socket.send(JSON.stringify(frame)),
+    }
+  }
+
+  /** What `StdioTransport.send` does once the engine is gone. */
+  const dies = () => {
+    throw new Error('The Neuron engine is not running.')
+  }
+
+  test('a frame that meets an engine that has just died is answered, and the host keeps serving', async () => {
+    await startHost()
+    engine.send = dies
+    const peer = await connectRaw()
+    peer.send({ t: 'send', message: { kind: 'command', type: 'submit', text: 'hi', attachments: [] } })
+    await until('the error', () => peer.errors().length === 1)
+    expect(peer.errors()).toEqual(['The engine is not running.'])
+    // The prompt never reached the engine, so it is not in the transcript either.
+    expect(host!.state.items).toEqual([])
+    // The same peer is still served, and so is a new one.
+    peer.send({ t: 'ping' })
+    await until('the pong', () => peer.frames.some((frame) => frame.t === 'pong'))
+    const late = await attach('mobile')
+    expect(late.controller.getState().connection).toBe('ready')
+  })
+
+  test('a permission reply the engine never got leaves the request open for the next try', async () => {
+    await startHost()
+    const input = '{"command":"cargo test"}'
+    engine.emit({ type: 'tool_call_started', id: 't1', name: 'bash', input, cut_off: false })
+    engine.emit({
+      type: 'permission_requested',
+      id: 7,
+      request: { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: null, input, session_prefixes: [] },
+    })
+    const working = engine.send.bind(engine)
+    engine.send = dies
+    const peer = await connectRaw()
+    const reply = { kind: 'permission_reply', id: 7, decision: { kind: 'allow_once' } }
+    peer.send({ t: 'send', message: reply })
+    await until('the error', () => peer.errors().length === 1)
+    expect(peer.errors()).toEqual(['The engine is not running.'])
+    expect(host!.state.permissions.map((permission) => permission.id)).toEqual([7])
+    // The engine is back: the same answer goes through, and only now is the request answered.
+    engine.send = working
+    peer.send({ t: 'send', message: reply })
+    await until('the answer to reach the engine', () => engine.sent.length === 1)
+    await until('the request to be answered', () => host!.state.permissions.length === 0)
+    expect(engine.sent).toEqual([{ kind: 'permission_reply', id: 7, decision: { kind: 'allow_once' } }])
+  })
+
+  test('whatever else a frame makes the host throw is answered too, without the details', async () => {
+    await startHost()
+    ;(host as unknown as { forward(): void }).forward = () => {
+      throw new Error('an internal detail the peer has no business seeing')
+    }
+    const peer = await connectRaw()
+    peer.send({ t: 'send', message: { kind: 'command', type: 'interrupt' } })
+    await until('the error', () => peer.errors().length === 1)
+    expect(peer.errors()).toEqual(['The host could not handle that frame.'])
+    peer.send({ t: 'ping' })
+    await until('the pong', () => peer.frames.some((frame) => frame.t === 'pong'))
   })
 })
 
