@@ -4,6 +4,7 @@ import path from 'path'
 
 import {
   CAPABILITY_GIT_VIEWS,
+  CAPABILITY_HOOK_PROGRESS,
   CAPABILITY_LIVE_OUTPUT,
   CAPABILITY_LIVE_PROGRESS,
   CAPABILITY_QUESTIONS,
@@ -16,13 +17,18 @@ import {
   FEATURE_ERROR_DETAILS,
   FEATURE_EXTENSIONS,
   FEATURE_GIT_VIEWS,
+  FEATURE_HOOK_PROGRESS,
   FEATURE_LIVE_OUTPUT,
   FEATURE_LIVE_PROGRESS,
+  FEATURE_MCP_CATALOG,
+  FEATURE_MCP_HOSTED,
+  FEATURE_MCP_POLICY,
   FEATURE_MCP_TOGGLE,
   FEATURE_MODEL_IMAGES,
   FEATURE_REPORTS,
   FEATURE_SESSIONS,
   FEATURE_SESSION_SCOPE,
+  FEATURE_STATUS_BAR,
   FEATURE_SUBAGENTS,
   FEATURE_TODOS,
   FEATURE_TRUST_PREVIEW,
@@ -36,8 +42,12 @@ import {
   permissionReplyMessage,
   type AccountDetails,
   type AccountInfo,
+  type BranchInfo,
   type ChangedFile,
   type CheckpointInfo,
+  type ConnectorInfo,
+  type ConnectorVariable,
+  type ContextBreakdown,
   type DefinitionInfo,
   type DiffFile,
   type EngineCommand,
@@ -141,7 +151,15 @@ const fieldsOf =
 
 const STRUCT_FIELDS: Record<string, string[]> = {
   TokenCounts: fieldsOf<TokenCounts>()(['input', 'output', 'cache_read', 'cache_write']),
-  PermissionView: fieldsOf<PermissionView>()(['tool', 'current_mode', 'required_mode', 'reason', 'input', 'session_prefixes']),
+  PermissionView: fieldsOf<PermissionView>()([
+    'tool',
+    'current_mode',
+    'required_mode',
+    'reason',
+    'input',
+    'session_prefixes',
+    'project_rules',
+  ]),
   GitStatus: fieldsOf<GitStatus>()(['branch', 'changed', 'staged', 'unstaged', 'untracked', 'conflicted']),
   ModelInfo: fieldsOf<ModelInfo>()([
     'id',
@@ -153,9 +171,41 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'status',
     'available_again_at',
     'supports_images',
+    'provider',
+    'reasoning_efforts',
+    'supports_reasoning',
   ]),
   AccountInfo: fieldsOf<AccountInfo>()(['email', 'plan', 'source', 'expires_at']),
-  McpServerInfo: fieldsOf<McpServerInfo>()(['name', 'scope', 'transport', 'status', 'tools', 'error', 'enabled']),
+  McpServerInfo: fieldsOf<McpServerInfo>()([
+    'name',
+    'scope',
+    'transport',
+    'status',
+    'tools',
+    'error',
+    'enabled',
+    'catalog',
+    'required',
+    'unpinned',
+    'connect_url',
+    'tool_tiers',
+  ]),
+  ConnectorVariable: fieldsOf<ConnectorVariable>()(['name', 'label', 'secret', 'required', 'default', 'help_url']),
+  ConnectorInfo: fieldsOf<ConnectorInfo>()([
+    'id',
+    'name',
+    'description',
+    'publisher',
+    'official',
+    'licence',
+    'source',
+    'transport',
+    'pinned',
+    'oauth',
+    'default_scope',
+    'variables',
+    'added',
+  ]),
   PluginInfo: fieldsOf<PluginInfo>()(['id', 'name', 'version', 'description', 'kind', 'enabled']),
   DefinitionInfo: fieldsOf<DefinitionInfo>()(['name', 'description', 'source', 'active']),
   SessionSummary: fieldsOf<SessionSummary>()([
@@ -194,9 +244,23 @@ const STRUCT_FIELDS: Record<string, string[]> = {
     'usage_window',
   ]),
   UsageWindow: fieldsOf<UsageWindow>()(['tokens', 'limit_tokens', 'remaining_tokens', 'resets_at', 'window_seconds']),
+  ContextBreakdown: fieldsOf<ContextBreakdown>()([
+    'context_window',
+    'output_reserve',
+    'system_tokens',
+    'tool_schema_tokens',
+    'tool_count',
+    'instruction_tokens',
+    'instruction_files',
+    'conversation_tokens',
+    'tool_output_tokens',
+    'used_tokens',
+    'threshold_tokens',
+  ]),
+  BranchInfo: fieldsOf<BranchInfo>()(['name', 'upstream', 'ahead', 'behind', 'last_commit_ms']),
   ErrorDetail: fieldsOf<ErrorDetail>()(['code', 'status', 'upgrade_url', 'resets_at', 'retry_after_seconds']),
-  HookPreview: fieldsOf<HookPreview>()(['event', 'command', 'source']),
-  McpServerPreview: fieldsOf<McpServerPreview>()(['name', 'transport', 'target', 'source']),
+  HookPreview: fieldsOf<HookPreview>()(['event', 'command', 'source', 'matcher']),
+  McpServerPreview: fieldsOf<McpServerPreview>()(['name', 'transport', 'target', 'source', 'command', 'fingerprint']),
   PermissionRulePreview: fieldsOf<PermissionRulePreview>()(['effect', 'rule', 'source']),
   TodoItem: fieldsOf<TodoItem>()(['content', 'status', 'active_form']),
   PermissionReply: fieldsOf<PermissionReply>()(['id', 'decision']),
@@ -238,6 +302,13 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
     'supports_images',
     'served_model',
     'request_tokens_estimate',
+    'served_model_display_name',
+    'provider',
+    'model_display_name',
+    'reasoning_effort',
+    'reasoning_efforts',
+    'full_access_allowed',
+    'context',
   ]),
   session_starting: eventFields('session_starting')([]),
   sign_in_code: eventFields('sign_in_code')(['url', 'url_complete', 'user_code', 'expires_in_secs', 'browser_opened']),
@@ -261,14 +332,18 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
   subagent_started: eventFields('subagent_started')(['id', 'description', 'subagent_type']),
   subagent_finished: eventFields('subagent_finished')(['id', 'status', 'is_error', 'result', 'note']),
   extensions: eventFields('extensions')(['mcp_servers', 'plugins', 'skills', 'agents']),
+  connector_catalog: eventFields('connector_catalog')(['version', 'connectors']),
   report: eventFields('report')(['command', 'title', 'sections', 'links']),
   account: eventFields('account')(['signed_in', 'account']),
+  branches: eventFields('branches')(['current', 'branches', 'dirty']),
   trust_preview: eventFields('trust_preview')([
     'cwd',
     'root',
     'is_git_root',
     'session_only',
     'trusted',
+    'changed_since_trust',
+    'changed_settings',
     'settings_files',
     'hooks',
     'mcp_servers',
@@ -280,6 +355,16 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
   output_progress: eventFields('output_progress')(['output_tokens']),
   request_usage: eventFields('request_usage')(['usage']),
   tool_output_delta: eventFields('tool_output_delta')(['tool_use_id', 'stream', 'chunk']),
+  hook_started: eventFields('hook_started')(['event', 'matcher', 'command', 'tool_use_id']),
+  hook_finished: eventFields('hook_finished')([
+    'event',
+    'matcher',
+    'command',
+    'tool_use_id',
+    'outcome',
+    'duration_ms',
+    'message',
+  ]),
   changes: eventFields('changes')(['files']),
   diff: eventFields('diff')(['title', 'files', 'truncated']),
   commit_proposal: eventFields('commit_proposal')(['message', 'branch', 'files', 'stage_all']),
@@ -323,6 +408,14 @@ const COMMAND_FIELDS: { [T in EngineCommand['type']]: string[] } = {
   refresh_account: commandFields('refresh_account')([]),
   commit: commandFields('commit')(['message']),
   rewind: commandFields('rewind')(['checkpoint', 'mode', 'dry_run']),
+  list_connector_catalog: commandFields('list_connector_catalog')(['query']),
+  add_mcp_server: commandFields('add_mcp_server')(['id', 'name', 'scope', 'secrets']),
+  remove_mcp_server: commandFields('remove_mcp_server')(['name', 'scope']),
+  approve_mcp_server: commandFields('approve_mcp_server')(['name', 'fingerprint']),
+  set_reasoning_effort: commandFields('set_reasoning_effort')(['effort']),
+  set_permission_mode: commandFields('set_permission_mode')(['mode']),
+  list_branches: commandFields('list_branches')([]),
+  switch_branch: commandFields('switch_branch')(['name', 'create']),
 }
 
 /** A typed list of a union's members: a missing member fails typecheck. */
@@ -366,14 +459,105 @@ const TS_FEATURE_CONSTANTS: Record<string, string> = {
   FEATURE_CHECKPOINTS,
   FEATURE_MCP_TOGGLE,
   FEATURE_LIVE_OUTPUT,
+  FEATURE_HOOK_PROGRESS,
+  FEATURE_MCP_CATALOG,
+  FEATURE_MCP_POLICY,
+  FEATURE_MCP_HOSTED,
+  FEATURE_STATUS_BAR,
   CAPABILITY_QUESTIONS,
   CAPABILITY_REPORTS,
   CAPABILITY_LIVE_PROGRESS,
   CAPABILITY_GIT_VIEWS,
   CAPABILITY_LIVE_OUTPUT,
+  CAPABILITY_HOOK_PROGRESS,
 }
 
 const sorted = (values: Iterable<string>) => [...values].sort()
+
+type CommandType = EngineCommand['type']
+
+/**
+ * What the untrusted-peer gate does with each command. `parseClientMessage` is the first thing a frame
+ * from a paired phone meets, so every `EngineCommand` tag is decided here, on purpose, in one of the
+ * two lists below. A tag in neither list, or in both, fails `bun run typecheck`; a command line in
+ * a fixture that is in neither fails `bun test`. An engine command cannot ship until someone has
+ * decided whether a phone may send it.
+ *
+ * These pass the gate, rebuilt from their known fields. Passing is not permission: `host.ts` still
+ * refuses some of them to every peer (`shutdown`, `commit`, `set_mcp_server_enabled`, a rewind that is
+ * not a dry run) and some to a peer on another machine (`trust_workspace`, most slash commands).
+ */
+const PEER_PASSES = [
+  'submit',
+  'slash',
+  'set_model',
+  'list_models',
+  'interrupt',
+  'shutdown',
+  'capabilities',
+  'answer',
+  'list_sessions',
+  'resume',
+  'trust_workspace',
+  'list_extensions',
+  'trust_preview',
+  'refresh_account',
+  'set_mcp_server_enabled',
+  'commit',
+  'rewind',
+] as const satisfies readonly CommandType[]
+
+/**
+ * Refused on purpose: `parseClientMessage` returns null, so the frame never reaches the host, let
+ * alone the engine. Each of these changes something, and the phone app has no screen for any of it:
+ * - `add_mcp_server` adds a connector for the engine to run, and stores the secrets typed for it;
+ * - `approve_mcp_server` starts a workspace's server, which runs the command its settings name;
+ * - `remove_mcp_server` deletes a server's settings, its stored secrets and its sign-in;
+ * - `set_permission_mode` can raise what the agent may do without asking, up to full access;
+ * - `switch_branch` checks out another branch, which rewrites the files of the workspace;
+ * - `set_reasoning_effort` changes how every following turn runs, and what it costs.
+ * `list_branches` and `list_connector_catalog` only read, and are opened by the next change; until
+ * then they are refused like any command the gate has no case for.
+ */
+const PEER_REFUSED = [
+  'add_mcp_server',
+  'approve_mcp_server',
+  'remove_mcp_server',
+  'set_permission_mode',
+  'switch_branch',
+  'set_reasoning_effort',
+  'list_branches',
+  'list_connector_catalog',
+] as const satisfies readonly CommandType[]
+
+type Undecided = Exclude<CommandType, (typeof PEER_PASSES)[number] | (typeof PEER_REFUSED)[number]>
+type DecidedTwice = Extract<(typeof PEER_PASSES)[number], (typeof PEER_REFUSED)[number]>
+/** `true` is not assignable to the other branch, so typecheck names the tags that break the rule. */
+const peerClassification: [Undecided | DecidedTwice] extends [never] ? true : { fix: Undecided | DecidedTwice } = true
+
+/**
+ * Runs every command line through the gate: one that passes comes back unchanged, one refused on
+ * purpose comes back null, and a tag in neither list fails. Returns the tags seen on each side.
+ */
+function peerGate(lines: string[]): { passed: string[]; refused: string[] } {
+  const passed = new Set<string>()
+  const refused = new Set<string>()
+  for (const line of lines) {
+    const sample = JSON.parse(line)
+    const type: string = sample.type
+    const result = parseClientMessage(sample)
+    if ((PEER_REFUSED as readonly string[]).includes(type)) {
+      expect({ type, result }).toEqual({ type, result: null })
+      refused.add(type)
+    } else if ((PEER_PASSES as readonly string[]).includes(type)) {
+      expect({ type, result }).toEqual({ type, result: sample })
+      passed.add(type)
+    } else {
+      throw new Error(`${type} is in neither PEER_PASSES nor PEER_REFUSED: decide whether a phone may send it`)
+    }
+  }
+  return { passed: sorted(passed), refused: sorted(refused) }
+}
 
 describe('the protocol mirrors protocol.rs', () => {
   test('every UiEvent variant has a tag here, and no more', () => {
@@ -462,10 +646,11 @@ describe('the fake engine samples (rust/crates/neuron-tui/fixtures)', () => {
     }
   })
 
-  test('every sample command passes the untrusted-peer check unchanged', () => {
-    for (const line of fixtureLines('protocol-v2-commands.jsonl')) {
-      expect(parseClientMessage(JSON.parse(line))).toEqual(JSON.parse(line))
-    }
+  test('every sample command passes the untrusted-peer check unchanged, or is refused on purpose', () => {
+    const { passed, refused } = peerGate(fixtureLines('protocol-v2-commands.jsonl'))
+    expect(passed.length).toBeGreaterThan(0)
+    // The samples hold each command refused on purpose, so each is refused here in its real wire shape.
+    expect(refused).toEqual(sorted(PEER_REFUSED))
   })
 })
 
@@ -498,10 +683,11 @@ describe('the live protocol samples (test/fixtures/protocol-v2-live.jsonl)', () 
     }
   })
 
-  test('every command line passes the untrusted-peer check unchanged, and every new command appears', () => {
-    for (const line of commandLines) expect(parseClientMessage(JSON.parse(line))).toEqual(JSON.parse(line))
-    const types = new Set(commandLines.map((line) => JSON.parse(line).type))
-    for (const type of ['set_mcp_server_enabled', 'commit', 'rewind']) expect(types.has(type)).toBe(true)
+  test('every command line passes the untrusted-peer check unchanged, none is refused, and every new command appears', () => {
+    const { passed, refused } = peerGate(commandLines)
+    expect(passed).toEqual(['capabilities', 'commit', 'rewind', 'set_mcp_server_enabled'])
+    expect(refused).toEqual([])
+    for (const type of ['set_mcp_server_enabled', 'commit', 'rewind']) expect(passed).toContain(type)
   })
 })
 
@@ -623,6 +809,43 @@ describe('client messages from untrusted peers', () => {
     ]) {
       expect(parseClientMessage(bad)).toBeNull()
     }
+  })
+
+  test('every command tag is decided once: it passes the check or is refused on purpose', () => {
+    expect(peerClassification).toBe(true)
+    expect(sorted([...PEER_PASSES, ...PEER_REFUSED])).toEqual(sorted(ENGINE_COMMAND_TYPES))
+  })
+
+  test('commands that change something are refused, however well formed', () => {
+    const changes: Array<Record<string, unknown> & { type: string }> = [
+      { type: 'add_mcp_server', id: 'github', name: null, scope: 'user', secrets: { EXAMPLE_TOKEN: 'not-a-real-token' } },
+      { type: 'add_mcp_server', id: 'github' },
+      { type: 'approve_mcp_server', name: 'postgres-tools', fingerprint: '4f1c0de5' },
+      { type: 'approve_mcp_server', name: 'postgres-tools' },
+      { type: 'remove_mcp_server', name: 'docs' },
+      { type: 'remove_mcp_server', name: 'docs', scope: 'user' },
+      { type: 'set_permission_mode', mode: 'danger-full-access' },
+      { type: 'set_permission_mode', mode: 'workspace-write' },
+      { type: 'set_permission_mode', mode: 'plan-off' },
+      { type: 'switch_branch', name: 'main' },
+      { type: 'switch_branch', name: 'topic', create: true },
+      { type: 'set_reasoning_effort', effort: 'max' },
+      { type: 'set_reasoning_effort', effort: null },
+    ]
+    for (const change of changes) {
+      expect({ type: change.type, result: parseClientMessage({ kind: 'command', ...change }) }).toEqual({ type: change.type, result: null })
+    }
+  })
+
+  test('a permission reply cannot save project rules or deny for the whole session', () => {
+    // `allow_for_project` writes allow rules into the project's settings for good: not a phone's decision.
+    expect(parseClientMessage({ kind: 'permission_reply', id: 4, decision: { kind: 'allow_for_project' } })).toBeNull()
+    // `session` on a denial would refuse matching calls for the rest of the session: it is dropped, so only this call is denied.
+    expect(parseClientMessage({ kind: 'permission_reply', id: 4, decision: { kind: 'deny', note: 'no', session: true } })).toEqual({
+      kind: 'permission_reply',
+      id: 4,
+      decision: { kind: 'deny', note: 'no' },
+    })
   })
 })
 

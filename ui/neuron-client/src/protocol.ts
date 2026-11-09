@@ -14,8 +14,13 @@
  * Protocol v2 is a set of engine features (`ready.features`): `reports`,
  * `account`, `error_details`, `session_scope`, `trust_preview`,
  * `model_images`, `live_progress`, `live_output`, `git_views`,
- * `checkpoints` and `mcp_toggle`. Send the commands a feature adds only when
- * the engine lists it.
+ * `checkpoints` and `mcp_toggle`. Engine 7.0.0-alpha.5 adds `hook_progress`,
+ * `mcp_catalog`, `mcp_policy`, `mcp_hosted` and `status_bar`. Send the
+ * commands a feature adds only when the engine lists it.
+ *
+ * Being an {@link EngineCommand} says nothing about who may send it: a frame
+ * from a remote peer meets {@link parseClientMessage} first, which refuses
+ * every command that changes something.
  */
 
 /** `PROTOCOL_VERSION` in protocol.rs, sent in {@link ReadyEvent}. */
@@ -38,6 +43,11 @@ export interface PermissionView {
   input: string
   /** What "allow for this session" approves from now on; empty when only once is possible. */
   session_prefixes: string[]
+  /**
+   * The `permissions.allow` rules "always allow in this project" would save to the project's
+   * `.neuron/settings.local.json`. Older engines leave it out, and the choice is offered only when it is not empty.
+   */
+  project_rules?: string[]
 }
 
 export interface GitStatus {
@@ -62,6 +72,12 @@ export interface ModelInfo {
   available_again_at?: string | null
   /** The catalog says the model reads images (feature `model_images`); absent when it does not say. */
   supports_images?: boolean | null
+  /** Who serves it (the gateway's `owned_by` or `provider`: `gemini`, `groq`, `zero-x` for `auto`, ...), feature `status_bar`. */
+  provider?: string | null
+  /** The thinking levels it takes, lowest first (feature `status_bar`). */
+  reasoning_efforts?: string[] | null
+  /** The catalog says it reasons (feature `status_bar`); absent or null when it does not say. */
+  supports_reasoning?: boolean | null
 }
 
 /** The Zero-X login as a client may show it. Never carries the token. */
@@ -107,6 +123,31 @@ export const FEATURE_MCP_TOGGLE = 'mcp_toggle'
 export const FEATURE_TODOS = 'todos'
 /** `subagent_started` and `subagent_finished` events. */
 export const FEATURE_SUBAGENTS = 'subagents'
+/** `hook_started` and `hook_finished` events while hook commands run (with the `hook_progress` capability). */
+export const FEATURE_HOOK_PROGRESS = 'hook_progress'
+/**
+ * The connector catalog: the `list_connector_catalog` command (a `connector_catalog` event answers),
+ * `add_mcp_server`, `remove_mcp_server` and `approve_mcp_server` (each answered with a notice and a fresh
+ * `extensions` event, or an error), and `catalog` on MCP servers.
+ */
+export const FEATURE_MCP_CATALOG = 'mcp_catalog'
+/**
+ * The connector policy (managed settings and the Zero-X plan): MCP servers with scope `managed`, status
+ * `blocked` with the policy's reason in `error`, and `required` on servers that cannot be turned off.
+ */
+export const FEATURE_MCP_POLICY = 'mcp_policy'
+/**
+ * Hosted connectors through Zero-X: MCP servers with transport `zerox`, status `needs_connect` while the
+ * connector is not linked to the Zero-X account, and `connect_url`, the page that links it.
+ */
+export const FEATURE_MCP_HOSTED = 'mcp_hosted'
+/**
+ * The prompt status bar's engine side: `provider`, `model_display_name`, `reasoning_effort(s)`,
+ * `full_access_allowed` and `context` on `status`; `provider`, `reasoning_efforts` and `supports_reasoning`
+ * on models; the `set_reasoning_effort`, `set_permission_mode`, `list_branches` and `switch_branch` commands
+ * and the `branches` event; `/effort` and a `/context` report.
+ */
+export const FEATURE_STATUS_BAR = 'status_bar'
 
 /** A UI capability: questions come as `question` events instead of a "Question:" notice. */
 export const CAPABILITY_QUESTIONS = 'questions'
@@ -118,8 +159,13 @@ export const CAPABILITY_LIVE_PROGRESS = 'live_progress'
 export const CAPABILITY_GIT_VIEWS = 'git_views'
 /** A UI capability: send the output of a running shell command as `tool_output_delta` events. */
 export const CAPABILITY_LIVE_OUTPUT = 'live_output'
+/** A UI capability: send `hook_started` and `hook_finished` events. Without it the engine sends neither. */
+export const CAPABILITY_HOOK_PROGRESS = 'hook_progress'
 
-/** What the desktop app renders and so declares in its `capabilities` command. */
+/**
+ * What the desktop app renders and so declares in its `capabilities` command. `hook_progress` is not
+ * here: no screen shows hook commands yet, and an engine only sends the events to a UI that asks.
+ */
 export const DESKTOP_CAPABILITIES: readonly string[] = [
   CAPABILITY_QUESTIONS,
   CAPABILITY_REPORTS,
@@ -271,6 +317,43 @@ export interface UsageWindow {
 }
 
 /**
+ * What fills the context window (feature `status_bar`), as the engine's estimated tokens. `used_tokens` is
+ * what each request sends (system prompt, tool schemas, instructions and the conversation);
+ * `context_window - output_reserve` is what it may use.
+ */
+export interface ContextBreakdown {
+  context_window: number
+  /** Kept free for the reply (`max_tokens`). */
+  output_reserve: number
+  /** The system prompt without the project instructions. */
+  system_tokens: number
+  tool_schema_tokens: number
+  tool_count: number
+  /** `NEURON.md` and the other instruction files and memory. */
+  instruction_tokens: number
+  instruction_files: string[]
+  /** Prompts, replies and tool calls. */
+  conversation_tokens: number
+  /** Tool results. */
+  tool_output_tokens: number
+  used_tokens: number
+  /** Auto-compaction starts when `used_tokens` reaches this. */
+  threshold_tokens: number
+}
+
+/** One local branch, for a branch picker (`branches` event, feature `status_bar`). */
+export interface BranchInfo {
+  name: string
+  /** Its upstream (`origin/main`), when it has one. */
+  upstream: string | null
+  /** Commits ahead of and behind the upstream; null without one. */
+  ahead: number | null
+  behind: number | null
+  /** Its last commit (Unix milliseconds). */
+  last_commit_ms: number | null
+}
+
+/**
  * What a failed request needs from the user. `code` is the gateway's
  * (`invalid_session`, `upgrade_required`, `insufficient_quota`, `rate_limited`,
  * ...), `unreachable` when the server could not be reached, `not_available`
@@ -339,22 +422,90 @@ export interface TodoItem {
 /** One configured MCP server and what it is doing now. */
 export interface McpServerInfo {
   name: string
-  /** `bundled`, `user`, `project` or `local`. */
+  /** `bundled`, `user`, `project`, `local` or `managed` (the machine's managed settings, or a server the connector policy requires). */
   scope: string
   /** `stdio`, `http`, `sse`, `ws`, `sdk` or `zerox` (older engines: `managed_proxy`). */
   transport: string
   /**
    * `starting`, `ready`, `failed`, `pending` (started, tools not found),
-   * `unsupported` (a transport Neuron does not speak yet), `not_started` or
-   * `disabled` (turned off in the settings).
+   * `unsupported` (a transport Neuron does not speak yet), `not_started`,
+   * `disabled` (turned off in the settings), `needs_approval` (a workspace server that is new or changed:
+   * it starts once the user approves it), `blocked` (a deny rule or the connector policy refuses it) or
+   * `needs_connect` (a hosted connector not linked to the Zero-X account yet, see `connect_url`); `error`
+   * says why for the last three. Older engines send none of the last three; show an unknown status as is.
    */
-  status: 'starting' | 'ready' | 'failed' | 'pending' | 'unsupported' | 'not_started' | 'disabled' | string
+  status:
+    | 'starting'
+    | 'ready'
+    | 'failed'
+    | 'pending'
+    | 'unsupported'
+    | 'not_started'
+    | 'disabled'
+    | 'needs_approval'
+    | 'blocked'
+    | 'needs_connect'
+    | string
   /** Its tools, without the `mcp__<server>__` prefix. */
   tools: string[]
   /** Why it failed or is unsupported. */
   error: string | null
   /** Turned on (feature `mcp_toggle`); absent from older engines, meaning on. */
   enabled?: boolean
+  /** The catalog connector it was added from, when its launch spec is exactly that entry's (feature `mcp_catalog`). */
+  catalog?: string
+  /** The connector policy requires it (feature `mcp_policy`): it is on, and cannot be turned off. Older engines leave it out. */
+  required?: boolean
+  /**
+   * A stdio server that is not a catalog connector and whose version and hashes are not recorded
+   * (`/mcp pin <name>` records them). Older engines leave it out.
+   */
+  unpinned?: boolean
+  /** Where the user links this hosted connector, while its status is `needs_connect` (feature `mcp_hosted`). Older engines leave it out. */
+  connect_url?: string
+  /**
+   * The permission tier of each of its tools (`read`, `write`, `destructive` or `external`) as the
+   * connector catalog pins it, for a catalog or hosted connector (feature `mcp_catalog`). Other servers,
+   * and older engines, leave it out.
+   */
+  tool_tiers?: Record<string, string>
+}
+
+/** A variable a catalog connector needs. */
+export interface ConnectorVariable {
+  /** The environment variable or `${secret:NAME}` name. */
+  name: string
+  label: string
+  /** Kept in the OS keychain: mask its field, never log it. */
+  secret: boolean
+  required: boolean
+  default: string | null
+  /** Where to get it (a token page). */
+  help_url: string | null
+}
+
+/** One connector of the catalog (`connector_catalog` event). */
+export interface ConnectorInfo {
+  id: string
+  name: string
+  description: string
+  publisher: string
+  /** Published by the service's vendor or the MCP project. */
+  official: boolean
+  licence: string
+  /** Its source repository. */
+  source: string
+  /** `stdio` (runs locally) or `http` (a remote server). */
+  transport: string
+  /** `<package>@<version>`, or the URL of a remote server. */
+  pinned: string
+  /** Signs in with OAuth once added. */
+  oauth: boolean
+  /** `user`, `project` or `local`. */
+  default_scope: string
+  variables: ConnectorVariable[]
+  /** The configured servers added from it. */
+  added: string[]
 }
 
 /** One installed plugin. */
@@ -411,6 +562,23 @@ export interface StatusEvent {
   served_model?: string | null
   /** Estimated input tokens of each model request the next turn sends; absent from older engines. */
   request_tokens_estimate?: number | null
+  /**
+   * How a person reads `served_model`: its catalog name without the gateway's route to it. Sent with
+   * `served_model`; absent from older engines.
+   */
+  served_model_display_name?: string | null
+  /** Who serves the model (feature `status_bar`), as on {@link ModelInfo}. */
+  provider?: string | null
+  /** The catalog's name for the model (feature `status_bar`), without the gateway's route to it from engines after 7.0.0-alpha.4. */
+  model_display_name?: string | null
+  /** The thinking level the next turn asks for; null for the model's default. */
+  reasoning_effort?: string | null
+  /** The levels the model takes; null when unknown, empty when it does not reason. */
+  reasoning_efforts?: string[] | null
+  /** Full access may be picked: the engine started with it, or with `--dangerously-skip-permissions`. Absent from older engines. */
+  full_access_allowed?: boolean
+  /** What fills the context window (feature `status_bar`); absent from older engines. */
+  context?: ContextBreakdown | null
 }
 
 export interface SessionStartingEvent {
@@ -576,6 +744,13 @@ export interface ExtensionsEvent {
   agents: DefinitionInfo[]
 }
 
+/** Answer to `list_connector_catalog` (feature `mcp_catalog`): the catalog's version and the connectors that match the query. */
+export interface ConnectorCatalogEvent {
+  type: 'connector_catalog'
+  version: string
+  connectors: ConnectorInfo[]
+}
+
 /** What a report command found (`/usage`, `/init`, `/memory`, `/doctor`); `turn_finished` follows. */
 export interface ReportEvent {
   type: 'report'
@@ -591,6 +766,16 @@ export interface AccountEvent {
   type: 'account'
   signed_in: boolean
   account: AccountDetails | null
+}
+
+/** Answer to `list_branches` (feature `status_bar`): the local branches, newest commit first. */
+export interface BranchesEvent {
+  type: 'branches'
+  /** The checked-out branch; null on a detached HEAD. */
+  current: string | null
+  branches: BranchInfo[]
+  /** The working tree has uncommitted changes (switching is refused then). */
+  dirty: boolean
 }
 
 /** Answer to `trust_preview`: what trusting the workspace would turn on. Nothing was started. */
@@ -656,6 +841,35 @@ export interface ToolOutputDeltaEvent {
   tool_use_id: string
   stream: OutputStream
   chunk: string
+}
+
+/**
+ * A hook command started. `event` is its settings name (`PreToolUse`, `Stop`, ...); `command` is shortened,
+ * with anything that looks like a secret hidden; `tool_use_id` is the tool call it runs for. With the
+ * `hook_progress` capability only.
+ */
+export interface HookStartedEvent {
+  type: 'hook_started'
+  event: string
+  /** The tool name the hook is limited to; absent when it runs for every tool. */
+  matcher?: string | null
+  command: string
+  tool_use_id?: string | null
+}
+
+/** How a hook command ended: `blocked` is exit 2 or a block decision. */
+export type HookOutcome = 'ok' | 'blocked' | 'error' | 'cancelled'
+
+/** A hook command ended; `message` is the start of what it said, when it said something. With the `hook_progress` capability only. */
+export interface HookFinishedEvent {
+  type: 'hook_finished'
+  event: string
+  matcher?: string | null
+  command: string
+  tool_use_id?: string | null
+  outcome: HookOutcome | string
+  duration_ms: number
+  message?: string | null
 }
 
 /** Every file the agent created, changed or deleted in this session, with lines added and removed. Sent when the list changes. With the `git_views` capability only. */
@@ -747,6 +961,10 @@ export type UiEvent =
   | CommitProposalEvent
   | CheckpointsEvent
   | RewoundEvent
+  | ConnectorCatalogEvent
+  | BranchesEvent
+  | HookStartedEvent
+  | HookFinishedEvent
 
 export type UiEventType = UiEvent['type']
 
@@ -789,6 +1007,10 @@ export const UI_EVENT_TYPES: readonly UiEventType[] = [
   'commit_proposal',
   'checkpoints',
   'rewound',
+  'connector_catalog',
+  'branches',
+  'hook_started',
+  'hook_finished',
 ]
 
 // ---------------------------------------------------------------- client → engine
@@ -829,6 +1051,41 @@ export type EngineCommand =
   | { type: 'commit'; message: string }
   /** Feature `checkpoints`: go back to a checkpoint; `dry_run` reports what it would do and changes nothing. Answered with `rewound`. */
   | { type: 'rewind'; checkpoint: number; mode: RewindMode; dry_run?: boolean }
+  /**
+   * Feature `mcp_catalog`: the catalog connectors whose id, name, publisher or description contain every
+   * word of `query` (all when empty), as a `connector_catalog` event. Read-only.
+   */
+  | { type: 'list_connector_catalog'; query?: string }
+  /**
+   * Feature `mcp_catalog`: add the catalog connector `id` as the server `name` (the id when null) to the
+   * settings of `scope` (`user`, `project` or `local`; the connector's default when null). `secrets` holds
+   * what the user typed for its variables: they go to the OS keychain, never into a settings file, and must
+   * never be logged. A notice and a fresh `extensions` event follow, or an error. A remote peer may not send it.
+   */
+  | { type: 'add_mcp_server'; id: string; name?: string | null; scope?: string | null; secrets?: Record<string, string> }
+  /** Feature `mcp_catalog`: remove the server `name` (from the settings of `scope` when given), with its keychain secrets and sign-in. A remote peer may not send it. */
+  | { type: 'remove_mcp_server'; name: string; scope?: string | null }
+  /**
+   * Feature `mcp_catalog`: approve the workspace server `name` (status `needs_approval`) as configured now;
+   * with `fingerprint` (from the trust preview), only if it is still configured as the preview showed it.
+   * Starts the server. A remote peer may not send it.
+   */
+  | { type: 'approve_mcp_server'; name: string; fingerprint?: string }
+  /** Feature `status_bar`: the thinking level of the next turns; null for the model's default. A `status` follows, or an `error`. A remote peer may not send it. */
+  | { type: 'set_reasoning_effort'; effort: string | null }
+  /**
+   * Feature `status_bar`: `read-only`, `workspace-write`, `danger-full-access` (only when the status says
+   * `full_access_allowed`), or `plan` / `plan-off` for plan mode. A `status` follows, or an `error`. A remote
+   * peer may not send it: it can raise what the agent may do.
+   */
+  | { type: 'set_permission_mode'; mode: string }
+  /** Feature `status_bar`: the local branches, as a `branches` event. Read-only. */
+  | { type: 'list_branches' }
+  /**
+   * Feature `status_bar`: check out `name` (`create`: a new branch from HEAD). Refused while a turn runs or
+   * the tree has changes. A notice and a `status` follow, or an `error`. A remote peer may not send it.
+   */
+  | { type: 'switch_branch'; name: string; create: boolean }
 
 export const ENGINE_COMMAND_TYPES: readonly EngineCommand['type'][] = [
   'submit',
@@ -848,12 +1105,26 @@ export const ENGINE_COMMAND_TYPES: readonly EngineCommand['type'][] = [
   'set_mcp_server_enabled',
   'commit',
   'rewind',
+  'list_connector_catalog',
+  'add_mcp_server',
+  'remove_mcp_server',
+  'approve_mcp_server',
+  'set_reasoning_effort',
+  'set_permission_mode',
+  'list_branches',
+  'switch_branch',
 ]
 
 export type PermissionDecision =
   | { kind: 'allow_once' }
   | { kind: 'allow_for_session' }
-  | { kind: 'deny'; note: string | null }
+  /**
+   * Run this call and save the request's `project_rules`, so matching calls run in this project from now on.
+   * Send it only when the request offered `project_rules`. A remote peer may not send it.
+   */
+  | { kind: 'allow_for_project' }
+  /** `session`: matching calls are refused for the rest of the session without asking; an older engine denies this call only. */
+  | { kind: 'deny'; note: string | null; session?: boolean }
 
 export interface PermissionReply {
   id: number
@@ -943,9 +1214,11 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
       return { kind: 'permission_reply', id: message.id as number, decision: { kind: decision.kind } }
     }
     if (decision.kind === 'deny') {
+      // Rebuilt from `note` alone: `session` would refuse matching calls for the rest of the session, and a remote peer may not decide that.
       const note = typeof decision.note === 'string' ? decision.note : null
       return { kind: 'permission_reply', id: message.id as number, decision: { kind: 'deny', note } }
     }
+    // Refused on purpose, `allow_for_project` among it: it saves allow rules into the project's settings for good.
     return null
   }
   if (message.kind !== 'command') return null
@@ -1022,7 +1295,19 @@ export function parseClientMessage(value: unknown): ClientMessage | null {
         ? { kind: 'command', type: 'rewind', checkpoint: message.checkpoint as number, mode: mode as RewindMode, dry_run: message.dry_run }
         : null
     }
+    // Refused on purpose: each of these changes something (a connector to run, a server started or
+    // removed, the permission mode, the branch checked out, how turns run), and a remote peer has no
+    // business doing any of it. `default` refuses them too; the names are here so the decision is on
+    // record. `PEER_REFUSED` in test/protocol.test.ts lists them with the reasons.
+    case 'add_mcp_server':
+    case 'approve_mcp_server':
+    case 'remove_mcp_server':
+    case 'set_permission_mode':
+    case 'switch_branch':
+    case 'set_reasoning_effort':
+      return null
     default:
+      // Any other command, including one a newer engine adds, stays refused until someone decides on it.
       return null
   }
 }
