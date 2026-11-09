@@ -24,6 +24,7 @@ import {
 } from '@neuron/client'
 
 import type { Connection } from '../connection'
+import { statusModelName } from '../modelName'
 import { colors, mono } from '../theme'
 import { useSession } from '../useSession'
 
@@ -80,7 +81,7 @@ export function SessionScreen({ connection, onLeave }: { connection: Connection;
         </View>
         {status?.model ? (
           <Text style={styles.chip} numberOfLines={1}>
-            {status.model}
+            {statusModelName(status)}
           </Text>
         ) : null}
         {history && (
