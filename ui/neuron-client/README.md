@@ -5,7 +5,9 @@ built on it. Nothing here runs the agent: the Rust engine does.
 
 - `src/protocol.ts`: the JSON-lines contract, mirrored from
   `rust/crates/neuron-tui/src/protocol.rs`. `test/protocol.test.ts` fails when the Rust enums
-  gain or lose a variant.
+  gain or lose a variant. `parseClientMessage` is the gate for frames from remote peers (a paired
+  phone): every engine command is decided there on purpose, in `PEER_PASSES` or `PEER_REFUSED` in
+  that test, so a new command stays refused until someone says a phone may send it.
 - `src/session.ts`: one reducer from engine events and user actions to a transcript. It covers
   messages, reasoning, tool calls with their state, permission requests tied to their call,
   questions, sign-in and usage.
