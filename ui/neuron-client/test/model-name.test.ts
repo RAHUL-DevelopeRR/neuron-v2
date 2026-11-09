@@ -2,8 +2,9 @@ import { describe, expect, test } from 'bun:test'
 
 import { cleanModelName, distinctModelName, findCatalogModel, sameNameSuffixes } from '../src/copy/model-name'
 
-// The same cases as gateway_catalog.rs's `model_names_leave_out_the_route_to_the_model`
-// and the terminal UI's utils/__tests__/model-name.test.ts: the three must agree.
+// The cases of gateway_catalog.rs's `model_names_leave_out_the_route_to_the_model` and the terminal UI's
+// utils/__tests__/model-name.test.ts, where the three agree. This copy is stricter on purpose (see "stricter
+// than Rust and the terminal UI" below), so two of the cases and one of this file's own differ and say why.
 describe('model names', () => {
   test('leave out the route the gateway takes to the model', () => {
     expect(cleanModelName('cohere/north-mini-code:free', 'North Mini Code (OpenRouter, free)', 'openrouter')).toBe(
@@ -19,8 +20,12 @@ describe('model names', () => {
 
   test('keep a parenthesis about the model itself', () => {
     expect(cleanModelName('x/qwen', 'Qwen3 (32B)', null)).toBe('Qwen3 (32B)')
-    expect(cleanModelName('x/m', 'Model (Preview, Groq)', null)).toBe('Model (Preview, Groq)')
-    expect(cleanModelName('x', '(Groq)', null)).toBe('(Groq)')
+    // Rust and the terminal UI leave a group alone unless all of it is a route ("Model (Preview, Groq)").
+    // The owner's rule is that a provider's name is never shown, so this copy takes the route out of the
+    // group and keeps what is about the model.
+    expect(cleanModelName('x/m', 'Model (Preview, Groq)', null)).toBe('Model (Preview)')
+    // And a name that is only a route has nothing to show: it is the id's last segment (Rust: "(Groq)").
+    expect(cleanModelName('x', '(Groq)', null)).toBe('x')
   })
 
   test('treat the provider the catalog names as a route too', () => {
@@ -73,8 +78,9 @@ describe('model names', () => {
     // A route word inside the name, or before the end, is the model's own.
     expect(cleanModelName('x/m', 'Groq Fast', null)).toBe('Groq Fast')
     expect(cleanModelName('x/m', 'Model (Groq) Turbo', null)).toBe('Model (Groq) Turbo')
-    // An empty part is not a route.
-    expect(cleanModelName('x/m', 'Model (Groq,)', null)).toBe('Model (Groq,)')
+    // An empty part is nothing to keep: what is left of "(Groq,)" is nothing, so the group goes too
+    // (it used to stay, route and all, because the empty part was not a route).
+    expect(cleanModelName('x/m', 'Model (Groq,)', null)).toBe('Model')
   })
 
   test('cleaning a name that is already clean changes nothing', () => {
@@ -89,7 +95,10 @@ describe('model names', () => {
     expect(cleanModelName('   ')).toBe('')
     expect(cleanModelName('x/m', 'Modèle 日本語 🚀 (Groq)', null)).toBe('Modèle 日本語 🚀')
     expect(cleanModelName('x/m', "Robert'); DROP TABLE models;-- (Groq)", null)).toBe("Robert'); DROP TABLE models;--")
-    expect(cleanModelName('x/m', '<b>Bold</b> (Groq)', null)).toBe('<b>Bold</b>')
+    // Markup is text. A name with a `/` in it is an id, not a name (a closing tag has one), so it is the id's
+    // last segment; this copy used to keep it ("<b>Bold</b>").
+    expect(cleanModelName('x/m', '<b>Bold</b> (Groq)', null)).toBe('m')
+    expect(cleanModelName('x/m', '<b>Bold (Groq)', null)).toBe('<b>Bold')
   })
 
   test('numbering handles a large catalog', () => {
@@ -106,6 +115,234 @@ describe('model names', () => {
 
   test('an empty catalog numbers nothing', () => {
     expect(sameNameSuffixes([]).size).toBe(0)
+  })
+})
+
+// The owner's rule is hard: a provider's name is never shown. gateway_catalog.rs and the terminal UI take off
+// only a plain " (Route)" at the end of a name; this copy also takes off the shapes a catalog's names can have
+// beyond that, so none of them reaches the screen. A model's own name is never scrubbed: a maker's name inside
+// it ("NVIDIA Nemotron 3 Ultra") is the model's, and the owner decides that separately.
+describe('model names, stricter than Rust and the terminal UI on purpose', () => {
+  const clean = (name: string, provider: string | null = null) => cleanModelName('x/model', name, provider)
+
+  /** Every shape a route takes after a name, with what a person should read. */
+  const SHAPES: Array<[string, string]> = [
+    // Other brackets, no space before the bracket, and any whitespace before it.
+    ['GPT-OSS 120B [Groq]', 'GPT-OSS 120B'],
+    ['GPT-OSS 120B(Groq)', 'GPT-OSS 120B'],
+    ['GPT-OSS 120B[Groq]', 'GPT-OSS 120B'],
+    ['GPT-OSS 120B\u{a0}(Groq)', 'GPT-OSS 120B'],
+    ['GPT-OSS 120B\t(Groq)', 'GPT-OSS 120B'],
+    ['GPT-OSS 120B\u{a0}[Groq]', 'GPT-OSS 120B'],
+    ['GPT-OSS 120B\u{3000}（Groq）', 'GPT-OSS 120B'],
+    ['GPT-OSS 120B（Groq）', 'GPT-OSS 120B'],
+    ['GPT-OSS 120B (Groq]', 'GPT-OSS 120B'],
+    ['GPT-OSS 120B (Groq)\u{a0}', 'GPT-OSS 120B'],
+    // A group with other things in it keeps them; it goes when nothing is left.
+    ['Model (Preview, Groq)', 'Model (Preview)'],
+    ['Model (Groq, Preview)', 'Model (Preview)'],
+    ['Model (Preview · Groq)', 'Model (Preview)'],
+    ['Model (Preview | Groq)', 'Model (Preview)'],
+    ['Model (a, b, Groq)', 'Model (a, b)'],
+    ['Model [Preview, Groq]', 'Model [Preview]'],
+    ['Model（Preview，Groq）', 'Model（Preview）'],
+    ['Model (Groq) (Preview)', 'Model (Preview)'],
+    ['Model (Preview) [Groq]', 'Model (Preview)'],
+    // A group that stays keeps its own spacing and brackets.
+    ['Model(Preview)(Groq)', 'Model(Preview)'],
+    ['Model  (Preview)  (Groq)', 'Model  (Preview)'],
+    ['Model[Preview] (Groq)', 'Model[Preview]'],
+    ['Model\u{a0}(Preview)\u{a0}(Groq)', 'Model\u{a0}(Preview)'],
+    ['Model (a (Groq))', 'Model (a)'],
+    ['Model (a (Groq) (free))', 'Model (a)'],
+    ['Model ((Groq))', 'Model'],
+    ['Model (Groq, free)', 'Model'],
+    ['Model (Groq,)', 'Model'],
+    ['Model ()', 'Model'],
+    // Spelling variants of a route.
+    ['Model (OpenRouter free)', 'Model'],
+    ['Model (OpenRouter · free)', 'Model'],
+    ['Model (OpenRouter | free)', 'Model'],
+    ['Model (Groq Cloud)', 'Model'],
+    ['Model (Groq Inference)', 'Model'],
+    ['Model (Fireworks API)', 'Model'],
+    ['Model (Together.ai)', 'Model'],
+    ['Model (Together.AI)', 'Model'],
+    ['Model (Workers-AI)', 'Model'],
+    ['Model (Workers_AI)', 'Model'],
+    ['Model (Workers AI)', 'Model'],
+    ['Model (Cloudflare Workers AI)', 'Model'],
+    ['Model (Hugging Face)', 'Model'],
+    ['Model (Google AI Studio)', 'Model'],
+    ['Model (Vertex AI)', 'Model'],
+    ['Model (NVIDIA NIM)', 'Model'],
+    ['Model (Free tier)', 'Model'],
+    ['Model (Hugging Face free)', 'Model'],
+    ['Model (Google AI Studio free)', 'Model'],
+    ['Model (HuggingFace · free)', 'Model'],
+    // Providers the list lacked.
+    ['Model (Bedrock)', 'Model'],
+    ['Model (Novita)', 'Model'],
+    ['Model (Nebius)', 'Model'],
+    ['Model (Ollama)', 'Model'],
+    // Characters that make a word look different without being one.
+    ['Model (Ｇｒｏｑ)', 'Model'],
+    ['Model (Gr\u{200b}oq)', 'Model'],
+    ['Model (Groq)\u{200b}', 'Model'],
+  ]
+
+  /** What is not a route, and so is the model's own: left exactly as it came. */
+  const STAYS: string[] = [
+    'Model (AI)',
+    'Model [AI]',
+    'Model (Preview)',
+    'Model (Cloud)',
+    'Model (API)',
+    'Model (Inference)',
+    'Model (Tier 2)',
+    'Model (Preview · Beta)',
+    'Model (OpenAI)',
+    'Model (Meta)',
+    'Model (Gemini Pro)',
+    'Model (Free Preview)',
+    'Model (Groq Fast)',
+    'Model (Google Gemma)',
+    'Model (Azure Dragon)',
+    'Model (Not Groq)',
+    'NVIDIA Nemotron 3 Ultra',
+    'Google Gemma 3',
+    'Groq Fast',
+    'Free Willy',
+    'Ollama Chat',
+    'Together We Stand',
+    'Azure Dragon',
+    'Model (Groq) Turbo',
+    // Not a clean name tidied: how it came, spacing and all.
+    'Qwen3(32B)',
+    'Model  (Preview)',
+    'Model\u{a0}(Preview)',
+  ]
+
+  test('every shape a route takes after a name is taken off', () => {
+    for (const [name, expected] of SHAPES) expect([name, clean(name)]).toEqual([name, expected])
+  })
+
+  test('every provider, in every bracket, whitespace and case', () => {
+    const providers = [
+      'OpenRouter', 'Groq', 'NVIDIA', 'NIM', 'Workers AI', 'Cloudflare', 'Google', 'Vertex', 'Cerebras', 'Together',
+      'Fireworks', 'DeepInfra', 'SambaNova', 'Hugging Face', 'HuggingFace', 'Azure', 'Zero-X', 'Bedrock', 'Novita',
+      'Nebius', 'Ollama', 'Z.ai', 'Zai', 'Z-ai', 'Together.ai',
+    ]
+    const brackets = [['(', ')'], ['[', ']'], ['（', '）']] as const
+    const gaps = ['', ' ', '  ', '\t', '\u{a0}', '\u{3000}']
+    let tried = 0
+    for (const provider of providers) {
+      for (const form of [provider, provider.toLowerCase(), provider.toUpperCase()]) {
+        for (const [open, close] of brackets) {
+          for (const gap of gaps) {
+            const name = `Model${gap}${open}${form}${close}`
+            expect([name, clean(name)]).toEqual([name, 'Model'])
+            tried++
+          }
+        }
+      }
+    }
+    expect(tried).toBe(providers.length * 3 * brackets.length * gaps.length)
+  })
+
+  test('a provider with free, paid, a tier or the cloud beside it, in one part, is still a route', () => {
+    // Words of one part: `-` and `_` are spaces in a word, and every word is a route word.
+    for (const joiner of [' ', '-', ' - ', '_']) {
+      for (const extra of ['free', 'paid', 'tier', 'Cloud', 'AI', 'Inference', 'API']) {
+        const name = `Model (Groq${joiner}${extra})`
+        expect([name, clean(name)]).toEqual([name, 'Model'])
+      }
+    }
+  })
+
+  test('with a separator each part is judged alone: a route goes, a bare AI, Cloud or Preview stays', () => {
+    for (const separator of [', ', ' · ', ' | ', '，', '|']) {
+      for (const [extra, expected] of [
+        ['free', 'Model'],
+        ['paid', 'Model'],
+        ['Cloud', 'Model (Cloud)'],
+        ['AI', 'Model (AI)'],
+        ['Preview', 'Model (Preview)'],
+      ] as const) {
+        const name = `Model (Groq${separator}${extra})`
+        expect([name, clean(name)]).toEqual([name, expected])
+      }
+    }
+  })
+
+  test('groups inside groups are looked at only so deep, so no name can overflow the stack', () => {
+    const deep = `Model ${'('.repeat(100_000)}Groq${')'.repeat(100_000)}`
+    expect(() => clean(deep)).not.toThrow()
+    expect(clean(deep).startsWith('Model')).toBe(true)
+    // Within reach, a route in a group in a group is off.
+    expect(clean('Model (a (b (c (Groq))))')).toBe('Model (a (b (c)))')
+    // A long name is not slow either.
+    const started = Date.now()
+    clean(`${'word '.repeat(20_000)}(Groq)`)
+    clean(`Model${'(a)'.repeat(2_000)}(Groq)`)
+    expect(Date.now() - started).toBeLessThan(2_000)
+  })
+
+  test('what is not a route is left exactly as it came', () => {
+    for (const name of STAYS) expect([name, clean(name)]).toEqual([name, name])
+  })
+
+  test('a name that is only a route, or only the id, is the last segment of the id, without its tag', () => {
+    const id = 'groq/openai/gpt-oss-120b'
+    for (const name of ['(Groq)', '[Groq]', '（Groq）', 'Groq', 'GROQ', 'Groq (free)', '(Groq) (free)']) {
+      expect([name, cleanModelName(id, name, 'groq')]).toEqual([name, 'gpt-oss-120b'])
+    }
+    expect(cleanModelName('x', '(Groq)', null)).toBe('x')
+    expect(cleanModelName('cohere/north-mini-code:free', '(OpenRouter, free)', 'openrouter')).toBe('north-mini-code')
+    // A name with a slash in it is an id, not a name; so is one that is the id.
+    expect(cleanModelName(id, id)).toBe('gpt-oss-120b')
+    expect(cleanModelName(id, 'Groq/OpenAI/GPT-OSS-120B (Groq)')).toBe('gpt-oss-120b')
+    expect(cleanModelName('openai/gpt-oss-120b', 'openai/gpt-oss-120b')).toBe('gpt-oss-120b')
+    expect(cleanModelName('cohere/north-mini-code:free', 'cohere/north-mini-code:free')).toBe('north-mini-code')
+    expect(cleanModelName('gpt-oss-120b', 'GPT-OSS-120B')).toBe('gpt-oss-120b')
+    expect(cleanModelName('x/m', 'Model/Turbo')).toBe('m')
+    // Nothing to fall back on.
+    expect(cleanModelName('', 'Groq')).toBe('')
+  })
+
+  test("the catalog's provider is a route in any bracket, and only when it is the whole part", () => {
+    expect(clean('Fast [Acme]', 'acme')).toBe('Fast')
+    expect(clean('Fast（Acme）', 'acme')).toBe('Fast')
+    expect(clean('Fast (Acme, free)', 'acme')).toBe('Fast')
+    expect(clean('Fast (Preview, Acme)', 'acme')).toBe('Fast (Preview)')
+    expect(clean('Fast (Workers AI)', 'workers-ai')).toBe('Fast')
+    expect(clean('Fast (Acme Labs)', 'acme')).toBe('Fast (Acme Labs)')
+    expect(clean('Fast (Acme)', null)).toBe('Fast (Acme)')
+    // Inside a group only: a model may be named like the provider that serves it.
+    expect(clean('Acme', 'acme')).toBe('Acme')
+    expect(clean('Acme Fast', 'acme')).toBe('Acme Fast')
+    expect(cleanModelName('acme/m', 'Cerebras', 'cerebras')).toBe('m')
+  })
+
+  test('is idempotent: cleaning what was cleaned changes nothing', () => {
+    const names = [...SHAPES.map(([name]) => name), ...STAYS, 'Llama 3.3 70B (Workers AI)', 'GLM 5.2 (Z.ai)', 'Auto (best available model)']
+    for (const name of names) {
+      const once = cleanModelName('groq/openai/gpt-oss-120b', name, 'groq')
+      expect([name, cleanModelName('groq/openai/gpt-oss-120b', once, 'groq')]).toEqual([name, once])
+    }
+  })
+
+  test('numbers models whose names are the same once every route is off', () => {
+    const catalog = [
+      { id: 'a/m', display_name: 'GPT-OSS 20B [Groq]', provider: null },
+      { id: 'b/m', display_name: 'GPT-OSS 20B（NVIDIA）', provider: null },
+      { id: 'c/m', display_name: 'GPT-OSS 20B (Together.ai)', provider: null },
+      { id: 'd/m', display_name: 'GPT-OSS 20B (Preview, Bedrock)', provider: null },
+    ]
+    expect([...sameNameSuffixes(catalog)]).toEqual([
+      ['b/m', ' (2)'],
+      ['c/m', ' (3)'],
+    ])
   })
 })
 

@@ -7,12 +7,15 @@
  */
 import { afterEach, describe, expect, test } from 'bun:test'
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import fs from 'fs'
+import path from 'path'
 
-import { initialSession, reduceSession, type ModelInfo, type SessionState, type UiEvent } from '@neuron/client'
+import { cleanModelName, initialSession, reduceSession, type ModelInfo, type SessionState, type UiEvent } from '@neuron/client'
 
 import { App } from '../src/App'
 import { StatusBar } from '../src/components/Bars'
 import { ModelPicker } from '../src/components/ModelPicker'
+import { modelLabel, modelRowName } from '../src/modelNames'
 import { FakeEngine, fakePlatform } from './fake-platform'
 
 afterEach(() => {
@@ -24,8 +27,8 @@ afterEach(() => {
   }
 })
 
-/** The words the owner's rule keeps out of the product. */
-const PROVIDER_WORDS = ['groq', 'openrouter', 'nvidia', 'workers ai', 'z.ai', 'free']
+/** The words the owner's rule keeps out of the product ("free" with them: a model is not named by its plan). */
+const PROVIDER_WORDS = ['groq', 'openrouter', 'nvidia', 'workers ai', 'z.ai', 'zai', 'cloudflare', 'together', 'bedrock', 'novita', 'nebius', 'free']
 /** Which of them `text` has, so a failure says which. */
 const providerWordsIn = (text: string | null | undefined) => PROVIDER_WORDS.filter((word) => (text ?? '').toLowerCase().includes(word))
 
@@ -222,6 +225,28 @@ describe('the model picker names models without their route', () => {
     const { list } = openPicker(CATALOG, { onPick: (id) => picked.push(id) })
     fireEvent.click(within(list).getByRole('option', { name: /North Mini Code/ }))
     expect(picked).toEqual(['openrouter/cohere/north-mini-code:free'])
+  })
+
+  test('a route in any bracket, with or without a space, in a group with more, or from a provider the plain rule lacked, is off too', () => {
+    const odd = [
+      entry('a/llama', 'Llama 3 70B [Bedrock]', 'bedrock'),
+      entry('b/mixtral', 'Mixtral 8x7B（Novita）', 'novita'),
+      entry('c/qwen', 'Qwen3 235B (Preview, Nebius)', 'nebius'),
+      entry('d/phi', 'Phi-4(Ollama)', 'ollama'),
+      entry('e/glm', 'GLM 5.2\u{a0}[Z.ai]', 'zhipu'),
+      entry('f/kimi', 'Kimi K2 (Together.ai)', 'together'),
+      // Nothing left of a name that is only a route: the id's last segment.
+      entry('g/only', '(Groq)', 'groq'),
+    ]
+    const { names, list, chip } = openPicker(odd)
+    expect(names).toEqual(['Llama 3 70B', 'Mixtral 8x7B', 'Qwen3 235B (Preview)', 'Phi-4', 'GLM 5.2', 'Kimi K2', 'only'])
+    expect(providerWordsIn(list.textContent)).toEqual([])
+    expect(providerWordsIn(chip.textContent)).toEqual([])
+    cleanup()
+    // And the status bar, for an engine that still sends the catalog's own name.
+    expect(statusBar(odd, { model: 'a/llama', model_display_name: 'Llama 3 70B [Bedrock]' }).model).toBe('Llama 3 70B')
+    cleanup()
+    expect(statusBar(odd, { model: 'auto', served_model: 'b/mixtral' }).served).toBe('answered by Mixtral 8x7B')
   })
 
   test('two rows with one name are told apart by a number, and not by the route', () => {
@@ -448,5 +473,80 @@ describe('the desktop app names models without their route', () => {
     fireEvent.click(within(sidebar()).getByRole('button', { name: 'Settings' }))
     fireEvent.click(screen.getByRole('button', { name: 'Sessions' }))
     expect([...document.querySelectorAll('#model-ids option')].map((option) => option.textContent)).toEqual(['GPT-OSS 20B', 'GPT-OSS 20B (2)'])
+  })
+})
+
+// The names the Rust gateway catalog's own tests use (read only, never changed from here): the catalog entries
+// the tests parse, and the names its `clean_model_name` test feeds in. Whatever route they carry, the owner's
+// rule holds for every surface that names a model, so none of them may show a provider.
+describe('the names in the Rust gateway catalog tests never reach the screen with a provider in them', () => {
+  const RUST_CATALOG = path.resolve(import.meta.dir, '../../../rust/crates/rusty-claude-cli/src/gateway_catalog.rs')
+  interface RustName {
+    id: string
+    name: string
+    provider: string | null
+  }
+
+  function rustNames(): RustName[] {
+    const source = fs.readFileSync(RUST_CATALOG, 'utf8')
+    const found: RustName[] = []
+    // The one-line entries of the catalogs the tests parse: {"id": "...", ..., "display_name": "...", "owned_by": "..."}.
+    for (const line of source.split(/\r?\n/)) {
+      const name = /"display_name"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(line)?.[1]
+      if (name === undefined) continue
+      found.push({
+        id: /"id"\s*:\s*"([^"]*)"/.exec(line)?.[1] ?? 'x/model',
+        name,
+        provider: /"(?:owned_by|provider)"\s*:\s*"([^"]*)"/.exec(line)?.[1] ?? null,
+      })
+    }
+    // The calls of the naming test: name("id", Some("display name"), Some("provider") or None).
+    const call = /\bname\(\s*"([^"]*)"\s*,\s*Some\(\s*"((?:[^"\\]|\\.)*)"\s*\)\s*,\s*(?:Some\(\s*"([^"]*)"\s*\)|None)\s*\)/g
+    for (const match of source.matchAll(call)) found.push({ id: match[1]!, name: match[2]!, provider: match[3] ?? null })
+    return found
+  }
+
+  /** The words of the rule in `text`. NVIDIA counts only as a bracketed route: a maker's name in a model's own name stays. */
+  const leaks = (text: string) => [
+    ...['groq', 'openrouter', 'workers ai', 'z.ai', 'zai', 'cloudflare', 'together', 'bedrock', 'novita', 'nebius'].filter((word) =>
+      text.toLowerCase().includes(word),
+    ),
+    ...(/[(\[（][^)\]）]*nvidia/i.test(text) ? ['nvidia (bracketed)'] : []),
+  ]
+
+  test('the names were found, so the check below is not empty', () => {
+    const names = rustNames().map((found) => found.name)
+    expect(names.length).toBeGreaterThanOrEqual(12)
+    for (const known of [
+      'GPT-OSS 120B (Groq)',
+      'North Mini Code (OpenRouter, free)',
+      'Llama 3.3 70B (Workers AI)',
+      'Step 5 Preview (NVIDIA)',
+      'Model (Preview, Groq)',
+      '(Groq)',
+    ]) {
+      expect(names).toContain(known)
+    }
+  })
+
+  test('cleanModelName, modelRowName and modelLabel show none of them, from the catalog or from an engine that sends the raw name', () => {
+    for (const { id, name, provider } of rustNames()) {
+      const model = entry(id, name, provider)
+      const shown = {
+        cleanModelName: cleanModelName(id, name, provider),
+        modelRowName: modelRowName([model], model),
+        'modelLabel (catalog)': modelLabel(id, [model]),
+        'modelLabel (engine name)': modelLabel(id, [], { name, provider }),
+      }
+      for (const [how, text] of Object.entries(shown)) expect([name, how, leaks(text)]).toEqual([name, how, []])
+    }
+  })
+
+  test('the checker finds a route when there is one, so a pass means something', () => {
+    expect(leaks('GPT-OSS 120B (Groq)')).toEqual(['groq'])
+    expect(leaks('Step 5 Preview (NVIDIA)')).toEqual(['nvidia (bracketed)'])
+    expect(leaks('Step 5 Preview [NVIDIA, free]')).toEqual(['nvidia (bracketed)'])
+    expect(leaks('NVIDIA Nemotron 3 Ultra')).toEqual([])
+    expect(leaks('Model (Together.ai)')).toEqual(['together'])
   })
 })
