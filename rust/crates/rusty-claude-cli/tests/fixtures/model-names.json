@@ -1,0 +1,303 @@
+{
+  "$comment": [
+    "What a person reads for a catalog model: cleanModelName(id, display_name, provider), without the route the gateway takes to it.",
+    "Neuron never shows the provider a model is routed through (Groq, OpenRouter, NVIDIA, Z.ai, ...), so every copy of the cleaner has to give these answers:",
+    "  ui/neuron-client/src/copy/model-name.ts           (the shared client: desktop and mobile)",
+    "  ui/neuron-tui/src/utils/model-name.ts             (the full-screen terminal UI)",
+    "  rust/crates/rusty-claude-cli/src/gateway_catalog.rs  (clean_model_name: the engine's own notices, status and JSON output)",
+    "Each one's tests read this file, so they cannot drift apart. Change a rule here and in all three.",
+    "",
+    "sections[].cases: [id, display_name, provider, expected]. null is 'not given'; an empty string is given and empty.",
+    "providerShapes: for every provider P, every form of it (P, P in lower case, P in upper case), every bracket and every gap,",
+    "  the name is 'Model' + gap + open + form + close, and what is read is 'Model'.",
+    "joinedRoutes: the name is 'Model (Groq' + joiner + extra + ')'; one part, so every word of it is a route word, and what is read is 'Model'.",
+    "separatedRoutes: the name is 'Model (Groq' + separator + extra + ')'; two parts, each judged alone: [extra, what is read].",
+    "All of them are cleaned with id 'x/model' and no provider, unless a case says otherwise."
+  ],
+  "sections": [
+    {
+      "name": "the route the gateway takes to the model is left out",
+      "cases": [
+        ["cohere/north-mini-code:free", "North Mini Code (OpenRouter, free)", "openrouter", "North Mini Code"],
+        ["groq/openai/gpt-oss-120b", "GPT-OSS 120B (Groq)", "groq", "GPT-OSS 120B"],
+        ["@cf/meta/llama-3.3-70b-instruct-fp8-fast", "Llama 3.3 70B (Workers AI)", "cloudflare", "Llama 3.3 70B"],
+        ["nvidia/stepfun-ai/step-5-preview", "Step 5 Preview (NVIDIA)", null, "Step 5 Preview"],
+        ["gemini/gemini-2.5-flash", "Gemini 2.5 Flash", "gemini", "Gemini 2.5 Flash"]
+      ]
+    },
+    {
+      "name": "a parenthesis about the model itself stays, and the route in a group that holds more goes",
+      "cases": [
+        ["x/qwen", "Qwen3 (32B)", null, "Qwen3 (32B)"],
+        ["x/m", "Model (Preview, Groq)", null, "Model (Preview)"],
+        ["x", "(Groq)", null, "x"]
+      ]
+    },
+    {
+      "name": "the provider the catalog names is a route too",
+      "cases": [
+        ["x/m", "Fast (Acme)", "acme", "Fast"]
+      ]
+    },
+    {
+      "name": "auto is Auto, whatever its catalog entry says",
+      "cases": [
+        ["auto", "Auto (best available model)", "zero-x", "Auto"],
+        ["openai/auto", null, null, "Auto"],
+        ["  AUTO  ", "whatever", null, "Auto"]
+      ]
+    },
+    {
+      "name": "without a display name, the model part of the id",
+      "cases": [
+        ["openai/cohere/north-mini-code:free", null, null, "north-mini-code"],
+        ["claude-sonnet-4-6", null, null, "claude-sonnet-4-6"],
+        ["x", "  ", null, "x"],
+        ["x", null, "groq", "x"],
+        ["groq/openai/gpt-oss-120b", null, "groq", "gpt-oss-120b"]
+      ]
+    },
+    {
+      "name": "every trailing route is taken off, whatever its case, and nothing else",
+      "cases": [
+        ["x/m", "Model (Groq) (free)", null, "Model"],
+        ["x/m", "Model (Preview) (Groq)", null, "Model (Preview)"],
+        ["x/m", "Model (GROQ)", null, "Model"],
+        ["x/m", "Model (OpenRouter , Free)", null, "Model"],
+        ["x/m", "  Model   (Workers AI)  ", null, "Model"],
+        ["x/m", "Groq Fast", null, "Groq Fast"],
+        ["x/m", "Model (Groq) Turbo", null, "Model (Groq) Turbo"],
+        ["x/m", "Model (Groq,)", null, "Model"]
+      ]
+    },
+    {
+      "name": "a name that is already clean comes back as it came",
+      "cases": [
+        ["x/m", "GPT-OSS 120B", "groq", "GPT-OSS 120B"],
+        ["x/m", "North Mini Code", "groq", "North Mini Code"],
+        ["x/m", "Llama 3.3 70B", "groq", "Llama 3.3 70B"],
+        ["x/m", "Qwen3 (32B)", "groq", "Qwen3 (32B)"],
+        ["x/m", "Auto", "groq", "Auto"]
+      ]
+    },
+    {
+      "name": "blank ids and names with special characters",
+      "cases": [
+        ["", null, null, ""],
+        ["   ", null, null, ""],
+        ["x/m", "Modèle 日本語 🚀 (Groq)", null, "Modèle 日本語 🚀"],
+        ["x/m", "Robert'); DROP TABLE models;-- (Groq)", null, "Robert'); DROP TABLE models;--"],
+        ["x/m", "<b>Bold</b> (Groq)", null, "m"],
+        ["x/m", "<b>Bold (Groq)", null, "<b>Bold"]
+      ]
+    },
+    {
+      "name": "every shape a route takes after a name is taken off",
+      "cases": [
+        ["x/model", "GPT-OSS 120B [Groq]", null, "GPT-OSS 120B"],
+        ["x/model", "GPT-OSS 120B(Groq)", null, "GPT-OSS 120B"],
+        ["x/model", "GPT-OSS 120B[Groq]", null, "GPT-OSS 120B"],
+        ["x/model", "GPT-OSS 120B (Groq)", null, "GPT-OSS 120B"],
+        ["x/model", "GPT-OSS 120B\t(Groq)", null, "GPT-OSS 120B"],
+        ["x/model", "GPT-OSS 120B [Groq]", null, "GPT-OSS 120B"],
+        ["x/model", "GPT-OSS 120B　（Groq）", null, "GPT-OSS 120B"],
+        ["x/model", "GPT-OSS 120B（Groq）", null, "GPT-OSS 120B"],
+        ["x/model", "GPT-OSS 120B (Groq]", null, "GPT-OSS 120B"],
+        ["x/model", "GPT-OSS 120B (Groq) ", null, "GPT-OSS 120B"],
+        ["x/model", "Model (Preview, Groq)", null, "Model (Preview)"],
+        ["x/model", "Model (Groq, Preview)", null, "Model (Preview)"],
+        ["x/model", "Model (Preview · Groq)", null, "Model (Preview)"],
+        ["x/model", "Model (Preview | Groq)", null, "Model (Preview)"],
+        ["x/model", "Model (a, b, Groq)", null, "Model (a, b)"],
+        ["x/model", "Model [Preview, Groq]", null, "Model [Preview]"],
+        ["x/model", "Model（Preview，Groq）", null, "Model（Preview）"],
+        ["x/model", "Model (Groq) (Preview)", null, "Model (Preview)"],
+        ["x/model", "Model (Preview) [Groq]", null, "Model (Preview)"],
+        ["x/model", "Model(Preview)(Groq)", null, "Model(Preview)"],
+        ["x/model", "Model  (Preview)  (Groq)", null, "Model  (Preview)"],
+        ["x/model", "Model[Preview] (Groq)", null, "Model[Preview]"],
+        ["x/model", "Model (Preview) (Groq)", null, "Model (Preview)"],
+        ["x/model", "Model (a (Groq))", null, "Model (a)"],
+        ["x/model", "Model (a (Groq) (free))", null, "Model (a)"],
+        ["x/model", "Model (a (b (c (Groq))))", null, "Model (a (b (c)))"],
+        ["x/model", "Model ((Groq))", null, "Model"],
+        ["x/model", "Model (Groq, free)", null, "Model"],
+        ["x/model", "Model (Groq,)", null, "Model"],
+        ["x/model", "Model ()", null, "Model"],
+        ["x/model", "Model (OpenRouter free)", null, "Model"],
+        ["x/model", "Model (OpenRouter · free)", null, "Model"],
+        ["x/model", "Model (OpenRouter | free)", null, "Model"],
+        ["x/model", "Model (Groq Cloud)", null, "Model"],
+        ["x/model", "Model (Groq Inference)", null, "Model"],
+        ["x/model", "Model (Fireworks API)", null, "Model"],
+        ["x/model", "Model (Together.ai)", null, "Model"],
+        ["x/model", "Model (Together.AI)", null, "Model"],
+        ["x/model", "Model (Workers-AI)", null, "Model"],
+        ["x/model", "Model (Workers_AI)", null, "Model"],
+        ["x/model", "Model (Workers AI)", null, "Model"],
+        ["x/model", "Model (Cloudflare Workers AI)", null, "Model"],
+        ["x/model", "Model (Hugging Face)", null, "Model"],
+        ["x/model", "Model (Google AI Studio)", null, "Model"],
+        ["x/model", "Model (Vertex AI)", null, "Model"],
+        ["x/model", "Model (NVIDIA NIM)", null, "Model"],
+        ["x/model", "Model (Free tier)", null, "Model"],
+        ["x/model", "Model (Hugging Face free)", null, "Model"],
+        ["x/model", "Model (Google AI Studio free)", null, "Model"],
+        ["x/model", "Model (HuggingFace · free)", null, "Model"],
+        ["x/model", "Model (Bedrock)", null, "Model"],
+        ["x/model", "Model (Novita)", null, "Model"],
+        ["x/model", "Model (Nebius)", null, "Model"],
+        ["x/model", "Model (Ollama)", null, "Model"],
+        ["x/model", "Model (Ｇｒｏｑ)", null, "Model"],
+        ["x/model", "Model (Gr​oq)", null, "Model"],
+        ["x/model", "Model (Groq)​", null, "Model"]
+      ]
+    },
+    {
+      "name": "what is not a route is the model's own and is left exactly as it came",
+      "cases": [
+        ["x/model", "Model (AI)", null, "Model (AI)"],
+        ["x/model", "Model [AI]", null, "Model [AI]"],
+        ["x/model", "Model (Preview)", null, "Model (Preview)"],
+        ["x/model", "Model (Cloud)", null, "Model (Cloud)"],
+        ["x/model", "Model (API)", null, "Model (API)"],
+        ["x/model", "Model (Inference)", null, "Model (Inference)"],
+        ["x/model", "Model (Tier 2)", null, "Model (Tier 2)"],
+        ["x/model", "Model (Preview · Beta)", null, "Model (Preview · Beta)"],
+        ["x/model", "Model (OpenAI)", null, "Model (OpenAI)"],
+        ["x/model", "Model (Meta)", null, "Model (Meta)"],
+        ["x/model", "Model (Gemini Pro)", null, "Model (Gemini Pro)"],
+        ["x/model", "Model (Free Preview)", null, "Model (Free Preview)"],
+        ["x/model", "Model (Groq Fast)", null, "Model (Groq Fast)"],
+        ["x/model", "Model (Google Gemma)", null, "Model (Google Gemma)"],
+        ["x/model", "Model (Azure Dragon)", null, "Model (Azure Dragon)"],
+        ["x/model", "Model (Not Groq)", null, "Model (Not Groq)"],
+        ["x/model", "NVIDIA Nemotron 3 Ultra", null, "NVIDIA Nemotron 3 Ultra"],
+        ["x/model", "Google Gemma 3", null, "Google Gemma 3"],
+        ["x/model", "Groq Fast", null, "Groq Fast"],
+        ["x/model", "Free Willy", null, "Free Willy"],
+        ["x/model", "Ollama Chat", null, "Ollama Chat"],
+        ["x/model", "Together We Stand", null, "Together We Stand"],
+        ["x/model", "Azure Dragon", null, "Azure Dragon"],
+        ["x/model", "Model (Groq) Turbo", null, "Model (Groq) Turbo"],
+        ["x/model", "Qwen3(32B)", null, "Qwen3(32B)"],
+        ["x/model", "Model  (Preview)", null, "Model  (Preview)"],
+        ["x/model", "Model (Preview)", null, "Model (Preview)"]
+      ]
+    },
+    {
+      "name": "a name that is only a route, or only the id, is the last segment of the id, without its tag",
+      "cases": [
+        ["groq/openai/gpt-oss-120b", "(Groq)", "groq", "gpt-oss-120b"],
+        ["groq/openai/gpt-oss-120b", "[Groq]", "groq", "gpt-oss-120b"],
+        ["groq/openai/gpt-oss-120b", "（Groq）", "groq", "gpt-oss-120b"],
+        ["groq/openai/gpt-oss-120b", "Groq", "groq", "gpt-oss-120b"],
+        ["groq/openai/gpt-oss-120b", "GROQ", "groq", "gpt-oss-120b"],
+        ["groq/openai/gpt-oss-120b", "Groq (free)", "groq", "gpt-oss-120b"],
+        ["groq/openai/gpt-oss-120b", "(Groq) (free)", "groq", "gpt-oss-120b"],
+        ["x", "(Groq)", null, "x"],
+        ["cohere/north-mini-code:free", "(OpenRouter, free)", "openrouter", "north-mini-code"],
+        ["groq/openai/gpt-oss-120b", "groq/openai/gpt-oss-120b", null, "gpt-oss-120b"],
+        ["groq/openai/gpt-oss-120b", "Groq/OpenAI/GPT-OSS-120B (Groq)", null, "gpt-oss-120b"],
+        ["openai/gpt-oss-120b", "openai/gpt-oss-120b", null, "gpt-oss-120b"],
+        ["cohere/north-mini-code:free", "cohere/north-mini-code:free", null, "north-mini-code"],
+        ["gpt-oss-120b", "GPT-OSS-120B", null, "gpt-oss-120b"],
+        ["x/m", "Model/Turbo", null, "m"],
+        ["", "Groq", null, ""]
+      ]
+    },
+    {
+      "name": "the catalog's provider is a route in any bracket, and only when it is the whole part",
+      "cases": [
+        ["x/model", "Fast [Acme]", "acme", "Fast"],
+        ["x/model", "Fast（Acme）", "acme", "Fast"],
+        ["x/model", "Fast (Acme, free)", "acme", "Fast"],
+        ["x/model", "Fast (Preview, Acme)", "acme", "Fast (Preview)"],
+        ["x/model", "Fast (Workers AI)", "workers-ai", "Fast"],
+        ["x/model", "Fast (Acme Labs)", "acme", "Fast (Acme Labs)"],
+        ["x/model", "Fast (Acme)", null, "Fast (Acme)"],
+        ["x/model", "Fast (Acme)", "", "Fast (Acme)"],
+        ["x/model", "Acme", "acme", "Acme"],
+        ["x/model", "Acme Fast", "acme", "Acme Fast"],
+        ["acme/m", "Cerebras", "cerebras", "m"]
+      ]
+    },
+    {
+      "name": "Z.ai is a route, whatever the catalog says the provider is",
+      "cases": [
+        ["z-ai/glm-5.2", "GLM 5.2 (Z.ai)", null, "GLM 5.2"],
+        ["z-ai/glm-5.2", "GLM 5.2 (Z.ai)", "", "GLM 5.2"],
+        ["z-ai/glm-5.2", "GLM 5.2 (Z.ai)", "z.ai", "GLM 5.2"],
+        ["z-ai/glm-5.2", "GLM 5.2 (Z.ai)", "zai", "GLM 5.2"],
+        ["z-ai/glm-5.2", "GLM 5.2 (Z.ai)", "z-ai", "GLM 5.2"],
+        ["z-ai/glm-5.2", "GLM 5.2 (Z.ai)", "zhipu", "GLM 5.2"],
+        ["z-ai/glm-5.2", "GLM 5.2 (Z.ai)", "openrouter", "GLM 5.2"],
+        ["z-ai/glm-5.2", "GLM 5.2 (Z.ai)", "acme", "GLM 5.2"],
+        ["x/m", "GLM 5.2 (Z.ai)", null, "GLM 5.2"],
+        ["x/m", "GLM 5.2 (z.ai)", null, "GLM 5.2"],
+        ["x/m", "GLM 5.2 (Z.AI)", null, "GLM 5.2"],
+        ["x/m", "GLM 5.2 (zai)", null, "GLM 5.2"],
+        ["x/m", "GLM 5.2 (Zai)", null, "GLM 5.2"],
+        ["x/m", "GLM 5.2 (ZAI)", null, "GLM 5.2"],
+        ["x/m", "GLM 5.2 (z-ai)", null, "GLM 5.2"],
+        ["x/m", "GLM 5.2 (Z-AI)", null, "GLM 5.2"],
+        ["x/m", "GLM 4.7 Flash (Z.ai, free)", null, "GLM 4.7 Flash"],
+        ["x/m", "GLM 4.7 Flash (OpenRouter, Z.ai)", null, "GLM 4.7 Flash"],
+        ["x/m", "GLM 4.7 Flash (Z.ai) (free)", null, "GLM 4.7 Flash"],
+        ["x/m", "GLM 4.7 Flash (free) (Z.ai)", null, "GLM 4.7 Flash"],
+        ["z-ai/glm-5.2", "(Z.ai)", "zai", "glm-5.2"]
+      ]
+    },
+    {
+      "name": "a model whose own name merely has the letters of Z.ai in it is left alone",
+      "cases": [
+        ["x/m", "Zaire 7B", null, "Zaire 7B"],
+        ["x/m", "Mazai Chat", null, "Mazai Chat"],
+        ["x/m", "Gonzaiz Pro", null, "Gonzaiz Pro"],
+        ["x/m", "Zaidoo (Preview)", null, "Zaidoo (Preview)"],
+        ["x/m", "Lazai Pro (32B)", null, "Lazai Pro (32B)"],
+        ["x/m", "Model (Zaire)", null, "Model (Zaire)"],
+        ["x/m", "Model (Zaitech)", null, "Model (Zaitech)"],
+        ["x/m", "Model (Z.ai Labs)", null, "Model (Z.ai Labs)"],
+        ["x/m", "Model (Zai Labs)", null, "Model (Zai Labs)"],
+        ["x/m", "Model (not-zai)", null, "Model (not-zai)"],
+        ["x/m", "Z.ai Model", null, "Z.ai Model"],
+        ["x/m", "Zai Model", null, "Zai Model"],
+        ["x/m", "Zaire 7B", "zai", "Zaire 7B"],
+        ["x/m", "Mazai Chat", "zai", "Mazai Chat"],
+        ["x/m", "Gonzaiz Pro", "zai", "Gonzaiz Pro"],
+        ["x/m", "Zaidoo (Preview)", "zai", "Zaidoo (Preview)"],
+        ["x/m", "Lazai Pro (32B)", "zai", "Lazai Pro (32B)"],
+        ["x/m", "Model (Zaire)", "zai", "Model (Zaire)"],
+        ["x/m", "Model (Zaitech)", "zai", "Model (Zaitech)"],
+        ["x/m", "Model (Z.ai Labs)", "zai", "Model (Z.ai Labs)"],
+        ["x/m", "Model (Zai Labs)", "zai", "Model (Zai Labs)"],
+        ["x/m", "Model (not-zai)", "zai", "Model (not-zai)"],
+        ["x/m", "Z.ai Model", "zai", "Z.ai Model"],
+        ["x/m", "Zai Model", "zai", "Zai Model"],
+        ["acme/zai-large", null, null, "zai-large"],
+        ["openrouter/z-ai/glm-4.7-flash:free", null, null, "glm-4.7-flash"]
+      ]
+    }
+  ],
+  "providerShapes": {
+    "providers": [
+      "OpenRouter", "Groq", "NVIDIA", "NIM", "Workers AI", "Cloudflare", "Google", "Vertex", "Cerebras", "Together",
+      "Fireworks", "DeepInfra", "SambaNova", "Hugging Face", "HuggingFace", "Azure", "Zero-X", "Bedrock", "Novita",
+      "Nebius", "Ollama", "Z.ai", "Zai", "Z-ai", "Together.ai"
+    ],
+    "brackets": [["(", ")"], ["[", "]"], ["（", "）"]],
+    "gaps": ["", " ", "  ", "\t", " ", "　"],
+    "prefix": "Model",
+    "expected": "Model"
+  },
+  "joinedRoutes": {
+    "joiners": [" ", "-", " - ", "_"],
+    "extras": ["free", "paid", "tier", "Cloud", "AI", "Inference", "API"],
+    "expected": "Model"
+  },
+  "separatedRoutes": {
+    "separators": [", ", " · ", " | ", "，", "|"],
+    "extras": [["free", "Model"], ["paid", "Model"], ["Cloud", "Model (Cloud)"], ["AI", "Model (AI)"], ["Preview", "Model (Preview)"]]
+  }
+}
