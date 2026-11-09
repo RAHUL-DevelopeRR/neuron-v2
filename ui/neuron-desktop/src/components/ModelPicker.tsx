@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 
-import type { ModelInfo } from '@neuron/client'
+import { findCatalogModel, type ModelInfo } from '@neuron/client'
 
 import { modelLabel, modelRowName } from '../modelNames'
 
@@ -50,6 +50,9 @@ export function ModelPicker({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openSignal])
   const shown = modelLabel(current, models, { name: currentName, provider: currentProvider })
+  // The engine's id for the model is not always the catalog's: it strips `openai/`, and a saved session or
+  // setting can hold a route id. Each still finds its family's row.
+  const currentId = findCatalogModel(models, current)?.id
 
   return (
     <div className="model-picker" ref={box}>
@@ -77,8 +80,8 @@ export function ModelPicker({
               <button
                 key={model.id}
                 role="option"
-                aria-selected={model.id === current}
-                className={`menu-item${model.id === current ? ' current' : ''}`}
+                aria-selected={model.id === currentId}
+                className={`menu-item${model.id === currentId ? ' current' : ''}`}
                 disabled={unusable}
                 onClick={() => {
                   onPick(model.id)

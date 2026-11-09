@@ -262,6 +262,66 @@ describe('the model picker names models without their route', () => {
   })
 })
 
+describe('the model picker marks the model the engine is on', () => {
+  // The gateway lists families (`openai/gpt-oss-120b`); the engine asks with the id `openai/` stripped
+  // (`gpt-oss-120b`), and a saved session or setting can hold a route id (`groq/openai/gpt-oss-120b`).
+  const families = [
+    entry('openai/gpt-oss-120b', 'GPT-OSS 120B (Groq)', 'groq'),
+    entry('openai/gpt-oss-20b', 'GPT-OSS 20B (Groq)', 'groq'),
+    entry('cohere/north-mini-code', 'North Mini Code (OpenRouter, free)', 'openrouter'),
+  ]
+
+  /** The rows marked as current. `aria-selected` and the `current` class must always say the same. */
+  function marked(list: HTMLElement): string[] {
+    const rows = within(list).getAllByRole('option')
+    for (const row of rows) expect(row.classList.contains('current')).toBe(row.getAttribute('aria-selected') === 'true')
+    return rows.filter((row) => row.getAttribute('aria-selected') === 'true').map((row) => row.querySelector('span')?.textContent ?? '')
+  }
+  const markedFor = (current: string, models: ModelInfo[] = families) => marked(openPicker(models, { current }).list)
+
+  test("by the catalog's own id, as before", () => {
+    expect(markedFor('openai/gpt-oss-120b')).toEqual(['GPT-OSS 120B'])
+    cleanup()
+    expect(markedFor('cohere/north-mini-code')).toEqual(['North Mini Code'])
+  })
+
+  test('by the id the engine asks with, `openai/` stripped', () => {
+    expect(markedFor('gpt-oss-120b')).toEqual(['GPT-OSS 120B'])
+    cleanup()
+    expect(markedFor('gpt-oss-20b')).toEqual(['GPT-OSS 20B'])
+  })
+
+  test('by a route id, which names the family it serves', () => {
+    for (const [current, name] of [
+      ['groq/openai/gpt-oss-120b', 'GPT-OSS 120B'],
+      ['workers-ai/openai/gpt-oss-20b', 'GPT-OSS 20B'],
+      ['openrouter/cohere/north-mini-code:free', 'North Mini Code'],
+    ]) {
+      cleanup()
+      expect(markedFor(current!)).toEqual([name!])
+    }
+  })
+
+  test('whatever the case of the id', () => {
+    expect(markedFor('GPT-OSS-120B')).toEqual(['GPT-OSS 120B'])
+  })
+
+  test('one row, even when two rows have one name', () => {
+    const twins = [entry('groq/openai/gpt-oss-20b', 'GPT-OSS 20B (Groq)', 'groq'), entry('nvidia/openai/gpt-oss-20b', 'GPT-OSS 20B (NVIDIA)', 'nvidia')]
+    expect(markedFor('nvidia/openai/gpt-oss-20b', twins)).toEqual(['GPT-OSS 20B (2)'])
+    cleanup()
+    expect(markedFor('groq/openai/gpt-oss-20b', twins)).toEqual(['GPT-OSS 20B'])
+  })
+
+  test('no row, when the catalog does not have the model or the engine has not named one', () => {
+    expect(markedFor('acme/made-up-model')).toEqual([])
+    cleanup()
+    expect(markedFor('groq/openai/gpt-oss-1200b')).toEqual([])
+    cleanup()
+    expect(markedFor('')).toEqual([])
+  })
+})
+
 describe('the desktop app names models without their route', () => {
   async function start(statusOverrides: Record<string, unknown> = {}) {
     const engine = new FakeEngine(statusOverrides)
@@ -285,6 +345,20 @@ describe('the desktop app names models without their route', () => {
     await start({ model: 'acme/fast', model_display_name: 'Fast (Acme)', provider: 'acme' })
     expect(screen.getByTitle('Switch model').textContent).toBe('Fast')
     expect(document.querySelector('.model-tag')?.textContent).toBe('Fast')
+  })
+
+  test('the picker marks the family of the id the engine reports, which has no `openai/` in it', async () => {
+    const engine = await start({ model: 'gpt-oss-120b' })
+    fireEvent.click(screen.getByTitle('Switch model'))
+    await emit(
+      engine,
+      modelsEvent([entry('openai/gpt-oss-120b', 'GPT-OSS 120B (Groq)', 'groq'), entry('openai/gpt-oss-20b', 'GPT-OSS 20B (Groq)', 'groq')], 'gpt-oss-120b'),
+    )
+    const rows = within(screen.getByRole('listbox', { name: 'Models' })).getAllByRole('option')
+    expect(rows.map((row) => [row.querySelector('span')?.textContent, row.getAttribute('aria-selected')])).toEqual([
+      ['GPT-OSS 120B', 'true'],
+      ['GPT-OSS 20B', 'false'],
+    ])
   })
 
   test('the picker, once the catalog arrives, and the chip agree', async () => {
