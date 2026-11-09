@@ -1,10 +1,10 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, expectTypeOf, test } from 'bun:test'
 
 import { cleanModelName, distinctModelName, findCatalogModel, sameNameSuffixes } from '../src/copy/model-name'
 
 // The cases of gateway_catalog.rs's `model_names_leave_out_the_route_to_the_model` and the terminal UI's
 // utils/__tests__/model-name.test.ts, where the three agree. This copy is stricter on purpose (see "stricter
-// than Rust and the terminal UI" below), so two of the cases and one of this file's own differ and say why.
+// than Rust and the terminal UI" below), so two of those cases and two of this file's own differ and say why.
 describe('model names', () => {
   test('leave out the route the gateway takes to the model', () => {
     expect(cleanModelName('cohere/north-mini-code:free', 'North Mini Code (OpenRouter, free)', 'openrouter')).toBe(
@@ -115,6 +115,12 @@ describe('model names', () => {
 
   test('an empty catalog numbers nothing', () => {
     expect(sameNameSuffixes([]).size).toBe(0)
+  })
+
+  test("hands out a catalog's numbering to read, not to change: it is kept and shared by every caller", () => {
+    // A compile-time check (`bun run typecheck`): a caller that could `.set` or `.delete` on it would change
+    // what every other caller of the same catalog reads.
+    expectTypeOf(sameNameSuffixes([])).toEqualTypeOf<ReadonlyMap<string, string>>()
   })
 })
 

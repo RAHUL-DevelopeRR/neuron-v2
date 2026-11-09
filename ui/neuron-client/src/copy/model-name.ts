@@ -308,16 +308,17 @@ export function cleanModelName(id: string, displayName?: string | null, provider
 
 type NamedModel = Pick<ModelInfo, 'id' | 'display_name' | 'provider'>
 
-const suffixCache = new WeakMap<ReadonlyArray<NamedModel>, Map<string, string>>()
+const suffixCache = new WeakMap<ReadonlyArray<NamedModel>, ReadonlyMap<string, string>>()
 
 /**
  * What tells a catalog's models apart when their names are the same without
  * the route ("GPT-OSS 20B (Groq)" and "GPT-OSS 20B (NVIDIA)" are both
  * "GPT-OSS 20B"): nothing for the first in catalog order, then " (2)",
  * " (3)", ..., which do not name the route either. By catalog id; a model
- * whose name no earlier one has is left out.
+ * whose name no earlier one has is left out. It is kept for the catalog and
+ * shared by every caller, so it is read-only.
  */
-export function sameNameSuffixes(models: ReadonlyArray<NamedModel>): Map<string, string> {
+export function sameNameSuffixes(models: ReadonlyArray<NamedModel>): ReadonlyMap<string, string> {
   const cached = suffixCache.get(models)
   if (cached) return cached
   const seen = new Map<string, number>()
