@@ -205,7 +205,7 @@ describe('NeuronHost', () => {
     expect(call && call.kind === 'tool' && call.state).toBe('denied')
   })
 
-  test('remote clients cannot shut the engine down', async () => {
+  test('a peer cannot send the shutdown command', async () => {
     await startHost()
     const { transport } = await attach('mobile')
     const errors: string[] = []

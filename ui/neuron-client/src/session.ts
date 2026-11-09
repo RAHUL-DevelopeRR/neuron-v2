@@ -694,8 +694,13 @@ export function reduceSession(state: SessionState, action: SessionAction, now?: 
     case 'hook_started':
     case 'hook_finished':
       return state
-    default:
+    default: {
+      // Exhaustive: a `UiEvent` or `LocalAction` without a case above fails `bun run typecheck` here. The
+      // runtime `return state` stays all the same, because a newer host can send an action this client does not know.
+      const unreachable: never = action
+      void unreachable
       return state
+    }
   }
 }
 

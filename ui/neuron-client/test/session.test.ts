@@ -494,6 +494,13 @@ describe('alpha.5: what the clients keep and what they leave alone', () => {
     for (const event of ignored) expect(reduceSession(before, event)).toBe(before)
   })
 
+  test('an action this client does not know, from a newer host, changes nothing', () => {
+    const before = run([{ type: 'local/submitted', text: 'go' }, { type: 'text_delta', text: 'working' }], started())
+    // Not a `SessionAction` as far as this client can tell. The reducer's default is exhaustive at compile time and still returns the state at run time.
+    const future = { type: 'a_future_event', anything: 1 } as unknown as SessionAction
+    expect(reduceSession(before, future)).toBe(before)
+  })
+
   test('they do not split a reply that is streaming', () => {
     const state = run([{ type: 'text_delta', text: 'one ' }, hookStarted, hookFinished, branches, catalog, { type: 'text_delta', text: 'two' }], started())
     expect(state.items).toMatchObject([{ kind: 'assistant', text: 'one two', streaming: true }])

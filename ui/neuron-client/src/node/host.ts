@@ -2,13 +2,18 @@
  * A Neuron host (Bun): owns one engine and serves it to remote clients over
  * WebSocket with the protocol in `../remote.ts`. The desktop app uses it in a
  * browser during development, and the mobile app on the LAN; the zero-x.live
- * relay will carry the same frames.
+ * relay will carry the same frames, and whoever builds it must apply this
+ * host's policy, not only `parseClientMessage`.
  *
  * Security: it binds to 127.0.0.1 unless told otherwise, every client must
- * open with the pairing token, browser origins other than local ones are
- * refused, and remote clients cannot shut the engine down. Commands that
- * change files, history, settings or what the agent may do are refused (see
- * `OWNER_ONLY_COMMANDS`), after `parseClientMessage` has already dropped them.
+ * open with the pairing token, and browser origins other than local ones are
+ * refused. A frame from a peer meets `parseClientMessage` first, which passes
+ * only the commands in `PEER_PASSES` (test/protocol.test.ts). Passing is not
+ * permission: `forward` still refuses, for every peer, local or not, what
+ * `HOST_POLICY` calls `owner_only` (`shutdown` among it), a rewind that is not
+ * a dry run, slash commands outside `REMOTE_SLASH` and a `resume` that names
+ * anything but a session id, and `trust_workspace` for a peer on another
+ * machine. A second `interrupt` in one turn still ends the engine.
  * The `fs.*` methods only read inside the workspace. Terminals (`term.open`)
  * are only for clients on this machine, since a shell would bypass the
  * engine's permission prompts.
@@ -134,7 +139,7 @@ const OWNER_ONLY_COMMANDS: ReadonlySet<string> = new Set(
   Object.entries(HOST_POLICY).flatMap(([type, policy]) => (policy === 'owner_only' ? [type] : [])),
 )
 
-const SESSION_ID =/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const LOOPBACK_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$/i
 
 /** A session id or `latest`, never a path. */

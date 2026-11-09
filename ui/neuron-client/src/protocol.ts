@@ -18,9 +18,14 @@
  * `mcp_catalog`, `mcp_policy`, `mcp_hosted` and `status_bar`. Send the
  * commands a feature adds only when the engine lists it.
  *
- * Being an {@link EngineCommand} says nothing about who may send it: a frame
- * from a remote peer meets {@link parseClientMessage} first, which refuses
- * every command that changes something.
+ * Being an {@link EngineCommand} says nothing about who may send it. A frame
+ * from a peer meets {@link parseClientMessage} first, which passes only the
+ * commands in `PEER_PASSES` (test/protocol.test.ts). Passing is not
+ * permission: `node/host.ts` still refuses some of them (what `HOST_POLICY`
+ * calls `owner_only`, `shutdown` among it, a rewind that is not a dry run,
+ * `trust_workspace` for a peer on another machine, slash commands outside
+ * `REMOTE_SLASH`, a `resume` that names anything but a session id), and a
+ * second `interrupt` in one turn ends the engine.
  */
 
 /** `PROTOCOL_VERSION` in protocol.rs, sent in {@link ReadyEvent}. */

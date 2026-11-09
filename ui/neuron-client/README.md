@@ -7,7 +7,10 @@ built on it. Nothing here runs the agent: the Rust engine does.
   `rust/crates/neuron-tui/src/protocol.rs`. `test/protocol.test.ts` fails when the Rust enums
   gain or lose a variant. `parseClientMessage` is the gate for frames from remote peers (a paired
   phone): every engine command is decided there on purpose, in `PEER_PASSES` or `PEER_REFUSED` in
-  that test, so a new command stays refused until someone says a phone may send it.
+  that test, so a new command stays refused until someone says a phone may send it. Passing it is
+  not permission: `src/node/host.ts` decides every command again in `HOST_POLICY` (a new command
+  fails `bun run typecheck` until it is listed there) and refuses more, for every peer, local or
+  not: slash commands outside `REMOTE_SLASH`, a rewind that is not a dry run.
 - `src/session.ts`: one reducer from engine events and user actions to a transcript. It covers
   messages, reasoning, tool calls with their state, permission requests tied to their call,
   questions, sign-in and usage.
