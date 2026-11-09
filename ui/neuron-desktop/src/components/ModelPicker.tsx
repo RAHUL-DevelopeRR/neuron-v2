@@ -84,8 +84,10 @@ export function ModelPicker({
                 className={`menu-item${model.id === currentId ? ' current' : ''}`}
                 disabled={unusable}
                 onClick={() => {
-                  onPick(model.id)
                   setOpen(false)
+                  // The model the engine is already on: picking it changes nothing, and the engine would answer by
+                  // printing its whole catalog, every id and raw name, into the chat. The menu just closes.
+                  if (model.id !== currentId) onPick(model.id)
                 }}
               >
                 <span>{modelRowName(models, model)}</span>

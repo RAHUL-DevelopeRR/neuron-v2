@@ -322,6 +322,41 @@ describe('the model picker marks the model the engine is on', () => {
   })
 })
 
+// Picking the model the engine is already on changes nothing, and the engine answers it by printing its
+// whole catalog, ids and raw names with the routes, into the chat as a notice.
+describe('the model picker and the model the engine is already on', () => {
+  const families = [entry('openai/gpt-oss-120b', 'GPT-OSS 120B (Groq)', 'groq'), entry('openai/gpt-oss-20b', 'GPT-OSS 20B (Groq)', 'groq')]
+
+  test('clicking the current row closes the menu and picks nothing, however the engine spells its id', () => {
+    for (const current of ['openai/gpt-oss-120b', 'gpt-oss-120b', 'groq/openai/gpt-oss-120b', 'GPT-OSS-120B']) {
+      const picked: string[] = []
+      const { list } = openPicker(families, { current, onPick: (id) => picked.push(id) })
+      fireEvent.click(within(list).getByRole('option', { name: /GPT-OSS 120B/ }))
+      expect(picked).toEqual([])
+      expect(screen.queryAllByRole('listbox').length).toBe(0)
+      cleanup()
+    }
+  })
+
+  test('clicking another row still picks it, by its id, and closes the menu', () => {
+    const picked: string[] = []
+    const { list } = openPicker(families, { current: 'gpt-oss-120b', onPick: (id) => picked.push(id) })
+    fireEvent.click(within(list).getByRole('option', { name: /GPT-OSS 20B/ }))
+    expect(picked).toEqual(['openai/gpt-oss-20b'])
+    expect(screen.queryAllByRole('listbox').length).toBe(0)
+  })
+
+  test('with a current model the catalog lacks, or none named yet, every row picks', () => {
+    for (const current of ['acme/made-up-model', '']) {
+      const picked: string[] = []
+      const { list } = openPicker(families, { current, onPick: (id) => picked.push(id) })
+      fireEvent.click(within(list).getByRole('option', { name: /GPT-OSS 120B/ }))
+      expect(picked).toEqual(['openai/gpt-oss-120b'])
+      cleanup()
+    }
+  })
+})
+
 describe('the desktop app names models without their route', () => {
   async function start(statusOverrides: Record<string, unknown> = {}) {
     const engine = new FakeEngine(statusOverrides)
@@ -359,6 +394,23 @@ describe('the desktop app names models without their route', () => {
       ['GPT-OSS 120B', 'true'],
       ['GPT-OSS 20B', 'false'],
     ])
+  })
+
+  test('in the app, picking the model it is on sends nothing, and picking another sends set_model', async () => {
+    const engine = await start({ model: 'gpt-oss-120b' })
+    fireEvent.click(screen.getByTitle('Switch model'))
+    await emit(
+      engine,
+      modelsEvent([entry('openai/gpt-oss-120b', 'GPT-OSS 120B (Groq)', 'groq'), entry('openai/gpt-oss-20b', 'GPT-OSS 20B (Groq)', 'groq')], 'gpt-oss-120b'),
+    )
+    const setModel = () => engine.commands().filter((command) => (command as { type?: string }).type === 'set_model')
+    fireEvent.click(within(screen.getByRole('listbox', { name: 'Models' })).getByRole('option', { name: /GPT-OSS 120B/ }))
+    expect(setModel()).toEqual([])
+    expect(screen.queryAllByRole('listbox').length).toBe(0)
+
+    fireEvent.click(screen.getByTitle('Switch model'))
+    fireEvent.click(within(screen.getByRole('listbox', { name: 'Models' })).getByRole('option', { name: /GPT-OSS 20B/ }))
+    expect(setModel()).toEqual([{ kind: 'command', type: 'set_model', model: 'openai/gpt-oss-20b' }])
   })
 
   test('the picker, once the catalog arrives, and the chip agree', async () => {
