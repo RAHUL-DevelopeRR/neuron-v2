@@ -4,17 +4,21 @@
  * desktop app in a browser during development, the mobile app on the LAN, and
  * later the zero-x.live relay all speak it.
  *
- * - The client's first frame is `hello` with the host's pairing token (never in
- *   the URL). The host answers `welcome` and a `snapshot` of the session as it
- *   stands, then every action in order, numbered by `seq`.
+ * - The client's first frame is `hello` with one of the host's pairing tokens
+ *   (never in the URL). The host answers `welcome` and a `snapshot` of the
+ *   session as it stands, then every action in order, numbered by `seq`.
+ * - A host has an owner token and, optionally, a peer token. The token decides
+ *   what a client is, not its address: the owner's token from the host's own
+ *   machine makes the owner, anything else a peer. `welcome` says which
+ *   (`role`), so a bridge that must only ever be a peer can check.
  * - Actions are the engine's events plus the clients' own (a prompt someone
  *   typed, a permission someone answered), so every client shows the same
  *   transcript. The host applies the first answer to a permission request and
  *   drops the rest.
  * - A client that reconnects gets a fresh snapshot: the reduced session is
  *   small next to the events behind it, and always right.
- * - Terminals (`term.open`) are for clients on the host's own machine only: a
- *   shell would bypass the engine's permission prompts.
+ * - Terminals (`term.open`) are for the owner only: a shell would bypass the
+ *   engine's permission prompts.
  * - A frame from a peer meets `parseClientMessage` (via {@link parseClientFrame}) first, which passes only
  *   the commands in `PEER_PASSES` (test/protocol.test.ts). Passing is not permission: the host then
  *   refuses more (`HOST_POLICY`, `REMOTE_SLASH` and the rest in node/host.ts). Whoever builds the
@@ -45,8 +49,12 @@ export interface HostInfo {
   cwd: string
 }
 
+/** What the host made of a client: `owner` is the owner's token from the host's own machine; everything else is a `peer`. */
+export type HostRole = 'owner' | 'peer'
+
 export type HostFrame =
-  | { t: 'welcome'; protocol: number; host: HostInfo; clients: number }
+  /** `role` is missing from a host older than the credential check: a client must read that as `peer`. */
+  | { t: 'welcome'; protocol: number; host: HostInfo; clients: number; role?: HostRole }
   | { t: 'snapshot'; seq: number; state: SessionState }
   | { t: 'action'; seq: number; action: SessionAction }
   | { t: 'rpc_result'; id: number; result?: unknown; error?: string }

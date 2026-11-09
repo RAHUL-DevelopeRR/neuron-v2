@@ -6,16 +6,22 @@
  * host's policy, not only `parseClientMessage`.
  *
  * Security: it binds to 127.0.0.1 unless told otherwise, every client must
- * open with the pairing token, and browser origins other than local ones are
- * refused. A frame from a peer meets `parseClientMessage` first, which passes
- * only the commands in `PEER_PASSES` (test/protocol.test.ts). Passing is not
- * permission: `forward` still refuses, for every peer, local or not, what
- * `HOST_POLICY` calls `owner_only` (`shutdown` among it), a rewind that is not
- * a dry run, slash commands outside `REMOTE_SLASH` and a `resume` that names
- * anything but a session id, and `trust_workspace` for a peer on another
- * machine. A second `interrupt` in one turn still ends the engine.
+ * open with a pairing token, and browser origins other than local ones are
+ * refused. A client is the owner or a peer, and the credential decides, not
+ * the address: the owner is a socket that said hello with `HostOptions.token`
+ * from this machine (the desktop app); every other socket is a peer, the
+ * phone on the LAN and the share bridge (`neuron engine --share`) among them.
+ * The bridge connects from 127.0.0.1 for every paired phone, so the address
+ * cannot tell a phone from the owner; it holds `HostOptions.peerToken`, which
+ * never makes an owner. A frame from a peer meets `parseClientMessage` first,
+ * which passes only the commands in `PEER_PASSES` (test/protocol.test.ts).
+ * Passing is not permission: `forward` still refuses, to everyone, what
+ * `HOST_POLICY` calls `owner_only` (`shutdown` among it) and a rewind that is
+ * not a dry run, and to every peer slash commands outside `REMOTE_SLASH`, a
+ * `resume` that names anything but a session id and `trust_workspace`. A
+ * second `interrupt` in one turn still ends the engine.
  * The `fs.*` methods only read inside the workspace. Terminals (`term.open`)
- * are only for clients on this machine, since a shell would bypass the
+ * and `engine.restart` are only for the owner, since a shell would bypass the
  * engine's permission prompts.
  */
 
@@ -38,7 +44,20 @@ import { gitDiff, gitStatus, searchFiles } from './workspace'
 
 export interface HostOptions {
   transport: EngineTransport
+  /**
+   * The owner's pairing token. A socket that says hello with it from this machine is the owner: it may use any slash
+   * command and resume a session by path (the desktop app in a browser needs a new session, the permission mode and
+   * login), trust the workspace, open terminals and restart the engine. The same token from another machine opens none
+   * of that: that socket is a peer.
+   */
   token: string
+  /**
+   * A second pairing token for a client that reaches this host from this machine without being the owner. The share
+   * bridge (`neuron engine --share`) connects from 127.0.0.1 for every paired phone, so the address cannot tell a phone
+   * from the owner: the bridge holds this token instead of the owner's. A socket that says hello with it is a peer
+   * wherever it connects from, never the owner. It must be non-empty and differ from `token`.
+   */
+  peerToken?: string
   /** The workspace the `fs.*` methods may read. */
   root: string
   name?: string
@@ -51,19 +70,11 @@ export interface HostOptions {
   helloTimeoutMs?: number
   /** The environment of terminals; defaults to this process's. */
   terminalEnv?: Record<string, string | undefined>
-  /** Whether a client's address is this machine (loopback by default; tests override it). */
+  /** Whether a client's address is this machine (loopback by default; tests override it). The owner must be on this machine. */
   isLocal?: (address: string) => boolean
   /**
-   * Treats a client on this machine as the owner: it may use any slash command and resume a session by path,
-   * which the desktop app in a browser needs (a new session, the permission mode, login). Off by default.
-   * Never turn it on while a share bridge (`neuron engine --share`) is connected: the bridge's phone reaches this
-   * host from 127.0.0.1 too, so the host cannot tell it from the owner. What `HOST_POLICY` calls `owner_only`
-   * stays refused either way.
-   */
-  ownerOnLoopback?: boolean
-  /**
-   * A new engine, continuing `resume` (a session id) when given: lets clients on this
-   * machine restart it (`engine.restart`), as trusting the workspace needs.
+   * A new engine, continuing `resume` (a session id) when given: lets the owner restart it
+   * (`engine.restart`), as trusting the workspace needs.
    */
   restart?: (resume: string | null) => EngineTransport
 }
@@ -81,10 +92,15 @@ interface Peer {
   timer: ReturnType<typeof setTimeout> | null
   /**
    * The client connected from this machine (loopback). That says where the socket came from, not who is
-   * typing: a phone behind `neuron engine --share` is local too. It opens only `term.open`, `engine.restart`
-   * and `trust_workspace`; the slash and resume walls bind every peer.
+   * typing: a phone behind `neuron engine --share` is local too. It opens nothing by itself.
    */
   local: boolean
+  /**
+   * The owner: said hello with `HostOptions.token` from this machine. Decided at hello, by the credential and the
+   * address together, and false before. Only the owner may open a terminal, restart the engine, trust the workspace,
+   * use a slash command outside `REMOTE_SLASH` or resume a session by path.
+   */
+  owner: boolean
   terminals: Map<number, { process: ReturnType<typeof Bun.spawn>; terminal: Terminal }>
 }
 
@@ -95,24 +111,24 @@ const MAX_READ_BYTES = 512 * 1024
 const MAX_LIST_ENTRIES = 2_000
 const MAX_TERMINALS_PER_CLIENT = 4
 
-/** Slash commands that only read. No peer may send any other, local or not, unless it is on this machine and the host was started with `ownerOnLoopback`. */
+/** Slash commands that only read. A peer may send no other; the owner may send any. */
 const REMOTE_SLASH = new Set(['help', 'status', 'cost', 'context', 'usage', 'doctor', 'changes', 'diff', 'stats', 'memory', 'model'])
 
 const OWNER_ONLY = 'Only the Neuron desktop app can change your files, history or settings.'
 
 /**
- * What the host does with each engine command a peer sends, local or not. Every `EngineCommand` tag is
+ * What the host does with each engine command a client sends, owner or peer. Every `EngineCommand` tag is
  * decided here, on purpose: a new one fails `bun run typecheck` until someone chooses.
- * - `owner_only`: refused to every peer. These change the workspace, the history, the user's settings or
+ * - `owner_only`: refused to every client, the owner included. These change the workspace, the history, the user's settings or
  *   what the agent may do, or cost the engine real work, and the phone app has no screen for them.
  *   `parseClientMessage` already drops all of them but `shutdown`, `commit` and `set_mcp_server_enabled`
  *   before they get here; this is the second wall, for the day the first has a hole. (`forward` answers
  *   `shutdown` first, with a message of its own.)
  * - `forward`: goes on to the engine, after what `forward` still checks: `slash` only for `REMOTE_SLASH`
  *   (and `/resume` with a session id), `resume` only by session id, `rewind` only as a dry run and
- *   `trust_workspace` only for a peer on this machine. `capabilities` is dropped: the host speaks for all
- *   its clients. A peer on this machine of a host started with `ownerOnLoopback` is exempt from the `slash`
- *   and `resume` checks, and from nothing else.
+ *   `trust_workspace` only for the owner. `capabilities` is dropped: the host speaks for all its clients.
+ *   The owner (the owner's token, from this machine) is exempt from the `slash`, `resume` and
+ *   `trust_workspace` checks, and from nothing else.
  * Every `PEER_REFUSED` tag in test/protocol.test.ts is `owner_only` here.
  */
 export const HOST_POLICY: Record<EngineCommand['type'], 'forward' | 'owner_only'> = {
@@ -167,6 +183,12 @@ export class NeuronHost {
   private transport: EngineTransport
 
   constructor(private readonly options: HostOptions) {
+    // An empty token would let a client that sends an empty one in; equal tokens would make every peer the owner.
+    if (!options.token) throw new Error('A host needs a pairing token.')
+    if (options.peerToken !== undefined && !options.peerToken) throw new Error('The peer token must not be empty.')
+    if (options.peerToken !== undefined && options.peerToken === options.token) {
+      throw new Error('The peer token must be different from the owner token.')
+    }
     this.transport = options.transport
     this.attach(options.transport)
   }
@@ -240,7 +262,7 @@ export class NeuronHost {
         }
         const local = (host.options.isLocal ?? isLoopback)(server.requestIP(request)?.address ?? '')
         const upgraded = server.upgrade(request, {
-          data: { authed: false, name: '', kind: 'web', timer: null, local, terminals: new Map() },
+          data: { authed: false, name: '', kind: 'web', timer: null, local, owner: false, terminals: new Map() },
         })
         return upgraded ? undefined : new Response('WebSocket upgrade required', { status: 426 })
       },
@@ -355,13 +377,24 @@ export class NeuronHost {
       this.send(socket, { t: 'error', message: `This host speaks remote protocol ${REMOTE_PROTOCOL}.`, fatal: true })
       return socket.close(4426, 'protocol mismatch')
     }
-    if (!sameSecret(frame.token, this.options.token)) {
+    const ownerToken = sameSecret(frame.token, this.options.token)
+    const peerToken = this.options.peerToken !== undefined && sameSecret(frame.token, this.options.peerToken)
+    if (!ownerToken && !peerToken) {
       this.send(socket, { t: 'error', message: 'The pairing token is not right.', fatal: true })
       return socket.close(4401, 'bad token')
     }
     if (socket.data.timer) clearTimeout(socket.data.timer)
-    socket.data = { ...socket.data, authed: true, name: frame.client.name, kind: frame.client.kind, timer: null }
-    this.send(socket, { t: 'welcome', protocol: REMOTE_PROTOCOL, host: this.info, clients: this.clientCount })
+    // The credential and the address together: the peer token never makes the owner, and nor does the owner's token
+    // from another machine. A bridge that connects from 127.0.0.1 for its phones is a peer because of what it holds.
+    const owner = ownerToken && socket.data.local
+    socket.data = { ...socket.data, authed: true, owner, name: frame.client.name, kind: frame.client.kind, timer: null }
+    this.send(socket, {
+      t: 'welcome',
+      protocol: REMOTE_PROTOCOL,
+      host: this.info,
+      clients: this.clientCount,
+      role: owner ? 'owner' : 'peer',
+    })
     this.send(socket, { t: 'snapshot', seq: this.seq, state: this.state })
     this.broadcast({ t: 'clients', count: this.clientCount })
   }
@@ -385,10 +418,10 @@ export class NeuronHost {
     if (HOST_POLICY[message.type] !== 'forward' || (message.type === 'rewind' && message.dry_run !== true)) {
       return refuse(OWNER_ONLY)
     }
-    // The next two walls hold for every peer, local or not: a phone behind `neuron engine --share` reaches this host
-    // from 127.0.0.1, so `local` says where a socket came from, not who is typing. Only a host started with
-    // `ownerOnLoopback` lets a peer on this machine past them.
-    const owner = this.options.ownerOnLoopback === true && socket.data.local
+    // The next three walls hold for every peer, whatever its address: a phone behind `neuron engine --share` reaches
+    // this host from 127.0.0.1, so the address says where a socket came from, not who is typing. Only the owner (the
+    // owner's token, from this machine) is past them, and the bridge holds the peer token, so it never is.
+    const owner = socket.data.owner === true
     if (!owner && message.type === 'slash') {
       const name = message.command.trim().toLowerCase()
       const allowed =
@@ -398,8 +431,8 @@ export class NeuronHost {
     if (!owner && message.type === 'resume' && !isSessionRef(message.session)) {
       return refuse('A remote client can only resume a session by its id.')
     }
-    // `local` is for this, `term.open`, `engine.restart` and `ownerOnLoopback`; the share bridge filters `trust_workspace` for its phone itself.
-    if (message.type === 'trust_workspace' && !socket.data.local) {
+    // Trusting a workspace loads its hooks and MCP servers: the owner's call, whatever a bridge in front of a phone filters.
+    if (message.type === 'trust_workspace' && !owner) {
       return refuse('Only the machine running Neuron can trust its workspace.')
     }
     // Nothing is recorded for a message the engine did not get.
@@ -430,7 +463,7 @@ export class NeuronHost {
       case 'git.diff':
         return gitDiff(this.options.root, typeof params.path === 'string' ? params.path : '', this.state.status?.workspace_trusted === true)
       case 'engine.restart': {
-        if (!socket.data.local) throw new Error('Only the machine running Neuron can restart its engine.')
+        if (!socket.data.owner) throw new Error('Only the machine running Neuron can restart its engine.')
         const resume = typeof params.resume === 'string' && params.resume ? params.resume : null
         await this.restartEngine(resume)
         return { restarted: true }
@@ -441,7 +474,7 @@ export class NeuronHost {
   }
 
   private openTerminal(socket: Socket, params: Record<string, unknown>): { id: number } {
-    if (!socket.data.local) throw new Error('Terminals are only available on the machine running Neuron.')
+    if (!socket.data.owner) throw new Error('Terminals are only available on the machine running Neuron.')
     if (socket.data.terminals.size >= MAX_TERMINALS_PER_CLIENT) throw new Error('Too many terminals open.')
     const size = (value: unknown, fallback: number) =>
       Number.isSafeInteger(value) && (value as number) > 0 && (value as number) <= 1000 ? (value as number) : fallback

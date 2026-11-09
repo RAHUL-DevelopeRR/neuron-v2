@@ -260,7 +260,11 @@ These are JSON text frames over WebSocket.
 
 - It binds 127.0.0.1, or the LAN with `--lan`.
 - The token is random each run. It is written to a 0600 file and printed only with
-  `--show-token`.
+  `--show-token`. That is the owner's token: a client that says hello with it from the same machine
+  is the owner (the desktop app in a browser); any other client is a peer.
+- `--peer-token-file FILE` makes a second token, for a bridge such as `neuron engine --share`
+  whose phones connect from 127.0.0.1. Whoever holds it is a peer wherever it connects from, so the
+  host tells a phone from the owner by credential, not by address. `welcome` carries `role`.
 - The engine runs as the user, on the user's machine. The phone connects to that machine directly
   over the LAN, which works only when both are on one network that both trust.
 

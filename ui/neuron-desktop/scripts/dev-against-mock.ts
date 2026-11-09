@@ -47,8 +47,8 @@ const host = new NeuronHost({
   root: home.workspace,
   name: 'Neuron (mock)',
   terminalEnv: { ...home.env },
-  // The browser on this machine is the owner here: a new session and the permission mode are slash commands.
-  ownerOnLoopback: true,
+  // `token` is the owner's, and the browser on this machine says hello with it: a new session and the permission
+  // mode are slash commands. There is no peer token because no share bridge is attached.
 })
 await host.start()
 
