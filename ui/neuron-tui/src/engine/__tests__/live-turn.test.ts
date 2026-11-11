@@ -125,7 +125,7 @@ describe('a long write_file call, as a live_progress engine streams it', () => {
       target: CSS_PATH,
       detail: '+412',
       stalled: false,
-      writing: { silence: null },
+      writing: { silence: null, shortSilence: null },
     })
     expect(formatBytes(streaming.liveInput!.bytes)).toMatch(/KB$/)
     expect(liveOutputTokens(live())).toBe(1200)
@@ -249,7 +249,7 @@ describe('a stalled stream', () => {
       target: null,
       detail: null,
       stalled: true,
-      writing: { silence: 'no new tokens for 15s' },
+      writing: { silence: 'no new tokens for 15s', shortSilence: 'no tokens 15s' },
     })
     sink.handle({
       type: 'tool_input_progress',
@@ -294,7 +294,7 @@ describe('a stalled stream', () => {
       target: 'site/index.js',
       detail: '+81',
       stalled: true,
-      writing: { silence: 'no new tokens for 37s' },
+      writing: { silence: 'no new tokens for 37s', shortSilence: 'no tokens 37s' },
     })
     expect(inWorkspace().verb).not.toBe('Waiting for the model')
     grow(91)

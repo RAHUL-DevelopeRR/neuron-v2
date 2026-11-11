@@ -6,7 +6,7 @@ import { routeUserPrompt } from '../router'
 
 import type { RouterParams } from '../command-registry'
 
-function params(inputValue: string) {
+function params(inputValue: string, busy: Partial<RouterParams> = {}) {
   const history: string[] = []
   const sendMessage = mock((_message: { content: string }) => {})
   return {
@@ -26,6 +26,7 @@ function params(inputValue: string) {
       sendMessage,
       addToQueue: mock(() => {}),
       scrollToLatest: () => {},
+      ...busy,
     } as unknown as RouterParams,
   }
 }
@@ -64,5 +65,20 @@ describe('Enter after a paused turn', () => {
     await routeUserPrompt(typed.params)
     expect(sentContents(typed.sendMessage)).toEqual(['use the other parser instead'])
     expect(hasPausedTurn()).toBe(false)
+  })
+
+  test('not while a turn runs or a message waits in the queue', async () => {
+    notePausedTurn()
+    for (const busy of [
+      { isStreaming: true },
+      { streamMessageIdRef: { current: 'ai-2' } },
+      { isChainInProgressRef: { current: true } },
+      { hasQueuedMessages: () => true },
+    ] as Partial<RouterParams>[]) {
+      const empty = params('', busy)
+      await routeUserPrompt(empty.params)
+      expect(sentContents(empty.sendMessage)).not.toContain('continue')
+      expect(empty.history).not.toContain('continue')
+    }
   })
 })

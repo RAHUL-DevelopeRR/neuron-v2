@@ -251,9 +251,16 @@ export async function routeUserPrompt(
   // waits behind it (engine/git-views.ts).
   if (!trimmed && !hasAttachments && inputMode === 'default' && revealDeferredGitPanel()) return
   // After a paused turn, Enter on an empty input continues it
-  // (engine/paused-turn.ts); anything else sent answers the pause too.
+  // (engine/paused-turn.ts); anything else sent answers the pause too. Not
+  // while a turn runs or waits in the queue: "continue" would go into a turn
+  // that has nothing to do with the pause.
+  const turnBusy =
+    isStreaming ||
+    Boolean(streamMessageIdRef.current) ||
+    isChainInProgressRef.current ||
+    Boolean(hasQueuedMessages?.())
   if (!trimmed && !hasAttachments && inputMode === 'default') {
-    trimmed = takeContinuePrompt() ?? ''
+    if (!turnBusy) trimmed = takeContinuePrompt() ?? ''
   } else if (trimmed || hasAttachments) {
     clearPausedTurn()
   }
