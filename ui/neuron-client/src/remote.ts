@@ -1,3 +1,13 @@
+/*
+ * Contains code adapted from Freebuff common/src/desktop-cloud/run-stream.ts
+ * (CloudRunReader), commit 0dc95cb, https://github.com/CodebuffAI/freebuff,
+ * Copyright Codebuff, Apache License 2.0 (see NOTICE and docs/PROVENANCE.md).
+ * Changed for Neuron: its silence watchdog, stall report and jittered backoff
+ * were rewritten for this WebSocket transport (keepalive pings, reconnecting
+ * instead of falling back to polling); `reconnectDelay`, `watch` and the
+ * `ConnectionStall` report are the adapted parts. The rest of this file is Neuron's.
+ */
+
 /**
  * The remote protocol: one engine, many clients, over WebSocket text frames
  * (JSON). A host owns the engine (`neuron engine --stdio`) and relays it: the

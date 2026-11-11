@@ -44,6 +44,25 @@ The neuron-tui binary is compiled with Bun and contains the Bun runtime and npm
 packages, among them OpenTUI and React. THIRD_PARTY_NOTICES.md on every release
 lists them with their licenses and reproduces ui/neuron-tui/LICENSE and NOTICE.
 
+Shared client (neuron-client), used by the desktop and mobile apps
+------------------------------------------------------------------
+
+Parts of ui/neuron-client are ported from Freebuff's common/src/desktop-cloud
+at https://github.com/CodebuffAI/freebuff commit 0dc95cb, Copyright Codebuff,
+under the Apache License, Version 2.0 (full text in ui/neuron-tui/LICENSE; the
+Freebuff NOTICE above applies):
+
+  src/threads.ts, test/threads.test.ts
+      from threads.ts and threads.test.ts: the thread digest and its group,
+      step count and status line. Modified: zod schemas replaced by plain
+      types; cloud kinds, funding, git, pull requests and the panel layout
+      removed; the digest is built from a Neuron session.
+  src/remote.ts (reconnectDelay and the silence watchdog)
+      after run-stream.ts (CloudRunReader): a silence watchdog, jittered
+      backoff and a stall report, rewritten for a WebSocket transport.
+
+Each of these files says so at the top.
+
 Bundled third-party skills
 --------------------------
 
