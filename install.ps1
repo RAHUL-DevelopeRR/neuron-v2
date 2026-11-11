@@ -431,13 +431,45 @@ function Write-ShadowingNeuronWarning([string]$Destination) {
     Write-Detail "If it is another program, move $(Split-Path -Parent $Destination) before $(Split-Path -Parent $found.Path) in PATH, or run neuron by its full path."
 }
 
+# Puts $Directory first in a ;-separated PATH value, dropping any later copy of it.
+function Get-PathWithEntryFirst([string]$PathValue, [string]$Directory) {
+    $wanted = $Directory.TrimEnd('\')
+    $rest = @()
+    if ($PathValue) {
+        $rest = @($PathValue.Split(';') | Where-Object { $_ -and ($_.Trim().TrimEnd('\') -ine $wanted) })
+    }
+    return (@($Directory) + $rest) -join ';'
+}
+
+# Puts $Directory FIRST in the user PATH (moving it if it is already there), so this install's
+# neuron wins over an older neuron in the user PATH, such as a NeuronCLI folder from an earlier
+# release. Returns $true when the stored value changed.
+# The system PATH comes before the user PATH in every new terminal, so a neuron there still wins
+# even with this install first in the user PATH. Moving it needs an administrator: only warn.
+function Write-SystemPathNeuronWarning([string]$Destination) {
+    $machine = [System.Environment]::GetEnvironmentVariable('Path', 'Machine')
+    if (-not $machine) { return }
+    foreach ($entry in $machine.Split(';')) {
+        $dir = [System.Environment]::ExpandEnvironmentVariables($entry.Trim())
+        if (-not $dir) { continue }
+        foreach ($name in @('neuron.exe', 'neuron.cmd', 'neuron.bat', 'neuron.ps1')) {
+            try { $candidate = Join-Path $dir $name } catch { continue }
+            if ((Test-Path -LiteralPath $candidate -PathType Leaf) -and ($candidate -ine $Destination)) {
+                Write-Warn "new terminals will still run $candidate first: the system PATH comes before your user PATH."
+                Write-Detail "Remove that copy (it needs an administrator), or run neuron by its full path: & '$($Destination -replace "'", "''")'"
+                return
+            }
+        }
+    }
+}
+
 function Add-UserPathEntry([string]$Directory) {
     # Read the raw registry value so %VARIABLE% references in the user PATH survive.
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
     try {
         $current = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-        if (Test-PathEntry $current $Directory) { return $false }
-        $updated = if ($current) { $current.TrimEnd(';') + ';' + $Directory } else { $Directory }
+        $updated = Get-PathWithEntryFirst $current $Directory
+        if ($updated -ceq $current) { return $false }
         $key.SetValue('Path', $updated, [Microsoft.Win32.RegistryValueKind]::ExpandString)
     } finally {
         $key.Close()
@@ -627,14 +659,17 @@ function Install-Neuron {
         if ($reported) { Write-Detail $reported }
 
         $onPath = Test-PathEntry $env:Path $target
-        if ($onPath) {
-            Write-ShadowingNeuronWarning $destination
-        } elseif ($changePath) {
+        if ($changePath) {
             if (Add-UserPathEntry $target) {
-                Write-Detail "added $target to your user PATH"
+                Write-Detail "put $target first in your user PATH"
             }
-            # Appended, as in the user PATH: an older neuron earlier on PATH still wins.
-            $env:Path = "$env:Path;$target"
+            # First in this window too (irm | iex runs in the user's own session), so `neuron`
+            # works here straight away and an older neuron on PATH no longer wins.
+            $env:Path = Get-PathWithEntryFirst $env:Path $target
+            $onPath = $true
+            Write-ShadowingNeuronWarning $destination
+            Write-SystemPathNeuronWarning $destination
+        } elseif ($onPath) {
             Write-ShadowingNeuronWarning $destination
         } else {
             Write-Warn "$target is not on your PATH (you asked not to change it); run neuron by its full path."
@@ -658,7 +693,8 @@ function Install-Neuron {
     Write-Host "Neuron $resolved is installed." -ForegroundColor Green
     Write-Host 'Next steps:'
     $step = 1
-    if ($run -eq 'neuron') {
+    if ($run -eq 'neuron' -and $changePath -and $InvokedAsFile) {
+        # Run as a file (powershell -File), this window's PATH is not the caller's.
         Write-Host "  $step. Open a new terminal window (PowerShell or Command Prompt) so it sees the updated PATH."
         $step++
     }
