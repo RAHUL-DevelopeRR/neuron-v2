@@ -15,13 +15,17 @@ import {
   type EngineInfo,
   type FileContent,
   type GitStatusView,
+  type BranchChanges,
+  type BranchList,
   type LaunchOptions,
   type Platform,
   type Project,
+  type QuitRequest,
   type TerminalSession,
   type UpdateInfo,
   type WorktreeStatus,
 } from '../src/platform'
+import type { PullRequestSnapshot } from '../src/pullRequest'
 import type { Settings } from '../src/settings'
 
 export const ALL_FEATURES = [
@@ -143,6 +147,15 @@ export interface FakePlatform extends Platform {
   notifyResult: 'shown' | 'denied' | 'unsupported'
   /** The chats, when the platform was made with `multiChat`. */
   fakeChats: FakeChats | null
+  // v1.1
+  /** Images, videos and sounds in the workspace (listed in the tree beside FILES), by path. */
+  media: Map<string, Uint8Array>
+  /** Paths `readMedia` was asked for. */
+  mediaReads: string[]
+  /** Answers to quit requests, as `[id, quit]`. */
+  quitAnswers: Array<[number, boolean]>
+  /** The host asks the window whether to quit. */
+  requestQuit(request: QuitRequest): void
 }
 
 export interface FakePlatformOptions {
@@ -165,6 +178,9 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
   let connecting: Promise<SessionController> | null = null
   let project: Project = { name: 'app', path: '/work/app' }
   const saved = new Map<string, unknown>([['settings', { firstRunDone: true, ...options.settings }]])
+  const quitListeners = new Set<(request: QuitRequest) => void>()
+  const media = new Map<string, Uint8Array>()
+  const files = () => [...Object.keys(FILES), ...media.keys()]
   const platform: FakePlatform = {
     kind: options.kind ?? 'tauri',
     label: 'test',
@@ -192,6 +208,25 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     attention: [],
     notifyResult: 'shown',
     fakeChats: options.multiChat ? new FakeChats(engine) : null,
+    media,
+    mediaReads: [],
+    quitAnswers: [],
+    requestQuit: (request) => {
+      for (const listener of [...quitListeners]) listener(request)
+    },
+    quit: {
+      onRequest(listener) {
+        quitListeners.add(listener)
+        return () => quitListeners.delete(listener)
+      },
+      answer: (id, quit) => void platform.quitAnswers.push([id, quit]),
+    },
+    async readMedia(path) {
+      platform.mediaReads.push(path)
+      const bytes = media.get(path)
+      if (!bytes) throw new Error(`No such file or folder: ${path}`)
+      return bytes
+    },
     notify: async (notification) => {
       platform.notifications.push(notification)
       return platform.notifyResult
@@ -242,7 +277,7 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
     async list(path: string): Promise<DirListing> {
       const prefix = path === '.' ? '' : `${path}/`
       const names = new Map<string, boolean>()
-      for (const file of Object.keys(FILES)) {
+      for (const file of files()) {
         if (!file.startsWith(prefix)) continue
         const [first, ...rest] = file.slice(prefix.length).split('/')
         names.set(first, rest.length > 0)
@@ -252,6 +287,8 @@ export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = 
       return { path, entries, truncated: false }
     },
     async read(path: string): Promise<FileContent> {
+      const bytes = media.get(path)
+      if (bytes) return { path, content: '', truncated: false, binary: true, size: bytes.length }
       const content = path === 'notes.txt' ? 'a new note\n' : FILES[path]
       if (content === undefined) throw new Error(`No such file or folder: ${path}`)
       return { path, content, truncated: false, binary: false, size: content.length }
@@ -302,7 +339,7 @@ export class FakeChats implements ChatHost {
   engines = new Map<string, FakeEngine>()
   controllers = new Map<string, SessionController>()
   infos = new Map<string, ChatInfo>()
-  opened: Array<{ path?: string; resume?: string | null; worktree?: { name?: string } }> = []
+  opened: Array<{ path?: string; resume?: string | null; worktree?: { name?: string; start?: string } }> = []
   activated: Array<string | null> = []
   stopped: string[] = []
   closed: string[] = []
@@ -325,7 +362,7 @@ export class FakeChats implements ChatHost {
     return [...this.infos.keys()]
   }
 
-  async open(request: { path?: string; resume?: string | null; worktree?: { name?: string } }) {
+  async open(request: { path?: string; resume?: string | null; worktree?: { name?: string; start?: string } }) {
     this.opened.push(request)
     if (this.failNext) {
       const text = this.failNext
@@ -342,7 +379,7 @@ export class FakeChats implements ChatHost {
       project: { name: path.split('/').pop() ?? path, path },
       cwd: slug ? `/wt/${slug}` : path,
       branch: slug ? `neuron/${slug}` : 'main',
-      worktree: slug ? { path: `/wt/${slug}`, branch: `neuron/${slug}`, base: 'main' } : null,
+      worktree: slug ? { path: `/wt/${slug}`, branch: `neuron/${slug}`, base: request.worktree?.start ?? 'main', named: true } : null,
     }
     const controller = new SessionController(engine)
     this.engines.set(id, engine)
@@ -406,6 +443,37 @@ export class FakeChats implements ChatHost {
   async worktreeStatus(id: string): Promise<WorktreeStatus> {
     const info = this.infos.get(id)
     return { branch: info?.worktree?.branch ?? '', path: info?.worktree?.path ?? '', ...this.worktreeState }
+  }
+
+  // v1.1
+  /** What `branches` answers. */
+  branchList: BranchList = { branches: ['main', 'feature/login', 'origin/main'], default: 'main' }
+  /** What `branchChanges` answers; rejects with `branchError` when set. */
+  branchState: BranchChanges = { branch: 'neuron/chat-1', base: 'main', commits: 0, files: [], totals: { files: 0, adds: 0, dels: 0 }, truncated: false }
+  branchError: string | null = null
+  /** `[chat, path]` for each branch diff asked for. */
+  branchDiffs: Array<[string, string]> = []
+  /** What `pullRequest` answers. */
+  pr: PullRequestSnapshot = { pullRequest: null }
+  prAsks: string[] = []
+
+  async branches() {
+    return this.branchList
+  }
+
+  async branchChanges(_id: string) {
+    if (this.branchError) throw new Error(this.branchError)
+    return this.branchState
+  }
+
+  async branchDiff(id: string, path: string) {
+    this.branchDiffs.push([id, path])
+    return `@@ -1 +1,2 @@\n line\n+added in ${path}\n`
+  }
+
+  async pullRequest(id: string) {
+    this.prAsks.push(id)
+    return this.pr
   }
 
   async discardWorktree(id: string, options: { force: boolean; deleteUnmerged: boolean }) {

@@ -46,9 +46,9 @@ describe('vite config', () => {
 describe('tauri.conf.json', () => {
   const conf = JSON.parse(fs.readFileSync(path.resolve(import.meta.dir, '../src-tauri/tauri.conf.json'), 'utf8'))
 
-  test('the CSP allows blob: image previews and nothing else new', () => {
+  test('the CSP allows blob: image and media previews and nothing else new', () => {
     expect(conf.app.security.csp).toBe(
-      "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src ipc: http://ipc.localhost",
+      "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src ipc: http://ipc.localhost",
     )
   })
 

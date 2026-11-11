@@ -1,3 +1,5 @@
+import type { ReactNode } from 'react'
+
 import { formatTokens, sessionAccount, type SessionState } from '@neuron/client'
 
 import { modelLabel } from '../modelNames'
@@ -20,6 +22,7 @@ export function ChatHeader({
   where,
   sidePaneOpen,
   onToggleSidePane,
+  extra = null,
 }: {
   state: SessionState
   title: string
@@ -28,6 +31,8 @@ export function ChatHeader({
   where: string
   sidePaneOpen: boolean
   onToggleSidePane: () => void
+  /** v1.1: shown after the branch (the pull request chip). */
+  extra?: ReactNode
 }) {
   const status = state.status
   const git = status?.git
@@ -43,6 +48,7 @@ export function ChatHeader({
           {git.changed > 0 && <span className="git-changes"> ● {git.changed}</span>}
         </span>
       )}
+      {extra}
       {status?.plan_mode && <span className="badge">plan mode</span>}
       <div className="spacer" />
       <span className={`connection ${state.connection}`} title={state.connectionError ?? `Engine on ${where}`}>

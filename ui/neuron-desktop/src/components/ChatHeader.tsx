@@ -1,7 +1,144 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 
 import { useFocusTrap } from '../a11y'
-import { ChatError, type ChatInfo, type WorktreeStatus } from '../platform'
+import { ChatError, type BranchList, type ChatInfo, type WorktreeStatus } from '../platform'
+import { checksSentence, normalizePullRequestChecks, pullRequestLabel, type PullRequestSnapshot, type PullRequestStatus } from '../pullRequest'
+
+/** How often the pull request chip asks again (the host keeps an answer as long). */
+const PR_REFRESH_MS = 60_000
+
+const everyMinute = (run: () => void) => {
+  const timer = setInterval(run, PR_REFRESH_MS)
+  return () => clearInterval(timer)
+}
+
+/**
+ * v1.1: the pull request of the chat's branch, in the chat header: "PR #12 · draft ·
+ * 3/4 checks". It opens the pull request in the browser. Nothing shows when there
+ * is none, or when it cannot be known (no GitHub CLI, signed out, offline).
+ */
+export function PullRequestChip({
+  load,
+  onOpen,
+  every = everyMinute,
+}: {
+  load: () => Promise<PullRequestSnapshot>
+  onOpen: (url: string) => void
+  /** Runs `run` on a schedule and returns how to stop it (tests drive it). */
+  every?: (run: () => void) => () => void
+}) {
+  const [pr, setPr] = useState<PullRequestStatus | null>(null)
+  const loadRef = useRef(load)
+  loadRef.current = load
+  useEffect(() => {
+    let alive = true
+    const ask = () =>
+      void loadRef.current().then(
+        (snapshot) => alive && setPr(snapshot.pullRequest),
+        () => alive && setPr(null),
+      )
+    ask()
+    const stop = every(ask)
+    return () => {
+      alive = false
+      stop()
+    }
+  }, [every])
+  if (!pr) return null
+  const checks = pr.state === 'open' ? normalizePullRequestChecks(pr.checks) : 'none'
+  return (
+    <button
+      className={`pr-chip pr-${pr.state}${pr.conflict ? ' pr-conflict' : ''}`}
+      data-checks={checks}
+      title={`${pr.title}\n${checksSentence(pr)}`}
+      aria-label={`Pull request #${pr.number}: ${pr.title}. ${pullRequestLabel(pr)}. Open it in the browser`}
+      onClick={() => onOpen(pr.url)}
+    >
+      {pullRequestLabel(pr)}
+    </button>
+  )
+}
+
+/**
+ * v1.1: a new chat in its own copy of the project, started from a branch the
+ * person picks (the repository's default branch is chosen first).
+ */
+export function NewCopyDialog({
+  loadBranches,
+  onCreate,
+  onClose,
+}: {
+  loadBranches: () => Promise<BranchList>
+  onCreate: (start: string) => void
+  onClose: () => void
+}) {
+  const ref = useRef<HTMLDivElement>(null)
+  useFocusTrap(ref)
+  const selectId = useId()
+  const [list, setList] = useState<BranchList | null>(null)
+  const [start, setStart] = useState('')
+  const [problem, setProblem] = useState<string | null>(null)
+  useEffect(() => {
+    let alive = true
+    loadBranches().then(
+      (loaded) => {
+        if (!alive) return
+        setList(loaded)
+        setStart(loaded.default ?? loaded.branches[0] ?? '')
+      },
+      (failure: Error) => alive && setProblem(failure.message),
+    )
+    return () => {
+      alive = false
+    }
+    // Read once, when the dialog opens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  return (
+    <div className="dialog-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div
+        ref={ref}
+        className="dialog small-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="new-copy-title"
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') {
+            event.stopPropagation()
+            onClose()
+          }
+        }}
+      >
+        <h2 id="new-copy-title">New chat in its own copy</h2>
+        <p className="muted">The chat works on a new branch in a copy of the project, so your own folder is not touched. Its first message names the branch.</p>
+        {!list && !problem && <p className="muted">Reading the branches…</p>}
+        {problem && (
+          <p className="error-line" role="alert">
+            {problem}
+          </p>
+        )}
+        {list && (
+          <div className="field">
+            <label htmlFor={selectId}>Start from</label>
+            <select id={selectId} value={start} onChange={(event) => setStart(event.target.value)}>
+              {list.branches.map((branch) => (
+                <option key={branch} value={branch}>
+                  {branch === list.default ? `${branch} (default)` : branch}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+        <div className="dialog-buttons">
+          <button onClick={onClose}>Cancel</button>
+          <button className="primary" disabled={!start} onClick={() => onCreate(start)}>
+            Make the copy
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
 
 /** After a question changes, answers to it wait this long. */
 const CONFIRM_DELAY_MS = 400

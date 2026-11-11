@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useId, useRef, useState, type ReactNode } from 'react'
+import { lazy, Suspense, useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 
 import {
   FEATURE_CHECKPOINTS,
@@ -15,7 +15,8 @@ import {
 } from '@neuron/client'
 
 import { useFocusTrap } from '../a11y'
-import type { FileContent, GitChange, GitStatusView, Platform } from '../platform'
+import { previewOf } from '../mediaFiles'
+import type { BranchChanges, FileContent, GitChange, GitStatusView, Platform, WorktreeInfo } from '../platform'
 import { CommitCard } from './CommitCard'
 import { DiffView } from './DiffView'
 import { FileTree } from './FileTree'
@@ -43,7 +44,84 @@ export type ReviewController = Pick<
   'requestDiff' | 'proposeCommit' | 'commit' | 'dismissCommit' | 'requestCheckpoints' | 'rewind'
 >
 
-type Scope = 'chat' | 'folder'
+type Scope = 'chat' | 'folder' | 'branch'
+
+const SCOPE_NAMES: Record<Scope, string> = { chat: 'This chat', folder: 'This folder', branch: 'Branch changes' }
+
+/** v1.1: where a chat in its own copy reads what its branch changed. */
+interface BranchSource {
+  base: string
+  load(): Promise<BranchChanges>
+  diff(path: string): Promise<string>
+}
+
+const plural = (count: number, one: string, many = `${one}s`) => `${count} ${count === 1 ? one : many}`
+
+/**
+ * v1.1: everything the chat's branch changed since it left its base (its merge
+ * base), committed or not, with the lines added and removed. Read only: a file
+ * shows its diff; reverting stays in "This folder".
+ */
+function BranchChangesView({ source, refreshKey }: { source: BranchSource; refreshKey: number }) {
+  const [changes, setChanges] = useState<BranchChanges | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [selected, setSelected] = useState<string | null>(null)
+  const [diff, setDiff] = useState<Diff | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    source.load().then(
+      (loaded) => !cancelled && (setChanges(loaded), setError(null)),
+      (failure: Error) => !cancelled && (setChanges(null), setError(failure.message)),
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [source, refreshKey])
+  useEffect(() => {
+    setDiff(null)
+    if (!selected) return
+    let cancelled = false
+    source.diff(selected).then(
+      (text) => !cancelled && setDiff(parseUnifiedDiff(text)),
+      (failure: Error) => !cancelled && setError(failure.message),
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [source, selected, refreshKey])
+
+  if (error) return <div className="error-line small">{error}</div>
+  if (!changes) return <div className="muted pad">Reading the branch…</div>
+  return (
+    <>
+      <div className="pane-subtitle">
+        ⎇ {changes.branch ?? 'this branch'} since {changes.base} · {plural(changes.commits, 'commit')} · {plural(changes.totals.files, 'file')}{' '}
+        <span className="change-counts">
+          <span className="diff-added">+{changes.totals.adds}</span> <span className="diff-removed">−{changes.totals.dels}</span>
+        </span>
+      </div>
+      {changes.files.length === 0 && <div className="muted pad">Nothing has changed on this branch since it left {changes.base}.</div>}
+      <ul className="changes">
+        {changes.files.map((file) => (
+          <ChangeRow
+            key={file.path}
+            path={file.path}
+            kind={file.untracked ? 'new' : file.status}
+            counts={file.adds !== null && file.dels !== null ? { added: file.adds, removed: file.dels } : undefined}
+            selected={selected === file.path}
+            onSelect={() => setSelected(selected === file.path ? null : file.path)}
+            onOpenEditor={null}
+            onRevert={null}
+          >
+            {selected === file.path &&
+              (file.binary ? <div className="muted pad">Binary file</div> : diff && <DiffView diff={diff} label={`diff of ${file.path}`} />)}
+          </ChangeRow>
+        ))}
+      </ul>
+      {changes.truncated && <div className="muted pad small">More files changed than are listed here.</div>}
+    </>
+  )
+}
 
 /** What reverting a file does, in words, for the confirmation. */
 function revertWords(path: string, change: GitChange | undefined) {
@@ -174,12 +252,15 @@ function ChangesPanel({
   tool,
   state,
   controller,
+  branch = null,
 }: {
   platform: Platform
   refreshKey: number
   tool: ToolItem | null
   state: SessionState | null
   controller: ReviewController | null
+  /** v1.1: a chat in its own copy also shows what its branch changed. */
+  branch?: BranchSource | null
 }) {
   const [status, setStatus] = useState<GitStatusView | null | undefined>(undefined)
   const [error, setError] = useState<string | null>(null)
@@ -212,6 +293,7 @@ function ChangesPanel({
   const checkpoints = Boolean(state && controller && hasFeature(state, FEATURE_CHECKPOINTS))
   const chatFiles = state?.changes ?? []
   const scope: Scope = choice ?? (gitViews && chatFiles.length > 0 ? 'chat' : 'folder')
+  const scopes: Scope[] = [...(gitViews ? (['chat'] as const) : []), 'folder', ...(branch ? (['branch'] as const) : [])]
   const busy = state?.busy ?? false
 
   useEffect(() => {
@@ -326,11 +408,11 @@ function ChangesPanel({
   return (
     <div className="pane-body">
       <div className="changes-head">
-        {gitViews && (
+        {scopes.length > 1 && (
           <div className="scope-toggle" role="group" aria-label="Show changes from">
-            {(['chat', 'folder'] as const).map((id) => (
+            {scopes.map((id) => (
               <button key={id} aria-pressed={scope === id} className={scope === id ? 'active' : ''} onClick={() => setChoice(id)}>
-                {id === 'chat' ? 'This chat' : 'This folder'}
+                {SCOPE_NAMES[id]}
               </button>
             ))}
           </div>
@@ -434,6 +516,8 @@ function ChangesPanel({
         </>
       )}
 
+      {scope === 'branch' && branch && <BranchChangesView source={branch} refreshKey={refreshKey + bump} />}
+
       {reverting && <ConfirmDialog {...revertWords(reverting, folderChange(reverting))} onConfirm={confirmRevert} onCancel={() => setReverting(null)} />}
       {rewinding && state && controller && <RewindPicker state={state} controller={controller} onClose={() => setRewinding(false)} />}
     </div>
@@ -445,8 +529,34 @@ function FilesPanel({ platform, refreshKey, changed }: { platform: Platform; ref
   const [content, setContent] = useState<FileContent | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [openError, setOpenError] = useState<string | null>(null)
+  // v1.1: images, videos and sounds are shown from their bytes (a blob: URL), not read as text.
+  const preview = file && platform.readMedia ? previewOf(file) : null
+  const [mediaUrl, setMediaUrl] = useState<string | null>(null)
+  const [mediaProblem, setMediaProblem] = useState<string | null>(null)
   useEffect(() => {
-    if (!file) return
+    setMediaUrl(null)
+    setMediaProblem(null)
+    if (!file || !preview || !platform.readMedia) return
+    let cancelled = false
+    let url: string | null = null
+    platform.readMedia(file).then(
+      (bytes) => {
+        if (cancelled) return
+        url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: preview.mimeType }))
+        setMediaUrl(url)
+        setError(null)
+      },
+      (failure: Error) => !cancelled && setMediaProblem(failure.message),
+    )
+    return () => {
+      cancelled = true
+      if (url) URL.revokeObjectURL(url)
+    }
+    // `preview` follows `file`.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [platform, file, refreshKey])
+  useEffect(() => {
+    if (!file || preview) return
     let cancelled = false
     platform.read(file).then(
       (result) => !cancelled && (setContent(result), setError(null)),
@@ -455,6 +565,7 @@ function FilesPanel({ platform, refreshKey, changed }: { platform: Platform; ref
     return () => {
       cancelled = true
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [platform, file, refreshKey])
   return (
     <div className="pane-body files-pane">
@@ -472,8 +583,18 @@ function FilesPanel({ platform, refreshKey, changed }: { platform: Platform; ref
           </div>
           {error && <div className="error-line small">{error}</div>}
           {openError && <div className="error-line small">{openError}</div>}
-          {content?.binary && <div className="muted pad">Binary file ({content.size} bytes)</div>}
-          {content && !content.binary && (
+          {preview && mediaProblem && <div className="error-line small">{mediaProblem}</div>}
+          {preview && !mediaUrl && !mediaProblem && <div className="muted pad">Loading…</div>}
+          {/* An SVG is shown as an image only: its scripts and links never run in the page. */}
+          {preview?.kind === 'image' && mediaUrl && <img className="file-image" src={mediaUrl} alt={file} />}
+          {preview?.kind === 'video' && mediaUrl && (
+            <video className="file-media" src={mediaUrl} controls aria-label={file} onError={() => setMediaProblem("This video can't play here.")} />
+          )}
+          {preview?.kind === 'audio' && mediaUrl && (
+            <audio className="file-media" src={mediaUrl} controls aria-label={file} onError={() => setMediaProblem("This sound can't play here.")} />
+          )}
+          {!preview && content?.binary && <div className="muted pad">Binary file ({content.size} bytes)</div>}
+          {!preview && content && !content.binary && (
             <pre className="file-view" data-testid="file-view">
               {content.content}
               {content.truncated && '\n… (cut)'}
@@ -534,6 +655,7 @@ export function SidePane({
   state = null,
   controller = null,
   chatKey,
+  worktree = null,
 }: {
   platform: Platform
   tab: PaneTab
@@ -549,7 +671,15 @@ export function SidePane({
   controller?: ReviewController | null
   /** L4: the chat in view; the Changes and Files panels and the terminal follow its folder. */
   chatKey?: string | null
+  /** v1.1: the chat in view's own copy of the project, for "Branch changes". */
+  worktree?: WorktreeInfo | null
 }) {
+  const chats = platform.chats
+  const base = worktree?.base ?? null
+  const branch = useMemo<BranchSource | null>(() => {
+    if (!chatKey || base === null || !chats?.branchChanges || !chats.branchDiff) return null
+    return { base, load: () => chats.branchChanges!(chatKey), diff: (path) => chats.branchDiff!(chatKey, path) }
+  }, [chats, chatKey, base])
   const tabs: Array<[PaneTab, string]> = [
     ['changes', 'Changes'],
     ['files', 'Files'],
@@ -567,7 +697,7 @@ export function SidePane({
       </div>
       {/* L4: each chat has its own folder, so a chat switch starts these panels afresh. */}
       {tab === 'changes' && (
-        <ChangesPanel key={chatKey ?? undefined} platform={platform} refreshKey={refreshKey} tool={tool} state={state} controller={controller} />
+        <ChangesPanel key={chatKey ?? undefined} platform={platform} refreshKey={refreshKey} tool={tool} state={state} controller={controller} branch={branch} />
       )}
       {tab === 'files' && <FilesPanel key={chatKey ?? undefined} platform={platform} refreshKey={refreshKey} changed={changed} />}
       {tab === 'tasks' && <TasksPanel todos={todos} subagents={subagents} />}

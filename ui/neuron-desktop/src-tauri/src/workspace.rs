@@ -249,6 +249,46 @@ pub fn prune_staged(dir: &Path, now: std::time::SystemTime, max_age: std::time::
     removed
 }
 
+// Image and media previews in the Files tab. The file type table is ported from
+// Freebuff, common/src/desktop-cloud/image-files.ts and media-files.ts, commit
+// 0dc95cb (https://github.com/CodebuffAI/freebuff). Copyright Codebuff, Apache
+// License 2.0. Changed for Neuron: a Rust match with a size cap per kind. The
+// window keeps the same list in `src/mediaFiles.ts`. See ui/neuron-desktop/NOTICE.
+
+/// The most an image shown in the Files tab may weigh.
+pub const MAX_IMAGE_PREVIEW_BYTES: u64 = 10 * 1024 * 1024;
+/// The most a video or a sound shown in the Files tab may weigh: it is read whole.
+pub const MAX_MEDIA_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The media type of a file the Files tab can show, by its extension, and the
+/// most it may weigh. `None` for every other file.
+pub fn preview_type(path: &str) -> Option<(&'static str, u64)> {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let (_, extension) = name.rsplit_once('.')?;
+    let image = |mime| Some((mime, MAX_IMAGE_PREVIEW_BYTES));
+    let media = |mime| Some((mime, MAX_MEDIA_PREVIEW_BYTES));
+    match extension.to_ascii_lowercase().as_str() {
+        "png" => image("image/png"),
+        "jpg" | "jpeg" => image("image/jpeg"),
+        "gif" => image("image/gif"),
+        "webp" => image("image/webp"),
+        "avif" => image("image/avif"),
+        "svg" => image("image/svg+xml"),
+        "ico" => image("image/x-icon"),
+        "bmp" => image("image/bmp"),
+        "mp4" | "m4v" => media("video/mp4"),
+        "mov" => media("video/quicktime"),
+        "webm" => media("video/webm"),
+        "ogv" => media("video/ogg"),
+        "mp3" => media("audio/mpeg"),
+        "m4a" => media("audio/mp4"),
+        "wav" => media("audio/wav"),
+        "ogg" | "oga" => media("audio/ogg"),
+        "flac" => media("audio/flac"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
@@ -440,6 +480,39 @@ impl Workspace {
             binary,
             size,
         })
+    }
+
+    /// The bytes of an image, video or sound in the workspace, for the Files
+    /// tab to show. Only the types [`preview_type`] names, only inside the
+    /// workspace, and only up to its size cap.
+    pub fn read_media(&self, relative: &str) -> Result<Vec<u8>, String> {
+        let (_, cap) = preview_type(relative).ok_or_else(|| {
+            "Neuron shows images, videos and sounds here, not this file.".to_string()
+        })?;
+        let (absolute, _) = self.inside(relative)?;
+        let file = fs::File::open(&absolute).map_err(|error| error.to_string())?;
+        let meta = file.metadata().map_err(|error| error.to_string())?;
+        if !meta.is_file() {
+            return Err("That is not a file.".into());
+        }
+        let too_big = || {
+            format!(
+                "This file is too large to show here (the most is {} MB).",
+                cap / (1024 * 1024)
+            )
+        };
+        if meta.len() > cap {
+            return Err(too_big());
+        }
+        let mut bytes = Vec::new();
+        file.take(cap + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        // It may have grown since it was measured.
+        if bytes.len() as u64 > cap {
+            return Err(too_big());
+        }
+        Ok(bytes)
     }
 }
 
@@ -660,6 +733,61 @@ mod tests {
         let found = workspace.search("src", 10);
         assert!(found.contains(&"src/".to_string()), "{found:?}");
         assert!(found.contains(&"src/main.rs".to_string()));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn preview_types_follow_the_extension_only() {
+        for (path, mime) in [
+            ("assets/photo.png", "image/png"),
+            ("PHOTO.PNG", "image/png"),
+            ("a.jpeg", "image/jpeg"),
+            ("logo.svg", "image/svg+xml"),
+            ("clip.MP4", "video/mp4"),
+            ("song.flac", "audio/flac"),
+            (r"dir\voice.ogg", "audio/ogg"),
+        ] {
+            assert_eq!(preview_type(path).map(|(m, _)| m), Some(mime), "{path}");
+        }
+        for path in [
+            "png",
+            "src/png",
+            "a.png/source",
+            "image.png.ts",
+            "data.bin",
+            "README.md",
+            "",
+        ] {
+            assert_eq!(preview_type(path), None, "{path}");
+        }
+        assert_eq!(preview_type("a.gif").unwrap().1, MAX_IMAGE_PREVIEW_BYTES);
+        assert_eq!(preview_type("a.webm").unwrap().1, MAX_MEDIA_PREVIEW_BYTES);
+    }
+
+    #[test]
+    fn media_is_read_inside_the_workspace_only_and_within_its_cap() {
+        let (base, workspace) = fixture();
+        fs::write(base.join("ws/logo.png"), PNG).unwrap();
+        fs::write(base.join("outside.png"), PNG).unwrap();
+        assert_eq!(workspace.read_media("logo.png").unwrap(), PNG);
+        assert_eq!(
+            workspace.read_media("../outside.png").unwrap_err(),
+            "That path is outside the workspace."
+        );
+        // Text files are read as text, never through here.
+        assert!(workspace.read_media("README.md").is_err());
+        assert!(workspace.read_media("src/main.rs").is_err());
+        // An image past the cap is refused before it is read.
+        let big = fs::File::create(base.join("ws/huge.png")).unwrap();
+        big.set_len(MAX_IMAGE_PREVIEW_BYTES + 1).unwrap();
+        drop(big);
+        assert!(workspace
+            .read_media("huge.png")
+            .unwrap_err()
+            .contains("too large"));
+        // A folder named like an image is no image.
+        fs::create_dir_all(base.join("ws/dir.png")).unwrap();
+        assert!(workspace.read_media("dir.png").is_err());
         let _ = fs::remove_dir_all(base);
     }
 

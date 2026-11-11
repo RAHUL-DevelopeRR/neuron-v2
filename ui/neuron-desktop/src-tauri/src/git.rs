@@ -240,6 +240,253 @@ pub fn path_problem(file: &str) -> Option<&'static str> {
     None
 }
 
+// Branch changes: everything a chat's copy changed since its branch left its
+// base. The result's shape is ported from Freebuff, common/src/desktop-cloud/
+// changes.ts (`ChangedFile`, `totals`), commit 0dc95cb
+// (https://github.com/CodebuffAI/freebuff). Copyright Codebuff, Apache License
+// 2.0. Changed for Neuron: Rust types, `commits` and `truncated` added, no
+// modification times. See ui/neuron-desktop/NOTICE.
+
+/// The most files the branch scope lists.
+const MAX_BRANCH_FILES: usize = 2_000;
+/// New files up to this size have their lines counted.
+const MAX_COUNTED_BYTES: u64 = 512 * 1024;
+
+/// One file the branch changed, committed or not.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BranchFile {
+    /// Relative to the copy's top folder, with `/`.
+    pub path: String,
+    /// `added`, `modified` or `deleted`.
+    pub status: String,
+    /// Lines added and removed; `None` for a binary file.
+    pub adds: Option<u64>,
+    pub dels: Option<u64>,
+    pub binary: bool,
+    /// New, and not known to git yet.
+    pub untracked: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct BranchTotals {
+    pub files: usize,
+    pub adds: u64,
+    pub dels: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BranchChanges {
+    pub branch: Option<String>,
+    /// What the branch is compared with: the branch or commit it was made from.
+    pub base: String,
+    /// Commits on the branch since it left the base.
+    pub commits: u64,
+    pub files: Vec<BranchFile>,
+    pub totals: BranchTotals,
+    /// More files changed than are listed.
+    pub truncated: bool,
+}
+
+/// `git diff --numstat -z`: `adds\tdels\tpath` records; `-` counts for a binary file.
+fn parse_numstat(text: &str) -> Vec<(String, Option<u64>, Option<u64>)> {
+    text.split('\0')
+        .filter_map(|record| {
+            let mut parts = record.splitn(3, '\t');
+            let adds = parts.next()?.trim();
+            let dels = parts.next()?;
+            let path = parts.next()?;
+            (!path.is_empty()).then(|| (path.to_string(), adds.parse().ok(), dels.parse().ok()))
+        })
+        .collect()
+}
+
+/// `git diff --name-status -z --no-renames`: a status letter, then the path.
+fn parse_name_status(text: &str) -> std::collections::HashMap<String, &'static str> {
+    let mut found = std::collections::HashMap::new();
+    let mut parts = text.split('\0').filter(|part| !part.is_empty());
+    while let (Some(code), Some(path)) = (parts.next(), parts.next()) {
+        let status = match code.chars().next() {
+            Some('A') => "added",
+            Some('D') => "deleted",
+            _ => "modified",
+        };
+        found.insert(path.to_string(), status);
+    }
+    found
+}
+
+/// A commit or branch name to compare with: nothing git would read as an option.
+fn plausible_base(base: &str) -> bool {
+    !base.is_empty()
+        && !base.starts_with('-')
+        && !base.contains("..")
+        && !base.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+/// Where the branch left `base`: their merge base.
+fn merge_base(root: &Path, base: &str) -> Result<String, String> {
+    if !plausible_base(base) {
+        return Err("That is not a branch to compare with.".into());
+    }
+    let run = git(root, &["merge-base", base, "HEAD"], true)?;
+    let commit = run.stdout.trim().to_string();
+    if !run.ok || commit.is_empty() {
+        return Err(format!("Could not find where this branch left {base}."));
+    }
+    Ok(commit)
+}
+
+/// Lines in a new file, when it is text and small enough to count.
+fn count_lines(path: &Path) -> Option<u64> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_COUNTED_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    let lines = bytes.iter().filter(|byte| **byte == b'\n').count() as u64;
+    Some(lines + u64::from(!bytes.is_empty() && !bytes.ends_with(b"\n")))
+}
+
+/// Everything the copy at `root` changed since its branch left `base`: the
+/// commits on the branch (`<merge-base>..HEAD`) and what is not committed yet,
+/// together, as `git diff <merge-base>` sees the working tree, plus new files.
+pub fn branch_changes(root: &Path, base: &str) -> Result<BranchChanges, String> {
+    assert_safe(root)?;
+    let since = merge_base(root, base)?;
+    let head = git(root, &["rev-parse", "--abbrev-ref", "HEAD"], true)?;
+    let branch = Some(head.stdout.trim().to_string())
+        .filter(|name| head.ok && !name.is_empty() && name != "HEAD");
+    let range = format!("{since}..HEAD");
+    let commits = git(root, &["rev-list", "--count", &range], true)?;
+    let commits = commits.stdout.trim().parse().unwrap_or(0);
+    let common = [
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+    ];
+    let mut numstat = vec!["diff", "--numstat", "-z"];
+    numstat.extend(common);
+    numstat.extend([since.as_str(), "--"]);
+    let counts = git(root, &numstat, true)?;
+    let mut names = vec!["diff", "--name-status", "-z"];
+    names.extend(common);
+    names.extend([since.as_str(), "--"]);
+    let names = git(root, &names, true)?;
+    if !counts.ok || !names.ok {
+        return Err("git could not compare this branch.".into());
+    }
+    let statuses = parse_name_status(&names.stdout);
+    let mut files: Vec<BranchFile> = parse_numstat(&counts.stdout)
+        .into_iter()
+        .map(|(path, adds, dels)| BranchFile {
+            status: statuses
+                .get(&path)
+                .copied()
+                .unwrap_or("modified")
+                .to_string(),
+            binary: adds.is_none() && dels.is_none(),
+            path,
+            adds,
+            dels,
+            untracked: false,
+        })
+        .collect();
+    let untracked = git(
+        root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        true,
+    )?;
+    if untracked.ok {
+        for path in untracked.stdout.split('\0').filter(|path| !path.is_empty()) {
+            let lines = count_lines(&root.join(path));
+            files.push(BranchFile {
+                path: path.to_string(),
+                status: "added".into(),
+                adds: lines,
+                dels: lines.map(|_| 0),
+                binary: lines.is_none(),
+                untracked: true,
+            });
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let totals = BranchTotals {
+        files: files.len(),
+        adds: files.iter().filter_map(|file| file.adds).sum(),
+        dels: files.iter().filter_map(|file| file.dels).sum(),
+    };
+    let truncated = files.len() > MAX_BRANCH_FILES;
+    files.truncate(MAX_BRANCH_FILES);
+    Ok(BranchChanges {
+        branch,
+        base: base.to_string(),
+        commits,
+        files,
+        totals,
+        truncated,
+    })
+}
+
+/// One file's change since the branch left `base`, committed or not, as a
+/// unified diff. A new file shows as all added.
+pub fn branch_diff(root: &Path, base: &str, file: &str) -> Result<String, String> {
+    if let Some(problem) = path_problem(file) {
+        return Err(problem.into());
+    }
+    assert_safe(root)?;
+    let since = merge_base(root, base)?;
+    let untracked = git(
+        root,
+        &[
+            "--literal-pathspecs",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            file,
+        ],
+        true,
+    )?;
+    if untracked.ok && untracked.stdout.split('\0').any(|listed| listed == file) {
+        // `--no-index` compares the empty file with the new one; it exits 1 when they differ.
+        let added = git(
+            root,
+            &[
+                "diff",
+                "--no-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--",
+                "/dev/null",
+                file,
+            ],
+            true,
+        )?;
+        return Ok(added.stdout);
+    }
+    let run = git(
+        root,
+        &[
+            "--literal-pathspecs",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            &since,
+            "--",
+            file,
+        ],
+        true,
+    )?;
+    Ok(if run.ok { run.stdout } else { String::new() })
+}
+
 /// Git's unmerged status pairs: `DD`, `AU`, `UD`, `UA`, `DU`, `AA`, `UU`, and
 /// anything with a `U` in either column.
 fn is_unmerged(index: &str, worktree: &str) -> bool {
@@ -580,6 +827,100 @@ mod tests {
             diff(&pkg, "../outside.txt").unwrap_err(),
             "That path is outside the workspace."
         );
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn numstat_and_name_status_records_are_read() {
+        assert_eq!(
+            parse_numstat("3\t1\tsrc/a.rs\0-\t-\tlogo.png\x0010\t0\tsp ace.txt\0"),
+            [
+                ("src/a.rs".to_string(), Some(3), Some(1)),
+                ("logo.png".to_string(), None, None),
+                ("sp ace.txt".to_string(), Some(10), Some(0)),
+            ]
+        );
+        assert!(parse_numstat("").is_empty());
+        let statuses = parse_name_status("A\0new.txt\0D\0gone.txt\0M\0a.rs\0T\0link\0");
+        assert_eq!(statuses["new.txt"], "added");
+        assert_eq!(statuses["gone.txt"], "deleted");
+        assert_eq!(statuses["a.rs"], "modified");
+        assert_eq!(statuses["link"], "modified");
+    }
+
+    #[test]
+    fn branch_changes_cover_commits_since_the_base_and_uncommitted_work() {
+        let repo = repo_with_changes("branch");
+        run(&repo, &["checkout", "-q", "-b", "neuron/work"]);
+        fs::write(repo.join("src/a.txt"), "a\nmore\nlines\n").unwrap();
+        fs::remove_file(repo.join("b.txt")).unwrap();
+        run(&repo, &["add", "-A"]);
+        run(&repo, &["commit", "-q", "-m", "work"]);
+        // Main moves on after the branch left it: that is not the branch's change.
+        run(&repo, &["checkout", "-q", "main"]);
+        fs::write(repo.join("main-only.txt"), "m\n").unwrap();
+        run(&repo, &["add", "-A"]);
+        run(&repo, &["commit", "-q", "-m", "main"]);
+        run(&repo, &["checkout", "-q", "neuron/work"]);
+        // Not committed yet: a change and a new file.
+        fs::write(repo.join("src/a.txt"), "a\nmore\nlines\nand one\n").unwrap();
+        fs::write(repo.join("new.txt"), "one\ntwo").unwrap();
+        let root = fs::canonicalize(&repo).unwrap();
+
+        let changes = branch_changes(&root, "main").unwrap();
+        assert_eq!(changes.branch.as_deref(), Some("neuron/work"));
+        assert_eq!(changes.commits, 1);
+        let rows: Vec<_> = changes
+            .files
+            .iter()
+            .map(|f| {
+                (
+                    f.path.as_str(),
+                    f.status.as_str(),
+                    f.adds,
+                    f.dels,
+                    f.untracked,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("b.txt", "deleted", Some(0), Some(1), false),
+                ("new.txt", "added", Some(2), Some(0), true),
+                ("src/a.txt", "modified", Some(3), Some(0), false),
+            ]
+        );
+        assert_eq!(
+            changes.totals,
+            BranchTotals {
+                files: 3,
+                adds: 5,
+                dels: 1
+            }
+        );
+        assert!(!changes.files.iter().any(|f| f.path == "main-only.txt"));
+
+        let diff = branch_diff(&root, "main", "src/a.txt").unwrap();
+        assert!(
+            diff.contains("+more") && diff.contains("+and one"),
+            "{diff}"
+        );
+        let added = branch_diff(&root, "main", "new.txt").unwrap();
+        assert!(added.contains("+one"), "{added}");
+        assert!(branch_diff(&root, "main", "../x").is_err());
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn branch_changes_refuse_odd_bases() {
+        let repo = repo_with_changes("branch-base");
+        let root = fs::canonicalize(&repo).unwrap();
+        for bad in ["", "--output=x", "main..HEAD", "a b", "nope"] {
+            assert!(branch_changes(&root, bad).is_err(), "{bad:?}");
+        }
+        let none = branch_changes(&root, "main").unwrap();
+        assert_eq!((none.commits, none.files.len()), (0, 0));
         let _ = fs::remove_dir_all(repo);
     }
 

@@ -21,7 +21,8 @@ import {
 
 import { AccountRow, SignOutDialog, type AccountAction } from './components/AccountMenu'
 import { ChatHeader, RestartBanner, StatusBar } from './components/Bars'
-import { ChatContextBar, DiscardDialog } from './components/ChatHeader'
+import { ChatContextBar, DiscardDialog, NewCopyDialog, PullRequestChip } from './components/ChatHeader'
+import { QuitDialog } from './components/QuitDialog'
 import { CommandPalette, ShortcutsSheet } from './components/CommandPalette'
 import { Composer, EffortPicker, ModeMenu, nextMode, type ComposerHandle } from './components/Composer'
 import { ExtensionsPanel } from './components/ExtensionsPanel'
@@ -44,7 +45,7 @@ import { buildDiagnostics, engineProblemFor, parseEngineProblem } from './engine
 import { exportName, transcriptJson, transcriptMarkdown, type DesktopCommand } from './commands'
 import { useSession } from './hooks'
 import { LINKS } from './links'
-import { ChatError, type EngineInfo, type LaunchOptions, type Platform, type Project, type UpdateInfo } from './platform'
+import { ChatError, type EngineInfo, type LaunchOptions, type Platform, type Project, type QuitRequest, type UpdateInfo } from './platform'
 import { safeExternalUrl } from './platform/links'
 import type { PaletteCommand } from './palette'
 import { noteSeen, sessionRows, type SessionRow } from './sessions'
@@ -98,6 +99,10 @@ export function App({ platform }: { platform: Platform }) {
   const [discardFromClose, setDiscardFromClose] = useState(false)
   // Why a chat could not replace the one just closed (the last one).
   const [replaceError, setReplaceError] = useState<string | null>(null)
+  // v1.1: the host's question before quitting while chats work, and the "copy from a branch" dialog.
+  const [quitRequest, setQuitRequest] = useState<QuitRequest | null>(null)
+  const [newCopyOpen, setNewCopyOpen] = useState(false)
+  useEffect(() => platform.quit?.onRequest(setQuitRequest), [platform])
   const switchingRef = useRef(false)
   const paletteOpen = useRef(false)
   paletteOpen.current = palette
@@ -236,7 +241,7 @@ export function App({ platform }: { platform: Platform }) {
 
   // L4: a chat in its own folder or copy; a refusal (the 4 working chats) is told, not thrown.
   const openChat = useCallback(
-    async (request: { path?: string; resume?: string | null; worktree?: { name?: string } }) => {
+    async (request: { path?: string; resume?: string | null; worktree?: { name?: string; start?: string } }) => {
       if (!chats || switchingRef.current) return
       switchingRef.current = true
       setSwitching(true)
@@ -422,6 +427,9 @@ export function App({ platform }: { platform: Platform }) {
     const actions: PaletteCommand[] = [
       { id: 'new-chat', title: 'New chat', group: 'Actions', keys: shortcutKeys('newChat'), run: newSession },
       ...(multi ? [{ id: 'new-copy', title: 'New chat in its own copy of the project', group: 'Actions', keys: shortcutKeys('newWorktreeChat'), run: newWorktreeChat }] : []),
+      ...(multi && platform.chats?.branches
+        ? [{ id: 'new-copy-from', title: 'New chat in its own copy, from a branch…', group: 'Actions', run: () => setNewCopyOpen(true) }]
+        : []),
       ...(multi && snapshot.needsYouCount > 0
         ? [{ id: 'jump', title: 'Go to the chat that needs you', group: 'Actions', keys: shortcutKeys('nextWaiting'), run: () => void chats?.jumpToWaiting() }]
         : []),
@@ -439,7 +447,7 @@ export function App({ platform }: { platform: Platform }) {
       : []
     const sessions: PaletteCommand[] = (rows ?? []).slice(0, 40).map((row) => ({ id: `session-${row.id}`, title: row.title, group: 'Sessions', run: () => openSession(row) }))
     return [...actions, ...openChats, ...sessions]
-  }, [multi, snapshot, chats, active, rows, newSession, newWorktreeChat, closeChat, focusSearch, openSettings, openSession])
+  }, [multi, platform, snapshot, chats, active, rows, newSession, newWorktreeChat, closeChat, focusSearch, openSettings, openSession])
 
   // A chat switch starts on the chat's own page, with nothing selected.
   useEffect(() => {
@@ -820,6 +828,12 @@ export function App({ platform }: { platform: Platform }) {
               where={platform.label}
               sidePaneOpen={paneOpen}
               onToggleSidePane={() => setPaneOpen(!paneOpen)}
+              extra={
+                // v1.1: the pull request of the chat's branch, asked again when the branch is renamed
+                multi && active && active.info.branch && platform.chats?.pullRequest ? (
+                  <PullRequestChip key={`${active.id}:${active.info.branch}`} load={() => platform.chats!.pullRequest!(active.id)} onOpen={openLink} />
+                ) : null
+              }
             />
             {/* L4: the copy this chat works in */}
             {multi && active && (
@@ -956,6 +970,7 @@ export function App({ platform }: { platform: Platform }) {
           state={state}
           controller={controller}
           chatKey={active?.id}
+          worktree={multi ? (active?.info.worktree ?? null) : null}
         />
       )}
       <StatusBar state={state} onPane={openPane} />
@@ -1023,6 +1038,27 @@ export function App({ platform }: { platform: Platform }) {
             await closeChat(discarding)
           }}
           onClose={() => setDiscarding(null)}
+        />
+      )}
+      {/* v1.1 */}
+      {newCopyOpen && multi && platform.chats?.branches && (
+        <NewCopyDialog
+          loadBranches={() => platform.chats!.branches!(project?.path)}
+          onCreate={(start) => {
+            setNewCopyOpen(false)
+            void openChat({ path: project?.path, worktree: { start } }).catch(() => {})
+          }}
+          onClose={() => setNewCopyOpen(false)}
+        />
+      )}
+      {quitRequest && (
+        <QuitDialog
+          key={quitRequest.id}
+          request={quitRequest}
+          onAnswer={(quit) => {
+            platform.quit?.answer(quitRequest.id, quit)
+            setQuitRequest(null)
+          }}
         />
       )}
       {toast && (

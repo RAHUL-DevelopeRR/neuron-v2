@@ -16,7 +16,19 @@ import {
   type TransportClose,
 } from '@neuron/client'
 
-import { ChatError, type ChatHost, type ChatInfo, type LaunchOptions, type Project, type WorktreeInfo, type WorktreeStatus } from './types'
+import type { PullRequestSnapshot } from '../pullRequest'
+import { copyNameFromPrompt } from '../worktreeName'
+import {
+  ChatError,
+  type BranchChanges,
+  type BranchList,
+  type ChatHost,
+  type ChatInfo,
+  type LaunchOptions,
+  type Project,
+  type WorktreeInfo,
+  type WorktreeStatus,
+} from './types'
 
 export interface Ipc {
   invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>
@@ -207,6 +219,8 @@ class ChatTransport implements EngineTransport, Handler {
     private generation: number,
     private readonly timeoutMs: number,
     private readonly retryMs: readonly number[] = REPLY_RETRY_MS,
+    /** v1.1: told of every prompt the user sends, before it goes. */
+    private readonly onPrompt?: (text: string) => void,
   ) {}
 
   /** Whether an event is this transport's engine's; a newer one is adopted while a launch runs. */
@@ -293,6 +307,7 @@ class ChatTransport implements EngineTransport, Handler {
 
   send(message: ClientMessage): void {
     if (!this.ready) throw new Error('The Neuron engine is not running.')
+    if (message.kind === 'command' && message.type === 'submit') this.onPrompt?.(message.text)
     this.deliver(message, { generation: this.generation, turn: this.turn, attempt: 0 })
   }
 
@@ -388,13 +403,43 @@ export function createChatHost(
     }
   }
 
+  /** Chats whose copy is being named now. */
+  const naming = new Set<string>()
+
+  /**
+   * v1.1: a copy made without a name takes one from the first prompt that has
+   * words: the host renames its branch (`neuron/chat-xxxxxx` becomes
+   * `neuron/fix-login-redirect`). The prompt goes on regardless; a refusal is quiet.
+   * The chat's info is updated in place, so every holder of it sees the new branch.
+   */
+  const nameCopy = (id: string, text: string) => {
+    const info = infos.get(id)
+    if (!info?.worktree || info.worktree.named !== false || naming.has(id) || text.trimStart().startsWith('/')) return
+    const name = copyNameFromPrompt(text)
+    if (!name) return
+    naming.add(id)
+    call<Summary>('worktree_name', { chat: id, name }).then(
+      (renamed) => {
+        if (renamed.worktree) info.worktree = renamed.worktree
+        info.branch = renamed.branch
+      },
+      // Tried once: a copy that could not be renamed keeps its first name.
+      () => {
+        if (info.worktree) info.worktree = { ...info.worktree, named: true }
+      },
+    )
+  }
+
   const attach = (summary: Summary) => {
-    const transport = new ChatTransport(ipc, summary.chat, summary.generation, options.startTimeoutMs ?? START_TIMEOUT_MS, replyRetryMs)
+    const transport = new ChatTransport(ipc, summary.chat, summary.generation, options.startTimeoutMs ?? START_TIMEOUT_MS, replyRetryMs, (text) =>
+      nameCopy(summary.chat, text),
+    )
     const controller = new SessionController(transport, { client: 'desktop', capabilities: options.capabilities })
+    const info = infoOf(summary)
     transports.set(summary.chat, transport)
     controllers.set(summary.chat, controller)
-    infos.set(summary.chat, infoOf(summary))
-    return { info: infoOf(summary), controller, transport }
+    infos.set(summary.chat, info)
+    return { info, controller, transport }
   }
 
   const forget = (id: string) => {
@@ -490,6 +535,11 @@ export function createChatHost(
     onStopped: (listener) => bus.onStopped(listener),
     list: async () => (await call<Summary[]>('chat_list')).map(infoOf),
     worktreeStatus: (id) => call<WorktreeStatus>('worktree_status', { chat: id }),
+    // v1.1
+    branches: (path) => call<BranchList>('worktree_branches', { path: path ?? null }),
+    branchChanges: (id) => call<BranchChanges>('branch_changes', { chat: id }),
+    branchDiff: (id, path) => call<string>('branch_diff', { chat: id, path }),
+    pullRequest: (id) => call<PullRequestSnapshot>('pr_status', { chat: id }),
     async discardWorktree(id, discard) {
       await call<void>('worktree_discard', { chat: id, force: discard.force, deleteUnmerged: discard.deleteUnmerged })
       forget(id)

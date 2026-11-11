@@ -1241,6 +1241,50 @@ h2 {
   overflow: auto;
   flex: 1;
 }
+/* v1.1: image, video and sound previews in Files. */
+.file-image {
+  display: block;
+  max-width: 100%;
+  max-height: 60vh;
+  margin: 8px auto;
+  object-fit: contain;
+}
+.file-media {
+  display: block;
+  width: calc(100% - 24px);
+  margin: 8px 12px;
+}
+/* v1.1: the pull request chip in the chat header. */
+.pr-chip {
+  font: 11.5px var(--ui);
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.pr-chip:hover {
+  color: var(--text);
+}
+.pr-chip[data-checks='passed'] {
+  border-color: var(--success);
+}
+.pr-chip[data-checks='pending'] {
+  border-color: var(--orange);
+}
+.pr-chip[data-checks='failed'],
+.pr-chip.pr-conflict {
+  border-color: var(--danger);
+}
+/* v1.1: the start branch of a new copy. */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0;
+}
 .terminal-tab {
   flex: 1;
   min-height: 0;

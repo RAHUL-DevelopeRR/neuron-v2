@@ -112,6 +112,30 @@ describe('the Tauri platform with several chats', () => {
     expect(callsOf('chat_resume').at(-1)).toMatchObject({ chat: 'c2bbbbbb', resume: '', trustOnce: false })
   })
 
+  test('v1.1: media, branch changes and the pull request are read for the chat in view', async () => {
+    handlers.set('fs_read_media', () => new Uint8Array([1, 2, 3]).buffer)
+    const bytes = await platform.readMedia!('assets/logo.png')
+    expect([...bytes]).toEqual([1, 2, 3])
+    expect(callsOf('fs_read_media').at(-1)).toEqual({ path: 'assets/logo.png', chat: 'c2bbbbbb' })
+    await platform.chats!.branchChanges!('c2bbbbbb')
+    await platform.chats!.branchDiff!('c2bbbbbb', 'src/a.ts')
+    await platform.chats!.pullRequest!('c2bbbbbb')
+    expect(callsOf('branch_changes').at(-1)).toEqual({ chat: 'c2bbbbbb' })
+    expect(callsOf('branch_diff').at(-1)).toEqual({ chat: 'c2bbbbbb', path: 'src/a.ts' })
+    expect(callsOf('pr_status').at(-1)).toEqual({ chat: 'c2bbbbbb' })
+  })
+
+  test('v1.1: a quit request reaches the window, and its answer goes back', async () => {
+    const asked: unknown[] = []
+    const stop = platform.quit!.onRequest((request) => asked.push(request))
+    await Promise.resolve()
+    emit('neuron://quit-request', { id: 4, working: 2, waiting: 0 })
+    expect(asked).toEqual([{ id: 4, working: 2, waiting: 0 }])
+    platform.quit!.answer(4, false)
+    expect(callsOf('quit_answer').at(-1)).toEqual({ id: 4, quit: false })
+    stop()
+  })
+
   test('L5\'s host calls are unchanged', async () => {
     handlers.set('engine_info', () => ({ source: 'bundled', path: '/app/neuron', bundledPath: '/app/neuron', bundledPresent: true }))
     handlers.set('diagnostics', () => 'App version: 0.2.0')

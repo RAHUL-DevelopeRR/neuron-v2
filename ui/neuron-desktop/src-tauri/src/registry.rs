@@ -169,6 +169,8 @@ pub struct WorktreeView {
     pub path: String,
     pub branch: String,
     pub base: String,
+    /// False until the copy has a name of its own (the first prompt gives one).
+    pub named: bool,
 }
 
 /// What the window is told about a chat.
@@ -959,6 +961,7 @@ impl EngineRegistry {
                 path: display_path(&record.path),
                 branch: record.branch.clone(),
                 base: record.base.clone(),
+                named: record.named,
             }),
             running: chat.running(),
             session: chat.session.clone(),
@@ -984,6 +987,50 @@ impl EngineRegistry {
     }
 
     /// The chats whose engine runs now.
+    /// How many chats are working, and how many wait for the user: what a
+    /// quit asks about first.
+    pub fn working(&self) -> (usize, usize) {
+        let chats = lock(&self.chats);
+        let waiting = chats.values().filter(|chat| chat.waiting).count();
+        let working = chats
+            .values()
+            .filter(|chat| chat.busy && !chat.waiting)
+            .count();
+        (working, waiting)
+    }
+
+    /// Names the chat's copy with `rename` (git runs with the lock released).
+    /// Nothing changes when the copy has a name already; an error when it is
+    /// being discarded or was replaced meanwhile.
+    pub fn rename_worktree(
+        &self,
+        id: &str,
+        rename: impl FnOnce(&WorktreeRecord) -> Result<WorktreeRecord, String>,
+    ) -> Result<ChatSummary, String> {
+        let record = {
+            let chats = lock(&self.chats);
+            let chat = chats.get(id).ok_or("No such chat.")?;
+            if chat.discarding {
+                return Err("discarding".into());
+            }
+            chat.worktree
+                .clone()
+                .ok_or("This chat has no copy of its own.")?
+        };
+        if record.named {
+            return self.summary(id);
+        }
+        let renamed = rename(&record)?;
+        let mut chats = lock(&self.chats);
+        let chat = chats.get_mut(id).ok_or("No such chat.")?;
+        if chat.discarding || chat.worktree.as_ref() != Some(&record) {
+            return Err("This chat's copy changed meanwhile.".into());
+        }
+        chat.branch = Some(renamed.branch.clone());
+        chat.worktree = Some(renamed);
+        Ok(Self::summarize(id, chat))
+    }
+
     pub fn running_count(&self) -> usize {
         lock(&self.chats)
             .values()
@@ -1996,6 +2043,7 @@ mod tests {
             slug: "copy".into(),
             branch: "neuron/copy".into(),
             base: "main".into(),
+            named: false,
         }
     }
 
@@ -2012,6 +2060,67 @@ mod tests {
                 )
                 .expect("a chat opens")
         }
+    }
+
+    /// What a quit asks about: chats working, and chats waiting for the user.
+    #[test]
+    fn working_counts_busy_and_waiting_chats_apart() {
+        let fixture = Fixture::new("working");
+        let (a, b, c) = (fixture.open(), fixture.open(), fixture.open());
+        assert_eq!(fixture.registry.working(), (0, 0));
+        fixture.registry.activity(&a.chat, true, false).unwrap();
+        fixture.registry.activity(&b.chat, true, true).unwrap();
+        assert_eq!(fixture.registry.working(), (1, 1));
+        fixture.registry.activity(&c.chat, true, false).unwrap();
+        assert_eq!(fixture.registry.working(), (2, 1));
+        fixture.registry.activity(&a.chat, false, false).unwrap();
+        fixture.registry.activity(&b.chat, false, false).unwrap();
+        assert_eq!(fixture.registry.working(), (1, 0));
+    }
+
+    #[test]
+    fn renaming_a_copy_updates_its_summary_once() {
+        let fixture = Fixture::new("rename-copy");
+        let chat = fixture.open_copy();
+        assert_eq!(chat.worktree.as_ref().map(|w| w.named), Some(false));
+        let calls = std::cell::Cell::new(0);
+        let renamed = fixture
+            .registry
+            .rename_worktree(&chat.chat, |record| {
+                calls.set(calls.get() + 1);
+                Ok(WorktreeRecord {
+                    slug: "fix-login".into(),
+                    branch: "neuron/fix-login".into(),
+                    named: true,
+                    ..record.clone()
+                })
+            })
+            .unwrap();
+        assert_eq!(renamed.branch.as_deref(), Some("neuron/fix-login"));
+        let view = renamed.worktree.unwrap();
+        assert_eq!(
+            (view.branch.as_str(), view.named),
+            ("neuron/fix-login", true)
+        );
+        assert_eq!(
+            fixture.registry.worktree(&chat.chat).unwrap().slug,
+            "fix-login"
+        );
+        // Named now: a later prompt does not run git again.
+        fixture
+            .registry
+            .rename_worktree(&chat.chat, |_| {
+                calls.set(calls.get() + 1);
+                Err("ran".into())
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        // A chat in the project's own folder has no copy to name.
+        let plain = fixture.open();
+        assert!(fixture
+            .registry
+            .rename_worktree(&plain.chat, |record| Ok(record.clone()))
+            .is_err());
     }
 
     /// An engine that stops reading its input stalls its own `send`, and nothing
