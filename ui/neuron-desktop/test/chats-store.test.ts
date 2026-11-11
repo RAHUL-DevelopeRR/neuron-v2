@@ -130,3 +130,47 @@ describe('closing a chat with a copy of its own', () => {
     expect(store.getSnapshot().items.map((item) => item.id)).not.toContain(second.id)
   })
 })
+
+describe('the digest of each chat', () => {
+  const rowOf = (store: ChatsStore, id: string) => store.getSnapshot().items.find((item) => item.id === id)!
+
+  test('a row carries its steps and a one-line status', async () => {
+    const { host, store, first, second } = await setup()
+    store.setActive(first.id)
+    const engine = host.engines.get(second.id)!
+    host.controllers.get(second.id)!.submit('fix the tests')
+    engine.emit({
+      type: 'todos',
+      items: [
+        { content: 'Read the failure', status: 'completed', active_form: null },
+        { content: 'Fix it', status: 'in_progress', active_form: 'Fixing it' },
+        { content: 'Run the tests', status: 'pending', active_form: null },
+      ],
+    })
+    await settle()
+    expect(rowOf(store, second.id).steps).toEqual({ done: 1, total: 3 })
+    expect(rowOf(store, second.id).status).toBe('Fixing it')
+    engine.emit({ type: 'tool_call_started', id: 't1', name: 'bash', input: '{"command":"bun test"}', cut_off: false })
+    await settle()
+    expect(rowOf(store, second.id).status).toMatch(/bun test/)
+  })
+
+  test('a turn that ended in an error is failed, and a new prompt clears it', async () => {
+    const { host, store, first, second } = await setup()
+    store.setActive(first.id)
+    const engine = host.engines.get(second.id)!
+    host.controllers.get(second.id)!.submit('go')
+    engine.emit({ type: 'error', message: 'boom' })
+    engine.emit({ type: 'turn_finished' })
+    await settle()
+    expect(rowOf(store, second.id).failed).toBe(true)
+    expect(rowOf(store, second.id).status).toBe('Turn failed')
+    // The taskbar count and the notifications stay for requests only.
+    expect(store.getSnapshot().needsYouCount).toBe(0)
+    // Ctrl+J goes to a chat that waits on a request, not to a failed one.
+    expect(store.jumpToWaiting()).toBeNull()
+    host.controllers.get(second.id)!.submit('again')
+    await settle()
+    expect(rowOf(store, second.id).failed).toBe(false)
+  })
+})

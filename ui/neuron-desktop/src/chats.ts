@@ -7,7 +7,16 @@
 
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
 
-import { chatActivity, openQuestionItem, type SessionController, type SessionState } from '@neuron/client'
+import {
+  chatActivity,
+  openQuestionItem,
+  sessionDigest,
+  threadGroup,
+  threadStatusLine,
+  threadStepCount,
+  type SessionController,
+  type SessionState,
+} from '@neuron/client'
 
 import { ChatError, type ChatHost, type ChatInfo, type Platform } from './platform'
 
@@ -15,6 +24,14 @@ export type Activity = ReturnType<typeof chatActivity>
 
 /** A chat as the sidebar lists it. */
 export interface ChatRow {
+  /** The engine's session, once it said: a pin follows it from one launch to the next. */
+  sessionId?: string | null
+  /** How far the task list got, when there is one. */
+  steps?: { done: number; total: number } | null
+  /** What it is doing or waiting for, in one plain line. */
+  status?: string | null
+  /** Its last turn ended in an error and it sits idle: it needs the user too. */
+  failed?: boolean
   id: string
   title: string
   branch: string | null
@@ -59,18 +76,55 @@ export function nextUnread(prev: ReadonlySet<string>, id: string, from: Activity
   return prev
 }
 
-/** The sidebar's four groups. A chat is in exactly one: needs you first, then working, then finished and unseen, then the rest. */
-export function triage(rows: readonly ChatRow[]): { needsYou: ChatRow[]; running: ChatRow[]; doneUnread: ChatRow[]; idle: ChatRow[] } {
-  const groups = { needsYou: [] as ChatRow[], running: [] as ChatRow[], doneUnread: [] as ChatRow[], idle: [] as ChatRow[] }
+/**
+ * The sidebar's four groups. A chat is in exactly one: needs you first (a request, or a failed
+ * turn while idle), then working, then finished and unseen, then the rest.
+ */
+export function triage<Row extends ChatRow>(rows: readonly Row[]): { needsYou: Row[]; running: Row[]; doneUnread: Row[]; idle: Row[] } {
+  const groups = { needsYou: [] as Row[], running: [] as Row[], doneUnread: [] as Row[], idle: [] as Row[] }
   for (const row of rows) {
-    if (row.activity === 'needs_you') groups.needsYou.push(row)
+    if (row.activity === 'needs_you' || (row.activity === 'idle' && row.failed === true)) groups.needsYou.push(row)
     else if (row.activity === 'running') groups.running.push(row)
     else if (row.unread) groups.doneUnread.push(row)
     else groups.idle.push(row)
   }
-  // The one waiting longest first.
-  groups.needsYou.sort((a, b) => (a.needsSince ?? 0) - (b.needsSince ?? 0))
+  // The one waiting longest on a request first; failed turns after them.
+  const since = (row: ChatRow) => (row.activity === 'needs_you' ? (row.needsSince ?? 0) : Number.MAX_SAFE_INTEGER)
+  groups.needsYou.sort((a, b) => since(a) - since(b))
   return groups
+}
+
+/** The most pins kept; pinning one more lets go of the oldest. */
+export const PIN_LIMIT = 100
+
+/** A chat is pinned by its session (kept between launches) or, before the engine named one, by itself. */
+export function isPinned(row: Pick<ChatRow, 'id' | 'sessionId'>, pins: ReadonlySet<string>): boolean {
+  return pins.has(row.id) || (!!row.sessionId && pins.has(row.sessionId))
+}
+
+/** The pins after the user pinned or unpinned `row`. Pure: `pins` is left alone. */
+export function togglePin(pins: ReadonlySet<string>, row: Pick<ChatRow, 'id' | 'sessionId'>): ReadonlySet<string> {
+  const next = new Set(pins)
+  if (isPinned(row, pins)) {
+    next.delete(row.id)
+    if (row.sessionId) next.delete(row.sessionId)
+    return next
+  }
+  next.add(row.sessionId || row.id)
+  // A Set keeps insertion order: the oldest pins go first.
+  for (const old of next) {
+    if (next.size <= PIN_LIMIT) break
+    next.delete(old)
+  }
+  return next
+}
+
+/** The pinned chats, listed in a group of their own above the others, and the rest. */
+export function splitPinned<Row extends ChatRow>(rows: readonly Row[], pins: ReadonlySet<string>): { pinned: Row[]; rest: Row[] } {
+  const pinned: Row[] = []
+  const rest: Row[] = []
+  for (const row of rows) (isPinned(row, pins) ? pinned : rest).push(row)
+  return { pinned, rest }
 }
 
 const STOP_NOTE: Record<string, string> = {
@@ -234,7 +288,8 @@ export class ChatsStore {
 
   /** The chat that needs the user longest, in view. Returns its id. */
   jumpToWaiting(): string | null {
-    const waiting = triage(this.snapshot.items).needsYou[0]
+    // A request, not a failed turn: that is what the badge counts.
+    const waiting = triage(this.snapshot.items).needsYou.find((item) => item.activity === 'needs_you')
     if (!waiting) return null
     if (waiting.id !== this.activeId) this.setActive(waiting.id)
     return waiting.id
@@ -317,11 +372,17 @@ export class ChatsStore {
         tracked.reported = report
         this.options.host?.reportActivity(id, { busy: state.busy, waiting: activity === 'needs_you' })
       }
+      const title = titleOf(state, tracked.info)
+      const digest = sessionDigest(state, { id, title })
+      const steps = threadStepCount(digest)
       items.push({
         id,
         info: tracked.info,
         controller: tracked.controller,
-        title: titleOf(state, tracked.info),
+        title,
+        steps,
+        status: threadStatusLine(digest),
+        failed: activity === 'idle' && threadGroup(digest) === 'waiting',
         branch: tracked.info.branch,
         worktree: tracked.info.worktree !== null,
         activity,
@@ -346,6 +407,10 @@ export class ChatsStore {
           old.id === next.id &&
           old.controller === next.controller &&
           old.title === next.title &&
+          old.status === next.status &&
+          old.failed === next.failed &&
+          old.steps?.done === next.steps?.done &&
+          old.steps?.total === next.steps?.total &&
           old.activity === next.activity &&
           old.unread === next.unread &&
           old.needsSince === next.needsSince &&

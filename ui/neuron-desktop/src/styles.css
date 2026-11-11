@@ -2382,6 +2382,45 @@ h2 {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.chat-row.failed .chat-dot {
+  color: var(--orange);
+  font-weight: 700;
+}
+/* The digest: title, branch and steps on one line, what it is doing under them. */
+.chat-text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+.chat-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.chat-line .session-title {
+  flex: 1;
+  min-width: 0;
+}
+.chat-steps {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+.chat-status {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-pin {
+  flex: none;
+  opacity: 0;
+}
+.chat-item.pinned .chat-pin,
+.chat-item:hover .chat-pin,
+.chat-item:focus-within .chat-pin {
+  opacity: 1;
+}
 .sidebar.rail .chat-groups {
   align-items: center;
   padding: 4px 0 8px;

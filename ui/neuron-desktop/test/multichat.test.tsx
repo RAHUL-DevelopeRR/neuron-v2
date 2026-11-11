@@ -487,3 +487,66 @@ describe('the trust dialog in several chats', () => {
     expect([asked(chats, first), asked(chats, second)]).toEqual([1, 1])
   })
 })
+
+describe('the digest in each row', () => {
+  test('a chat with a task list shows its steps and what it is doing, in words', async () => {
+    const { chats } = await start()
+    const [first] = chats.ids()
+    act(() => chats.controllers.get(first)!.send('fix the tests'))
+    await emitTo(chats, first, {
+      type: 'todos',
+      items: [
+        { content: 'Read the failure', status: 'completed', active_form: null },
+        { content: 'Fix it', status: 'completed', active_form: null },
+        { content: 'Run the tests', status: 'in_progress', active_form: 'Running the tests' },
+      ],
+    })
+    const row = rowOf(first)
+    await waitFor(() => expect(row.textContent).toContain('2/3'))
+    expect(row.textContent).toContain('2 of 3 steps done')
+    expect(row.querySelector('.chat-status')?.textContent).toBe('Running the tests')
+  })
+
+  test('a turn that failed waits under Needs you, and says so without the raw error', async () => {
+    const { chats } = await start()
+    const [first] = chats.ids()
+    act(() => chats.controllers.get(first)!.send('go'))
+    await emitTo(chats, first, { type: 'error', message: 'upstream 401 invalid_session' }, { type: 'turn_finished' })
+    const group = await within(sidebar()).findByRole('region', { name: 'Needs you, 1' })
+    expect(group.textContent).toContain('needs you: the last turn failed')
+    expect(rowOf(first).querySelector('.chat-status')?.textContent).toBe('Signed out: sign in again')
+  })
+})
+
+describe('pins', () => {
+  test('a pinned chat moves to Pinned above the other groups, and the pin is saved', async () => {
+    const { platform, chats } = await start()
+    const [first] = chats.ids()
+    const second = await openSecond(platform)
+    // Each chat is a session of its own (the fake engines all start as session-1).
+    await emitTo(chats, second, chats.engines.get(second)!.status({ session_id: 'session-2' }))
+    const pin = within(rowOf(first).closest('li')!).getByRole('button', { name: /^Pin chat: / })
+    expect(pin.getAttribute('aria-pressed')).toBe('false')
+    fireEvent.click(pin)
+    const pinned = await within(sidebar()).findByRole('region', { name: 'Pinned, 1' })
+    expect(pinned.contains(rowOf(first))).toBe(true)
+    // Pinned comes first.
+    const regions = within(sidebar()).getAllByRole('region').map((region) => region.getAttribute('aria-label'))
+    expect(regions[0]).toBe('Pinned, 1')
+    // Kept by session, so it holds on the next launch.
+    await waitFor(() => expect(platform.saved.get('pins')).toEqual(['session-1']))
+    fireEvent.click(within(rowOf(first).closest('li')!).getByRole('button', { name: /^Pin chat: / }))
+    await waitFor(() => expect(within(sidebar()).queryByRole('region', { name: /^Pinned/ })).toBeNull())
+    await waitFor(() => expect(platform.saved.get('pins')).toEqual([]))
+  })
+
+  test('pins saved by an earlier launch apply', async () => {
+    const engine = new FakeEngine()
+    const platform = fakePlatform(engine, { multiChat: true })
+    platform.saved.set('pins', ['session-1'])
+    render(<App platform={platform} />)
+    await screen.findByLabelText('Message Neuron')
+    const pinned = await within(sidebar()).findByRole('region', { name: 'Pinned, 1' })
+    expect(within(pinned).getByRole('button', { name: /^Pin chat: / }).getAttribute('aria-pressed')).toBe('true')
+  })
+})

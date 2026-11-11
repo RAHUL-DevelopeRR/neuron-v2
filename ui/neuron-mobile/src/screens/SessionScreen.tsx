@@ -23,9 +23,9 @@ import {
   type TranscriptItem,
 } from '@neuron/client'
 
-import type { Connection } from '../connection'
+import { healthText, type Connection } from '../connection'
 import { colors, mono } from '../theme'
-import { useSession } from '../useSession'
+import { useConnectionHealth, useSession } from '../useSession'
 
 const basename = (path: string) => path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || path
 
@@ -43,19 +43,27 @@ const TOOL_STATE: Record<string, string> = {
 export function SessionScreen({ connection, onLeave }: { connection: Connection; onLeave: () => void }) {
   const { controller, transport } = connection
   const state = useSession(controller)
+  const health = useConnectionHealth(transport)
   const [text, setText] = useState('')
   const [chatsOpen, setChatsOpen] = useState(false)
   const list = useRef<FlatList<TranscriptItem>>(null)
   const status = state.status
   const permission = state.permissions[0] ?? null
   const question = openQuestionItem(state)
-  const ready = state.connection === 'ready'
+  // While the connection is down, what is shown may be stale and nothing can be sent.
+  const ready = state.connection === 'ready' && health.state === 'connected'
+  const connectionLine = healthText(health)
   const history = hasFeature(state, FEATURE_SESSIONS)
 
   // The computer's chats, kept fresh after each turn.
   useEffect(() => {
     if (ready && history && !state.busy) controller.listSessions()
   }, [controller, ready, history, state.busy, status?.session_id])
+
+  /** Steering needs the computer: while the connection is down, a tap does nothing rather than throw. */
+  const whenReady = (act: () => void) => {
+    if (ready) act()
+  }
 
   const send = () => {
     if (!text.trim() || !ready) return
@@ -73,7 +81,7 @@ export function SessionScreen({ connection, onLeave }: { connection: Connection;
           </Text>
           <Text style={styles.dim} numberOfLines={1}>
             <Text style={{ color: ready ? colors.success : colors.danger }}>● </Text>
-            {ready ? `on ${transport.host?.name ?? 'your computer'}` : state.connection}
+            {ready ? `on ${transport.host?.name ?? 'your computer'}` : health.state === 'connected' ? state.connection : health.state}
             {transport.clients > 1 ? ` · ${transport.clients} watching` : ''}
             {state.usage ? ` · ↑${formatTokens(state.usage.cumulative.input)} ↓${formatTokens(state.usage.cumulative.output)}` : ''}
           </Text>
@@ -96,8 +104,23 @@ export function SessionScreen({ connection, onLeave }: { connection: Connection;
       {needsSignIn(state) && (
         <Text style={styles.banner}>The computer's Neuron is signed out. Sign in there (or send /login and approve the code).</Text>
       )}
-      {state.connection === 'exited' && (
-        <Text style={[styles.banner, styles.bannerError]}>{state.connectionError ?? 'Disconnected from the Neuron host.'}</Text>
+      {health.state === 'reconnecting' || health.state === 'offline' ? (
+        <View style={styles.connectionBanner} accessibilityRole="alert" accessibilityLiveRegion="polite">
+          <Text style={[styles.connectionText, health.state === 'offline' && styles.bannerError]}>{connectionLine}</Text>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Try now"
+            accessibilityHint="Tries to reach your computer again without waiting"
+            onPress={() => transport.reconnectNow()}
+            style={styles.leave}
+          >
+            <Text style={styles.leaveText}>Try now</Text>
+          </Pressable>
+        </View>
+      ) : (
+        state.connection === 'exited' && (
+          <Text style={[styles.banner, styles.bannerError]}>{state.connectionError ?? 'Disconnected from the Neuron host.'}</Text>
+        )
       )}
 
       {chatsOpen && (
@@ -107,11 +130,11 @@ export function SessionScreen({ connection, onLeave }: { connection: Connection;
           busy={state.busy}
           onNew={() => {
             setChatsOpen(false)
-            controller.newChat()
+            whenReady(() => controller.newChat())
           }}
           onPick={(id) => {
             setChatsOpen(false)
-            controller.resume(id)
+            whenReady(() => controller.resume(id))
           }}
         />
       )}
@@ -122,13 +145,13 @@ export function SessionScreen({ connection, onLeave }: { connection: Connection;
         contentContainerStyle={{ padding: 12, paddingBottom: 24 }}
         data={state.items}
         keyExtractor={(item) => item.key}
-        renderItem={({ item }) => <Row item={item} onAnswer={(id, answer) => controller.answer(id, answer)} />}
+        renderItem={({ item }) => <Row item={item} onAnswer={(id, answer) => whenReady(() => controller.answer(id, answer))} />}
         onContentSizeChange={() => list.current?.scrollToEnd({ animated: false })}
         ListEmptyComponent={<Text style={styles.empty}>Nothing in this session yet. Send a prompt, or wait for the computer to start one.</Text>}
         ListFooterComponent={state.busy ? <Text style={styles.working}>working…</Text> : undefined}
       />
 
-      {permission && <PermissionSheet key={permission.id} pending={permission} onAnswer={(decision) => controller.answerPermission(permission.id, decision)} />}
+      {permission && <PermissionSheet key={permission.id} pending={permission} onAnswer={(decision) => whenReady(() => controller.answerPermission(permission.id, decision))} />}
 
       {state.todos.length > 0 && <TasksStrip todos={state.todos} />}
 
@@ -148,7 +171,7 @@ export function SessionScreen({ connection, onLeave }: { connection: Connection;
             blurOnSubmit
           />
           {state.busy ? (
-            <Pressable accessibilityRole="button" style={[styles.send, styles.stop]} onPress={() => controller.interrupt()}>
+            <Pressable accessibilityRole="button" style={[styles.send, styles.stop]} onPress={() => whenReady(() => controller.interrupt())}>
               <Text style={styles.stopText}>Stop</Text>
             </Pressable>
           ) : (
@@ -337,6 +360,8 @@ const styles = StyleSheet.create({
   leave: { paddingHorizontal: 8, paddingVertical: 4 },
   leaveText: { color: colors.link },
   banner: { backgroundColor: colors.sunken, color: colors.warning, padding: 10, fontSize: 13 },
+  connectionBanner: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: colors.sunken, paddingLeft: 10, paddingRight: 4, paddingVertical: 4 },
+  connectionText: { flex: 1, color: colors.warning, fontSize: 13 },
   bannerError: { color: colors.diffRemoveText },
   transcript: { flex: 1 },
   empty: { color: colors.textDim, textAlign: 'center', marginTop: 40, paddingHorizontal: 24 },
