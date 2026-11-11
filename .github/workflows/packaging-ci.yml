@@ -160,7 +160,7 @@ jobs:
           fi
           base="http://127.0.0.1:$(cat "$RUNNER_TEMP/port")"
           curl -fsSL "$base/install.sh" \
-            | NEURON_DOWNLOAD_BASE="$base" NEURON_CHECKSUMS_BASE="$base" NEURON_RELEASES_API="$base/repos/neuron/releases/latest" \
+            | NEURON_DOWNLOAD_BASE="$base" NEURON_CHECKSUMS_BASE="$base" NEURON_RELEASES_API="$base/repos/neuron/releases?per_page=10" \
               NEURON_INSTALL_DIR="$RUNNER_TEMP/bin" sh
           "$RUNNER_TEMP/bin/neuron" --version | tee /dev/stderr | grep -Fx "neuron-dummy $SMOKE_VERSION"
 
@@ -178,7 +178,7 @@ jobs:
             $base = "http://127.0.0.1:$(Get-Content $portFile)"
             $env:NEURON_DOWNLOAD_BASE = $base
             $env:NEURON_CHECKSUMS_BASE = $base
-            $env:NEURON_RELEASES_API = "$base/repos/neuron/releases/latest"
+            $env:NEURON_RELEASES_API = "$base/repos/neuron/releases?per_page=10"
             foreach ($powershell in 'powershell', 'pwsh') {
               $env:NEURON_INSTALL_DIR = Join-Path $env:RUNNER_TEMP "bin-$powershell"
               & $powershell -NoProfile -NonInteractive -Command "irm '$base/install.ps1' | iex"

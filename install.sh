@@ -7,20 +7,20 @@
 # terminal; nothing about the UI fails the install (without it, `neuron` runs
 # its line REPL).
 #
-# The latest stable release:
-#   curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/latest/download/install.sh | sh
-# A given release; a prerelease such as 7.0.0-alpha.5 is never the latest release, so name it:
-#   curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.sh | sh -s -- --version 7.0.0-alpha.5
+# The release this script was published with (the newest release when it has none):
+#   curl -fsSL https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.sh | sh
+# A given release, or another directory:
 #   curl -fsSL .../install.sh | sh -s -- --version 7.0.0-alpha.5 --install-dir "$HOME/bin"
 #
 # Environment:
-#   NEURON_VERSION         release to install, e.g. 7.0.0-alpha.5 (default: latest stable release)
+#   NEURON_VERSION         release to install, e.g. 7.0.0-alpha.5 (default: the release this
+#                          script came with, else the newest release, prereleases included)
 #   NEURON_INSTALL_DIR     install directory (default: $HOME/.local/bin)
 #   NEURON_DOWNLOAD_BASE   release download base URL (default: GitHub Releases);
 #                          must be HTTPS unless it points at a loopback host
 #   NEURON_CHECKSUMS_BASE  where SHA256SUMS is fetched from (default: the GitHub release,
 #                          whatever NEURON_DOWNLOAD_BASE is); HTTPS unless loopback
-#   NEURON_RELEASES_API    URL of the "latest release" JSON (default: GitHub API)
+#   NEURON_RELEASES_API    URL of the release list JSON (default: GitHub API)
 #   GITHUB_TOKEN           optional token for the GitHub API rate limit
 #   NEURON_NO_TUI          1 skips the full-screen UI
 #
@@ -30,7 +30,12 @@ set -eu
 
 REPOSITORY="RAHUL-DevelopeRR/neuron-v2"
 DEFAULT_DOWNLOAD_BASE="https://github.com/${REPOSITORY}/releases/download"
-DEFAULT_RELEASES_API="https://api.github.com/repos/${REPOSITORY}/releases/latest"
+# Not /releases/latest: GitHub never marks a prerelease "latest", so that is a 404 while every
+# Neuron 7 release is a prerelease.
+DEFAULT_RELEASES_API="https://api.github.com/repos/${REPOSITORY}/releases?per_page=10"
+# The release workflow writes the release's version here, so the script installs that release
+# without a lookup (the GitHub API allows 60 anonymous calls an hour).
+RELEASE_VERSION=""
 SUPPORTED="Linux (x64, arm64), macOS (arm64, x64) and Windows (x64)"
 
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -62,7 +67,7 @@ Install the Neuron coding agent from GitHub Releases.
 Usage: install.sh [--version VERSION] [--install-dir DIR] [--help]
 
 Options:
-  --version VERSION    Release to install, e.g. 7.0.0-alpha.5 (default: latest stable)
+  --version VERSION    Release to install, e.g. 7.0.0-alpha.5 (default: this script's release)
   --install-dir DIR    Directory for the neuron binary (default: ~/.local/bin)
   -h, --help           Show this help
 
@@ -119,14 +124,17 @@ is_valid_version() {
     printf '%s\n' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'
 }
 
-# The install.ps1 command for Windows: for the requested release when one was named
-# (a prerelease is never the latest release), otherwise for the latest stable release.
+# The install.ps1 command for Windows: for the requested release when one was named, else for
+# this script's release. The script-block form with -Version works with every install.ps1.
 powershell_install_command() {
     named="${VERSION#v}"
-    if [ -n "${named}" ] && is_valid_version "${named}"; then
+    if [ -z "${named}" ] || ! is_valid_version "${named}"; then
+        named="${RELEASE_VERSION}"
+    fi
+    if [ -n "${named}" ]; then
         printf '%s\n' "& ([scriptblock]::Create((irm https://github.com/${REPOSITORY}/releases/download/v${named}/install.ps1))) -Version ${named}"
     else
-        printf '%s\n' "irm https://github.com/${REPOSITORY}/releases/latest/download/install.ps1 | iex"
+        printf '%s\n' "irm https://github.com/${REPOSITORY}/releases/download/<version>/install.ps1 | iex, with the newest version from https://github.com/${REPOSITORY}/releases"
     fi
 }
 
@@ -203,10 +211,26 @@ else
     die "neither curl nor wget is installed; install one of them and retry."
 fi
 
-# fetch URL OUTPUT
+# checked_curl ARGS...: curl, except that an exit status of 0 without a 2xx response counts as a
+# failure (curl 8.14 exits 0 when --retry gives up on a refused connection): 7 when no server
+# answered, 22 for an HTTP error.
+checked_curl() {
+    http_code="$(curl --write-out '%{http_code}' "$@")" || return $?
+    case "${http_code}" in
+        2??) return 0 ;;
+        000) return 7 ;;
+        *) return 22 ;;
+    esac
+}
+
+# fetch URL OUTPUT [progress]: a progress bar on a terminal when a third argument is given.
 fetch() {
+    if [ "${DOWNLOADER}" = "curl" ] && [ -n "${3:-}" ] && [ -t 2 ]; then
+        checked_curl --fail --progress-bar --show-error --location --proto-redir =https --retry 3 --connect-timeout 20 -o "$2" "$1"
+        return
+    fi
     if [ "${DOWNLOADER}" = "curl" ]; then
-        curl --fail --silent --show-error --location --proto-redir =https --retry 3 --connect-timeout 20 -o "$2" "$1"
+        checked_curl --fail --silent --show-error --location --proto-redir =https --retry 3 --connect-timeout 20 -o "$2" "$1"
     else
         wget --quiet --tries=3 --timeout=30 -O "$2" "$1"
     fi
@@ -234,7 +258,7 @@ fetch_releases_api() {
         return
     fi
     printf 'header = "Authorization: Bearer %s"\n' "${GITHUB_TOKEN}" |
-        curl --fail --silent --show-error --location --proto-redir =https --retry 3 --connect-timeout 20 --config - -o "$2" "$1"
+        checked_curl --fail --silent --show-error --location --proto-redir =https --retry 3 --connect-timeout 20 --config - -o "$2" "$1"
 }
 
 sha256_of() {
@@ -247,15 +271,38 @@ sha256_of() {
     fi
 }
 
+# The newest published release: the first tag_name in the list (newest first) whose release
+# is not a draft (a draft only shows up for a token that can see it). In a release object
+# "tag_name" comes before "draft"; a single release object without "draft" works too.
+first_published_tag() {
+    tr ',{}[]' '\n\n\n\n\n' <"$1" | awk '
+        /"tag_name"[[:space:]]*:/ {
+            if (tag != "" && !draft) { print tag; found = 1; exit }
+            value = $0
+            sub(/^[^:]*:[[:space:]]*"/, "", value)
+            sub(/".*$/, "", value)
+            tag = value
+            draft = 0
+            next
+        }
+        /"draft"[[:space:]]*:[[:space:]]*true/ { if (tag != "") draft = 1 }
+        END { if (!found && tag != "" && !draft) print tag }
+    ' | head -n 1
+}
+
 resolve_latest_version() {
+    if [ -n "${RELEASE_VERSION}" ]; then
+        printf '%s\n' "${RELEASE_VERSION}"
+        return
+    fi
     api="${NEURON_RELEASES_API:-${DEFAULT_RELEASES_API}}"
     is_allowed_url "${api}" || die "NEURON_RELEASES_API must be an HTTPS URL (or loopback HTTP): ${api}"
-    if ! fetch_releases_api "${api}" "${TMP_DIR}/latest.json"; then
-        die "could not look up the latest Neuron release at ${api}.
+    if ! fetch_releases_api "${api}" "${TMP_DIR}/releases.json"; then
+        die "could not look up the newest Neuron release at ${api}.
     Set NEURON_VERSION (for example NEURON_VERSION=7.0.0-alpha.5) to skip the lookup."
     fi
-    tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${TMP_DIR}/latest.json" | head -n 1)"
-    [ -n "${tag}" ] || die "the latest-release response from ${api} has no tag_name; set NEURON_VERSION."
+    tag="$(first_published_tag "${TMP_DIR}/releases.json")"
+    [ -n "${tag}" ] || die "the release lookup at ${api} returned no published release; set NEURON_VERSION."
     printf '%s\n' "${tag#v}"
 }
 
@@ -286,11 +333,11 @@ URL="${DOWNLOAD_BASE}/v${VERSION}/${ASSET}"
 say "${BOLD}Installing Neuron ${VERSION} (${TARGET})${RESET}"
 info "from ${URL}"
 
-# fetch_or_die URL OUTPUT: an HTTP error status (curl 22, wget 8) means the asset is
+# fetch_or_die URL OUTPUT [progress]: an HTTP error status (curl 22, wget 8) means the asset is
 # missing; anything else is a network problem.
 fetch_or_die() {
     status=0
-    fetch "$1" "$2" || status=$?
+    fetch "$1" "$2" "${3:-}" || status=$?
     # A downloader that reports success but leaves nothing behind counts as a failure.
     if [ "${status}" = 0 ] && [ ! -s "$2" ]; then
         status=22
@@ -326,7 +373,7 @@ if ! printf '%s\n' "${EXPECTED}" | grep -Eq '^[0-9a-f]{64}$'; then
     die "${URL}.sha256 does not contain a SHA-256 checksum."
 fi
 
-fetch_or_die "${URL}" "${TMP_DIR}/${ASSET}"
+fetch_or_die "${URL}" "${TMP_DIR}/${ASSET}" progress
 ACTUAL="$(sha256_of "${TMP_DIR}/${ASSET}")"
 if [ "${ACTUAL}" != "${EXPECTED}" ]; then
     die "checksum mismatch for ${ASSET}: expected ${EXPECTED}, got ${ACTUAL}. Nothing was installed."
@@ -361,7 +408,7 @@ install_ui() {
     fetch "${UI_URL}.sha256" "${TMP_DIR}/${UI_ASSET}.sha256" || return 1
     UI_EXPECTED="$(awk 'NR == 1 {print tolower($1)}' "${TMP_DIR}/${UI_ASSET}.sha256")"
     printf '%s\n' "${UI_EXPECTED}" | grep -Eq '^[0-9a-f]{64}$' || return 1
-    fetch "${UI_URL}" "${TMP_DIR}/${UI_ASSET}" || return 1
+    fetch "${UI_URL}" "${TMP_DIR}/${UI_ASSET}" progress || return 1
     if [ "$(sha256_of "${TMP_DIR}/${UI_ASSET}")" != "${UI_EXPECTED}" ]; then
         warn "checksum mismatch for ${UI_ASSET}; it was not installed."
         return 1
@@ -433,7 +480,7 @@ esac
 cat >&2 <<EOF
 
 Next steps:
-  ${RUN} auth login     # sign in to Zero-X (a free plan is available)
+  ${RUN} login          # sign in to Zero-X (a free plan is available)
   ${RUN}                # start a session in your project directory
 
 Docs: https://github.com/${REPOSITORY}#readme

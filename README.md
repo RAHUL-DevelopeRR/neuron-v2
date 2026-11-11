@@ -7,13 +7,13 @@ native binary written in Rust. New to coding agents? Read
 [how an AI coding agent works](https://zero-x.live/ai-coding-agent).
 
 By default Neuron talks to models through the [Zero-X gateway](https://zero-x.live).
-You sign in once with `neuron auth login`; the provider API keys stay on the gateway
+You sign in once with `neuron login`; the provider API keys stay on the gateway
 and never reach your machine. You can also use your own provider key instead.
 
 > 7.0.0-alpha.5 is Neuron's fifth alpha, built and published by this repository's
 > release pipeline. Its known limitations are listed in
 > the [changelog](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/CHANGELOG.md).
-> It is a GitHub prerelease, so the install scripts need the versioned commands below.
+> It is a GitHub prerelease, so the install commands below name its release.
 > The npm 6.2.0 and PyPI 6.2.4 (and earlier) packages were built outside the pipeline
 > and are not supported.
 
@@ -23,9 +23,32 @@ Every method installs the same `neuron` binary from
 [GitHub Releases](https://github.com/RAHUL-DevelopeRR/neuron-v2/releases) and checks
 its SHA-256 checksum before using it.
 
-A prerelease is never the "latest" GitHub release, so the install script commands below
-name the alpha's version. Without one, the install scripts look up the latest release,
-and there is none until the first stable release is out.
+**Windows** (PowerShell as it comes with Windows; no Node.js or Python needed)
+
+```powershell
+& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1))) -Version 7.0.0-alpha.5 -AddToPath
+```
+
+From Command Prompt (cmd.exe):
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1))) -Version 7.0.0-alpha.5 -AddToPath"
+```
+
+The script installs `neuron.exe` (about 23 MB) and the full-screen UI, `neuron-tui.exe`
+(about 115 MB), into `%LOCALAPPDATA%\Programs\Neuron\bin` and adds that folder to your
+user `PATH`. The 7.0.0-alpha.5 installer shows no download progress, so on a slow
+connection it can sit at "installing the full-screen UI" for several minutes; to install
+only `neuron` (which then uses its line REPL), run `$env:NEURON_NO_TUI = '1'` first. Then
+open a new terminal and run `neuron login`. It works under PowerShell's default execution
+policy, because it installs only `.exe` files and no `.ps1` scripts. `-InstallDir C:\Tools\Neuron`
+picks another folder, and leaving out `-AddToPath` leaves `PATH` alone.
+
+From 7.0.0-alpha.6 on, the release's installer adds itself to `PATH`, shows download
+progress and installs that release with the plain
+`irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v<version>/install.ps1 | iex`.
+The 7.0.0-alpha.5 installer needs the script block form above: without `-Version` it looks
+for a "latest" release, which GitHub never sets for a prerelease.
 
 **macOS and Linux**
 
@@ -38,18 +61,8 @@ The script installs to `~/.local/bin` and tells you if that directory is not on 
 `sh -s -- --version 7.0.0-alpha.5 --install-dir "$HOME/bin"`, or set `NEURON_VERSION`
 and `NEURON_INSTALL_DIR`.
 
-**Windows (PowerShell 5.1 or 7)**
-
-```powershell
-& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1))) -Version 7.0.0-alpha.5
-```
-
-The script installs to `%LOCALAPPDATA%\Programs\Neuron\bin` and only changes your
-`PATH` if you ask it to:
-
-```powershell
-& ([scriptblock]::Create((irm https://github.com/RAHUL-DevelopeRR/neuron-v2/releases/download/v7.0.0-alpha.5/install.ps1))) -Version 7.0.0-alpha.5 -AddToPath
-```
+Without a version, either script installs the release it was published with, or, run
+from a checkout, the newest release on GitHub (prereleases included).
 
 **npm** (Node.js 22.14 or later)
 
@@ -57,12 +70,22 @@ The script installs to `%LOCALAPPDATA%\Programs\Neuron\bin` and only changes you
 npm install --global @zero-x.live/neuron
 ```
 
+On Windows PowerShell, `npm` and the installed `neuron` are `.ps1` scripts that the
+default execution policy blocks ("running scripts is disabled on this system"). Use
+`npm.cmd install --global @zero-x.live/neuron` and then `neuron.cmd`, use Command
+Prompt, or use the PowerShell installer above, which needs neither Node.js nor scripts.
+
 **pip** (Python 3.9 or later). The alpha is a pre-release on PyPI, so pip needs
 `--pre`:
 
 ```sh
-pip install --pre neuroncli
+python -m pip install --pre neuroncli
 ```
+
+Windows does not come with Python: if `python` prints "Python was not found" or opens
+the Microsoft Store, Python is not installed. Use the PowerShell installer above
+instead, or install Python 3.9 or later from python.org first. On Python 3.8, pip
+quietly picks the old, unsupported 6.2.4 instead of the alpha.
 
 The registry packages are published after the GitHub release, so check them first:
 `npm view @zero-x.live/neuron version` should print `7.0.0-alpha.5`, and
