@@ -1241,6 +1241,50 @@ h2 {
   overflow: auto;
   flex: 1;
 }
+/* v1.1: image, video and sound previews in Files. */
+.file-image {
+  display: block;
+  max-width: 100%;
+  max-height: 60vh;
+  margin: 8px auto;
+  object-fit: contain;
+}
+.file-media {
+  display: block;
+  width: calc(100% - 24px);
+  margin: 8px 12px;
+}
+/* v1.1: the pull request chip in the chat header. */
+.pr-chip {
+  font: 11.5px var(--ui);
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.pr-chip:hover {
+  color: var(--text);
+}
+.pr-chip[data-checks='passed'] {
+  border-color: var(--success);
+}
+.pr-chip[data-checks='pending'] {
+  border-color: var(--orange);
+}
+.pr-chip[data-checks='failed'],
+.pr-chip.pr-conflict {
+  border-color: var(--danger);
+}
+/* v1.1: the start branch of a new copy. */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0;
+}
 .terminal-tab {
   flex: 1;
   min-height: 0;
@@ -2337,6 +2381,45 @@ h2 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.chat-row.failed .chat-dot {
+  color: var(--orange);
+  font-weight: 700;
+}
+/* The digest: title, branch and steps on one line, what it is doing under them. */
+.chat-text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+.chat-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.chat-line .session-title {
+  flex: 1;
+  min-width: 0;
+}
+.chat-steps {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+.chat-status {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-pin {
+  flex: none;
+  opacity: 0;
+}
+.chat-item.pinned .chat-pin,
+.chat-item:hover .chat-pin,
+.chat-item:focus-within .chat-pin {
+  opacity: 1;
 }
 .sidebar.rail .chat-groups {
   align-items: center;

@@ -17,7 +17,7 @@ import { DESKTOP_CAPABILITIES, type SessionController } from '@neuron/client'
 
 import { createChatHost } from './chat-host'
 import { createUpdateChecker } from './updates'
-import type { DirListing, EngineInfo, FileContent, GitStatusView, KeyValueStore, LaunchOptions, Platform, Project, TerminalSession } from './types'
+import type { DirListing, EngineInfo, FileContent, GitStatusView, KeyValueStore, LaunchOptions, Platform, Project, QuitRequest, TerminalSession } from './types'
 
 interface TerminalOutput {
   id: number
@@ -148,5 +148,22 @@ export function tauriPlatform(): Platform {
       }
     },
     setAttention: (count) => void invoke('attention_set', { count }).catch(() => {}),
+    // v1.1: the Files tab's previews come as raw bytes, from the chat in view's folder.
+    readMedia: async (path) => new Uint8Array(await invoke<ArrayBuffer>('fs_read_media', { path, chat: chat() })),
+    quit: {
+      onRequest(listener) {
+        let stop: UnlistenFn | null = null
+        let gone = false
+        void listen<QuitRequest>('neuron://quit-request', ({ payload }) => listener(payload)).then((unlisten) => {
+          if (gone) unlisten()
+          else stop = unlisten
+        })
+        return () => {
+          gone = true
+          stop?.()
+        }
+      },
+      answer: (id, quit) => void invoke('quit_answer', { id, quit }).catch(() => {}),
+    },
   }
 }

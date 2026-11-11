@@ -9,7 +9,9 @@ pub mod diagnostics; // L5: extensions and resilience
 pub mod editor;
 pub mod engine;
 pub mod git;
+pub mod pr;
 pub mod projects;
+pub mod quit;
 pub mod registry;
 pub mod terminal;
 pub mod workspace;
@@ -163,6 +165,35 @@ fn fs_read(
     chat: Option<String>,
 ) -> Result<FileContent, String> {
     chats::workspace_for(&state, &registry, chat.as_deref())?.read(&path)
+}
+
+/// The bytes of an image, video or sound in the chat's folder, for the Files
+/// tab: only those file types, only inside the folder, and size-capped.
+#[tauri::command]
+async fn fs_read_media(
+    state: State<'_, AppState>,
+    registry: State<'_, Arc<EngineRegistry>>,
+    path: String,
+    chat: Option<String>,
+) -> Result<tauri::ipc::Response, String> {
+    let workspace = chats::workspace_for(&state, &registry, chat.as_deref())?;
+    let bytes = blocking(move || workspace.read_media(&path)).await?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// The window's answer to a quit request (`neuron://quit-request`): Quit
+/// closes the window, Keep working changes nothing.
+#[tauri::command]
+fn quit_answer(
+    window: tauri::Window,
+    gate: State<'_, quit::QuitGate>,
+    id: u64,
+    quit: bool,
+) -> Result<(), String> {
+    if gate.answer(id, quit) {
+        window.close().map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -419,11 +450,15 @@ pub fn run() {
         })
         .manage(Terminals::default())
         .manage(chats::AttentionState::default())
+        .manage(pr::PrCache::default())
+        .manage(quit::QuitGate::default())
         .invoke_handler(tauri::generate_handler![
             projects_recent,
             fs_list,
             fs_read,
+            fs_read_media,
             fs_search,
+            quit_answer,
             git_status,
             git_diff,
             term_open,
@@ -448,15 +483,34 @@ pub fn run() {
             chats::chat_list,
             chats::worktree_status,
             chats::worktree_discard,
-            chats::attention_set
+            chats::attention_set,
+            // v1.1: copies named by their first prompt, branch changes, pull requests
+            chats::worktree_branches,
+            chats::worktree_name,
+            chats::branch_changes,
+            chats::branch_diff,
+            chats::pr_status
         ])
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
+        .on_window_event(|window, event| match event {
+            // Chats still working or waiting: ask once before closing.
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                let (working, waiting) = window
+                    .try_state::<Arc<EngineRegistry>>()
+                    .map_or((0, 0), |registry| registry.working());
+                if let quit::CloseDecision::Ask(request) =
+                    window.state::<quit::QuitGate>().on_close(working, waiting)
+                {
+                    api.prevent_close();
+                    let _ = window.emit("neuron://quit-request", request);
+                }
+            }
+            tauri::WindowEvent::Destroyed => {
                 if let Some(registry) = window.try_state::<Arc<EngineRegistry>>() {
                     registry.shutdown_all();
                 }
                 window.state::<Terminals>().close_all();
             }
+            _ => {}
         })
         .run(tauri::generate_context!())
         .expect("error while running Neuron Desktop");

@@ -2,6 +2,10 @@ import { hostPlatform } from './host'
 import type { Platform } from './types'
 
 export type {
+  BranchChanges,
+  BranchFile,
+  BranchList,
+  QuitRequest,
   ChatErrorCode,
   ChatHost,
   ChatInfo,

@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::engine::EngineExit;
+use crate::git::{self, BranchChanges};
+use crate::pr::{self, PrCache, PullRequestSnapshot};
 use crate::projects::{self, Project};
 use crate::registry::{
     valid_chat_id, ChatEvents, ChatSummary, EngineRegistry, ExitReason, OpenRequest,
@@ -122,6 +124,9 @@ fn remember_options(state: &AppState, options: Option<LaunchOptions>) {
 #[derive(Debug, Default, Deserialize)]
 pub struct WorktreeRequest {
     pub name: Option<String>,
+    /// The branch the copy starts from: an existing local or remote branch.
+    /// The repository's default branch (else HEAD) when absent.
+    pub start: Option<String>,
 }
 
 /// Opens a chat in `path` (the default workspace when absent), on a fresh
@@ -147,7 +152,12 @@ pub fn chat_open(
                 .path()
                 .app_data_dir()
                 .map_err(|error| error.to_string())?;
-            Some(worktree::create(&data, &path, request.name.as_deref())?)
+            Some(worktree::create(
+                &data,
+                &path,
+                request.name.as_deref(),
+                request.start.as_deref(),
+            )?)
         }
         None => None,
     };
@@ -256,6 +266,65 @@ pub fn chat_list(registry: Registry<'_>) -> Vec<ChatSummary> {
 #[tauri::command(async)]
 pub fn worktree_status(registry: Registry<'_>, chat: String) -> Result<WorktreeStatus, String> {
     worktree::status(&registry.worktree(chat_id(&chat)?)?)
+}
+
+/// The branches a copy of `path`'s repository (the default workspace when
+/// absent) can start from, and the default one.
+#[tauri::command(async)]
+pub fn worktree_branches(
+    state: State<'_, AppState>,
+    path: Option<String>,
+) -> Result<worktree::BranchList, String> {
+    let path = path.map_or_else(
+        || lock(&state.workspace).root().to_path_buf(),
+        |path| PathBuf::from(path.trim()),
+    );
+    worktree::branches(&path)
+}
+
+/// Names a copy made without a name after its first prompt (`name` is what the
+/// window made of the prompt; it is slugified here). A copy with a name keeps it.
+#[tauri::command(async)]
+pub fn worktree_name(
+    registry: Registry<'_>,
+    chat: String,
+    name: String,
+) -> Result<ChatSummary, String> {
+    registry.rename_worktree(chat_id(&chat)?, |record| worktree::rename(record, &name))
+}
+
+/// Everything the chat's copy changed since its branch left its base.
+#[tauri::command(async)]
+pub fn branch_changes(registry: Registry<'_>, chat: String) -> Result<BranchChanges, String> {
+    let record = registry.worktree(chat_id(&chat)?)?;
+    git::branch_changes(&record.path, &record.base)
+}
+
+/// One file's change on the chat's branch, as a unified diff; the path is
+/// relative to the copy's top folder.
+#[tauri::command(async)]
+pub fn branch_diff(registry: Registry<'_>, chat: String, path: String) -> Result<String, String> {
+    let record = registry.worktree(chat_id(&chat)?)?;
+    git::branch_diff(&record.path, &record.base, &path)
+}
+
+/// The pull request of the chat's branch, from `gh`, reused for a minute.
+/// Quietly nothing when `gh` is missing, signed out, or there is none.
+#[tauri::command(async)]
+pub fn pr_status(
+    registry: Registry<'_>,
+    cache: State<'_, PrCache>,
+    chat: String,
+) -> Result<PullRequestSnapshot, String> {
+    let id = chat_id(&chat)?;
+    let summary = registry.summary(id)?;
+    let Some(branch) = summary.branch else {
+        return Ok(PullRequestSnapshot::default());
+    };
+    let dir = registry.cwd(id)?;
+    Ok(cache.get(&dir, &branch, Instant::now(), || {
+        pr::gh_pr_view(&dir, &branch)
+    }))
 }
 
 /// Removes the chat's copy and its branch, and forgets the chat. Nothing is

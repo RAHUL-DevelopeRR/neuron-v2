@@ -220,7 +220,19 @@ the lanes in section 6 list them, plus unsigned installers for Windows, macOS an
 
 **v1.1 (next):**
 - per-hunk revert, and comments on the diff that become the agent's next instruction
-- Create PR, CI status and auto-merge through `gh`
+- Create PR, CI status and auto-merge through `gh`. **Status done:** the chat header shows the
+  branch's pull request ("PR #12 · draft · 3/4 checks", read with `gh pr view`, kept 60 s, quiet
+  without `gh`, sign-in or a PR). Create PR and auto-merge are still to do.
+- **Done (v1.1 port from Freebuff `common/src/desktop-cloud`, commit `0dc95cb`, Apache-2.0; see
+  `ui/neuron-desktop/NOTICE`):** a copy made without a name takes its branch name from the chat's
+  first prompt (`neuron/fix-login-redirect`), and can start from a chosen local or remote branch
+  (palette: "New chat in its own copy, from a branch…"; default: the repository's default branch,
+  else HEAD); a "Branch changes" scope in the side pane (everything since the branch left its base,
+  committed or not, with +/− totals); image, video and sound previews in Files (size-capped, inside
+  the workspace only, SVG as an image); and a question before quitting while chats work or wait
+  ("2 chats are still working. Quit anyway?"). Follow-ups: macOS Cmd+Q from the app menu is not
+  asked about yet (only closing the window is); the updater's "install when idle" card waits for an
+  updater that installs (`platform/updates.ts` only checks today).
 - a "rewind to here" button on each user message, and forking a chat
 - MCP add, sign-in and remove; provider keys in the keychain (engine phases E3 and E7)
 - an in-app browser preview

@@ -1,0 +1,46 @@
+Neuron Desktop (ui/neuron-desktop)
+Copyright (c) 2026 RAHUL S / Zero-X
+
+Neuron Desktop is distributed under the MIT License (see the repository's
+LICENSE). Some of its files contain code ported from other projects, recorded
+below, one block per port. Each ported file starts with a comment naming its
+source file, the upstream commit, the copyright and license, and what changed.
+
+==== BEGIN: Freebuff desktop-cloud port (desktop v1.1) ====
+
+Source: Freebuff, https://github.com/CodebuffAI/freebuff, commit 0dc95cb,
+folder common/src/desktop-cloud/. Licensed under the Apache License, Version
+2.0 (http://www.apache.org/licenses/LICENSE-2.0; full text also in
+ui/neuron-tui/LICENSE). Freebuff's NOTICE file reads:
+
+    Codebuff
+    Copyright 2025 Codebuff
+
+    This product includes software developed for the Codebuff project.
+
+Ported, and modified for Neuron (zod schemas replaced with plain types):
+
+  project-name.ts (projectNameFromPrompt and its word lists)
+      -> src/worktreeName.ts (copyNameFromPrompt); slugified into the copy's
+         branch by src-tauri/src/worktree.rs (rename)
+  project-name.test.ts (projectNameFromPrompt cases) -> test/worktree-name.test.ts
+  pull-request.ts (PullRequestChecks, PullRequestStatus, PullRequestSnapshot,
+      normalizePullRequestChecks) -> src/pullRequest.ts; the snapshot shape
+      also in src-tauri/src/pr.rs
+  pull-request.test.ts -> test/pull-request.test.tsx
+  image-files.ts (imageMimeType) and media-files.ts (mediaType)
+      -> src/mediaFiles.ts; the same type list in src-tauri/src/workspace.rs
+      (preview_type)
+  image-files.test.ts -> test/v11-desktop.test.tsx
+  changes.ts (ChangedFile, totals) -> shapes of BranchFile and BranchChanges in
+      src/platform/types.ts and src-tauri/src/git.rs
+  hosted-git.ts (GitSummary: branch, base, pull request) -> the branch scope
+      and the pull request chip's data flow
+  hosted-workspace.ts (quit.onRequest / quit.answer) -> Platform.quit in
+      src/platform/types.ts and src/platform/tauri.ts; src-tauri/src/quit.rs
+
+Not ported: file-download.ts and parseByteRange (media is read whole, with a
+size cap, not served by byte range), desktop-update.ts (the "install when
+idle" update card; the desktop updater does not install yet).
+
+==== END: Freebuff desktop-cloud port (desktop v1.1) ====

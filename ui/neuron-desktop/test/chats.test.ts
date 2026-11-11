@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { nextUnread, triage, type ChatRow } from '../src/chats'
+import { PIN_LIMIT, isPinned, nextUnread, splitPinned, togglePin, triage, type ChatRow } from '../src/chats'
 import { rankCommands, type PaletteCommand } from '../src/palette'
 import { SHORTCUTS, keysOf, shortcutFor } from '../src/shortcuts'
 
@@ -69,6 +69,49 @@ describe('triage', () => {
   })
   test('empty in, empty out', () => {
     expect(triage([])).toEqual({ needsYou: [], running: [], doneUnread: [], idle: [] })
+  })
+})
+
+describe('a failed turn', () => {
+  test('needs the user while idle, after the chats that wait on a request', () => {
+    const groups = triage([
+      row('failed', { failed: true }),
+      row('wait', { activity: 'needs_you', needsSince: 100 }),
+      row('failed-running', { activity: 'running', failed: true }),
+    ])
+    expect(groups.needsYou.map((entry) => entry.id)).toEqual(['wait', 'failed'])
+    expect(groups.running.map((entry) => entry.id)).toEqual(['failed-running'])
+  })
+})
+
+describe('pins', () => {
+  test('a pinned chat is listed above the groups, the rest keep their order', () => {
+    const rows = [row('a'), row('b', { sessionId: 's-b' }), row('c')]
+    const { pinned, rest } = splitPinned(rows, new Set(['s-b', 'c']))
+    expect(pinned.map((entry) => entry.id)).toEqual(['b', 'c'])
+    expect(rest.map((entry) => entry.id)).toEqual(['a'])
+    expect(splitPinned(rows, new Set()).pinned).toEqual([])
+  })
+
+  test('a pin follows the session when the chat has one, else the chat', () => {
+    const withSession = row('a', { sessionId: 's-a' })
+    const pinned = togglePin(new Set(), withSession)
+    expect([...pinned]).toEqual(['s-a'])
+    expect(isPinned(withSession, pinned)).toBe(true)
+    expect([...togglePin(new Set(), row('b'))]).toEqual(['b'])
+    // Unpinning clears either key.
+    expect([...togglePin(new Set(['a', 's-a']), withSession)]).toEqual([])
+  })
+
+  test('is pure and keeps the newest pins within the limit', () => {
+    const before = new Set(['x'])
+    togglePin(before, row('y'))
+    expect([...before]).toEqual(['x'])
+    let pins: ReadonlySet<string> = new Set()
+    for (let index = 0; index < PIN_LIMIT + 5; index++) pins = togglePin(pins, row(`r${index}`))
+    expect(pins.size).toBe(PIN_LIMIT)
+    expect(pins.has(`r${PIN_LIMIT + 4}`)).toBe(true)
+    expect(pins.has('r0')).toBe(false)
   })
 })
 
