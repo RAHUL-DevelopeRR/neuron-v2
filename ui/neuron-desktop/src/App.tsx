@@ -38,7 +38,7 @@ import { SignInPanel } from './components/SignIn'
 import { TrustModal } from './components/TrustModal'
 import { Transcript } from './components/Transcript'
 import { TodoStrip } from './components/TodoStrip' // L1: live transcript
-import { useChats } from './chats'
+import { togglePin, useChats } from './chats'
 import { NOT_KEEPING_UP } from './platform/chat-host'
 import { buildDiagnostics, engineProblemFor, parseEngineProblem } from './engineProblems'
 import { exportName, transcriptJson, transcriptMarkdown, type DesktopCommand } from './commands'
@@ -48,7 +48,7 @@ import { ChatError, type EngineInfo, type LaunchOptions, type Platform, type Pro
 import { safeExternalUrl } from './platform/links'
 import type { PaletteCommand } from './palette'
 import { noteSeen, sessionRows, type SessionRow } from './sessions'
-import { useSeen, useSettings, type Settings } from './settings'
+import { usePins, useSeen, useSettings, type Settings } from './settings'
 import { shortcutFor, shortcutKeys, type ShortcutId } from './shortcuts'
 
 type ToolItem = Extract<TranscriptItem, { kind: 'tool' }>
@@ -120,6 +120,7 @@ export function App({ platform }: { platform: Platform }) {
   const controller: SessionController | null = active?.controller ?? null
   const state = useSession(controller)
   const [seen, updateSeen] = useSeen(platform.store)
+  const [pins, updatePins] = usePins(platform.store)
   const [view, setView] = useState<View>('chat')
   const [section, setSection] = useState<SettingsSection>('account')
   const [paneOpen, setPaneOpen] = useState(true)
@@ -756,6 +757,8 @@ export function App({ platform }: { platform: Platform }) {
         onJumpWaiting={() => chats?.jumpToWaiting()}
         onNewWorktreeChat={multi ? newWorktreeChat : undefined}
         onCloseChat={multi ? (id) => void closeChat(id) : undefined}
+        pins={pins}
+        onTogglePin={multi ? (row) => updatePins((current) => togglePin(current, row)) : undefined}
       />
       <main className="chat" aria-label={view === 'chat' ? 'Session' : undefined}>
         {view === 'settings' && (

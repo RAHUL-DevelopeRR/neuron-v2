@@ -1,7 +1,7 @@
 import { forwardRef, useState, type ReactNode } from 'react'
 
 import { ago, filterRows, groupRows, type Badge, type GroupBy, type SessionRow } from '../sessions'
-import { triage, type Activity, type ChatRow } from '../chats'
+import { isPinned, splitPinned, triage, type Activity, type ChatRow } from '../chats'
 import type { Project } from '../platform'
 import { PixelLogo } from './PixelLogo'
 
@@ -70,34 +70,60 @@ const ACTIVITY_LABEL: Record<Activity, string> = { needs_you: 'needs you', runni
 
 /** What a chat's row says to a screen reader beyond its title. */
 function chatStatus(row: ChatRow): string {
+  if (row.activity === 'idle' && row.failed) return 'needs you: the last turn failed'
   if (row.activity === 'idle' && row.unread) return 'finished, not seen yet'
   return row.stopNote ? `${ACTIVITY_LABEL[row.activity]}: ${row.stopNote}` : ACTIVITY_LABEL[row.activity]
 }
 
+function chatMark(row: ChatRow): string {
+  if (row.activity === 'idle' && row.failed) return '✕'
+  return row.unread && row.activity !== 'needs_you' && row.activity !== 'running' ? '•' : ACTIVITY_MARK[row.activity]
+}
+
 function ChatButton({ row, active, rail, onOpen }: { row: ChatRow; active: boolean; rail: boolean; onOpen: (id: string) => void }) {
   const status = chatStatus(row)
+  // The one-line digest under the title: why a stopped engine stopped, else what the chat is doing.
+  const line = row.activity === 'stopped' ? row.stopNote ?? row.status : row.status
+  const steps = row.steps ?? null
   return (
     <button
       data-chat-id={row.id}
-      className={`chat-row activity-${row.activity}${active ? ' current' : ''}${row.unread ? ' unread' : ''}`}
+      className={`chat-row activity-${row.activity}${active ? ' current' : ''}${row.unread ? ' unread' : ''}${row.failed ? ' failed' : ''}`}
       aria-current={active ? 'true' : undefined}
       aria-label={rail ? `${row.title}, ${status}` : undefined}
-      title={rail ? `${row.title} (${status})` : row.stopNote ?? row.title}
+      title={rail ? `${row.title} (${status})` : line ? `${row.title}\n${line}` : row.title}
       onClick={() => onOpen(row.id)}
     >
       <span className="chat-dot" aria-hidden>
-        {row.unread && row.activity !== 'needs_you' && row.activity !== 'running' ? '•' : ACTIVITY_MARK[row.activity]}
+        {chatMark(row)}
       </span>
       {!rail && (
         <>
-          <span className="session-title">{row.title}</span>
-          {row.worktree && row.branch && <span className="chat-tag muted small">{row.branch.replace(/^neuron\//, '')}</span>}
+          <span className="chat-text">
+            <span className="chat-line">
+              <span className="session-title">{row.title}</span>
+              {row.worktree && row.branch && <span className="chat-tag muted small">{row.branch.replace(/^neuron\//, '')}</span>}
+              {steps && (
+                <span className="chat-steps muted small" aria-hidden>
+                  {steps.done}/{steps.total}
+                </span>
+              )}
+            </span>
+            {line && <span className="chat-status muted small">{line}</span>}
+          </span>
+          {steps && (
+            <span className="sr-only">
+              , {steps.done} of {steps.total} steps done
+            </span>
+          )}
           <span className="sr-only">, {status}</span>
         </>
       )}
     </button>
   )
 }
+
+const NO_PINS: ReadonlySet<string> = new Set()
 
 const CHAT_GROUPS: Array<['needsYou' | 'running' | 'doneUnread' | 'idle', string]> = [
   ['needsYou', 'Needs you'],
@@ -106,38 +132,61 @@ const CHAT_GROUPS: Array<['needsYou' | 'running' | 'doneUnread' | 'idle', string
   ['idle', 'Idle'],
 ]
 
-/** The open chats in four groups: waiting for the user, working, finished out of view, and the rest. */
+/** The open chats: the pinned ones first, then four groups: waiting for the user, working, finished out of view, and the rest. */
 function ChatGroups({
   chats,
   active,
   rail,
   onOpen,
   onClose,
+  pins,
+  onTogglePin,
 }: {
   chats: ChatRow[]
   active: string | null
   rail: boolean
   onOpen: (id: string) => void
   onClose?: (id: string) => void
+  pins: ReadonlySet<string>
+  onTogglePin?: (row: ChatRow) => void
 }) {
-  const groups = triage(chats)
+  const { pinned, rest } = splitPinned(chats, pins)
+  const groups = triage(rest)
+  const sections: Array<[string, string, ChatRow[]]> = [
+    ['pinned', 'Pinned', pinned],
+    ...CHAT_GROUPS.map(([key, label]): [string, string, ChatRow[]] => [key, label, groups[key]]),
+  ]
   return (
     <div className="chat-groups">
-      {CHAT_GROUPS.map(([key, label]) =>
-        groups[key].length === 0 ? null : (
-          <section key={key} className={`chat-group group-${key}`} aria-label={`${label}, ${groups[key].length}`}>
+      {sections.map(([key, label, rows]) =>
+        rows.length === 0 ? null : (
+          <section key={key} className={`chat-group group-${key}`} aria-label={`${label}, ${rows.length}`}>
             {!rail && <h2 className="chat-group-head">{label}</h2>}
             <ul>
-              {groups[key].map((row) => (
-                <li key={row.id} className="chat-item">
-                  <ChatButton row={row} active={row.id === active} rail={rail} onOpen={onOpen} />
-                  {onClose && !rail && (
-                    <button className="icon-button chat-close" aria-label={`Close chat: ${row.title}`} title="Close this chat" onClick={() => onClose(row.id)}>
-                      ✕
-                    </button>
-                  )}
-                </li>
-              ))}
+              {rows.map((row) => {
+                const isPin = isPinned(row, pins)
+                return (
+                  <li key={row.id} className={`chat-item${isPin ? ' pinned' : ''}`}>
+                    <ChatButton row={row} active={row.id === active} rail={rail} onOpen={onOpen} />
+                    {onTogglePin && !rail && (
+                      <button
+                        className="icon-button chat-pin"
+                        aria-label={`Pin chat: ${row.title}`}
+                        aria-pressed={isPin}
+                        title={isPin ? 'Unpin this chat' : 'Pin this chat to the top'}
+                        onClick={() => onTogglePin(row)}
+                      >
+                        <span aria-hidden>{isPin ? '★' : '☆'}</span>
+                      </button>
+                    )}
+                    {onClose && !rail && (
+                      <button className="icon-button chat-close" aria-label={`Close chat: ${row.title}`} title="Close this chat" onClick={() => onClose(row.id)}>
+                        ✕
+                      </button>
+                    )}
+                  </li>
+                )
+              })}
             </ul>
           </section>
         ),
@@ -193,8 +242,11 @@ export const Sidebar = forwardRef<HTMLInputElement, {
   onNewWorktreeChat?: () => void
   /** Closes a chat from its row (a chat with a copy of its own asks first). */
   onCloseChat?: (id: string) => void
+  /** The pinned chats (session or chat ids), listed in a group of their own above the others. */
+  pins?: ReadonlySet<string>
+  onTogglePin?: (row: ChatRow) => void
 }>(function Sidebar(
-  { rail, onToggleRail, rows, open, groupBy, onGroupBy, busy, historyAvailable, page, onNewSession, onOpenSession, onOpenProject, onNavigate, onSettings, onSearch, footer, chats, activeChat = null, onOpenChat, needsYouCount = 0, onJumpWaiting, onNewWorktreeChat, onCloseChat },
+  { rail, onToggleRail, rows, open, groupBy, onGroupBy, busy, historyAvailable, page, onNewSession, onOpenSession, onOpenProject, onNavigate, onSettings, onSearch, footer, chats, activeChat = null, onOpenChat, needsYouCount = 0, onJumpWaiting, onNewWorktreeChat, onCloseChat, pins = NO_PINS, onTogglePin },
   searchRef,
 ) {
   const [query, setQuery] = useState('')
@@ -239,7 +291,9 @@ export const Sidebar = forwardRef<HTMLInputElement, {
         <NavButton icon="⧉" label="Extensions" rail={rail} active={page === 'extensions'} onClick={() => onNavigate('extensions')} />
         {rail && <NavButton icon="⚙" label="Settings" shortcut="Ctrl+," rail onClick={onSettings} active={page === 'settings'} />}
       </div>
-      {chats && chats.length > 0 && <ChatGroups chats={chats} active={activeChat} rail={rail} onOpen={onOpenChat ?? (() => {})} onClose={onCloseChat} />}
+      {chats && chats.length > 0 && (
+        <ChatGroups chats={chats} active={activeChat} rail={rail} onOpen={onOpenChat ?? (() => {})} onClose={onCloseChat} pins={pins} onTogglePin={onTogglePin} />
+      )}
       {!rail && (
         <>
           <input

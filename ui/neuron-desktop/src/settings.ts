@@ -110,6 +110,42 @@ export function useSettings(store: KeyValueStore): [Settings, (change: Partial<S
   return [settings, update, loaded]
 }
 
+const PINS_KEY = 'pins'
+
+/**
+ * The pinned chats (their session ids, or chat ids before an engine named a session), kept between
+ * launches next to `seen`. The setter takes the next set from the current one, and saves it.
+ */
+export function usePins(store: KeyValueStore): [ReadonlySet<string>, (next: (current: ReadonlySet<string>) => ReadonlySet<string>) => void] {
+  const [pins, setPins] = useState<ReadonlySet<string>>(() => new Set())
+  useEffect(() => {
+    let cancelled = false
+    store.get<unknown>(PINS_KEY).then(
+      (saved) => {
+        if (cancelled || !Array.isArray(saved)) return
+        const loaded = saved.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0)
+        // What this launch already pinned wins over what was saved.
+        setPins((current) => (current.size > 0 ? new Set([...loaded, ...current]) : new Set(loaded)))
+      },
+      () => {},
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [store])
+  const update = useCallback(
+    (next: (current: ReadonlySet<string>) => ReadonlySet<string>) => {
+      setPins((current) => {
+        const value = next(current)
+        if (value !== current) void store.set(PINS_KEY, [...value]).catch(() => {})
+        return value
+      })
+    },
+    [store],
+  )
+  return [pins, update]
+}
+
 /** When each session was last looked at, and which failed, kept between launches. */
 export function useSeen(store: KeyValueStore): [SeenState, (next: (current: SeenState) => SeenState) => void] {
   const [seen, setSeen] = useState<SeenState>({ seen: {}, failed: {} })
