@@ -1020,11 +1020,15 @@ $env:NEURON_NO_MODIFY_PATH = $null
 function Add-UserPathEntry([string]$Directory) {{ Write-Host "user-path-stub $Directory"; return $true }}
 $env:Path = '{path}'
 Install-Neuron
+$resolved = @(Get-Command neuron -CommandType Application -ErrorAction SilentlyContinue)
+if ($resolved.Count -gt 0) {{ Write-Host "resolves-to $($resolved[0].Path)" }} else {{ Write-Host 'resolves-to nothing' }}
 """
         return self.run_functions(self.INSTALL_FUNCTIONS, body, with_assignments=True)
 
-    def test_add_to_path_warns_when_an_older_neuron_comes_first(self) -> None:
-        # As on a PC with an old %LOCALAPPDATA%\Programs\NeuronCLI\neuron.exe on PATH.
+    def test_add_to_path_puts_this_install_before_an_older_neuron(self) -> None:
+        # As on a PC with an old %LOCALAPPDATA%\Programs\NeuronCLI\neuron.exe on PATH (a v0.1.0
+        # build that answers `neuron login` with "has been removed"): this install goes first, in
+        # the user PATH and in this window, so `neuron` runs it straight away.
         shadow = self.root / "Programs" / "NeuronCLI"
         shadow.mkdir(parents=True)
         (shadow / "neuron.exe").write_bytes(b"MZ old neuron")
@@ -1032,22 +1036,46 @@ Install-Neuron
         result = self.run_add_to_path_install(f"{shadow};{system}")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"user-path-stub {self.install_dir}", result.stdout)
+        self.assertIn(f"put {self.install_dir} first in your user PATH", result.stdout)
+        self.assertNotIn("comes first on PATH", result.stdout)
+        self.assertIn(f"resolves-to {self.installed()}", result.stdout)
+        self.assertNotIn("Open a new terminal window", result.stdout)
+        self.assertTrue(self.installed().is_file())
+
+    def test_shadow_warning_still_names_an_older_neuron_that_wins(self) -> None:
+        # With -NoPathChange this install is not moved, so an older neuron already first still wins.
+        shadow = self.root / "Programs" / "NeuronCLI"
+        shadow.mkdir(parents=True)
+        (shadow / "neuron.exe").write_bytes(b"MZ old neuron")
+        result = self.run_add_to_path_install(f"{shadow};{self.install_dir}", no_path_change=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(
             f"another neuron at {shadow / 'neuron.exe'} comes first on PATH and runs instead of {self.installed()}",
             result.stdout,
         )
         self.assertIn(r'Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\NeuronCLI"', result.stdout)
         self.assertIn("npm.cmd uninstall -g @zero-x.live/neuron neuron-cli-app", result.stdout)
-        self.assertIn(f"move {self.install_dir} before {shadow} in PATH", result.stdout)
-        self.assertTrue(self.installed().is_file())
+
+    def test_path_entry_first_moves_an_existing_entry(self) -> None:
+        body = r"""
+Write-Host "a: $(Get-PathWithEntryFirst 'C:\old;C:\N\bin\;C:\x' 'C:\N\bin')"
+Write-Host "b: $(Get-PathWithEntryFirst '' 'C:\N\bin')"
+Write-Host "c: $(Get-PathWithEntryFirst 'C:\N\bin;C:\x' 'C:\N\bin')"
+"""
+        result = self.run_functions(["Get-PathWithEntryFirst"], body)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(r"a: C:\N\bin;C:\old;C:\x", result.stdout)
+        self.assertIn(r"b: C:\N\bin", result.stdout)
+        self.assertIn(r"c: C:\N\bin;C:\x", result.stdout)
 
     def test_add_to_path_without_another_neuron_does_not_warn(self) -> None:
         system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
         result = self.run_add_to_path_install(str(system))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(f"added {self.install_dir} to your user PATH", result.stdout)
+        self.assertIn(f"put {self.install_dir} first in your user PATH", result.stdout)
         self.assertNotIn("comes first on PATH", result.stdout)
-        self.assertIn("Open a new terminal window", result.stdout)
+        self.assertNotIn("Open a new terminal window", result.stdout, "irm | iex: neuron works in this window")
+        self.assertIn(f"resolves-to {self.installed()}", result.stdout)
         self.assertIn("Sign in:  neuron login", result.stdout)
 
     def test_no_path_change_leaves_the_user_path_alone(self) -> None:
@@ -1091,6 +1119,7 @@ Install-Neuron
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             entries = [entry.rstrip("\\").lower() for entry in (self.user_path() or "").split(";")]
             self.assertEqual(entries.count(str(self.install_dir).lower()), 1)
+            self.assertEqual(entries[0], str(self.install_dir).lower(), "this install comes first in the user PATH")
         finally:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as key:
                 if original is None:
