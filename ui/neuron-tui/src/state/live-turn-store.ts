@@ -16,6 +16,8 @@ export interface LiveToolCall {
   /** Lines and bytes of the input so far (while it streams). */
   lines: number
   bytes: number
+  /** Lines an edit replaces, as far as the model wrote them (`edit_file`). */
+  removed?: number
 }
 
 /**

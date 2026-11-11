@@ -1,7 +1,8 @@
 /**
  * The status line's account of a running turn:
  *
- *   ⠹ Writing grocery-shop/style.css · 412 lines · 12.3 KB       1m 52s · ↓ 1.2K tokens  esc to interrupt
+ *   ● writing grocery-shop/style.css +412 ⠹                       1m 52s · ↓ 1.2K tokens  esc to interrupt
+ *   ● editing src/app.ts +12 -3 ⠼ · no new tokens for 14s
  *   ⠼ Waiting for the model · no tokens for 32s
  *
  * The verb and target come from the live turn (engine/live-turn.ts); this
@@ -99,17 +100,35 @@ export const LiveActivityLine = () => {
   const theme = useTheme()
   const live = useLiveActivityInput()
   const awaitingApproval = useEngineStore((state) => state.permissionQueue.length > 0)
+  const cwd = useEngineStore((state) => state.status?.cwd ?? null)
   useLiveClock()
   // Drawn with the exact time of the last token: the rounded one only says when to draw.
   const { lastTokenAt } = useLiveTurnStore.getState()
   const activity = describeLiveActivity(
     { ...live, lastTokenAt },
-    { now: liveTurnNow(), awaitingApproval },
+    { now: liveTurnNow(), awaitingApproval, cwd },
   )
   const color = activity.stalled ? theme.warning : theme.secondary
   const head = activity.target
     ? `${activity.verb} ${shortTarget(activity.target)}`
     : activity.verb
+  if (activity.writing) {
+    // `● writing index.js +91 ⠹`: the file and its count lead, the spinner says
+    // it is still going, and a quiet stream is named after it.
+    return (
+      <>
+        <span fg={theme.success}>{GLYPHS.activity}</span>
+        <span> </span>
+        <ShimmerText text={head} interval={SHIMMER_INTERVAL_MS} primaryColor={theme.secondary} />
+        {activity.detail ? <span fg={theme.success}>{` ${activity.detail}`}</span> : null}
+        <span> </span>
+        <Spinner color={color} />
+        {activity.writing.silence ? (
+          <span fg={theme.warning}>{` · ${activity.writing.silence}`}</span>
+        ) : null}
+      </>
+    )
+  }
   return (
     <>
       <Spinner color={color} />
