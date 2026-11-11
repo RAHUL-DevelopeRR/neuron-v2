@@ -94,6 +94,12 @@ export const FEATURE_MCP_HOSTED = 'mcp_hosted'
  * `/context` report.
  */
 export const FEATURE_STATUS_BAR = 'status_bar'
+/**
+ * A turn that reached its model-request cap, or kept repeating itself, ends
+ * with a `paused` notice instead of an error (UIs with {@link
+ * CAPABILITY_TURN_PAUSE}); a new prompt ("continue") picks it up.
+ */
+export const FEATURE_TURN_PAUSE = 'turn_pause'
 
 /** A UI capability: questions come as `question` events, not "Question:" notices. */
 export const CAPABILITY_QUESTIONS = 'questions'
@@ -121,6 +127,11 @@ export const CAPABILITY_LIVE_OUTPUT = 'live_output'
  * engine sends neither.
  */
 export const CAPABILITY_HOOK_PROGRESS = 'hook_progress'
+/**
+ * A UI capability: a paused turn's notice comes with kind `paused` and says
+ * that Enter on an empty prompt continues it ({@link FEATURE_TURN_PAUSE}).
+ */
+export const CAPABILITY_TURN_PAUSE = 'turn_pause'
 
 /** Token counts as the provider reported them (or estimated before it did). */
 export interface TokenCounts {
@@ -789,7 +800,7 @@ export interface PermissionRequestedEvent {
 }
 
 /** What a {@link NoticeEvent} is about. `NoticeKind` in protocol.rs. */
-export type NoticeKind = 'refusal'
+export type NoticeKind = 'refusal' | 'paused'
 
 /** A notice (retries, warnings, interrupts). ANSI-free; may be multi-line. */
 export interface NoticeEvent {
@@ -799,7 +810,9 @@ export interface NoticeEvent {
    * Set when the notice is more than a status line; left out of plain notices
    * (and absent from engines older than the field). `refusal`: the model
    * declined to continue the turn's request (`message` is the one line to
-   * show, with the provider's note); it is not assistant text.
+   * show, with the provider's note); it is not assistant text. `paused`: the
+   * turn reached its model-request cap or kept repeating itself; nothing was
+   * lost, and the message says how to continue.
    */
   kind?: NoticeKind | null
 }
@@ -998,6 +1011,11 @@ export interface ToolInputProgressEvent {
   target: string | null
   /** The last lines of the main text so far (at most about 1 KB), unescaped. */
   preview: string | null
+  /**
+   * Lines an edit replaces (`edit_file`'s `old_string` so far); absent for
+   * other tools and from older engines.
+   */
+  removed?: number | null
 }
 
 /**

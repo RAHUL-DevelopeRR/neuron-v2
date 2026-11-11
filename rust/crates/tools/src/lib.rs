@@ -4762,6 +4762,10 @@ fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<
         runtime::TurnOutcome::LoopDetected { tool_name, repeats } => Err(format!(
             "sub-agent stopped after repeating `{tool_name}` {repeats} times"
         )),
+        runtime::TurnOutcome::IterationLimit { limit } => Err(format!(
+            "sub-agent stopped after {limit} model requests without finishing"
+        )),
+        runtime::TurnOutcome::NoProgress { reason } => Err(format!("sub-agent stopped: {reason}")),
         runtime::TurnOutcome::Refused { note, .. } => Err(format!(
             "sub-agent stopped: {}",
             runtime::refusal_line(note.as_deref())

@@ -3311,6 +3311,10 @@ impl LiveCli {
             self.replace_runtime(runtime)?;
         }
 
+        // An interactive turn that reaches its model-request cap pauses (the user can
+        // say "continue"); a one-shot run fails there, as scripts expect.
+        self.runtime
+            .set_pause_at_iteration_limit(!crate::headless::one_shot());
         let cancel = runtime::CancellationToken::new();
         let hook_abort_signal = runtime::HookAbortSignal::new();
         self.runtime.set_cancellation_token(cancel.clone());
@@ -3413,9 +3417,14 @@ impl LiveCli {
                     runtime::TurnOutcome::Cancelled { .. } => {
                         spinner.fail("Interrupted", theme, &mut stdout)?;
                     }
-                    runtime::TurnOutcome::LoopDetected { .. }
-                    | runtime::TurnOutcome::BudgetStopped { .. } => {
+                    runtime::TurnOutcome::BudgetStopped { .. } => {
                         spinner.fail("Stopped", theme, &mut stdout)?;
+                    }
+                    // Not a failure: the line below says how to continue.
+                    runtime::TurnOutcome::LoopDetected { .. }
+                    | runtime::TurnOutcome::IterationLimit { .. }
+                    | runtime::TurnOutcome::NoProgress { .. } => {
+                        spinner.finish("Paused", theme, &mut stdout)?;
                     }
                     // Not a reply: the line below says why.
                     runtime::TurnOutcome::Refused { .. } => {

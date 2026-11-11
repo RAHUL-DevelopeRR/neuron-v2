@@ -23,6 +23,9 @@ pub(crate) struct ToolInputPreview {
     pub(crate) lines: u64,
     /// The main text's last lines (at most [`PREVIEW_LINES`], about [`PREVIEW_BYTES`]).
     pub(crate) preview: Option<String>,
+    /// Lines the call replaces, for an edit: `edit_file`'s `old_string` so far (whole
+    /// or not). `None` for other tools and before the field starts.
+    pub(crate) removed: Option<u64>,
 }
 
 /// Reads `input`, the JSON text of a `tool` call so far.
@@ -50,10 +53,15 @@ pub(crate) fn preview_tool_input(tool: &str, input: &str) -> ToolInputPreview {
                 }
             }),
     };
+    let removed = (tool == "edit_file")
+        .then(|| field("old_string"))
+        .flatten()
+        .map(|field| field.value.lines().count() as u64);
     ToolInputPreview {
         target,
         lines: main.map_or(0, |field| field.value.lines().count() as u64),
         preview: main.and_then(|field| tail(&field.value)),
+        removed,
     }
 }
 
@@ -543,6 +551,21 @@ mod tests {
         );
         assert_eq!(edit.target.as_deref(), Some("a.rs"));
         assert_eq!(edit.preview.as_deref(), Some("new"));
+        assert_eq!((edit.lines, edit.removed), (1, Some(1)));
+        // An edit's replaced lines count as far as they streamed; a write has none.
+        let streaming_edit = preview_tool_input(
+            "edit_file",
+            r#"{"path":"src/app.ts","old_string":"one
+two
+three
+","new_string":"uno
+do"#,
+        );
+        assert_eq!(streaming_edit.target.as_deref(), Some("src/app.ts"));
+        assert_eq!((streaming_edit.lines, streaming_edit.removed), (2, Some(3)));
+        let edit_before_old_text = preview_tool_input("edit_file", r#"{"path":"src/app.ts","#);
+        assert_eq!(edit_before_old_text.removed, None);
+        assert_eq!(write.removed, None);
 
         let bash = preview_tool_input(
             "bash",

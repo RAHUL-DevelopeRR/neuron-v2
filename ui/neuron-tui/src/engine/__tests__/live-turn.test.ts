@@ -16,6 +16,7 @@ import {
   setLiveTurnClockForTesting,
   startLiveTurn,
   targetOfToolInput,
+  writeSizeDetail,
 } from '../live-turn'
 import { turnHarness } from './turn-harness'
 
@@ -110,7 +111,7 @@ describe('a long write_file call, as a live_progress engine streams it', () => {
     })
     expect(recorded.streamStatus).toEqual(['streaming'])
     expect(recorded.streamingRows.has('toolu_w')).toBe(true)
-    expect(activity()).toMatchObject({ verb: 'Writing', target: null })
+    expect(activity()).toMatchObject({ verb: 'writing', target: null, writing: { silence: null } })
 
     // The input grows: path, line count and the last lines show before the
     // complete input arrives.
@@ -120,11 +121,13 @@ describe('a long write_file call, as a live_progress engine streams it', () => {
     expect(streaming.liveInput).toMatchObject({ lines: 412, target: CSS_PATH })
     expect(streaming.liveInput!.preview).toContain('.rule-411 { color: red; }')
     expect(activity()).toEqual({
-      verb: 'Writing',
+      verb: 'writing',
       target: CSS_PATH,
-      detail: `412 lines · ${formatBytes(streaming.liveInput!.bytes)}`,
+      detail: '+412',
       stalled: false,
+      writing: { silence: null },
     })
+    expect(formatBytes(streaming.liveInput!.bytes)).toMatch(/KB$/)
     expect(liveOutputTokens(live())).toBe(1200)
 
     // The complete input replaces what streamed, in the same row.
@@ -204,9 +207,9 @@ describe('a long write_file call, as a live_progress engine streams it', () => {
       preview: null,
     })
     expect(activity()).toMatchObject({
-      verb: 'Editing',
+      verb: 'editing',
       target: 'C:\\work\\src\\app.ts',
-      detail: '3 lines · 2 KB',
+      detail: '+3',
     })
     sink.handle({ type: 'output_progress', output_tokens: 90 })
     expect(liveFooterTokens(live())).toEqual({ input: 0, output: 90 })
@@ -237,11 +240,17 @@ describe('a stalled stream', () => {
     expect(activity()).toMatchObject({ verb: 'Responding', stalled: false })
   })
 
-  test('a tool input that stops growing is a stall too', () => {
+  test('a tool input that stops growing is a stall too, still named for the file', () => {
     const { sink } = turnHarness()
     sink.handle({ type: 'tool_input_started', id: 'w', name: 'write_file' })
     advance(15_000)
-    expect(activity()).toMatchObject({ detail: 'no tokens for 15s', stalled: true })
+    expect(activity()).toEqual({
+      verb: 'writing',
+      target: null,
+      detail: null,
+      stalled: true,
+      writing: { silence: 'no new tokens for 15s' },
+    })
     sink.handle({
       type: 'tool_input_progress',
       id: 'w',
@@ -251,7 +260,64 @@ describe('a stalled stream', () => {
       target: 'a.txt',
       preview: 'x',
     })
-    expect(activity()).toMatchObject({ verb: 'Writing', target: 'a.txt', stalled: false })
+    expect(activity()).toMatchObject({ verb: 'writing', target: 'a.txt', detail: '+1', stalled: false })
+  })
+
+  test('while a file streams, the line keeps its path and count instead of "Waiting for the model"', () => {
+    const { sink } = turnHarness()
+    sink.handle({ type: 'tool_input_started', id: 'w', name: 'write_file' })
+    const grow = (lines: number) =>
+      sink.handle({
+        type: 'tool_input_progress',
+        id: 'w',
+        name: 'write_file',
+        bytes: lines * 30,
+        lines,
+        target: 'C:\\work\\site\\index.js',
+        preview: null,
+      })
+    const inWorkspace = () =>
+      describeLiveActivity(live(), { now, awaitingApproval: false, cwd: 'C:\\work' })
+    grow(40)
+    expect(inWorkspace()).toMatchObject({ verb: 'writing', target: 'site/index.js', detail: '+40' })
+    // Argument deltas are tokens: each one resets the silence.
+    for (let step = 0; step < 5; step += 1) {
+      advance(9_000)
+      grow(41 + step * 10)
+      expect(inWorkspace().stalled).toBe(false)
+    }
+    expect(inWorkspace().detail).toBe('+81')
+    // A quiet stream keeps the file and its count, and says how long it has been quiet.
+    advance(37_000)
+    expect(inWorkspace()).toEqual({
+      verb: 'writing',
+      target: 'site/index.js',
+      detail: '+81',
+      stalled: true,
+      writing: { silence: 'no new tokens for 37s' },
+    })
+    expect(inWorkspace().verb).not.toBe('Waiting for the model')
+    grow(91)
+    expect(inWorkspace()).toMatchObject({ detail: '+91', stalled: false, writing: { silence: null } })
+  })
+
+  test('an edit shows the lines it adds and the lines it replaces', () => {
+    const { sink } = turnHarness()
+    sink.handle({ type: 'tool_input_started', id: 'e', name: 'edit_file' })
+    sink.handle({
+      type: 'tool_input_progress',
+      id: 'e',
+      name: 'edit_file',
+      bytes: 300,
+      lines: 12,
+      target: 'src/app.ts',
+      preview: null,
+      removed: 3,
+    })
+    expect(activity()).toMatchObject({ verb: 'editing', target: 'src/app.ts', detail: '+12 -3' })
+    expect(writeSizeDetail(0)).toBeNull()
+    expect(writeSizeDetail(0, 2)).toBe('+0 -2')
+    expect(writeSizeDetail(91)).toBe('+91')
   })
 
   test('before the first token it waits, with the wait time after 10 s', () => {

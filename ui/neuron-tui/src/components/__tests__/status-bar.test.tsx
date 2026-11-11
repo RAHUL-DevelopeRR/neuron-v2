@@ -87,7 +87,7 @@ async function frame(
 }
 
 describe('StatusBar', () => {
-  test('a file being written: verb, path, size, elapsed, tokens and the interrupt hint', async () => {
+  test('a file being written: the file, its line count, elapsed, tokens and the interrupt hint', async () => {
     liveTurn({
       calls: [
         { id: 'w', name: 'write_file', phase: 'input', target: 'grocery-shop/style.css', lines: 412, bytes: 12_595 },
@@ -96,7 +96,7 @@ describe('StatusBar', () => {
       streamingOutput: 400,
     })
     const shown = await frame({}, { elapsedSeconds: 112, onStop: () => {} })
-    expect(shown).toContain('Writing grocery-shop/style.css · 412 lines · 12.3 KB')
+    expect(shown).toContain('● writing grocery-shop/style.css +412 ')
     expect(shown).toContain('1m 52s · ↓ 1.2K tokens')
     expect(shown).toContain('esc to interrupt')
     expect(shown).not.toContain('working...')
@@ -111,6 +111,19 @@ describe('StatusBar', () => {
     const shown = await frame()
     expect(shown).toContain('Running cargo test')
     expect(shown).not.toContain('no tokens')
+  })
+
+  test('a file whose stream goes quiet keeps its line, with the silence after it', async () => {
+    liveTurn({
+      lastTokenAt: NOW - 37_000,
+      calls: [
+        { id: 'w', name: 'write_file', phase: 'input', target: 'index.js', lines: 91, bytes: 2_800 },
+      ],
+    })
+    const shown = await frame({}, { elapsedSeconds: 930, onStop: () => {} })
+    expect(shown).toContain('● writing index.js +91 ')
+    expect(shown).toContain('· no new tokens for 37s')
+    expect(shown).not.toContain('Waiting for the model')
   })
 
   test('a stream silent for over 10 s says so, with the elapsed time and the hint', async () => {

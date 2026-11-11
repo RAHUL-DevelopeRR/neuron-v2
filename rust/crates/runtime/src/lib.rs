@@ -126,13 +126,14 @@ pub use config_validate::{
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, auto_compaction_threshold_override_from_env,
-    is_refusal_stop_reason, is_truncation_stop_reason, is_turn_end_note, resolve_max_iterations,
-    ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent, ChangeReviewer,
-    ConversationRuntime, HarnessConfig, PromptCacheEvent, RequestEstimate, RequestGuard,
-    ReviewRequest, RuntimeError, RuntimeErrorKind, StaticToolExecutor, ToolError, ToolExecutor,
-    TurnOutcome, TurnSummary, AUTO_CHECKS_ENV_VAR, BUDGET_STOPPED_NOTE, COMPLETION_CHECK_ENV_VAR,
-    DEFAULT_MAX_ITERATIONS, FAILED_RESPONSE_NOTE_PREFIX, INTERRUPTED_RESPONSE_NOTE,
-    INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR, REFUSAL_STOP_REASON,
+    is_refusal_stop_reason, is_truncation_stop_reason, is_turn_end_note, paused_turn_reason,
+    resolve_max_iterations, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
+    ChangeReviewer, ConversationRuntime, HarnessConfig, PromptCacheEvent, RequestEstimate,
+    RequestGuard, ReviewRequest, RuntimeError, RuntimeErrorKind, StaticToolExecutor, ToolError,
+    ToolExecutor, TurnOutcome, TurnSummary, AUTO_CHECKS_ENV_VAR, BUDGET_STOPPED_NOTE,
+    COMPLETION_CHECK_ENV_VAR, DEFAULT_MAX_ITERATIONS, FAILED_RESPONSE_NOTE_PREFIX,
+    INTERRUPTED_RESPONSE_NOTE, INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR,
+    PAUSED_RESPONSE_NOTE_PREFIX, REFUSAL_STOP_REASON,
 };
 pub use file_ops::{
     display_path, edit_file, edit_file_in_workspace, glob_search, grep_search,

@@ -20,7 +20,7 @@ import {
 import { formatElapsedTime } from '../utils/format-elapsed-time'
 import { toTodoStatus, type TodoItem } from '../utils/todos'
 import { FEATURE_LIVE_PROGRESS } from './protocol'
-import { displayPath, mapToolCall } from './tool-mapping'
+import { displayPath, mapToolCall, workspacePath } from './tool-mapping'
 
 import type { TodoItem as EngineTodoItem, UiEvent } from './protocol'
 
@@ -212,6 +212,7 @@ export function reduceLiveTurn(
           target: event.target ? normalizeTarget(event.name, event.target) : (call?.target ?? null),
           lines: event.lines,
           bytes: event.bytes,
+          ...(typeof event.removed === 'number' && { removed: event.removed }),
         })),
       })
     case 'output_progress':
@@ -372,13 +373,33 @@ export interface LiveActivity {
   detail: string | null
   /** The streaming request sent nothing for {@link STALL_AFTER_MS}. */
   stalled: boolean
+  /**
+   * The model is writing a file (`write_file`, `edit_file`): the line reads
+   * `● writing index.js +91 ⠹`, with `detail` the diff-style count and
+   * `silence` how long the stream has been quiet, once that is worth saying.
+   */
+  writing?: { silence: string | null }
 }
 
-/** Verbs for a call whose input the model is writing. */
-const INPUT_VERBS: Record<string, string> = {
-  write_file: 'Writing',
-  edit_file: 'Editing',
-  NotebookEdit: 'Editing',
+/**
+ * Tools that write a file, and the verb their live line uses while the model
+ * streams the content: `● writing index.js +91`.
+ */
+const FILE_WRITE_VERBS: Record<string, string> = {
+  write_file: 'writing',
+  edit_file: 'editing',
+  NotebookEdit: 'editing',
+}
+
+/**
+ * The diff-style count of a file being written: `+91` lines so far, and
+ * `-12` lines an edit replaces; `null` before any.
+ */
+export function writeSizeDetail(lines: number, removed?: number): string | null {
+  const parts: string[] = []
+  if (lines > 0 || (removed ?? 0) > 0) parts.push(`+${lines}`)
+  if ((removed ?? 0) > 0) parts.push(`-${removed}`)
+  return parts.length > 0 ? parts.join(' ') : null
 }
 
 /** Verbs for a call that runs. */
@@ -440,7 +461,7 @@ export function hookActivity(hook: { event: string; command: string }): LiveActi
 
 export function describeLiveActivity(
   state: LiveTurnState,
-  options: { now: number; awaitingApproval: boolean },
+  options: { now: number; awaitingApproval: boolean; cwd?: string | null },
 ): LiveActivity {
   const { now } = options
   const running = state.calls.find((call) => call.phase === 'running')
@@ -464,11 +485,24 @@ export function describeLiveActivity(
           stalled: true,
         }
   const writing = [...state.calls].reverse().find((call) => call.phase === 'input')
+  const fileVerb = writing ? FILE_WRITE_VERBS[writing.name] : undefined
+  if (writing && fileVerb) {
+    // The file and its growing line count stay on the line while the model
+    // writes it, also through a pause in the stream: the silence is added, the
+    // progress is not replaced by a bare "Waiting for the model".
+    return {
+      verb: fileVerb,
+      target: writing.target ? workspacePath(writing.target, options.cwd) : null,
+      detail: writeSizeDetail(writing.lines, writing.removed),
+      stalled: silent !== null,
+      writing: { silence: silent === null ? null : `no new tokens for ${seconds(silent)}` },
+    }
+  }
   if (writing) {
     return (
       stall ?? {
-        verb: INPUT_VERBS[writing.name] ?? 'Preparing',
-        target: writing.target ?? (INPUT_VERBS[writing.name] ? null : writing.name),
+        verb: 'Preparing',
+        target: writing.target ?? writing.name,
         detail: inputSizeDetail(writing.lines, writing.bytes),
         stalled: false,
       }
