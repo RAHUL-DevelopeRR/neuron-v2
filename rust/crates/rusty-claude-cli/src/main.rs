@@ -3457,7 +3457,7 @@ impl LiveCli {
                     println!("{warning}");
                 }
                 persisted?;
-                Ok(())
+                self.fail_paused_one_shot(&summary.outcome)
             }
             Err(error) => {
                 spinner.fail(
@@ -3526,7 +3526,24 @@ impl LiveCli {
         if let Some(warning) = crate::plan_window::near_limit_notice() {
             eprintln!("{warning}");
         }
-        Ok(())
+        self.fail_paused_one_shot(&summary.outcome)
+    }
+
+    /// A one-shot run (`neuron -p`) whose turn the loop guard or the progress watch
+    /// paused did not finish: it fails (exit code 1, the reason and how to resume on
+    /// stderr), as it does at the model-request cap, so a script does not take it for
+    /// success. Interactive turns only pause.
+    fn fail_paused_one_shot(
+        &self,
+        outcome: &runtime::TurnOutcome,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !headless::one_shot() {
+            return Ok(());
+        }
+        match repl_loop::one_shot_pause_message(outcome, &self.session.id) {
+            Some(message) => Err(message.into()),
+            None => Ok(()),
+        }
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -3646,7 +3663,7 @@ impl LiveCli {
                 ),
                 "estimated_cost_known": pricing_for_model(&self.model).is_some()
             }),
-            Ok(()),
+            self.fail_paused_one_shot(&summary.outcome),
         )
     }
 

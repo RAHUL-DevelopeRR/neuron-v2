@@ -1,8 +1,13 @@
 //! Notices a turn going round in circles after its tool calls ran: the same few calls
-//! coming back with the same results (`A, B, A, B, A, B`), or the same part of a file
-//! read again and again without anything changing it. [`super::LoopGuard`] catches the
+//! coming back with the same results (`A, B, A, B, A, B`), or the same lines of a file
+//! read again and again and coming back unchanged. [`super::LoopGuard`] catches the
 //! plainest loop, one call repeated with identical arguments, before it runs; this
 //! watch sees what the calls returned, so polling that gets new output is not a loop.
+//!
+//! A read counts as a re-read only when most of the lines it returned were already
+//! returned, word for word, by earlier reads. A read that shows changed lines starts
+//! the file's count again, and so does any call that may change files (a shell, a
+//! sub-agent, an MCP tool, ...): what was read before it may be out of date.
 //!
 //! The answer is graduated: the first time, a note on the tool result asks the model
 //! to change its approach; when it keeps going, the turn is paused (it ends normally,
@@ -16,6 +21,7 @@ use serde_json::Value;
 
 use super::{tool_call_signature, FILE_EDIT_TOOLS};
 use crate::file_ops::DEFAULT_READ_LINE_LIMIT;
+use crate::parallel_tools::CONCURRENCY_SAFE_TOOLS;
 use crate::session::{ContentBlock, ConversationMessage};
 
 /// How many full rounds of a short cycle of calls (with the same results) count as
@@ -25,8 +31,8 @@ const CYCLE_ROUNDS: usize = 3;
 const CYCLE_LENGTHS: [usize; 2] = [2, 3];
 /// Calls remembered for cycle detection.
 const HISTORY_LEN: usize = 12;
-/// Reads of a part of a file already read this turn (with no edit to it since) before
-/// the model is told it is re-reading.
+/// Reads of a part of a file already read this turn (and unchanged since) before the
+/// model is told it is re-reading.
 const REREAD_WARN: usize = 3;
 /// Such re-reads before the turn is paused.
 const REREAD_PAUSE: usize = 5;
@@ -52,8 +58,8 @@ pub(super) struct ProgressWatch {
     /// A hash of each recent call with its result, oldest first.
     history: VecDeque<u64>,
     cycle_warned: bool,
-    /// Line ranges read per file since it was last edited, and how many reads overlapped
-    /// an earlier one.
+    /// What was read of each file since it last changed (keyed by [`FilePath::key`]),
+    /// and how many reads showed nothing new.
     reads: HashMap<String, FileReads>,
     /// Set when a verdict paused the turn, until the turn loop takes it.
     pending_pause: Option<String>,
@@ -61,8 +67,67 @@ pub(super) struct ProgressWatch {
 
 #[derive(Debug, Default)]
 struct FileReads {
-    ranges: Vec<(usize, usize)>,
+    /// A hash of each line's text as last read, by line number (1-based).
+    lines: HashMap<usize, u64>,
+    /// The file's length in lines as last read.
+    total_lines: Option<usize>,
+    /// A hash of the whole result by requested line range, for results whose lines
+    /// could not be read out (not the usual JSON).
+    results: HashMap<(usize, usize), u64>,
     rereads: usize,
+}
+
+impl FileReads {
+    /// Records the lines a read showed; whether most of them were shown before,
+    /// unchanged. Changed lines (or a changed length) start the count again.
+    fn record_lines(&mut self, shown: &ShownLines) -> bool {
+        let line_number = |index: usize| shown.start_line.saturating_add(index);
+        let changed = self
+            .total_lines
+            .is_some_and(|total| total != shown.total_lines)
+            || shown.hashes.iter().enumerate().any(|(index, hash)| {
+                self.lines
+                    .get(&line_number(index))
+                    .is_some_and(|old| old != hash)
+            });
+        if changed {
+            *self = Self::default();
+        }
+        let seen = shown
+            .hashes
+            .iter()
+            .enumerate()
+            .filter(|(index, hash)| self.lines.get(&line_number(*index)) == Some(*hash))
+            .count();
+        for (index, hash) in shown.hashes.iter().enumerate() {
+            self.lines.insert(line_number(index), *hash);
+        }
+        self.total_lines = Some(shown.total_lines);
+        // More than half of it already seen: a window that shares a line or two with
+        // the one before is still reading on.
+        !shown.hashes.is_empty() && seen * 2 > shown.hashes.len()
+    }
+
+    /// Records a result whose lines could not be read out; whether the same range
+    /// returned exactly this before. A different result starts the count again.
+    fn record_result(&mut self, range: (usize, usize), output: &str) -> bool {
+        let hash = hash_of(output);
+        match self.results.insert(range, hash) {
+            Some(old) if old == hash => true,
+            Some(_) => {
+                *self = Self::default();
+                self.results.insert(range, hash);
+                false
+            }
+            None => false,
+        }
+    }
+}
+
+/// Tools that cannot change a file the turn reads. Any other call (a shell, a
+/// sub-agent, an MCP tool, ...) may have, so what was read before it is out of date.
+fn leaves_files_alone(tool_name: &str) -> bool {
+    CONCURRENCY_SAFE_TOOLS.contains(&tool_name) || tool_name == "TodoWrite"
 }
 
 impl ProgressWatch {
@@ -80,17 +145,23 @@ impl ProgressWatch {
             // An edit is progress: what was read of the file is out of date, and the
             // calls before it are not a cycle with the ones after.
             if let Some(path) = input_value.as_ref().and_then(path_of) {
-                self.reads.remove(&path);
+                self.reads.remove(&path.key);
             }
             self.history.clear();
             self.cycle_warned = false;
             return WatchVerdict::Proceed;
         }
+        if !leaves_files_alone(tool_name) {
+            // It may have changed any file, even when it failed part way.
+            self.reads.clear();
+        }
         let verdict = self.observe_cycle(tool_name, input, output, is_error);
         let verdict = match verdict {
-            WatchVerdict::Proceed if !is_error && tool_name == "read_file" => input_value
-                .as_ref()
-                .map_or(WatchVerdict::Proceed, |value| self.observe_read(value)),
+            WatchVerdict::Proceed if !is_error && tool_name == "read_file" => {
+                input_value.as_ref().map_or(WatchVerdict::Proceed, |value| {
+                    self.observe_read(value, output)
+                })
+            }
             verdict => verdict,
         };
         if let WatchVerdict::Pause { reason, .. } = &verdict {
@@ -140,43 +211,79 @@ impl ProgressWatch {
         }
     }
 
-    fn observe_read(&mut self, input: &Value) -> WatchVerdict {
+    fn observe_read(&mut self, input: &Value, output: &str) -> WatchVerdict {
         let Some(path) = path_of(input) else {
             return WatchVerdict::Proceed;
         };
-        let offset = number(input, "offset").unwrap_or(0);
-        let limit = number(input, "limit")
-            .filter(|limit| *limit > 0)
-            .unwrap_or(DEFAULT_READ_LINE_LIMIT);
-        let range = (offset, offset.saturating_add(limit));
-        let reads = self.reads.entry(path.clone()).or_default();
-        let overlaps = reads
-            .ranges
-            .iter()
-            .any(|(start, end)| range.0 < *end && *start < range.1);
-        reads.ranges.push(range);
-        if !overlaps {
+        let reads = self.reads.entry(path.key).or_default();
+        let reread = if let Some(shown) = shown_lines(output) {
+            reads.record_lines(&shown)
+        } else {
+            let offset = number(input, "offset").unwrap_or(0);
+            let limit = number(input, "limit")
+                .filter(|limit| *limit > 0)
+                .unwrap_or(DEFAULT_READ_LINE_LIMIT);
+            reads.record_result((offset, offset.saturating_add(limit)), output)
+        };
+        if !reread {
             return WatchVerdict::Proceed;
         }
         reads.rereads += 1;
         let times = reads.rereads + 1;
+        let shown = path.shown;
         if reads.rereads >= REREAD_PAUSE {
             return WatchVerdict::Pause {
                 reason: format!(
-                    "the model read the same part of {path} {times} times without changing the file"
+                    "the model read the same part of {shown} {times} times and it had not changed"
                 ),
                 note: format!(
-                    "[progress check] The turn has been paused: {path} was read {times} times without being changed."
+                    "[progress check] The turn has been paused: the same part of {shown} was read {times} times and came back unchanged each time."
                 ),
             };
         }
         if reads.rereads == REREAD_WARN {
             return WatchVerdict::Warn(format!(
-                "[progress check] You have now read this part of {path} {times} times in this turn without changing the file, so its content is the same as before. Do not read it again: work from what you already have (write down the details you need in your reply if an earlier result was shortened), then take the next step. Reading it again without changing it will pause the turn."
+                "[progress check] You have now read this part of {shown} {times} times in this turn and it came back unchanged each time. Do not read it again: work from what you already have (write down the details you need in your reply if an earlier result was shortened), then take the next step. Reading it again while it is unchanged will pause the turn."
             ));
         }
         WatchVerdict::Proceed
     }
+}
+
+/// The lines a `read_file` result showed, hashed one by one.
+struct ShownLines {
+    /// The first line's number (1-based).
+    start_line: usize,
+    /// The file's length in lines.
+    total_lines: usize,
+    hashes: Vec<u64>,
+}
+
+/// The lines of a `read_file` result, or `None` when it is not the usual JSON (cut
+/// short to fit the context, for one). Notes added after the JSON are ignored.
+fn shown_lines(output: &str) -> Option<ShownLines> {
+    let value = serde_json::Deserializer::from_str(output)
+        .into_iter::<Value>()
+        .next()?
+        .ok()?;
+    let file = value.get("file")?;
+    let content = file.get("content")?.as_str()?;
+    let hashes = if content.is_empty() {
+        Vec::new()
+    } else {
+        content.split('\n').map(hash_of).collect()
+    };
+    Some(ShownLines {
+        start_line: number(file, "startLine")?,
+        total_lines: number(file, "totalLines")?,
+        hashes,
+    })
+}
+
+fn hash_of(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Whether the newest `CYCLE_ROUNDS * length` entries of `history` are one cycle of
@@ -220,10 +327,18 @@ fn result_of(message: &ConversationMessage) -> (&str, bool) {
         .unwrap_or(("", false))
 }
 
-/// The file a call's input names, written one way however the model spelled it:
-/// forward slashes, no leading `./`, relative to the working directory when inside it,
-/// and (on Windows) in lower case.
-fn path_of(input: &Value) -> Option<String> {
+/// The file a call's input names.
+struct FilePath {
+    /// Written one way however the model spelled it: forward slashes, no leading `./`,
+    /// relative to the working directory when inside it, and (on Windows) in lower case.
+    key: String,
+    /// As the model wrote it, with forward slashes and relative to the working
+    /// directory when inside it: the form notes and pause reasons name it by, so the
+    /// model never sees a wrong-case path to copy into an edit or an import.
+    shown: String,
+}
+
+fn path_of(input: &Value) -> Option<FilePath> {
     let raw = ["path", "file_path", "notebook_path"]
         .iter()
         .find_map(|key| input.get(*key).and_then(Value::as_str))?
@@ -245,17 +360,18 @@ fn path_of(input: &Value) -> Option<String> {
             path.starts_with(&root)
         };
         if inside {
-            path = path[root.len()..].to_string();
+            path = path.get(root.len()..).unwrap_or(&path).to_string();
         }
     }
     while let Some(rest) = path.strip_prefix("./") {
         path = rest.to_string();
     }
-    Some(if cfg!(windows) {
+    let key = if cfg!(windows) {
         path.to_lowercase()
     } else {
-        path
-    })
+        path.clone()
+    };
+    Some(FilePath { key, shown: path })
 }
 
 fn number(input: &Value, key: &str) -> Option<usize> {
@@ -274,8 +390,49 @@ mod tests {
         ConversationMessage::tool_result("id", "tool", output, false)
     }
 
+    /// What `read_file` returns for `offset`/`limit` of a file of `total` lines whose
+    /// line `n` reads `{text} n`.
+    fn file_output(offset: usize, limit: usize, total: usize, text: &str) -> String {
+        let start = offset.min(total);
+        let end = (start + limit).min(total);
+        let content = (start + 1..=end)
+            .map(|number| format!("{text} {number}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        serde_json::to_string_pretty(&serde_json::json!({
+            "type": "text",
+            "file": {
+                "filePath": "file",
+                "content": content,
+                "numLines": end - start,
+                "startLine": start + 1,
+                "totalLines": total,
+            }
+        }))
+        .unwrap()
+    }
+
+    /// A read of an unchanging 5000-line file, as `read_file` would answer it.
     fn read(watch: &mut ProgressWatch, input: &str) -> WatchVerdict {
-        watch.observe("read_file", input, &result("same content"))
+        read_returning(watch, input, "line")
+    }
+
+    fn read_returning(watch: &mut ProgressWatch, input: &str, text: &str) -> WatchVerdict {
+        let value = serde_json::from_str::<serde_json::Value>(input).unwrap();
+        let field = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+        let offset = usize::try_from(field("offset").unwrap_or(0)).unwrap();
+        let limit = usize::try_from(field("limit").unwrap_or(2_000)).unwrap();
+        let output = file_output(offset, limit, 5_000, text);
+        watch.observe("read_file", input, &result(&output))
+    }
+
+    fn assert_never_paused(verdicts: impl IntoIterator<Item = WatchVerdict>) {
+        for verdict in verdicts {
+            assert!(
+                !matches!(verdict, WatchVerdict::Pause { .. }),
+                "unexpected pause: {verdict:?}"
+            );
+        }
     }
 
     #[test]
@@ -290,6 +447,7 @@ mod tests {
             panic!("expected a warning");
         };
         assert!(note.contains("src/app.py 4 times"), "{note}");
+        assert!(note.contains("came back unchanged"), "{note}");
         for _ in REREAD_WARN + 1..REREAD_PAUSE {
             assert_eq!(read(&mut watch, input), WatchVerdict::Proceed);
         }
@@ -298,19 +456,19 @@ mod tests {
         };
         assert_eq!(
             reason,
-            "the model read the same part of src/app.py 6 times without changing the file"
+            "the model read the same part of src/app.py 6 times and it had not changed"
         );
         assert_eq!(watch.take_pause(), Some(reason));
         assert_eq!(watch.take_pause(), None);
     }
 
     #[test]
-    fn overlapping_ranges_and_spellings_of_one_path_count_as_the_same_read() {
+    fn mostly_covered_ranges_and_spellings_of_one_path_count_as_the_same_read() {
         let mut watch = ProgressWatch::default();
         let inputs = [
             r#"{"path":"src/app.py","offset":0,"limit":100}"#,
-            r#"{"path":"./src/app.py","offset":50,"limit":100}"#,
-            r#"{"path":"src\\app.py","offset":90,"limit":20}"#,
+            r#"{"path":"./src/app.py","offset":10,"limit":100}"#,
+            r#"{"path":"src\\app.py","offset":20,"limit":80}"#,
         ];
         for input in inputs {
             assert_eq!(read(&mut watch, input), WatchVerdict::Proceed);
@@ -331,6 +489,115 @@ mod tests {
             );
             assert_eq!(read(&mut watch, &input), WatchVerdict::Proceed);
         }
+    }
+
+    #[test]
+    fn chunks_that_share_a_line_are_not_rereading() {
+        // A 1-based offset habit: each window repeats the last line of the one before.
+        let mut watch = ProgressWatch::default();
+        for chunk in 0..20 {
+            let input = format!(
+                r#"{{"path":"big.log","offset":{},"limit":100}}"#,
+                chunk * 99
+            );
+            assert_eq!(read(&mut watch, &input), WatchVerdict::Proceed);
+        }
+    }
+
+    #[test]
+    fn sliding_windows_are_not_rereading() {
+        let mut watch = ProgressWatch::default();
+        for window in 0..20 {
+            let input = format!(
+                r#"{{"path":"big.log","offset":{},"limit":200}}"#,
+                window * 180
+            );
+            assert_eq!(read(&mut watch, &input), WatchVerdict::Proceed);
+        }
+    }
+
+    #[test]
+    fn polling_a_file_that_changes_is_not_rereading() {
+        // A sub-agent still writing its output file: each read shows something new.
+        let mut watch = ProgressWatch::default();
+        let input = r#"{"path":"agent-output.md"}"#;
+        assert_never_paused((0..12).map(|round| {
+            let verdict = read_returning(&mut watch, input, &format!("round {round}"));
+            assert_eq!(verdict, WatchVerdict::Proceed);
+            verdict
+        }));
+        // Once it stops changing, the count starts from the last read.
+        for _ in 1..REREAD_WARN {
+            assert_eq!(
+                read_returning(&mut watch, input, "round 11"),
+                WatchVerdict::Proceed
+            );
+        }
+        assert!(matches!(
+            read_returning(&mut watch, input, "round 11"),
+            WatchVerdict::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn reading_a_log_rewritten_by_a_shell_is_not_rereading() {
+        // Edit one file, run the tests into a log, read the log: the log may well read
+        // the same each time, but the shell wrote it again.
+        let mut watch = ProgressWatch::default();
+        let log = r#"{"path":"out.txt"}"#;
+        for round in 0..10 {
+            watch.observe(
+                "edit_file",
+                &format!(r#"{{"path":"src/a.rs","old_string":"{round}","new_string":"x"}}"#),
+                &result("ok"),
+            );
+            watch.observe("bash", r#"{"command":"cargo test > out.txt"}"#, &result(""));
+            assert_eq!(read(&mut watch, log), WatchVerdict::Proceed);
+        }
+    }
+
+    #[test]
+    fn any_call_that_may_change_files_starts_the_counts_again() {
+        let mut watch = ProgressWatch::default();
+        let input = r#"{"path":"notes.md"}"#;
+        for tool in ["PowerShell", "Agent", "mcp__fs__write", "bash"] {
+            for _ in 0..REREAD_WARN {
+                assert_eq!(read(&mut watch, input), WatchVerdict::Proceed);
+            }
+            watch.observe(tool, &format!(r#"{{"x":"{tool}"}}"#), &result("done"));
+        }
+    }
+
+    #[test]
+    fn results_that_are_not_the_usual_json_are_compared_whole() {
+        let mut watch = ProgressWatch::default();
+        let input = r#"{"path":"src/app.py"}"#;
+        let mut read_raw = |output: &str| watch.observe("read_file", input, &result(output));
+        for _ in 0..REREAD_WARN {
+            assert_eq!(read_raw("cut short"), WatchVerdict::Proceed);
+        }
+        assert_eq!(read_raw("something else"), WatchVerdict::Proceed);
+        for _ in 0..REREAD_WARN - 1 {
+            assert_eq!(read_raw("something else"), WatchVerdict::Proceed);
+        }
+        assert!(matches!(read_raw("something else"), WatchVerdict::Warn(_)));
+    }
+
+    #[test]
+    fn notes_name_the_path_as_the_model_wrote_it() {
+        let mut watch = ProgressWatch::default();
+        let input = r#"{"path":"src/components/UserProfile.tsx"}"#;
+        let verdicts = (0..=REREAD_PAUSE)
+            .map(|_| read(&mut watch, input))
+            .collect::<Vec<_>>();
+        let Some(WatchVerdict::Pause { reason, note }) = verdicts.last() else {
+            panic!("expected a pause: {verdicts:?}");
+        };
+        assert!(
+            reason.contains("src/components/UserProfile.tsx"),
+            "{reason}"
+        );
+        assert!(note.contains("src/components/UserProfile.tsx"), "{note}");
     }
 
     #[test]

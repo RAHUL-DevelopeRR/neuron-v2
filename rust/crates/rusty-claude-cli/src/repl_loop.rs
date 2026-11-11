@@ -302,11 +302,10 @@ pub(crate) fn describe_turn_outcome_without_refusal(
 /// [`describe_turn_outcome`] without the refusal line and the pause notice, which the
 /// full-screen UI gets as notices of their own kinds.
 pub(crate) fn describe_turn_outcome_for_ui(summary: &TurnSummary) -> Option<String> {
+    let paused = paused_notice(&summary.outcome, ContinueHint::Typed);
     let notes = outcome_notes(summary, QuitHint::Hidden)
         .into_iter()
-        .skip(usize::from(
-            runtime::paused_turn_reason(&summary.outcome).is_some(),
-        ))
+        .filter(|note| Some(note) != paused.as_ref())
         .collect::<Vec<_>>();
     (!notes.is_empty()).then(|| notes.join("\n"))
 }
@@ -334,6 +333,16 @@ pub(crate) fn paused_notice(outcome: &TurnOutcome, hint: ContinueHint) -> Option
     ))
 }
 
+/// Why a one-shot run (`neuron -p`) whose turn was paused failed, and how to go on
+/// from where it stopped: there is no prompt to type `continue` into. `None` for
+/// outcomes that are not pauses.
+pub(crate) fn one_shot_pause_message(outcome: &TurnOutcome, session_id: &str) -> Option<String> {
+    let reason = runtime::paused_turn_reason(outcome)?;
+    Some(format!(
+        "the run stopped before the task was finished: {reason}. The work so far is saved. To keep going, run: neuron --resume {session_id} -p continue (or give different instructions in place of continue)."
+    ))
+}
+
 /// The notes of [`describe_turn_outcome`] other than the refusal line.
 fn outcome_notes(summary: &TurnSummary, hint: QuitHint) -> Vec<String> {
     let mut notes = Vec::new();
@@ -353,10 +362,14 @@ fn outcome_notes(summary: &TurnSummary, hint: QuitHint) -> Vec<String> {
                 format!("Interrupted. {calls} pending tool call(s) were not run.")
             }
         }),
+        // A one-shot run has no prompt to type continue into: it fails instead, with
+        // [`one_shot_pause_message`] on stderr.
         TurnOutcome::LoopDetected { .. }
         | TurnOutcome::IterationLimit { .. }
         | TurnOutcome::NoProgress { .. } => {
-            notes.extend(paused_notice(&summary.outcome, ContinueHint::Typed));
+            if !crate::headless::one_shot() {
+                notes.extend(paused_notice(&summary.outcome, ContinueHint::Typed));
+            }
         }
         TurnOutcome::OutputTruncated => notes.push(
             "Note: the response was cut off at the output token limit even after one automatic continuation. Ask the model to continue or to work in smaller steps."
@@ -846,9 +859,10 @@ mod tests {
     use super::{
         check_context_argument, context_command_argument, describe_turn_outcome,
         describe_turn_outcome_for_ui, describe_turn_outcome_without_refusal, dispatch_line,
-        group_digits, handle_turn_interrupt, paused_notice, refusal_note_text, refusal_notice,
-        render_context_report, turn_outcome_label, watch_turn_interrupts, ContextReport,
-        ContinueHint, InterruptAction, InterruptPresses, QuitHint, ReplBackend, ReplStep,
+        group_digits, handle_turn_interrupt, one_shot_pause_message, paused_notice,
+        refusal_note_text, refusal_notice, render_context_report, turn_outcome_label,
+        watch_turn_interrupts, ContextReport, ContinueHint, InterruptAction, InterruptPresses,
+        QuitHint, ReplBackend, ReplStep,
     };
     use crate::{CliAction, ResumeLaunchOptions, DEFAULT_MODEL};
     use runtime::context_manager::{ContextBudget, ContextManager, ContextPolicy};
@@ -1071,8 +1085,25 @@ mod tests {
             QuitHint::Shown,
         )
         .expect("notice");
-        assert!(looped.contains("`bash` 4 times"));
+        // Plain words, not the tool's internal name.
+        assert!(
+            looped.contains("the model kept running the same command 4 times in a row"),
+            "{looped}"
+        );
+        assert!(!looped.contains('`'), "{looped}");
         assert!(looped.contains("shortened 1 older tool result(s)"));
+    }
+
+    #[test]
+    fn a_paused_one_shot_run_says_how_to_resume_it() {
+        let stuck = TurnOutcome::NoProgress {
+            reason: "the model kept repeating the same 2 tool calls".to_string(),
+        };
+        let message = one_shot_pause_message(&stuck, "session-123").expect("a pause");
+        assert!(message.contains("the model kept repeating the same 2 tool calls"));
+        assert!(message.contains("neuron --resume session-123 -p continue"));
+        assert!(!message.contains("type continue"));
+        assert_eq!(one_shot_pause_message(&TurnOutcome::Completed, "s"), None);
     }
 
     #[test]

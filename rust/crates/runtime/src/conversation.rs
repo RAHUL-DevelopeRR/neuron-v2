@@ -2530,10 +2530,26 @@ pub fn paused_turn_reason(outcome: &TurnOutcome) -> Option<String> {
             "the turn reached its limit of {limit} model requests"
         )),
         TurnOutcome::LoopDetected { tool_name, repeats } => Some(format!(
-            "the model called `{tool_name}` {repeats} times in a row with identical arguments"
+            "the model kept {} {repeats} times in a row",
+            repeated_action(tool_name)
         )),
         TurnOutcome::NoProgress { reason } => Some(reason.clone()),
         _ => None,
+    }
+}
+
+/// What a call repeated by the loop guard did, in plain words for the pause notice
+/// ("running the same command"), instead of the tool's internal name.
+fn repeated_action(tool_name: &str) -> &'static str {
+    match tool_name {
+        "bash" | "PowerShell" | "REPL" => "running the same command",
+        "read_file" => "reading the same file",
+        "edit_file" | "write_file" | "NotebookEdit" => "making the same change to a file",
+        "grep_search" | "glob_search" | "ToolSearch" => "running the same search",
+        "WebSearch" => "running the same web search",
+        "WebFetch" => "opening the same web page",
+        "Agent" => "starting the same helper task",
+        _ => "making the same request",
     }
 }
 
@@ -5880,7 +5896,34 @@ mod resilience_tests {
                 ])
             }
         }
-        let tools = StaticToolExecutor::new().register("read_file", |input| Ok(input.to_string()));
+        // Answers like `read_file` does, for a file of 1000 unchanging lines.
+        let tools = StaticToolExecutor::new().register("read_file", |input| {
+            let input = serde_json::from_str::<serde_json::Value>(input).expect("json input");
+            let field = |key: &str| {
+                input
+                    .get(key)
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0)
+            };
+            let start = field("offset");
+            let end = (start + field("limit")).min(1_000);
+            let content = (start + 1..=end)
+                .map(|number| format!("line {number}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(serde_json::json!({
+                "type": "text",
+                "file": {
+                    "filePath": "src/desktop_service.py",
+                    "content": content,
+                    "numLines": end - start,
+                    "startLine": start + 1,
+                    "totalLines": 1_000,
+                }
+            })
+            .to_string())
+        });
         let mut runtime = runtime_with(Session::new(), RereadingApi { calls: 0 }, tools)
             .with_pause_at_iteration_limit(true);
 
@@ -5893,7 +5936,7 @@ mod resilience_tests {
         };
         assert_eq!(
             reason,
-            "the model read the same part of src/desktop_service.py 6 times without changing the file"
+            "the model read the same part of src/desktop_service.py 6 times and it had not changed"
         );
         assert_eq!(runtime.api_client().calls, 6);
         let results = tool_results(runtime.session());
@@ -5986,7 +6029,7 @@ mod resilience_tests {
         assert!(results[6].1.contains("Not executed"));
         assert_eq!(
             last_text(runtime.session()),
-            "[turn paused: the model called `echo` 4 times in a row with identical arguments]"
+            "[turn paused: the model kept making the same request 4 times in a row]"
         );
     }
 

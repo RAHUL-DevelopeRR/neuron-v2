@@ -376,9 +376,10 @@ export interface LiveActivity {
   /**
    * The model is writing a file (`write_file`, `edit_file`): the line reads
    * `● writing index.js +91 ⠹`, with `detail` the diff-style count and
-   * `silence` how long the stream has been quiet, once that is worth saying.
+   * `silence` how long the stream has been quiet, once that is worth saying
+   * (`shortSilence` says it in fewer columns, for a narrow terminal).
    */
-  writing?: { silence: string | null }
+  writing?: { silence: string | null; shortSilence?: string | null }
 }
 
 /**
@@ -495,7 +496,10 @@ export function describeLiveActivity(
       target: writing.target ? workspacePath(writing.target, options.cwd) : null,
       detail: writeSizeDetail(writing.lines, writing.removed),
       stalled: silent !== null,
-      writing: { silence: silent === null ? null : `no new tokens for ${seconds(silent)}` },
+      writing: {
+        silence: silent === null ? null : `no new tokens for ${seconds(silent)}`,
+        shortSilence: silent === null ? null : `no tokens ${seconds(silent)}`,
+      },
     }
   }
   if (writing) {

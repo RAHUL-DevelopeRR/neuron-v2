@@ -9,6 +9,7 @@ import {
   hasPausedTurn,
   takeContinuePrompt,
 } from '../paused-turn'
+import { turnHarness } from './turn-harness'
 
 const PAUSED =
   'Paused: the turn reached its limit of 200 model requests. Your progress is saved: press Enter or type continue to keep going, or tell it what to do differently.'
@@ -52,5 +53,15 @@ describe('a paused turn', () => {
     })
     expect(chatLines()).toHaveLength(1)
     expect(hasPausedTurn()).toBe(false)
+  })
+
+  test('a new turn answers the pause, however it was sent (a queued message too)', () => {
+    handleEngineEvent({ type: 'notice', message: PAUSED, kind: 'paused' })
+    expect(hasPausedTurn()).toBe(true)
+    // use-message-queue sends a queued message with sendMessage, not through
+    // the router; every turn starts its event sink.
+    turnHarness()
+    expect(hasPausedTurn()).toBe(false)
+    expect(takeContinuePrompt()).toBeNull()
   })
 })
