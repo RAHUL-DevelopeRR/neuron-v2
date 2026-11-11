@@ -264,6 +264,11 @@ describe('reconnecting', () => {
     sockets[1].drop(4401, 'bad token')
     expect(transport.health).toEqual({ state: 'offline', reason: 'The pairing token is not right.' })
     expect(closes).toEqual([{ code: 4401, error: 'The pairing token is not right.' }])
+    // Coming back to the foreground does not send the token to that host again; asking does.
+    transport.wake()
+    expect(sockets).toHaveLength(2)
+    transport.reconnectNow()
+    expect(sockets).toHaveLength(3)
   })
 
   test('requests in flight fail when the connection drops', async () => {

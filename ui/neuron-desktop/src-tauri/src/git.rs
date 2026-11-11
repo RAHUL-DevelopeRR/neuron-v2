@@ -315,12 +315,10 @@ fn parse_name_status(text: &str) -> std::collections::HashMap<String, &'static s
     found
 }
 
-/// A commit or branch name to compare with: nothing git would read as an option.
+/// A commit or branch name to compare with: the same check as a branch the window
+/// names, so nothing git would read as an option, a range or a revision expression.
 fn plausible_base(base: &str) -> bool {
-    !base.is_empty()
-        && !base.starts_with('-')
-        && !base.contains("..")
-        && !base.chars().any(|c| c.is_control() || c.is_whitespace())
+    crate::worktree::plausible_branch(base)
 }
 
 /// Where the branch left `base`: their merge base.

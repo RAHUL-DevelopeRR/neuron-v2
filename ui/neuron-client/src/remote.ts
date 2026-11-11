@@ -560,6 +560,8 @@ export class WebSocketTransport implements EngineTransport {
    */
   wake(): void {
     if (this.closedByUs) return
+    // A host that refused this client is retried only when the user asks (`reconnectNow`).
+    if (this.current.state === 'offline' && this.refused) return
     if (this.current.state !== 'connected') return this.reconnectNow()
     const keepaliveMs = this.options.keepaliveMs ?? KEEPALIVE_MS
     if (this.clock.now() - this.lastFrameAt > keepaliveMs && this.reconnectOptions) {
