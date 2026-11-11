@@ -222,6 +222,8 @@ pub(crate) fn turn_outcome_label(outcome: &TurnOutcome) -> &'static str {
         TurnOutcome::Completed => "completed",
         TurnOutcome::Cancelled { .. } => "cancelled",
         TurnOutcome::LoopDetected { .. } => "loop_detected",
+        TurnOutcome::IterationLimit { .. } => "iteration_limit",
+        TurnOutcome::NoProgress { .. } => "no_progress",
         TurnOutcome::OutputTruncated => "output_truncated",
         TurnOutcome::Refused { .. } => "refused",
         TurnOutcome::BudgetStopped { .. } => "budget_stopped",
@@ -297,6 +299,50 @@ pub(crate) fn describe_turn_outcome_without_refusal(
     (!notes.is_empty()).then(|| notes.join("\n"))
 }
 
+/// [`describe_turn_outcome`] without the refusal line and the pause notice, which the
+/// full-screen UI gets as notices of their own kinds.
+pub(crate) fn describe_turn_outcome_for_ui(summary: &TurnSummary) -> Option<String> {
+    let paused = paused_notice(&summary.outcome, ContinueHint::Typed);
+    let notes = outcome_notes(summary, QuitHint::Hidden)
+        .into_iter()
+        .filter(|note| Some(note) != paused.as_ref())
+        .collect::<Vec<_>>();
+    (!notes.is_empty()).then(|| notes.join("\n"))
+}
+
+/// How the user continues a paused turn, as its notice says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContinueHint {
+    /// Type `continue` (the line terminal, older full-screen UIs).
+    Typed,
+    /// Press Enter on an empty prompt, or type `continue` (a UI with `turn_pause`).
+    EnterOrTyped,
+}
+
+/// The calm one-line notice a paused turn ends with (the model-request cap, the loop
+/// guard, the progress watch): what happened, that nothing was lost, and how to go
+/// on. `None` for other outcomes.
+pub(crate) fn paused_notice(outcome: &TurnOutcome, hint: ContinueHint) -> Option<String> {
+    let reason = runtime::paused_turn_reason(outcome)?;
+    let how = match hint {
+        ContinueHint::Typed => "type continue to keep going",
+        ContinueHint::EnterOrTyped => "press Enter or type continue to keep going",
+    };
+    Some(format!(
+        "Paused: {reason}. Your progress is saved: {how}, or tell it what to do differently."
+    ))
+}
+
+/// Why a one-shot run (`neuron -p`) whose turn was paused failed, and how to go on
+/// from where it stopped: there is no prompt to type `continue` into. `None` for
+/// outcomes that are not pauses.
+pub(crate) fn one_shot_pause_message(outcome: &TurnOutcome, session_id: &str) -> Option<String> {
+    let reason = runtime::paused_turn_reason(outcome)?;
+    Some(format!(
+        "the run stopped before the task was finished: {reason}. The work so far is saved. To keep going, run: neuron --resume {session_id} -p continue (or give different instructions in place of continue)."
+    ))
+}
+
 /// The notes of [`describe_turn_outcome`] other than the refusal line.
 fn outcome_notes(summary: &TurnSummary, hint: QuitHint) -> Vec<String> {
     let mut notes = Vec::new();
@@ -316,9 +362,15 @@ fn outcome_notes(summary: &TurnSummary, hint: QuitHint) -> Vec<String> {
                 format!("Interrupted. {calls} pending tool call(s) were not run.")
             }
         }),
-        TurnOutcome::LoopDetected { tool_name, repeats } => notes.push(format!(
-            "Stopped: the model called `{tool_name}` {repeats} times in a row with identical arguments. Rephrase the request or give more guidance."
-        )),
+        // A one-shot run has no prompt to type continue into: it fails instead, with
+        // [`one_shot_pause_message`] on stderr.
+        TurnOutcome::LoopDetected { .. }
+        | TurnOutcome::IterationLimit { .. }
+        | TurnOutcome::NoProgress { .. } => {
+            if !crate::headless::one_shot() {
+                notes.extend(paused_notice(&summary.outcome, ContinueHint::Typed));
+            }
+        }
         TurnOutcome::OutputTruncated => notes.push(
             "Note: the response was cut off at the output token limit even after one automatic continuation. Ask the model to continue or to work in smaller steps."
                 .to_string(),
@@ -806,10 +858,11 @@ fn group_digits(value: usize) -> String {
 mod tests {
     use super::{
         check_context_argument, context_command_argument, describe_turn_outcome,
-        describe_turn_outcome_without_refusal, dispatch_line, group_digits, handle_turn_interrupt,
+        describe_turn_outcome_for_ui, describe_turn_outcome_without_refusal, dispatch_line,
+        group_digits, handle_turn_interrupt, one_shot_pause_message, paused_notice,
         refusal_note_text, refusal_notice, render_context_report, turn_outcome_label,
-        watch_turn_interrupts, ContextReport, InterruptAction, InterruptPresses, QuitHint,
-        ReplBackend, ReplStep,
+        watch_turn_interrupts, ContextReport, ContinueHint, InterruptAction, InterruptPresses,
+        QuitHint, ReplBackend, ReplStep,
     };
     use crate::{CliAction, ResumeLaunchOptions, DEFAULT_MODEL};
     use runtime::context_manager::{ContextBudget, ContextManager, ContextPolicy};
@@ -1032,8 +1085,66 @@ mod tests {
             QuitHint::Shown,
         )
         .expect("notice");
-        assert!(looped.contains("`bash` 4 times"));
+        // Plain words, not the tool's internal name.
+        assert!(
+            looped.contains("the model kept running the same command 4 times in a row"),
+            "{looped}"
+        );
+        assert!(!looped.contains('`'), "{looped}");
         assert!(looped.contains("shortened 1 older tool result(s)"));
+    }
+
+    #[test]
+    fn a_paused_one_shot_run_says_how_to_resume_it() {
+        let stuck = TurnOutcome::NoProgress {
+            reason: "the model kept repeating the same 2 tool calls".to_string(),
+        };
+        let message = one_shot_pause_message(&stuck, "session-123").expect("a pause");
+        assert!(message.contains("the model kept repeating the same 2 tool calls"));
+        assert!(message.contains("neuron --resume session-123 -p continue"));
+        assert!(!message.contains("type continue"));
+        assert_eq!(one_shot_pause_message(&TurnOutcome::Completed, "s"), None);
+    }
+
+    #[test]
+    fn a_paused_turn_says_what_happened_and_how_to_continue_without_env_vars() {
+        let capped = summary(TurnOutcome::IterationLimit { limit: 200 }, 0);
+        assert_eq!(turn_outcome_label(&capped.outcome), "iteration_limit");
+        assert_eq!(
+            describe_turn_outcome(&capped, QuitHint::Shown).as_deref(),
+            Some("Paused: the turn reached its limit of 200 model requests. Your progress is saved: type continue to keep going, or tell it what to do differently.")
+        );
+        assert_eq!(
+            paused_notice(&capped.outcome, ContinueHint::EnterOrTyped).as_deref(),
+            Some("Paused: the turn reached its limit of 200 model requests. Your progress is saved: press Enter or type continue to keep going, or tell it what to do differently.")
+        );
+        let stuck = summary(
+            TurnOutcome::NoProgress {
+                reason: "the model read the same part of a.py 6 times without changing the file"
+                    .to_string(),
+            },
+            2,
+        );
+        assert_eq!(turn_outcome_label(&stuck.outcome), "no_progress");
+        let notice = describe_turn_outcome(&stuck, QuitHint::Shown).unwrap();
+        assert!(notice.starts_with("Paused: the model read the same part of a.py 6 times"));
+        assert!(!notice.contains("NEURON_MAX_ITERATIONS"));
+        // The full-screen UI gets the pause as its own notice; the rest stays.
+        assert_eq!(
+            describe_turn_outcome_for_ui(&stuck).as_deref(),
+            Some("Context: shortened 2 older tool result(s) to stay within the model's context window.")
+        );
+        assert_eq!(
+            describe_turn_outcome_for_ui(&summary(TurnOutcome::OutputTruncated, 0))
+                .map(|notice| notice.starts_with("Note: the response was cut off")),
+            Some(true)
+        );
+        assert_eq!(
+            paused_notice(&TurnOutcome::Completed, ContinueHint::Typed),
+            None
+        );
+        // No em dashes in what the user reads.
+        assert!(!notice.contains('\u{2014}'));
     }
 
     #[test]

@@ -83,7 +83,8 @@ rather than starting a session.
 
 `--output-format json` prints one JSON object when the turn ends. `message` is the
 final answer text (never the model's reasoning), `outcome` says how the turn ended
-(`completed`, `output_truncated`, `loop_detected`, `cancelled` or `refused`) and
+(`completed`, `output_truncated`, `loop_detected`, `no_progress`, `budget_stopped`,
+`cancelled` or `refused`) and
 `stop_reason` is the provider's last stop reason. When the model declines to continue
 (`outcome` `refused`, `stop_reason` `refusal`; OpenAI-compatible providers call it
 `content_filter`), `message` keeps whatever it wrote before, and `refusal` holds the
@@ -479,7 +480,7 @@ names the file, the line and the closest known key. Commonly used keys:
 | `permissions.defaultMode` | Default permission mode (`permissionMode` still works but prints a deprecation warning) |
 | `permissions` | `allow`, `ask` and `deny` rules for individual tools |
 | `provider` | Provider to use (see [Bring your own key](#bring-your-own-key)) |
-| `maxIterations` | Model calls allowed in one turn (default 50); `NEURON_MAX_ITERATIONS` overrides it |
+| `maxIterations` | Model calls allowed in one turn (default 200); `NEURON_MAX_ITERATIONS` overrides it. An interactive turn that reaches it is paused, with its work kept: type `continue` (or press Enter in the full-screen UI) to go on. A `neuron -p` run stops with an error there |
 | `workingSetTokens` | Conversation tokens to keep before older tool results become stubs and history is compacted (default 40000 on a plan with a token window, such as Free; none on other plans); `0` turns it off, and `NEURON_WORKING_SET_TOKENS` overrides it. See [The Free token window](#the-free-token-window) |
 | `hooks` | Commands run before and after tool calls |
 | `mcpServers`, `defaultMcpServers`, `disabledMcpServers` | MCP servers (`"type": "zerox"` is a [hosted connector](#hosted-connectors)) |
@@ -658,7 +659,7 @@ such a call is not run. Turn one off like any other server (`/mcp disable <serve
 | `NEURON_API_BASE` | neuron | Gateway URL (default `https://zero-x.live/v1`) |
 | `NEURON_MODEL` | neuron | Model for this process |
 | `NEURON_PROVIDER` | neuron | Provider for this process (see [Bring your own key](#bring-your-own-key)) |
-| `NEURON_MAX_ITERATIONS` | neuron | Model calls allowed in one turn (default 50) |
+| `NEURON_MAX_ITERATIONS` | neuron | Model calls allowed in one turn (default 200; interactive turns pause there, `-p` runs fail) |
 | `NEURON_WORKING_SET_TOKENS` | neuron | Working set in conversation tokens; overrides `workingSetTokens` (`0` turns it off) |
 | `NEURON_AUTO_COMPACT_INPUT_TOKENS` | neuron | Estimated context tokens at which older history is compacted automatically (default: worked out from the model's context budget) |
 | `NEURON_FIRST_TOKEN_TIMEOUT_SECS` | neuron | Seconds to wait for a response to start, also after tool results (default 100 for the gateway; 90, and 60 after tool results, for a provider called directly) |

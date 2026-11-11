@@ -804,6 +804,7 @@ impl ChannelSink {
             lines: preview.lines,
             target: preview.target,
             preview: preview.preview,
+            removed: preview.removed,
         })
     }
 }
@@ -1615,6 +1616,7 @@ mod tests {
                 lines,
                 target: target.map(Into::into),
                 preview: preview.map(Into::into),
+                removed: None,
             }
         };
         let full = "{\"path\":\"shop/style.css\",\"content\":\"body {\\n  margin: 0;\\n}\\n\"}";
@@ -1722,6 +1724,45 @@ mod tests {
                 "progress b a.txt",
             ]
         );
+    }
+
+    /// While the model streams an edit, the UI hears the file, the lines added and the
+    /// lines replaced as they grow, at most ten times a second, and the final count when
+    /// the input is complete.
+    #[test]
+    fn an_edit_streams_its_added_and_removed_lines_at_most_ten_times_a_second() {
+        let capabilities = Arc::new(UiCapabilities::default());
+        capabilities.set(&[CAPABILITY_LIVE_PROGRESS.to_string()]);
+        let (clock, now) = manual_clock();
+        let (tx, rx) = mpsc::channel();
+        let mut sink = ChannelSink::with_capabilities(tx, capabilities).with_clock(clock);
+        sink.tool_input_started("e", "edit_file").unwrap();
+        let mut input =
+            String::from(r#"{"path":"src/index.js","old_string":"a\nb\n","new_string":""#);
+        // 50 deltas 10 ms apart: half a second of streaming.
+        for line in 0..50 {
+            input.push_str(&format!("line {line}\\n"));
+            sink.tool_input_delta("e", "edit_file", &input).unwrap();
+            advance(&now, 10);
+        }
+        input.push_str("\"}");
+        sink.tool_input_finished("e", "edit_file", &input).unwrap();
+        let progress = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                UiEvent::ToolInputProgress {
+                    lines,
+                    removed,
+                    target,
+                    ..
+                } => Some((lines, removed, target)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // At 0, 100, 200, 300 and 400 ms, then the complete input.
+        assert_eq!(progress.len(), 6, "{progress:?}");
+        assert_eq!(progress[4], (41, Some(2), Some("src/index.js".to_string())));
+        assert_eq!(progress[5], (50, Some(2), Some("src/index.js".to_string())));
     }
 
     #[test]

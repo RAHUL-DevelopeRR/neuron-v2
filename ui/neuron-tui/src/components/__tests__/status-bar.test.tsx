@@ -8,6 +8,7 @@ import { createRoot, flushSync } from '@opentui/react'
 import React from 'react'
 
 import { EngineFooter } from '../engine-footer'
+import { fitWritingLine, statusLineWidth } from '../live-activity'
 import { StatusBar } from '../status-bar'
 import { setLiveTurnClockForTesting } from '../../engine/live-turn'
 import { initializeThemeStore } from '../../hooks/use-theme'
@@ -50,7 +51,7 @@ const liveTurn = (patch: Partial<LiveTurnState>) =>
 
 async function frame(
   args: Partial<StatusIndicatorStateArgs> = {},
-  options: { elapsedSeconds?: number; onStop?: () => void } = {},
+  options: { elapsedSeconds?: number; onStop?: () => void; width?: number } = {},
 ): Promise<string> {
   const statusIndicatorState = getStatusIndicatorState({
     statusMessage: null,
@@ -59,7 +60,7 @@ async function frame(
     isConnected: true,
     ...args,
   })
-  const setup = await createTestRenderer({ width: 120, height: 3 })
+  const setup = await createTestRenderer({ width: options.width ?? 120, height: 3 })
   const root = createRoot(setup.renderer)
   flushSync(() => {
     root.render(
@@ -87,7 +88,7 @@ async function frame(
 }
 
 describe('StatusBar', () => {
-  test('a file being written: verb, path, size, elapsed, tokens and the interrupt hint', async () => {
+  test('a file being written: the file, its line count, elapsed, tokens and the interrupt hint', async () => {
     liveTurn({
       calls: [
         { id: 'w', name: 'write_file', phase: 'input', target: 'grocery-shop/style.css', lines: 412, bytes: 12_595 },
@@ -96,7 +97,7 @@ describe('StatusBar', () => {
       streamingOutput: 400,
     })
     const shown = await frame({}, { elapsedSeconds: 112, onStop: () => {} })
-    expect(shown).toContain('Writing grocery-shop/style.css · 412 lines · 12.3 KB')
+    expect(shown).toContain('● writing grocery-shop/style.css +412 ')
     expect(shown).toContain('1m 52s · ↓ 1.2K tokens')
     expect(shown).toContain('esc to interrupt')
     expect(shown).not.toContain('working...')
@@ -111,6 +112,75 @@ describe('StatusBar', () => {
     const shown = await frame()
     expect(shown).toContain('Running cargo test')
     expect(shown).not.toContain('no tokens')
+  })
+
+  test('a file whose stream goes quiet keeps its line, with the silence after it', async () => {
+    liveTurn({
+      lastTokenAt: NOW - 37_000,
+      calls: [
+        { id: 'w', name: 'write_file', phase: 'input', target: 'index.js', lines: 91, bytes: 2_800 },
+      ],
+    })
+    const shown = await frame({}, { elapsedSeconds: 930, onStop: () => {} })
+    expect(shown).toContain('● writing index.js +91 ')
+    expect(shown).toContain('· no new tokens for 37s')
+    expect(shown).not.toContain('Waiting for the model')
+  })
+
+  test('a long path gives way to the count and the silence in a narrow terminal', async () => {
+    const target = 'src/components/dashboard/RevenueChart.tsx'
+    for (const width of [80, 100, 120]) {
+      liveTurn({
+        lastTokenAt: NOW - 37_000,
+        calls: [{ id: 'w', name: 'write_file', phase: 'input', target, lines: 91, bytes: 2_800 }],
+      })
+      const shown = await frame({}, { elapsedSeconds: 930, onStop: () => {}, width })
+      const line = shown.split('\n').find((row) => row.includes('●')) ?? ''
+      expect(line).toContain('+91')
+      expect(line).toMatch(/no (new )?tokens( for)? 37s/)
+      // What stays of the path is its end: the file name, whole when it fits
+      // (at 80 columns only the progress fits).
+      expect(line).not.toContain('src/components/dashboard/Rev')
+      if (width >= 100) expect(line).toMatch(/Chart\.tsx \+91/)
+      if (width >= 120) expect(line).toContain('RevenueChart.tsx +91')
+    }
+  })
+
+  test('a file name that fits is kept whole while the stream runs at 80 columns', async () => {
+    liveTurn({
+      calls: [
+        { id: 'w', name: 'write_file', phase: 'input', target: 'src/components/dashboard/RevenueChart.tsx', lines: 91, bytes: 2_800 },
+      ],
+    })
+    const shown = await frame({}, { width: 80 })
+    const line = shown.split('\n').find((row) => row.includes('●')) ?? ''
+    expect(line).toContain('RevenueChart.tsx +91 ')
+  })
+
+  test('the writing line fits the count and the silence first', () => {
+    for (const width of [20, 37, 47, 57, 80]) {
+      const fitted = fitWritingLine(width, {
+        verb: 'writing',
+        target: 'src/components/dashboard/RevenueChart.tsx',
+        detail: '+91',
+        silence: 'no new tokens for 37s',
+        shortSilence: 'no tokens 37s',
+      })
+      const line = `● writing${fitted.target ? ` ${fitted.target}` : ''} +91 ⠋${fitted.silence ? ` · ${fitted.silence}` : ''}`
+      if (width >= 37) expect(line.length).toBeLessThanOrEqual(width)
+      expect(fitted.silence).not.toBeNull()
+    }
+    expect(statusLineWidth(80)).toBe(37)
+  })
+
+  test('a long path that fits is shown whole, with the count and the spinner', async () => {
+    liveTurn({
+      calls: [
+        { id: 'w', name: 'write_file', phase: 'input', target: 'src/components/dashboard/RevenueChart.tsx', lines: 91, bytes: 2_800 },
+      ],
+    })
+    const shown = await frame({}, { width: 120 })
+    expect(shown).toContain('● writing src/components/dashboard/RevenueChart.tsx +91 ')
   })
 
   test('a stream silent for over 10 s says so, with the elapsed time and the hint', async () => {

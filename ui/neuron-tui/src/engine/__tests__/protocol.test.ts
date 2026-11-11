@@ -449,6 +449,7 @@ const EVENT_FIELDS: { [T in UiEventType]: string[] } = {
     'lines',
     'target',
     'preview',
+    'removed',
   ]),
   output_progress: eventFields('output_progress')(['output_tokens']),
   request_usage: eventFields('request_usage')(['usage']),

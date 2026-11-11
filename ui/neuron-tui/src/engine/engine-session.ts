@@ -33,6 +33,7 @@ import {
 } from './neuron-engine-client'
 import { handleGitViewsEvent, resetGitViews } from './git-views'
 import { handleMcpPanelEvent, requestExtensions, resetMcpPanel } from './mcp-panel'
+import { clearPausedTurn, notePausedTurn } from './paused-turn'
 import { hookFinishedLine } from './hook-progress'
 import { FEATURE_MCP_CATALOG, FEATURE_TRUST_PREVIEW } from './protocol'
 import { closeQuestionForm, openQuestionForm } from './question-form'
@@ -308,6 +309,13 @@ export function handleEngineEvent(event: UiEvent): void {
         // A turn's refusal ends its message (turn-events.ts); anywhere else
         // it is a chat line.
         if (!(turnActive && turnMessageId)) showSystemMessage(event.message)
+        return
+      }
+      if (event.kind === 'paused') {
+        // Not an error: a calm line saying what happened and how to go on.
+        // Enter on an empty prompt continues the turn (./paused-turn.ts).
+        notePausedTurn()
+        showSystemMessage(event.message)
         return
       }
       // The trust screen says what trusting did, and the engine restarts at once.
@@ -609,6 +617,7 @@ async function launchEngineSession(launch: EngineLaunchOptions): Promise<void> {
   const engine = useEngineStore.getState()
   engine.reset()
   resetGitViews()
+  clearPausedTurn()
   resetMcpPanel()
   // No turn, unsettled tokens or task list of the last engine.
   resetLiveTurnStore()

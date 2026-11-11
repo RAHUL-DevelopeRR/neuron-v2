@@ -35,15 +35,21 @@ use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::transcript::{normalize_messages, normalized_messages};
 use crate::usage::{TokenUsage, UsageTracker};
 
+mod progress_watch;
 mod tool_batch;
+
+use progress_watch::{ProgressWatch, WatchVerdict};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 /// Environment variable setting the automatic compaction threshold.
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "NEURON_AUTO_COMPACT_INPUT_TOKENS";
 /// The name claw-code gave it, still read when the new one is unset.
 const LEGACY_AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
-/// Default cap on model calls per turn.
-pub const DEFAULT_MAX_ITERATIONS: usize = 50;
+/// Default cap on model calls per turn: a backstop against a runaway turn, not a
+/// normal place to stop. Interactive sessions pause there (see
+/// [`ConversationRuntime::set_pause_at_iteration_limit`]) and the user can say
+/// "continue"; loops are caught earlier by the loop guard and the progress watch.
+pub const DEFAULT_MAX_ITERATIONS: usize = 200;
 /// Environment variable overriding the per-turn model-call cap.
 pub const MAX_ITERATIONS_ENV_VAR: &str = "NEURON_MAX_ITERATIONS";
 /// Output recorded for tool calls that never ran because the user interrupted.
@@ -74,6 +80,10 @@ const STOPPED_ANSWER_NOTE_FOR_MODEL: &str = "(answer cut off: the user stopped t
 /// Starts the assistant note that closes a failed turn in the transcript, for the
 /// same reason as [`INTERRUPTED_RESPONSE_NOTE`]; requests never show it either.
 pub const FAILED_RESPONSE_NOTE_PREFIX: &str = "[response failed: ";
+/// Starts the assistant note that closes a paused turn in the transcript (the turn
+/// reached its model-request cap, or kept repeating itself); the reason follows.
+/// Requests show it as an out-of-band note (see [`TurnEndNote`]).
+pub const PAUSED_RESPONSE_NOTE_PREFIX: &str = "[turn paused: ";
 /// Longest error excerpt kept in a failed turn's note.
 const FAILED_RESPONSE_NOTE_MAX_CHARS: usize = 300;
 /// Identical consecutive tool calls tolerated before the loop guard warns.
@@ -109,6 +119,9 @@ const CUT_OFF_BEFORE_ANSWER_NOTE: &str =
     "the output token limit was reached before any answer was written";
 const LOOP_STOPPED_REMAINING_MESSAGE: &str =
     "Not executed: the turn was stopped by the repeated-tool-call guard.";
+/// The result of calls not run because the progress watch paused the turn.
+const PAUSED_REMAINING_MESSAGE: &str =
+    "Not executed: the turn was paused because it kept repeating itself.";
 /// Sent once when a turn ends on a short promise of the next step instead of the
 /// tool call that does it (weaker models often stop on "I'll now update the file.").
 const ACTION_NUDGE_MESSAGE: &str = "Your last reply described a next step but made no tool call, and a reply without a tool call ends your turn. If work remains and you are not waiting for the user, make that tool call now. If you need the user's answer or are finished, say so in your final answer.";
@@ -468,8 +481,18 @@ pub enum TurnOutcome {
     /// The user interrupted the turn; `interrupted_tool_calls` calls received a
     /// synthetic "Interrupted by user" result instead of running.
     Cancelled { interrupted_tool_calls: usize },
-    /// The model repeated an identical tool call after being warned.
+    /// The model repeated an identical tool call after being warned. The turn is
+    /// paused: the work so far is kept, and the user can say "continue".
     LoopDetected { tool_name: String, repeats: usize },
+    /// The turn made `limit` model requests, its cap, and was paused there instead of
+    /// failing (interactive sessions; see
+    /// [`ConversationRuntime::set_pause_at_iteration_limit`]). The work so far is
+    /// kept, and the user can say "continue".
+    IterationLimit { limit: usize },
+    /// The model kept going round in circles after being warned: the same few calls
+    /// with the same results, or the same part of a file read again and again. The
+    /// turn is paused; `reason` says what happened ("the model read ...").
+    NoProgress { reason: String },
     /// The response hit the output limit again after one automatic
     /// continuation.
     OutputTruncated,
@@ -574,6 +597,8 @@ struct TurnProgress {
     pre_compact_hooks_ran: bool,
     /// Harness events this turn, for the experience library.
     stats: HarnessStats,
+    /// Notices the turn going round in circles (see [`ProgressWatch`]).
+    watch: ProgressWatch,
 }
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
@@ -584,6 +609,9 @@ pub struct ConversationRuntime<C, T> {
     permission_policy: PermissionPolicy,
     system_prompt: Vec<String>,
     max_iterations: usize,
+    /// End a turn that reaches `max_iterations` with [`TurnOutcome::IterationLimit`]
+    /// instead of an error.
+    pause_at_iteration_limit: bool,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     context_manager: ContextManager,
@@ -658,6 +686,7 @@ where
             permission_policy,
             system_prompt,
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            pause_at_iteration_limit: false,
             usage_tracker,
             hook_runner,
             context_manager,
@@ -775,6 +804,25 @@ where
     #[must_use]
     pub fn max_iterations(&self) -> usize {
         self.max_iterations
+    }
+
+    /// Whether a turn that reaches the model-request cap pauses
+    /// ([`TurnOutcome::IterationLimit`], `Ok`) instead of failing
+    /// ([`RuntimeErrorKind::MaxIterations`]). Interactive sessions pause, so the user
+    /// can say "continue"; one-shot runs and sub-agents fail, as scripts expect.
+    pub fn set_pause_at_iteration_limit(&mut self, pause: bool) {
+        self.pause_at_iteration_limit = pause;
+    }
+
+    #[must_use]
+    pub fn with_pause_at_iteration_limit(mut self, pause: bool) -> Self {
+        self.set_pause_at_iteration_limit(pause);
+        self
+    }
+
+    #[must_use]
+    pub fn pauses_at_iteration_limit(&self) -> bool {
+        self.pause_at_iteration_limit
     }
 
     /// Compacts once the estimated transcript reaches `threshold` tokens,
@@ -1016,9 +1064,10 @@ where
     /// The transcript stays consistent no matter how the turn ends: every
     /// `tool_use` gets a `tool_result` (synthetic ones for interrupted or
     /// skipped calls), and each message is appended to the session file as
-    /// it is produced. Cancellation, the repeated-call guard and output
-    /// truncation end the turn with `Ok` and a [`TurnOutcome`]; provider
-    /// failures and the iteration cap return `Err`. An interrupted or failed
+    /// it is produced. Cancellation, the repeated-call guard, the progress watch
+    /// and output truncation end the turn with `Ok` and a [`TurnOutcome`];
+    /// provider failures return `Err`, and so does the iteration cap unless the
+    /// runtime pauses there ([`Self::set_pause_at_iteration_limit`]). An interrupted or failed
     /// turn still ends with an assistant message (the partial answer and
     /// [`INTERRUPTED_RESPONSE_NOTE`], or a note about the failure), so the next
     /// turn's request does not answer this one's prompt again.
@@ -1089,6 +1138,12 @@ where
             }
             progress.iterations += 1;
             if progress.iterations > self.max_iterations {
+                if self.pause_at_iteration_limit {
+                    // Nothing is lost: the next turn ("continue") picks up from here.
+                    progress.iterations -= 1;
+                    let limit = self.max_iterations;
+                    return Ok(self.finish_turn(progress, TurnOutcome::IterationLimit { limit }));
+                }
                 let error = RuntimeError::with_kind(
                     RuntimeErrorKind::MaxIterations,
                     format!(
@@ -1314,6 +1369,15 @@ where
                 )?;
                 if batched > 0 {
                     batched_until = index + batched;
+                    if let Some(reason) = progress.watch.take_pause() {
+                        self.push_synthetic_results(
+                            progress.iterations,
+                            &pending_tool_uses[batched_until..],
+                            PAUSED_REMAINING_MESSAGE,
+                            &mut progress,
+                        )?;
+                        return Ok(self.finish_turn(progress, TurnOutcome::NoProgress { reason }));
+                    }
                     continue;
                 }
 
@@ -1386,7 +1450,21 @@ where
                                 progress.edited_paths.push(path);
                             }
                         }
+                        if !interrupted {
+                            watch_tool_result(&mut progress.watch, tool_name, input, &mut result);
+                        }
                         self.record_tool_result(progress.iterations, result, &mut progress)?;
+                        if let Some(reason) = progress.watch.take_pause() {
+                            self.push_synthetic_results(
+                                progress.iterations,
+                                &pending_tool_uses[index + 1..],
+                                PAUSED_REMAINING_MESSAGE,
+                                &mut progress,
+                            )?;
+                            return Ok(
+                                self.finish_turn(progress, TurnOutcome::NoProgress { reason })
+                            );
+                        }
                         if interrupted {
                             let remaining = self.push_synthetic_results(
                                 progress.iterations,
@@ -2028,7 +2106,14 @@ where
             TurnOutcome::BudgetStopped { .. } => {
                 self.close_turn_with_note(BUDGET_STOPPED_NOTE.to_string(), None);
             }
-            _ => {}
+            _ => {
+                if let Some(reason) = paused_turn_reason(&outcome) {
+                    self.close_turn_with_note(
+                        format!("{PAUSED_RESPONSE_NOTE_PREFIX}{reason}]"),
+                        None,
+                    );
+                }
+            }
         }
         let summary = TurnSummary {
             assistant_messages: progress.assistant_messages,
@@ -2432,6 +2517,55 @@ pub fn is_turn_end_note(text: &str) -> bool {
     text == INTERRUPTED_RESPONSE_NOTE
         || text == BUDGET_STOPPED_NOTE
         || (text.starts_with(FAILED_RESPONSE_NOTE_PREFIX) && text.ends_with(']'))
+        || (text.starts_with(PAUSED_RESPONSE_NOTE_PREFIX) && text.ends_with(']'))
+}
+
+/// Why a turn was paused, for a turn the runtime paused (the model-request cap, the
+/// loop guard, the progress watch); `None` for other outcomes. Past tense, no
+/// trailing period: "the turn reached its limit of 200 model requests".
+#[must_use]
+pub fn paused_turn_reason(outcome: &TurnOutcome) -> Option<String> {
+    match outcome {
+        TurnOutcome::IterationLimit { limit } => Some(format!(
+            "the turn reached its limit of {limit} model requests"
+        )),
+        TurnOutcome::LoopDetected { tool_name, repeats } => Some(format!(
+            "the model kept {} {repeats} times in a row",
+            repeated_action(tool_name)
+        )),
+        TurnOutcome::NoProgress { reason } => Some(reason.clone()),
+        _ => None,
+    }
+}
+
+/// What a call repeated by the loop guard did, in plain words for the pause notice
+/// ("running the same command"), instead of the tool's internal name.
+fn repeated_action(tool_name: &str) -> &'static str {
+    match tool_name {
+        "bash" | "PowerShell" | "REPL" => "running the same command",
+        "read_file" => "reading the same file",
+        "edit_file" | "write_file" | "NotebookEdit" => "making the same change to a file",
+        "grep_search" | "glob_search" | "ToolSearch" => "running the same search",
+        "WebSearch" => "running the same web search",
+        "WebFetch" => "opening the same web page",
+        "Agent" => "starting the same helper task",
+        _ => "making the same request",
+    }
+}
+
+/// Adds the progress watch's note, if any, to the result of a call that ran.
+fn watch_tool_result(
+    watch: &mut ProgressWatch,
+    tool_name: &str,
+    input: &str,
+    result: &mut ConversationMessage,
+) {
+    match watch.observe(tool_name, input, result) {
+        WatchVerdict::Proceed => {}
+        WatchVerdict::Warn(note) | WatchVerdict::Pause { note, .. } => {
+            append_to_tool_result(result, &note);
+        }
+    }
 }
 
 /// The transcript as the model sees it: [`normalized_messages`] without the notes that
@@ -2481,6 +2615,8 @@ enum TurnEndNote {
     Interrupted,
     /// The error excerpt the note names.
     Failed(String),
+    /// Why the turn was paused.
+    Paused(String),
 }
 
 impl TurnEndNote {
@@ -2496,6 +2632,12 @@ impl TurnEndNote {
         if text == INTERRUPTED_RESPONSE_NOTE {
             return Some(Self::Interrupted);
         }
+        if let Some(reason) = text
+            .strip_prefix(PAUSED_RESPONSE_NOTE_PREFIX)
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            return Some(Self::Paused(reason.trim().to_string()));
+        }
         text.strip_prefix(FAILED_RESPONSE_NOTE_PREFIX)
             .and_then(|rest| rest.strip_suffix(']'))
             .map(|reason| Self::Failed(reason.trim().to_string()))
@@ -2509,6 +2651,7 @@ impl TurnEndNote {
                 "{FAILED_PROMPT_REPLY_PREFIX_FOR_MODEL}{})",
                 short_error(reason)
             ),
+            Self::Paused(reason) => format!("(no answer yet: this turn was paused: {reason})"),
         }
     }
 
@@ -2518,6 +2661,9 @@ impl TurnEndNote {
             Self::Interrupted => INTERRUPTED_TURN_NOTE_FOR_MODEL.to_string(),
             Self::Failed(reason) => format!(
                 "(Note from Neuron, not a reply: this turn failed before an answer was written. The error: {reason})"
+            ),
+            Self::Paused(reason) => format!(
+                "(Note from Neuron, not a reply: this turn was paused before an answer was written, because {reason}. The work so far is kept. If the user says to continue, pick up from where it stopped without redoing finished steps, and change the approach if it was repeating itself.)"
             ),
         }
     }
@@ -2654,6 +2800,8 @@ impl LoopGuard {
         } else {
             self.last_signature = Some(signature);
             self.streak = 1;
+            // A new streak earns its own warning before it is stopped.
+            self.warned = false;
         }
         if self.streak < self.threshold {
             LoopVerdict::Proceed
@@ -5588,7 +5736,7 @@ mod resilience_tests {
     }
 
     #[test]
-    fn iteration_cap_defaults_to_fifty_and_stops_with_consistent_transcript() {
+    fn iteration_cap_defaults_to_two_hundred_and_stops_with_consistent_transcript() {
         struct EndlessApi {
             calls: usize,
         }
@@ -5609,7 +5757,8 @@ mod resilience_tests {
         let tools = StaticToolExecutor::new().register("echo", |input| Ok(input.to_string()));
         let runtime = runtime_with(Session::new(), EndlessApi { calls: 0 }, tools);
         assert_eq!(runtime.max_iterations(), DEFAULT_MAX_ITERATIONS);
-        assert_eq!(DEFAULT_MAX_ITERATIONS, 50);
+        assert_eq!(DEFAULT_MAX_ITERATIONS, 200);
+        assert!(!runtime.pauses_at_iteration_limit());
 
         let mut runtime = runtime.with_max_iterations(5);
         let error = runtime
@@ -5625,6 +5774,262 @@ mod resilience_tests {
         assert_eq!(
             unanswered_tool_use_ids(&runtime.session().messages),
             Vec::<String>::new()
+        );
+    }
+
+    /// Calls `echo` with new arguments every time, so neither the loop guard nor the
+    /// progress watch fires: only the cap ends the turn.
+    struct EndlessEcho {
+        calls: usize,
+        requests: Vec<ApiRequest>,
+        stop_after: Option<usize>,
+    }
+
+    impl ApiClient for EndlessEcho {
+        fn stream(&mut self, request: ApiRequest) -> Response {
+            self.calls += 1;
+            self.requests.push(request);
+            if self.stop_after.is_some_and(|stop| self.calls > stop) {
+                return Ok(vec![text("all done"), AssistantEvent::MessageStop]);
+            }
+            Ok(vec![
+                tool_call(
+                    &format!("call-{}", self.calls),
+                    "echo",
+                    &format!(r#"{{"n":{}}}"#, self.calls),
+                ),
+                AssistantEvent::MessageStop,
+            ])
+        }
+    }
+
+    fn request_texts(request: &ApiRequest) -> Vec<String> {
+        request
+            .messages
+            .iter()
+            .flat_map(|message| message.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn last_text(session: &Session) -> String {
+        let last = session.messages.last().expect("a message");
+        assert_eq!(last.role, MessageRole::Assistant);
+        let [ContentBlock::Text { text }] = last.blocks.as_slice() else {
+            panic!("expected one text block: {last:?}");
+        };
+        text.clone()
+    }
+
+    #[test]
+    fn an_interactive_turn_pauses_at_the_iteration_cap_and_continue_picks_up() {
+        let tools = StaticToolExecutor::new().register("echo", |input| Ok(input.to_string()));
+        let api = EndlessEcho {
+            calls: 0,
+            requests: Vec::new(),
+            stop_after: Some(5),
+        };
+        let mut runtime = runtime_with(Session::new(), api, tools)
+            .with_max_iterations(3)
+            .with_pause_at_iteration_limit(true);
+
+        let summary = runtime
+            .run_turn("never ends", None)
+            .expect("the cap pauses the turn instead of failing it");
+
+        assert_eq!(summary.outcome, TurnOutcome::IterationLimit { limit: 3 });
+        assert_eq!(summary.iterations, 3);
+        assert_eq!(runtime.api_client().calls, 3);
+        assert_eq!(
+            unanswered_tool_use_ids(&runtime.session().messages),
+            Vec::<String>::new()
+        );
+        // The transcript ends on the pause note, which is not model output.
+        let note = last_text(runtime.session());
+        assert_eq!(
+            note,
+            "[turn paused: the turn reached its limit of 3 model requests]"
+        );
+        assert!(is_turn_end_note(&note));
+        assert_eq!(
+            super::paused_turn_reason(&summary.outcome).as_deref(),
+            Some("the turn reached its limit of 3 model requests")
+        );
+
+        // "continue" is a new turn with a fresh count and the whole transcript.
+        let summary = runtime.run_turn("continue", None).expect("continues");
+        assert_eq!(summary.outcome, TurnOutcome::Completed);
+        let texts = request_texts(&runtime.api_client().requests[3]);
+        assert!(
+            texts.iter().any(|text| text
+                .starts_with("(Note from Neuron, not a reply: this turn was paused")
+                && text.contains("limit of 3 model requests")),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|text| text.starts_with("[turn paused")));
+        assert_eq!(tool_results(runtime.session()).len(), 5);
+    }
+
+    #[test]
+    fn rereading_the_same_lines_warns_then_pauses_the_turn() {
+        struct RereadingApi {
+            calls: usize,
+        }
+        impl ApiClient for RereadingApi {
+            fn stream(&mut self, _request: ApiRequest) -> Response {
+                self.calls += 1;
+                // A slightly different window every time: the loop guard, which wants
+                // identical arguments, never fires.
+                Ok(vec![
+                    tool_call(
+                        &format!("read-{}", self.calls),
+                        "read_file",
+                        &format!(
+                            r#"{{"path":"src/desktop_service.py","offset":{},"limit":200}}"#,
+                            self.calls
+                        ),
+                    ),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+        // Answers like `read_file` does, for a file of 1000 unchanging lines.
+        let tools = StaticToolExecutor::new().register("read_file", |input| {
+            let input = serde_json::from_str::<serde_json::Value>(input).expect("json input");
+            let field = |key: &str| {
+                input
+                    .get(key)
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0)
+            };
+            let start = field("offset");
+            let end = (start + field("limit")).min(1_000);
+            let content = (start + 1..=end)
+                .map(|number| format!("line {number}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(serde_json::json!({
+                "type": "text",
+                "file": {
+                    "filePath": "src/desktop_service.py",
+                    "content": content,
+                    "numLines": end - start,
+                    "startLine": start + 1,
+                    "totalLines": 1_000,
+                }
+            })
+            .to_string())
+        });
+        let mut runtime = runtime_with(Session::new(), RereadingApi { calls: 0 }, tools)
+            .with_pause_at_iteration_limit(true);
+
+        let summary = runtime
+            .run_turn("fix it", None)
+            .expect("paused, not failed");
+
+        let TurnOutcome::NoProgress { reason } = &summary.outcome else {
+            panic!("expected a pause: {:?}", summary.outcome);
+        };
+        assert_eq!(
+            reason,
+            "the model read the same part of src/desktop_service.py 6 times and it had not changed"
+        );
+        assert_eq!(runtime.api_client().calls, 6);
+        let results = tool_results(runtime.session());
+        assert_eq!(results.len(), 6);
+        assert!(!results[2].1.contains("[progress check]"));
+        assert!(results[3].1.contains("[progress check] You have now read"));
+        assert!(results[5].1.contains("The turn has been paused"));
+        assert_eq!(
+            unanswered_tool_use_ids(&runtime.session().messages),
+            Vec::<String>::new()
+        );
+        assert!(is_turn_end_note(&last_text(runtime.session())));
+    }
+
+    #[test]
+    fn a_cycle_of_two_calls_with_the_same_results_pauses_the_turn() {
+        struct CyclingApi {
+            calls: usize,
+        }
+        impl ApiClient for CyclingApi {
+            fn stream(&mut self, _request: ApiRequest) -> Response {
+                self.calls += 1;
+                let input = if self.calls.is_multiple_of(2) {
+                    r#"{"command":"cargo check"}"#
+                } else {
+                    r#"{"command":"git status"}"#
+                };
+                Ok(vec![
+                    tool_call(&format!("call-{}", self.calls), "bash", input),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+        let tools = StaticToolExecutor::new().register("bash", |_| Ok("unchanged".to_string()));
+        let mut runtime = runtime_with(Session::new(), CyclingApi { calls: 0 }, tools);
+
+        let summary = runtime.run_turn("loop", None).expect("paused, not failed");
+
+        assert!(matches!(
+            &summary.outcome,
+            TurnOutcome::NoProgress { reason } if reason.contains("same 2 tool calls")
+        ));
+        // Warned on the sixth call, paused on the seventh.
+        assert_eq!(runtime.api_client().calls, 7);
+        let results = tool_results(runtime.session());
+        assert!(results[5]
+            .1
+            .contains("[progress check] Your last 6 tool calls"));
+        assert!(results[6].1.contains("The turn has been paused"));
+    }
+
+    #[test]
+    fn the_loop_guard_pause_closes_the_turn_with_a_note_and_warns_each_new_streak() {
+        let call = |id: &str, input: &str| {
+            Ok(vec![
+                tool_call(id, "echo", input),
+                AssistantEvent::MessageStop,
+            ])
+        };
+        let api = ScriptedApi::new(vec![
+            call("a1", r#"{"q":1}"#),
+            call("a2", r#"{"q":1}"#),
+            call("a3", r#"{"q":1}"#),
+            call("b1", r#"{"q":2}"#),
+            call("b2", r#"{"q":2}"#),
+            call("b3", r#"{"q":2}"#),
+            call("b4", r#"{"q":2}"#),
+        ]);
+        let counter = Rc::new(RefCell::new(0_usize));
+        let count = Rc::clone(&counter);
+        let tools = StaticToolExecutor::new().register("echo", move |_| {
+            *count.borrow_mut() += 1;
+            Ok(format!("output {}", count.borrow()))
+        });
+        let mut runtime = runtime_with(Session::new(), api, tools);
+
+        let summary = runtime.run_turn("loop", None).expect("paused");
+
+        assert_eq!(
+            summary.outcome,
+            TurnOutcome::LoopDetected {
+                tool_name: "echo".to_string(),
+                repeats: 4
+            }
+        );
+        let results = tool_results(runtime.session());
+        // The second streak was warned too, before it was stopped.
+        assert!(results[2].1.contains("[loop guard]"));
+        assert!(results[5].1.contains("[loop guard] You have made"));
+        assert!(results[6].1.contains("Not executed"));
+        assert_eq!(
+            last_text(runtime.session()),
+            "[turn paused: the model kept making the same request 4 times in a row]"
         );
     }
 

@@ -57,7 +57,8 @@ use crate::workspace_changes::{
 use neuron_tui::protocol::{
     AccountInfo, Attachment, ChangedFile, DefinitionInfo, EngineCommand, GitStatus, McpServerInfo,
     ModelInfo, NoticeKind, PermissionReply, PluginInfo, SessionScope, TokenCounts, TranscriptEntry,
-    UiEvent, CAPABILITY_QUESTIONS, CAPABILITY_REPORTS, ENGINE_FEATURES, PROTOCOL_VERSION,
+    UiEvent, CAPABILITY_QUESTIONS, CAPABILITY_REPORTS, CAPABILITY_TURN_PAUSE, ENGINE_FEATURES,
+    PROTOCOL_VERSION,
 };
 use repl_loop::InterruptPresses;
 use runtime::checkpoints::RewindMode;
@@ -1109,6 +1110,9 @@ struct Shared {
     structured_questions: AtomicBool,
     /// The UI shows reports as [`UiEvent::Report`] (its `reports` capability).
     report_panels: AtomicBool,
+    /// The UI draws a paused turn's notice apart and continues it on Enter (its
+    /// `turn_pause` capability).
+    turn_pause: AtomicBool,
     /// Which UI this is, as its capabilities named it (`terminal`, `desktop`).
     client: Mutex<Option<String>>,
     /// Shutdown was requested: commands still queued are dropped.
@@ -1346,6 +1350,9 @@ fn forward_commands(
                 shared
                     .report_panels
                     .store(has(CAPABILITY_REPORTS), Ordering::SeqCst);
+                shared
+                    .turn_pause
+                    .store(has(CAPABILITY_TURN_PAUSE), Ordering::SeqCst);
                 if queue
                     .send(EngineCommand::Capabilities { features, client })
                     .is_err()
@@ -2161,9 +2168,24 @@ impl Engine {
                 kind: Some(NoticeKind::Refusal),
             });
         }
-        if let Some(notice) =
-            repl_loop::describe_turn_outcome_without_refusal(summary, repl_loop::QuitHint::Hidden)
-        {
+        // A paused turn is not an error: a calm notice says how to continue.
+        let turn_pause = self.shared.turn_pause.load(Ordering::SeqCst);
+        let hint = if turn_pause {
+            repl_loop::ContinueHint::EnterOrTyped
+        } else {
+            repl_loop::ContinueHint::Typed
+        };
+        if let Some(paused) = repl_loop::paused_notice(&summary.outcome, hint) {
+            if turn_pause {
+                self.send(UiEvent::Notice {
+                    message: paused,
+                    kind: Some(NoticeKind::Paused),
+                });
+            } else {
+                self.notice(&paused);
+            }
+        }
+        if let Some(notice) = repl_loop::describe_turn_outcome_for_ui(summary) {
             self.notice(&notice);
         }
         self.send(UiEvent::Usage {
