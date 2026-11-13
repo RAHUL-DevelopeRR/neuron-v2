@@ -1,7 +1,9 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the folder
-// icons come from utils/glyphs.ts, and the logo is in NeuronCLI's brand
-// colours. See ui/neuron-tui/PORTING.md.
+// icons come from utils/glyphs.ts, the logo is in NeuronCLI's brand colours,
+// and "New folder", "No project" and the Ctrl shortcuts are Neuron's own.
+// See ui/neuron-tui/PORTING.md.
 import os from 'os'
+import path from 'path'
 
 import React, { useCallback, useMemo, useState } from 'react'
 
@@ -19,6 +21,13 @@ import { useTheme } from '../hooks/use-theme'
 import { exitCliCleanly } from '../utils/exit-cleanly'
 import { GLYPHS } from '../utils/glyphs'
 import { formatCwd } from '../utils/path-helpers'
+import {
+  createNewFolder,
+  createScratchWorkspace,
+  projectPickerKeyAction,
+  SCRATCH_PARENT,
+  shortName,
+} from '../utils/project-picker'
 import { loadRecentProjects } from '../utils/recent-projects'
 import { isPlainEnterKey } from '../utils/terminal-enter-detection'
 
@@ -33,7 +42,11 @@ const LAYOUT = {
 
   // Essential element heights (always shown)
   INPUT_HEIGHT: 1,
+  HINT_HEIGHT: 1, // shortcuts, or the new folder's prompt and errors
   BOTTOM_BAR_HEIGHT: 2,
+  // "New folder" (14) + "No project" (14) + "Open" (10) + the gaps between
+  // them and the path (3): what is left of the bar shows the path.
+  BOTTOM_BUTTONS_WIDTH: 41,
   MIN_LIST_HEIGHT: 2, // Minimum rows to show in file picker
   MAX_LIST_HEIGHT: 12,
 
@@ -53,16 +66,36 @@ const LAYOUT = {
   RECENTS_PADDING_LEFT: 1,
 } as const
 
+/** How a folder was chosen: `scratch` is the "No project" folder. */
+export interface ProjectSelectOptions {
+  scratch?: boolean
+}
+
+/** The shortcuts, shown under the filter. */
+export const PICKER_SHORTCUTS_HINT = 'Ctrl+N new folder   Ctrl+O open   Ctrl+P no project'
+
+type PickerNotice = { kind: 'error' | 'info'; text: string }
+
+/** The end of `text` in `max` columns: the folder's own name is the useful part. */
+export function truncateStart(text: string, max: number): string {
+  if (text.length <= max) return text
+  if (max <= 3) return text.slice(text.length - Math.max(0, max))
+  return `...${text.slice(text.length - (max - 3))}`
+}
+
 interface ProjectPickerScreenProps {
   /** Called when user selects a directory to open as project */
-  onSelectProject: (projectPath: string) => void
+  onSelectProject: (projectPath: string, options?: ProjectSelectOptions) => void
   /** Initial path to browse from */
   initialPath?: string
+  /** The home folder "No project" makes its scratch folder under (tests). */
+  homeDir?: string
 }
 
 export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
   onSelectProject,
   initialPath,
+  homeDir = os.homedir(),
 }) => {
   const theme = useTheme()
   const [sheenPosition, setSheenPosition] = useState(0)
@@ -102,11 +135,16 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
     resetKey: currentPath,
   })
 
+  // "New folder": the filter input takes the new folder's name while naming.
+  const [naming, setNaming] = useState(false)
+  const [newFolderName, setNewFolderName] = useState('')
+  const [notice, setNotice] = useState<PickerNotice | null>(null)
+
   // Load recent projects, excluding the home directory
-  const recentProjects = useMemo(() => {
-    const homeDir = os.homedir()
-    return loadRecentProjects().filter((project) => project.path !== homeDir)
-  }, [])
+  const recentProjects = useMemo(
+    () => loadRecentProjects().filter((project) => project.path !== homeDir),
+    [homeDir],
+  )
 
   // Use the terminal layout hook for responsive breakpoints
   const { terminalWidth, terminalHeight } = useTerminalLayout()
@@ -123,7 +161,11 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
   // Calculate essential height first (these always show)
   // Essential = input (1) + file picker border (2) + bottom bar (2) + minimal padding
   const essentialHeight =
-    LAYOUT.INPUT_HEIGHT + 2 + LAYOUT.BOTTOM_BAR_HEIGHT + (isCompactMode ? 0 : 2)
+    LAYOUT.INPUT_HEIGHT +
+    LAYOUT.HINT_HEIGHT +
+    2 +
+    LAYOUT.BOTTOM_BAR_HEIGHT +
+    (isCompactMode ? 0 : 2)
 
   // Calculate remaining height for file picker and optional elements
   const remainingHeight = terminalHeight - essentialHeight
@@ -217,6 +259,45 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
     onSelectProject(currentPath)
   }, [currentPath, onSelectProject])
 
+  const startNaming = useCallback(() => {
+    setNaming(true)
+    setNewFolderName('')
+    setNotice(null)
+  }, [])
+
+  const cancelNaming = useCallback(() => {
+    setNaming(false)
+    setNewFolderName('')
+    setNotice(null)
+  }, [])
+
+  // Create the named folder here and move into it, so Open opens it.
+  const confirmNewFolder = useCallback(() => {
+    const result = createNewFolder(newFolderName, currentPath)
+    if (!result.ok) {
+      setNotice({ kind: 'error', text: result.error })
+      return
+    }
+    setNaming(false)
+    setNewFolderName('')
+    setSearchQuery('')
+    setCurrentPath(result.path)
+    setNotice({
+      kind: 'info',
+      text: `Created "${shortName(path.basename(result.path), 18)}". Press Ctrl+O to open it.`,
+    })
+  }, [newFolderName, currentPath, setSearchQuery, setCurrentPath])
+
+  // "No project": a new scratch folder under ~/Neuron, never the home folder.
+  const startWithoutProject = useCallback(() => {
+    const result = createScratchWorkspace(homeDir)
+    if (!result.ok) {
+      setNotice({ kind: 'error', text: result.error })
+      return
+    }
+    onSelectProject(result.path, { scratch: true })
+  }, [homeDir, onSelectProject])
+
   // Tab completion for path input
   const { handleTabCompletion } = usePathTabCompletion({
     searchQuery,
@@ -236,6 +317,39 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
       meta?: boolean
       option?: boolean
     }) => {
+      // Ctrl+C always quits
+      if (key.name === 'c' && key.ctrl) {
+        void exitCliCleanly()
+        return true
+      }
+      if (naming) {
+        if (key.name === 'escape') {
+          cancelNaming()
+          return true
+        }
+        if (isPlainEnterKey(key)) {
+          confirmNewFolder()
+          return true
+        }
+        // The list and the shortcuts wait until the name is in or cancelled.
+        if (
+          key.name === 'up' ||
+          key.name === 'down' ||
+          key.name === 'tab' ||
+          projectPickerKeyAction(key) !== 'none'
+        ) {
+          return true
+        }
+        return false
+      }
+      const action = projectPickerKeyAction(key)
+      if (action !== 'none') {
+        if (action === 'new_folder') startNaming()
+        else if (action === 'open') selectCurrentDirectory()
+        else startWithoutProject()
+        return true
+      }
+      if (notice) setNotice(null)
       if (key.name === 'escape') {
         if (searchQuery.length > 0) {
           setSearchQuery('')
@@ -272,15 +386,17 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
         }
         return true
       }
-      // Ctrl+C always quits
-      if (key.name === 'c' && key.ctrl) {
-        void exitCliCleanly()
-        return true
-      }
       // All other single-character keys should go to the input for typing
       return false
     },
     [
+      naming,
+      notice,
+      cancelNaming,
+      confirmNewFolder,
+      startNaming,
+      selectCurrentDirectory,
+      startWithoutProject,
       searchQuery,
       setSearchQuery,
       handleTabCompletion,
@@ -292,6 +408,17 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
       navigateToDirectory,
     ],
   )
+
+  const scratchParentLabel = formatCwd(path.join(homeDir, SCRATCH_PARENT))
+  const secondaryButtonStyle = {
+    paddingLeft: 1,
+    paddingRight: 1,
+    paddingTop: 0,
+    paddingBottom: 0,
+    borderStyle: 'single',
+    borderColor: theme.muted,
+    flexShrink: 0,
+  }
 
   return (
     <box
@@ -348,6 +475,9 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
             <text style={{ fg: theme.muted, wrapMode: 'word' }}>
               Navigate to your project folder and press Open.
             </text>
+            <text style={{ fg: theme.muted, wrapMode: 'word' }}>
+              {`No project starts in a new scratch folder in ${scratchParentLabel}.`}
+            </text>
           </box>
         )}
 
@@ -360,17 +490,47 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
           }}
         >
           <MultilineInput
-            value={searchQuery}
-            onChange={({ text }) => setSearchQuery(text)}
+            value={naming ? newFolderName : searchQuery}
+            onChange={({ text }) => {
+      if (naming) {
+                setNewFolderName(text)
+                if (notice) setNotice(null)
+              } else {
+                setSearchQuery(text)
+              }
+            }}
             onSubmit={() => {}} // Enter key handled by onKeyIntercept
             onPaste={() => {}} // Paste not needed for path input
             onKeyIntercept={handleSearchKeyIntercept}
-            placeholder="Select project directory..."
+            placeholder={
+              naming ? 'Name of the new folder...' : 'Select project directory...'
+            }
             focused={true}
             maxHeight={1}
             minHeight={1}
-            cursorPosition={searchQuery.length}
+            cursorPosition={naming ? newFolderName.length : searchQuery.length}
           />
+        </box>
+
+        {/* Shortcuts, or the new folder's prompt and what went wrong */}
+        <box style={{ width: contentWidth, height: 1, flexShrink: 0, overflow: 'hidden' }}>
+          <text
+            style={{
+              fg:
+                notice?.kind === 'error'
+                  ? theme.error
+                  : notice?.kind === 'info'
+                    ? theme.success
+                    : theme.muted,
+              wrapMode: 'none',
+            }}
+          >
+            {notice
+              ? notice.text
+              : naming
+                ? 'Enter creates the folder here, Esc cancels.'
+                : PICKER_SHORTCUTS_HINT}
+          </text>
         </box>
 
         {/* Directory list - only show if we have enough space */}
@@ -433,7 +593,7 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
         )}
       </box>
 
-      {/* Bottom bar - fixed at bottom with Open button */}
+      {/* Bottom bar - fixed at bottom with New folder, No project and Open */}
       <box
         style={{
           flexDirection: 'row',
@@ -455,12 +615,34 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
             alignItems: 'center',
             justifyContent: 'space-between',
             width: contentWidth,
+            gap: 1,
           }}
         >
           {/* Current directory path */}
           <box style={{ flexGrow: 1, flexShrink: 1, overflow: 'hidden' }}>
-            <text style={{ fg: theme.muted }}>{formatCwd(currentPath)}</text>
+            <text style={{ fg: theme.muted, wrapMode: 'none' }}>
+              {truncateStart(
+                formatCwd(currentPath),
+                contentWidth - LAYOUT.BOTTOM_BUTTONS_WIDTH,
+              )}
+            </text>
           </box>
+
+          <Button
+            onClick={startNaming}
+            style={secondaryButtonStyle}
+            border={['top', 'bottom', 'left', 'right']}
+          >
+            <text style={{ fg: theme.foreground }}>New folder</text>
+          </Button>
+
+          <Button
+            onClick={startWithoutProject}
+            style={secondaryButtonStyle}
+            border={['top', 'bottom', 'left', 'right']}
+          >
+            <text style={{ fg: theme.foreground }}>No project</text>
+          </Button>
 
           {/* Open button */}
           <Button
@@ -473,6 +655,7 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
               borderStyle: 'single',
               borderColor: theme.primary,
               backgroundColor: theme.primary,
+              flexShrink: 0,
             }}
             border={['top', 'bottom', 'left', 'right']}
           >

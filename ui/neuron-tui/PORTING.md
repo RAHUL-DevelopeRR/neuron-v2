@@ -425,6 +425,12 @@ once this branch has it.
 - **T24, the git-root banner** never offers the home folder or a folder above
   it (`isAtOrAboveHome` in `utils/project-picker.ts`), which the engine refuses
   as too broad.
+- **The project picker** has "New folder" (Ctrl+N: the filter takes the
+  name, checked against the Windows rules everywhere, then the picker moves
+  into the new folder for Open) and "No project" (Ctrl+P: a new, empty
+  `~/Neuron/scratch-<date>` folder, never the home folder itself, and not kept
+  in the recent projects). Ctrl+O opens the folder shown in the bar. The
+  shortcuts take Ctrl because plain keys type into the filter.
 - **"Can't reach Zero-X".** A `/login` that could not start, because Zero-X was
   unreachable, offers no device sign-in (404) or answered with a server error,
   turns the sign-in panel into "Can't reach Zero-X": the engine's reason and
