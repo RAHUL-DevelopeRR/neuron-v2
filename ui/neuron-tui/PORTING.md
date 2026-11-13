@@ -426,11 +426,15 @@ once this branch has it.
   it (`isAtOrAboveHome` in `utils/project-picker.ts`), which the engine refuses
   as too broad.
 - **The project picker** has "New folder" (Ctrl+N: the filter takes the
-  name, checked against the Windows rules everywhere, then the picker moves
-  into the new folder for Open) and "No project" (Ctrl+P: a new, empty
-  `~/Neuron/scratch-<date>` folder, never the home folder itself, and not kept
-  in the recent projects). Ctrl+O opens the folder shown in the bar. The
-  shortcuts take Ctrl because plain keys type into the filter.
+  name, checked against the Windows name rules everywhere and, on Windows, the
+  full path's length; then the picker moves into the new folder for Open, and
+  clicking Open while naming creates the folder and opens it) and "No project"
+  (Ctrl+P or Alt+P: `~/Neuron/scratch-<date>`, never the home folder itself,
+  and not kept in the recent projects; today's newest scratch folder is used
+  again while it holds nothing but the engine's `.neuron`, then `-2`, `-3`...).
+  Ctrl+O opens the folder shown in the bar. The shortcuts take Ctrl because
+  plain keys type into the filter. VS Code's integrated terminal keeps Ctrl+P
+  (Quick Open), so Alt+P and the button are the fallbacks there.
 - **"Can't reach Zero-X".** A `/login` that could not start, because Zero-X was
   unreachable, offers no device sign-in (404) or answered with a server error,
   turns the sign-in panel into "Can't reach Zero-X": the engine's reason and

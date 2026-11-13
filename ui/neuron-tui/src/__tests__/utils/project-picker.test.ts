@@ -100,6 +100,19 @@ describe('the project picker: new folder and no project', () => {
     for (const name of ['CON', 'nul', 'Com1', 'lpt9', 'aux.txt', 'PRN.tar.gz']) {
       expect(newFolderNameError(name, dir)).toContain('reserved by Windows')
     }
+    // The rest of Microsoft's list: COM0/LPT0, superscript 1-3, the console names.
+    for (const name of [
+      'COM0',
+      'lpt0',
+      'COM\u00b9',
+      'com\u00b2.txt',
+      'LPT\u00b3',
+      'CONIN$',
+      'conout$',
+      'CONOUT$.log',
+    ]) {
+      expect(newFolderNameError(name, dir)).toContain('reserved by Windows')
+    }
     // Only the whole stem is reserved.
     expect(newFolderNameError('console', dir)).toBeNull()
     expect(newFolderNameError('com10', dir)).toBeNull()
@@ -109,7 +122,23 @@ describe('the project picker: new folder and no project', () => {
     expect(newFolderNameError('app.', dir)).toBe('A folder name cannot end with a dot or a space.')
     expect(newFolderNameError('app ', dir)).toBe('A folder name cannot end with a dot or a space.')
     expect(newFolderNameError(' app', dir)).toBe('A folder name cannot start with a space.')
-    expect(newFolderNameError('x'.repeat(256), dir)).toContain('at most 255')
+  })
+
+  test('a name too long for the file system or for Windows paths is refused', () => {
+    const dir = tempDir()
+    const tooLong = 'The name is too long. Choose a shorter one.'
+    expect(newFolderNameError('x'.repeat(256), dir, 'linux')).toBe(tooLong)
+    // ext4 counts UTF-8 bytes: 200 CJK characters are 600 bytes.
+    const cjk = '\u4e2d'
+    expect(newFolderNameError(cjk.repeat(200), dir, 'linux')).toBe(tooLong)
+    expect(newFolderNameError(cjk.repeat(85), dir, 'linux')).toBeNull()
+    expect(newFolderNameError(cjk.repeat(86), dir, 'linux')).toBe(tooLong)
+    // On Windows the whole path must stay usable by tools without long paths.
+    const deep = path.join(dir, 'p'.repeat(150))
+    expect(newFolderNameError('n'.repeat(120), deep, 'win32')).toBe(
+      'The path is too long for Windows. Use a shorter name.',
+    )
+    expect(newFolderNameError('n'.repeat(120), deep, 'linux')).toBeNull()
   })
 
   test('an existing folder or file is not created over', () => {
@@ -146,16 +175,24 @@ describe('the project picker: new folder and no project', () => {
     const day = new Date(2026, 10, 3, 23, 59)
     expect(scratchFolderName(day)).toBe('scratch-2026-11-03')
 
+    const firstPath = path.join(home, 'Neuron', 'scratch-2026-11-03')
     const first = createScratchWorkspace(home, day)
-    expect(first).toEqual({ ok: true, path: path.join(home, 'Neuron', 'scratch-2026-11-03') })
-    // A second one the same day is new and empty too.
+    expect(first).toEqual({ ok: true, path: firstPath })
+    expect(statSync(firstPath).isDirectory()).toBe(true)
+    expect(isAtOrAboveHome(firstPath, home)).toBe(false)
+
+    // Pressed again while it is unused (only the engine's .neuron in it): the
+    // same folder, so no empty folders pile up and no new trust prompt.
+    expect(createScratchWorkspace(home, day)).toEqual(first)
+    mkdirSync(path.join(firstPath, '.neuron'))
+    expect(createScratchWorkspace(home, day)).toEqual(first)
+
+    // Once it has work in it, the next is a new folder, reused in turn.
+    writeFileSync(path.join(firstPath, 'notes.md'), 'hi')
     const second = createScratchWorkspace(home, day)
-    expect(second).toEqual({ ok: true, path: path.join(home, 'Neuron', 'scratch-2026-11-03-2') })
-    if (first.ok && second.ok) {
-      expect(statSync(first.path).isDirectory()).toBe(true)
-      expect(isAtOrAboveHome(first.path, home)).toBe(false)
-      expect(path.dirname(path.dirname(second.path))).toBe(home)
-    }
+    expect(second).toEqual({ ok: true, path: `${firstPath}-2` })
+    expect(createScratchWorkspace(home, day)).toEqual(second)
+    if (second.ok) expect(path.dirname(path.dirname(second.path))).toBe(home)
   })
 
   test('no project: a file in the way is an error, not a crash', () => {
@@ -174,5 +211,14 @@ describe('the project picker: new folder and no project', () => {
     expect(projectPickerKeyAction({ name: 'n', ctrl: true, shift: true })).toBe('none')
     expect(projectPickerKeyAction({ name: 'n', ctrl: true, meta: true })).toBe('none')
     expect(projectPickerKeyAction({ name: 'c', ctrl: true })).toBe('none')
+  })
+
+  test('Alt+P is a second key for no project (VS Code keeps Ctrl+P)', () => {
+    expect(projectPickerKeyAction({ name: 'p', meta: true })).toBe('no_project')
+    expect(projectPickerKeyAction({ name: 'p', option: true })).toBe('no_project')
+    expect(projectPickerKeyAction({ name: 'p', meta: true, ctrl: true })).toBe('none')
+    expect(projectPickerKeyAction({ name: 'p', meta: true, shift: true })).toBe('none')
+    expect(projectPickerKeyAction({ name: 'n', meta: true })).toBe('none')
+    expect(projectPickerKeyAction({ name: 'o', meta: true })).toBe('none')
   })
 })

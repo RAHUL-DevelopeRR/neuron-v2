@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'fs'
 import os from 'os'
 import path from 'path'
 
@@ -172,9 +172,53 @@ describe('the project picker', () => {
     expect(path.basename(chosen.path)).toMatch(/^scratch-\d{4}-\d{2}-\d{2}$/)
     expect(statSync(chosen.path).isDirectory()).toBe(true)
 
-    // Ctrl+P does the same, in a folder of its own.
+    // Ctrl+P does the same; the unused folder is used again, not a new one.
     await ui.act(() => ui.mockInput.pressKey('p', { ctrl: true }))
     expect(ui.selected).toHaveLength(2)
-    expect(ui.selected[1]!.path).toBe(`${chosen.path}-2`)
+    expect(ui.selected[1]!.path).toBe(chosen.path)
+
+    // Once it has files, Alt+P (for VS Code, which keeps Ctrl+P) makes the next.
+    writeFileSync(path.join(chosen.path, 'notes.md'), 'hi')
+    await ui.act(() => ui.mockInput.pressKey('p', { meta: true }))
+    expect(ui.selected).toHaveLength(3)
+    expect(ui.selected[2]!.path).toBe(`${chosen.path}-2`)
+  })
+
+  test('clicking Open while naming creates the named folder and opens it', async () => {
+    const ui = await mountPicker(80, 24)
+    await ui.act(() => ui.mockInput.pressKey('n', { ctrl: true }))
+    await ui.act(() => ui.mockInput.typeText('demo'))
+    await ui.clickButton('Open ')
+
+    const made = path.join(ui.project, 'demo')
+    expect(statSync(made).isDirectory()).toBe(true)
+    // Not the folder it was made in, and the typed name was not dropped.
+    expect(ui.selected).toEqual([{ path: made, options: undefined }])
+  })
+
+  test('clicking Open with a bad name opens nothing and says why', async () => {
+    const ui = await mountPicker(80, 24)
+    await ui.act(() => ui.mockInput.pressKey('n', { ctrl: true }))
+    await ui.act(() => ui.mockInput.typeText('alpha'))
+    await ui.clickButton('Open ')
+    expect(ui.selected).toEqual([])
+    expect(ui.frame()).toContain('"alpha" already exists here.')
+  })
+
+  test('clicking a folder in the list while naming cancels the name', async () => {
+    const ui = await mountPicker(80, 24)
+    await ui.act(() => ui.mockInput.pressKey('n', { ctrl: true }))
+    await ui.act(() => ui.mockInput.typeText('demo'))
+    const lines = ui.frame().split('\n')
+    const y = lines.findIndex((line) => line.includes('alpha'))
+    expect(y).toBeGreaterThanOrEqual(0)
+    await ui.act(() => ui.mockMouse.click(lines[y]!.indexOf('alpha') + 2, y))
+
+    expect(ui.frame()).toContain(PICKER_SHORTCUTS_HINT)
+    expect(ui.frame()).toContain('Select project directory...')
+    const bar = ui.frame().split('\n').find((line) => line.includes('Open  │'))
+    expect(bar).toContain(`${path.sep}alpha`)
+    expect(existsSync(path.join(ui.project, 'demo'))).toBe(false)
+    expect(ui.selected).toEqual([])
   })
 })

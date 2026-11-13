@@ -72,7 +72,7 @@ export interface ProjectSelectOptions {
 }
 
 /** The shortcuts, shown under the filter. */
-export const PICKER_SHORTCUTS_HINT = 'Ctrl+N new folder   Ctrl+O open   Ctrl+P no project'
+export const PICKER_SHORTCUTS_HINT = 'Ctrl+N new folder  Ctrl+O open  Ctrl+P/Alt+P no project'
 
 type PickerNotice = { kind: 'error' | 'info'; text: string }
 
@@ -243,15 +243,23 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
     themeName: theme.name,
   })
 
-  // Handle directory selection from SelectableList
+  const cancelNaming = useCallback(() => {
+    setNaming(false)
+    setNewFolderName('')
+    setNotice(null)
+  }, [])
+
+  // Handle directory selection from SelectableList. A click while naming
+  // moves elsewhere, so the name (not yet created) is dropped, as Esc would.
   const handleDirectorySelect = useCallback(
     (item: SelectableListItem) => {
+      if (naming) cancelNaming()
       const entry = directories.find((d) => d.path === item.id)
       if (entry) {
         navigateToDirectory(entry)
       }
     },
-    [directories, navigateToDirectory],
+    [naming, cancelNaming, directories, navigateToDirectory],
   )
 
   // Select current directory as project
@@ -265,18 +273,13 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
     setNotice(null)
   }, [])
 
-  const cancelNaming = useCallback(() => {
-    setNaming(false)
-    setNewFolderName('')
-    setNotice(null)
-  }, [])
-
-  // Create the named folder here and move into it, so Open opens it.
-  const confirmNewFolder = useCallback(() => {
+  // Create the named folder here and move into it, so Open opens it. Returns
+  // the new folder, or null when the name was refused (the notice says why).
+  const confirmNewFolder = useCallback((): string | null => {
     const result = createNewFolder(newFolderName, currentPath)
     if (!result.ok) {
       setNotice({ kind: 'error', text: result.error })
-      return
+      return null
     }
     setNaming(false)
     setNewFolderName('')
@@ -286,17 +289,30 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
       kind: 'info',
       text: `Created "${shortName(path.basename(result.path), 18)}". Press Ctrl+O to open it.`,
     })
+    return result.path
   }, [newFolderName, currentPath, setSearchQuery, setCurrentPath])
 
-  // "No project": a new scratch folder under ~/Neuron, never the home folder.
+  // The Open button. While naming, it creates the named folder and opens it,
+  // rather than opening the folder the new one was to go in.
+  const handleOpenClick = useCallback(() => {
+    if (!naming) {
+      selectCurrentDirectory()
+      return
+    }
+    const made = confirmNewFolder()
+    if (made) onSelectProject(made)
+  }, [naming, selectCurrentDirectory, confirmNewFolder, onSelectProject])
+
+  // "No project": a scratch folder under ~/Neuron, never the home folder.
   const startWithoutProject = useCallback(() => {
+    if (naming) cancelNaming()
     const result = createScratchWorkspace(homeDir)
     if (!result.ok) {
       setNotice({ kind: 'error', text: result.error })
       return
     }
     onSelectProject(result.path, { scratch: true })
-  }, [homeDir, onSelectProject])
+  }, [naming, cancelNaming, homeDir, onSelectProject])
 
   // Tab completion for path input
   const { handleTabCompletion } = usePathTabCompletion({
@@ -476,7 +492,7 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
               Navigate to your project folder and press Open.
             </text>
             <text style={{ fg: theme.muted, wrapMode: 'word' }}>
-              {`No project starts in a new scratch folder in ${scratchParentLabel}.`}
+              {`No project starts in a scratch folder in ${scratchParentLabel}.`}
             </text>
           </box>
         )}
@@ -492,7 +508,7 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
           <MultilineInput
             value={naming ? newFolderName : searchQuery}
             onChange={({ text }) => {
-      if (naming) {
+              if (naming) {
                 setNewFolderName(text)
                 if (notice) setNotice(null)
               } else {
@@ -646,7 +662,7 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
 
           {/* Open button */}
           <Button
-            onClick={selectCurrentDirectory}
+            onClick={handleOpenClick}
             style={{
               paddingLeft: 2,
               paddingRight: 2,
