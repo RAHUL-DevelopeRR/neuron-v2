@@ -39,6 +39,51 @@ const DIFF_CONTEXT_LINES: usize = 3;
 /// Match locations reported when `old_string` is ambiguous.
 const MAX_REPORTED_MATCH_LINES: usize = 20;
 
+/// File extensions `read_document` converts to Markdown, with what each is.
+pub const DOCUMENT_KINDS: &[(&str, &str)] = &[
+    ("docx", "Word document"),
+    ("pptx", "PowerPoint presentation"),
+    ("xlsx", "spreadsheet"),
+    ("xlsm", "spreadsheet"),
+    ("xlsb", "spreadsheet"),
+    ("xls", "spreadsheet"),
+    ("ods", "spreadsheet"),
+    ("pdf", "PDF document"),
+];
+
+/// What `path` is when `read_document` can read it, judged by its extension.
+#[must_use]
+pub fn document_kind(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    DOCUMENT_KINDS
+        .iter()
+        .find(|(known, _)| *known == extension)
+        .map(|(_, kind)| *kind)
+}
+
+fn file_label(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// Refuses files over [`MAX_READ_SIZE`], the limit every reading tool shares.
+fn check_read_size(path: &Path) -> io::Result<()> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_READ_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "file is too large ({} bytes, max {} bytes)",
+                metadata.len(),
+                MAX_READ_SIZE
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Check whether a file appears to contain binary content by examining
 /// the first chunk for NUL bytes.
 fn is_binary_file(path: &Path) -> io::Result<bool> {
@@ -281,26 +326,18 @@ pub fn read_file(
     limit: Option<usize>,
 ) -> io::Result<ReadFileOutput> {
     let absolute_path = normalize_path(path)?;
-
-    // Check file size before reading
-    let metadata = fs::metadata(&absolute_path)?;
-    if metadata.len() > MAX_READ_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "file is too large ({} bytes, max {} bytes)",
-                metadata.len(),
-                MAX_READ_SIZE
-            ),
-        ));
-    }
+    check_read_size(&absolute_path)?;
 
     // Detect binary files
     if is_binary_file(&absolute_path)? {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "file appears to be binary",
-        ));
+        let message = match document_kind(&absolute_path) {
+            Some(kind) => format!(
+                "{} is a {kind}; read it with read_document (read_file reads text files only)",
+                file_label(&absolute_path)
+            ),
+            None => "file appears to be binary".to_string(),
+        };
+        return Err(io::Error::new(io::ErrorKind::InvalidData, message));
     }
 
     let content = fs::read_to_string(&absolute_path)?;
@@ -1382,6 +1419,25 @@ pub fn read_file_in_workspace(
     read_file(path, offset, limit)
 }
 
+/// The file `path` names, checked the way `read_file` checks it: inside the
+/// workspace, an existing regular file and within the shared size limit. For
+/// tools that read a file themselves, such as `read_document`.
+pub fn readable_file_in_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBuf> {
+    let absolute_path = normalize_path(path)?;
+    let canonical_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    validate_workspace_boundary(&absolute_path, &canonical_root)?;
+    if !absolute_path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a file", absolute_path.display()),
+        ));
+    }
+    check_read_size(&absolute_path)?;
+    Ok(absolute_path)
+}
+
 /// Write a file with workspace boundary enforcement.
 #[allow(dead_code)]
 pub fn write_file_in_workspace(
@@ -1799,6 +1855,67 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("binary"));
+    }
+
+    #[test]
+    fn a_binary_office_or_pdf_file_points_at_read_document() {
+        for (name, kind) in [
+            ("report.docx", "Word document"),
+            ("deck.PPTX", "PowerPoint presentation"),
+            ("data.xlsx", "spreadsheet"),
+            ("paper.pdf", "PDF document"),
+        ] {
+            let path = temp_path("doc-dir").join(name);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(&path, [b'P', b'K', 3, 4, 0, 0, b'x']).expect("write");
+            let error = read_file(path.to_string_lossy().as_ref(), None, None)
+                .expect_err("documents are not text");
+            let message = error.to_string();
+            assert!(message.contains("read_document"), "{message}");
+            assert!(message.contains(kind), "{message}");
+            assert!(message.contains(name), "{message}");
+            assert!(!message.contains("appears to be binary"), "{message}");
+        }
+        // A text file with a document extension still reads as text.
+        let text = temp_path("text-dir").join("notes.pdf");
+        std::fs::create_dir_all(text.parent().expect("parent")).expect("dir");
+        std::fs::write(&text, "plain text").expect("write");
+        assert!(read_file(text.to_string_lossy().as_ref(), None, None).is_ok());
+    }
+
+    #[test]
+    fn readable_file_in_workspace_applies_read_file_checks() {
+        let workspace = temp_path("readable-ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let inside = workspace.join("deck.pptx");
+        std::fs::write(&inside, b"PK").expect("write");
+        let resolved =
+            super::readable_file_in_workspace(inside.to_string_lossy().as_ref(), &workspace)
+                .expect("inside the workspace");
+        assert!(resolved.ends_with("deck.pptx"));
+
+        let outside_dir = temp_path("readable-outside");
+        std::fs::create_dir_all(&outside_dir).expect("outside");
+        let outside = outside_dir.join("secret.pdf");
+        std::fs::write(&outside, b"%PDF").expect("write");
+        let error =
+            super::readable_file_in_workspace(outside.to_string_lossy().as_ref(), &workspace)
+                .expect_err("outside the workspace");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let error =
+            super::readable_file_in_workspace(workspace.to_string_lossy().as_ref(), &workspace)
+                .expect_err("a directory is not a file");
+        assert!(error.to_string().contains("not a file"));
+
+        let huge = workspace.join("huge.pdf");
+        let file = std::fs::File::create(&huge).expect("create");
+        file.set_len(super::MAX_READ_SIZE + 1).expect("grow");
+        let error = super::readable_file_in_workspace(huge.to_string_lossy().as_ref(), &workspace)
+            .expect_err("over the size limit");
+        assert!(error.to_string().contains("too large"));
+        std::fs::remove_dir_all(&workspace).ok();
+        std::fs::remove_dir_all(&outside_dir).ok();
     }
 
     #[test]

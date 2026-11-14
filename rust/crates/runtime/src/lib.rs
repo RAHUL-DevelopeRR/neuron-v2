@@ -25,6 +25,7 @@ pub mod context_manager;
 mod conversation;
 mod default_skill_files;
 pub mod default_skills;
+pub mod enforced_skills;
 mod file_ops;
 mod git_context;
 pub mod green_contract;
@@ -135,10 +136,11 @@ pub use conversation::{
     INTERRUPTED_TOOL_RESULT, MAX_ITERATIONS_ENV_VAR, REFUSAL_STOP_REASON,
 };
 pub use file_ops::{
-    display_path, edit_file, edit_file_in_workspace, glob_search, grep_search,
-    is_blank_search_path, read_file, read_file_in_workspace, write_file, write_file_in_workspace,
-    EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput, ReadFileOutput,
-    StructuredPatchHunk, TextFilePayload, WriteFileOutput,
+    display_path, document_kind, edit_file, edit_file_in_workspace, glob_search, grep_search,
+    is_blank_search_path, read_file, read_file_in_workspace, readable_file_in_workspace,
+    write_file, write_file_in_workspace, EditFileOutput, GlobSearchOutput, GrepSearchInput,
+    GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
+    DOCUMENT_KINDS,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hook_matcher::{matcher_matches, validate_matcher, HookCommand, HookSource};

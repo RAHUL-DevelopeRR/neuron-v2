@@ -467,7 +467,7 @@ const MODIFYING_TOOLS: &[&str] = &[
     "Edit",
     "MultiEdit",
 ];
-const READING_TOOLS: &[&str] = &["read_file", "Read"];
+const READING_TOOLS: &[&str] = &["read_file", "read_document", "Read"];
 const PATH_KEYS: &[&str] = &["path", "file_path", "filePath", "notebook_path"];
 
 fn push_touched_paths(lines: &mut Vec<String>, messages: &[ConversationMessage]) {

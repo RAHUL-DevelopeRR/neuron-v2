@@ -32,6 +32,7 @@ pub const MAX_CONCURRENT_TOOL_CALLS: usize = 4;
 /// calls that another call of the batch could see half-done.
 pub const CONCURRENCY_SAFE_TOOLS: &[&str] = &[
     "read_file",
+    "read_document",
     "glob_search",
     "grep_search",
     "WebFetch",
