@@ -27,14 +27,13 @@ fn disabled_names(object: &Map<String, Value>) -> Vec<String> {
     object
         .get("disabledMcpServers")
         .and_then(Value::as_array)
-        .map(|names| {
+        .map_or_default(|names| {
             names
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::to_string)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 pub(crate) fn read_object(path: &Path) -> Result<Map<String, Value>, String> {

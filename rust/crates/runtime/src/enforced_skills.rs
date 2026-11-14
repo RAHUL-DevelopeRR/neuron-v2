@@ -150,9 +150,6 @@ fn is_private_dir(path: &Path) -> bool {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return false;
     };
-    if !metadata.is_dir() {
-        return false;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -160,7 +157,7 @@ fn is_private_dir(path: &Path) -> bool {
             return false;
         }
     }
-    true
+    metadata.is_dir()
 }
 
 /// The system prompt section naming the enforced skills, one short line each.

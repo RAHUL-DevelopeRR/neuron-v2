@@ -1981,9 +1981,8 @@ fn usage_error(command: &str, argument_hint: &str) -> SlashCommandParseError {
 }
 
 fn command_error(message: &str, command: &str, usage: &str) -> SlashCommandParseError {
-    let detail = render_slash_command_help_detail(command)
-        .map(|detail| format!("\n\n{detail}"))
-        .unwrap_or_default();
+    let detail =
+        render_slash_command_help_detail(command).map_or_default(|detail| format!("\n\n{detail}"));
     SlashCommandParseError::new(format!("{message}\n  Usage            {usage}{detail}"))
 }
 
@@ -3999,8 +3998,7 @@ fn enforced_shadow_warnings(skills: &[SkillSummary]) -> Vec<String> {
 #[must_use]
 pub fn enforced_skill_shadow_warnings(cwd: &Path) -> Vec<String> {
     load_skills_from_roots(&discover_skill_roots(cwd))
-        .map(|skills| enforced_shadow_warnings(&skills))
-        .unwrap_or_default()
+        .map_or_default(|skills| enforced_shadow_warnings(&skills))
 }
 
 fn render_skill_install_report(skill: &InstalledSkill) -> String {
@@ -4409,8 +4407,7 @@ impl McpChange {
                 let query = rest.join(" ");
                 let added = loader
                     .load()
-                    .map(|config| runtime::mcp_catalog_servers(config.mcp()))
-                    .unwrap_or_default();
+                    .map_or_default(|config| runtime::mcp_catalog_servers(config.mcp()));
                 let catalog = runtime::McpCatalog::builtin();
                 Some(Self::Catalog {
                     version: catalog.version.clone(),
@@ -4431,10 +4428,7 @@ impl McpChange {
             }
             "remove" => {
                 let parsed = parse_mcp_remove_args(rest);
-                let name = parsed
-                    .as_ref()
-                    .map(|(name, _)| name.clone())
-                    .unwrap_or_default();
+                let name = parsed.as_ref().map_or_default(|(name, _)| name.clone());
                 Some(Self::Removed {
                     name,
                     outcome: parsed

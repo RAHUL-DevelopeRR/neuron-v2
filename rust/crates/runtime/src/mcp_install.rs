@@ -212,8 +212,7 @@ fn use_data_dir(
     let value = resolved
         .env
         .get(&data.variable)
-        .map(|value| value.trim().to_string())
-        .unwrap_or_default();
+        .map_or_default(|value| value.trim().to_string());
     let path = if value.is_empty() {
         dir.join(&data.file)
     } else if value.starts_with(['~', '/', '\\']) || std::path::Path::new(&value).is_absolute() {

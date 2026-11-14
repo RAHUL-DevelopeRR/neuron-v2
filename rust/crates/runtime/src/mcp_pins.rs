@@ -447,14 +447,13 @@ fn parse_npm_lock(
             entry
                 .get(key)
                 .and_then(Value::as_array)
-                .map(|items| {
+                .map_or_default(|items| {
                     items
                         .iter()
                         .filter_map(Value::as_str)
                         .map(str::to_string)
                         .collect::<Vec<_>>()
                 })
-                .unwrap_or_default()
         };
         let (Some(version), Some(resolved), Some(integrity)) =
             (text("version"), text("resolved"), text("integrity"))

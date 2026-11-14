@@ -832,8 +832,7 @@ impl McpRemoteConnection {
         let post_url = self
             .legacy
             .as_ref()
-            .map(|stream| stream.post_url.clone())
-            .unwrap_or_default();
+            .map_or_default(|stream| stream.post_url.clone());
         if let Err(error) = self.post_legacy(&post_url, message).await {
             self.legacy = None;
             return Err(error);

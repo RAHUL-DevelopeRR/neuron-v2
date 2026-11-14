@@ -1249,8 +1249,7 @@ where
                     let final_text = progress
                         .assistant_messages
                         .last()
-                        .map(message_text)
-                        .unwrap_or_default();
+                        .map_or_default(message_text);
                     if let Some(note) = self.before_finishing(&mut progress, &final_text) {
                         self.session
                             .push_user_text(format!("{AUTO_CONTINUE_PREFIX} {note}"))
@@ -1859,8 +1858,7 @@ where
             .or_else(|| crate::workdir::current_dir().ok());
         let checks = root
             .as_deref()
-            .map(|root| detect_checks(root, edited))
-            .unwrap_or_default();
+            .map_or_default(|root| detect_checks(root, edited));
         let mut lines = vec![COMPLETION_CHECK_INTRO.to_string()];
         let shown = edited.iter().take(12).cloned().collect::<Vec<_>>();
         let more = if edited.len() > shown.len() {

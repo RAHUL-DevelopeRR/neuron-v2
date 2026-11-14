@@ -608,8 +608,7 @@ fn collect_tool_outcomes(messages: &[ConversationMessage]) -> Vec<String> {
                 let brief = inputs
                     .get(tool_use_id.as_str())
                     .copied()
-                    .map(brief_tool_input)
-                    .unwrap_or_default();
+                    .map_or_default(brief_tool_input);
                 let first_line = output
                     .lines()
                     .map(str::trim)
@@ -641,8 +640,7 @@ fn brief_tool_input(input: &str) -> String {
     ]
     .iter()
     .find_map(|key| object.get(*key).and_then(Value::as_str))
-    .map(|value| format!("({})", truncate_summary(&single_line(value), 100)))
-    .unwrap_or_default()
+    .map_or_default(|value| format!("({})", truncate_summary(&single_line(value), 100)))
 }
 
 fn last_n(items: Vec<String>, limit: usize) -> Vec<String> {

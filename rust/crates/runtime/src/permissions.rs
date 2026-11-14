@@ -257,8 +257,7 @@ pub fn non_interactive_hint(remedy: &PermissionRemedy) -> String {
     let why = remedy
         .no_prefix_rule
         .as_deref()
-        .map(|why| format!(" (no prefix rule covers this command: {why})"))
-        .unwrap_or_default();
+        .map_or_default(|why| format!(" (no prefix rule covers this command: {why})"));
     if remedy.allow_rules.is_empty() {
         format!("{NOT_RUN} and tell the user that no permissions.allow rule covers it{why}.")
     } else {
@@ -342,8 +341,7 @@ impl SessionApprovals {
         self.state()
             .shell_prefixes
             .get(tool_name)
-            .map(|prefixes| prefixes.iter().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|prefixes| prefixes.iter().cloned().collect())
     }
 
     /// Approves a web domain for `WebFetch`.
@@ -496,17 +494,13 @@ fn escalation_reason(
     let why = if current_mode == PermissionMode::Prompt {
         "Permission mode prompt asks before every tool call.".to_string()
     } else if command.is_some() {
-        let detail = detail
-            .map(|detail| format!(" ({detail})"))
-            .unwrap_or_default();
+        let detail = detail.map_or_default(|detail| format!(" ({detail})"));
         format!(
             "It is outside the auto-allow list for {}{detail}.",
             current_mode.as_str()
         )
     } else {
-        let detail = detail
-            .map(|detail| format!(" ({detail})"))
-            .unwrap_or_default();
+        let detail = detail.map_or_default(|detail| format!(" ({detail})"));
         format!(
             "It needs {}, beyond what {} allows{detail}.",
             required_mode.as_str(),

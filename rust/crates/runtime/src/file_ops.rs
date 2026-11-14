@@ -715,8 +715,7 @@ fn reindent(replacement: &str, old_string: &str, matched: &str) -> String {
     let first_line = |text: &str| {
         text.lines()
             .find(|line| !line.trim().is_empty())
-            .map(leading_whitespace)
-            .unwrap_or_default()
+            .map_or_default(leading_whitespace)
             .to_string()
     };
     let (from, to) = (first_line(old_string), first_line(matched));
