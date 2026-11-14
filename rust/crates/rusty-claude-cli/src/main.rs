@@ -237,9 +237,9 @@ fn main() {
     {
         std::process::exit(tools::run_document_worker());
     }
-    if let Ok(exe) = std::env::current_exe() {
-        tools::use_document_worker(exe);
-    }
+    // Never parse documents in this process: with no binary to start, reads
+    // are refused.
+    tools::use_own_binary_as_document_worker();
     if let Err(error) = run() {
         let message = error.to_string();
         // When --output-format json is active, emit errors as JSON so downstream

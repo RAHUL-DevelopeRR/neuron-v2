@@ -98,8 +98,29 @@ pub fn has_pdf_header(bytes: &[u8]) -> bool {
         .any(|window| window == b"%PDF-")
 }
 
-/// Whether the file starts like a PDF (see [`has_pdf_header`]), a zip
-/// package (OOXML, ODF) or an OLE compound file (`.xls`).
+/// The first bytes of an OLE compound file (`.xls`, and Office files that
+/// are password protected).
+const OLE_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+
+/// Whether `head` (the start of a file) carries the signature `read_document`
+/// reads a file with extension `extension` by: a PDF header (see
+/// [`has_pdf_header`]) for `.pdf`; a zip package (OOXML, ODF) or an OLE
+/// compound file at the very start for every other document kind. Both
+/// tools use this one test, so a file one of them sends to the other is
+/// always read there: text that merely mentions `%PDF-` under a `.xls` name
+/// is text.
+#[must_use]
+pub fn has_document_signature(extension: &str, head: &[u8]) -> bool {
+    if extension.eq_ignore_ascii_case("pdf") {
+        return has_pdf_header(head);
+    }
+    head.starts_with(b"PK\x03\x04")
+        || head.starts_with(b"PK\x05\x06")
+        || head.starts_with(&OLE_SIGNATURE)
+}
+
+/// Whether the file at `path` carries its document signature (see
+/// [`has_document_signature`]).
 fn has_document_magic(path: &Path) -> io::Result<bool> {
     let mut head = [0u8; PDF_HEADER_WINDOW];
     let mut file = fs::File::open(path)?;
@@ -110,10 +131,10 @@ fn has_document_magic(path: &Path) -> io::Result<bool> {
             count => read += count,
         }
     }
-    let head = &head[..read];
-    Ok(has_pdf_header(head)
-        || head.starts_with(b"PK\x03\x04")
-        || head.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]))
+    let extension = path.extension().map_or_else(String::new, |extension| {
+        extension.to_string_lossy().into_owned()
+    });
+    Ok(has_document_signature(&extension, &head[..read]))
 }
 
 /// Whether `bytes` start with a UTF-16 byte order mark.
@@ -2049,6 +2070,46 @@ mod tests {
         std::fs::create_dir_all(text.parent().expect("parent")).expect("dir");
         std::fs::write(&text, "plain text").expect("write");
         assert!(read_file(text.to_string_lossy().as_ref(), None, None).is_ok());
+    }
+
+    #[test]
+    fn a_pdf_header_counts_only_for_pdf_files() {
+        // A text export that mentions "%PDF-" is still text under any other
+        // document extension: read_document sends it back here, so refusing
+        // it would leave the file unreadable by both tools.
+        let dir = temp_path("pdf-mention");
+        std::fs::create_dir_all(&dir).expect("dir");
+        for name in [
+            "report.xls",
+            "report.xlsx",
+            "report.ods",
+            "report.docx",
+            "report.pptx",
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, "Name,Note\nA,100%PDF-ready\n").expect("write");
+            let output = read_file(path.to_string_lossy().as_ref(), None, None)
+                .unwrap_or_else(|error| panic!("{name} reads as text: {error}"));
+            assert!(output.file.content.contains("100%PDF-ready"), "{name}");
+        }
+        // The same bytes under .pdf hold a PDF header.
+        assert!(super::has_document_signature(
+            "pdf",
+            b"Name,Note\nA,100%PDF-ready\n"
+        ));
+        assert!(!super::has_document_signature(
+            "xls",
+            b"Name,Note\nA,100%PDF-ready\n"
+        ));
+        assert!(super::has_document_signature("XLSX", b"PK\x03\x04rest"));
+        assert!(super::has_document_signature(
+            "xls",
+            &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0]
+        ));
+        // A CSV whose first column is "PK" is not a zip package.
+        assert!(!super::has_document_signature("xls", b"PK,Name\n1,a\n"));
+        assert!(!super::has_document_signature("pdf", b"PK\x03\x04"));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

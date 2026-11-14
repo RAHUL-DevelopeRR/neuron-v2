@@ -8457,8 +8457,9 @@ mod powershell;
 mod read_document;
 pub use read_document::worker::{
     read_document_with_worker, run_worker as run_document_worker,
+    use_own_binary_as_worker as use_own_binary_as_document_worker,
     use_worker as use_document_worker, worker_request as document_worker_request,
-    WORKER_ARG as DOCUMENT_WORKER_ARG,
+    TEST_DELAY_VAR as DOCUMENT_WORKER_TEST_DELAY_VAR, WORKER_ARG as DOCUMENT_WORKER_ARG,
 };
 #[cfg(test)]
 mod safety_tests;

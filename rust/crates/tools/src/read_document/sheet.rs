@@ -84,7 +84,12 @@ impl Book {
                 .map(Self::Xls)
                 .map_err(unreadable);
         }
-        if !data.starts_with(b"PK") {
+        // The zip signature read_file also tests, so the two tools agree on
+        // which files are text.
+        let extension = path.extension().map_or_else(String::new, |extension| {
+            extension.to_string_lossy().into_owned()
+        });
+        if !runtime::has_document_signature(&extension, &data) {
             if looks_like_text(&data) {
                 return Err(text_file_error(path));
             }
@@ -290,7 +295,8 @@ fn check_shared_strings(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<
             .take(MAX_OTHER_PART_BYTES + 1)
             .read_to_end(&mut bytes)
             .map_err(unreadable)?;
-        let claimed = shared_string_count(&bytes);
+        let claimed = shared_string_count(&bytes)
+            .map_err(|error| unreadable(format!("its shared string table is damaged: {error}")))?;
         let holds = (bytes.len() as u64 / 5 + 16).max(SHARED_STRINGS_ALWAYS_ALLOWED);
         if claimed > holds {
             return Err(unreadable(
@@ -307,24 +313,37 @@ fn check_shared_strings(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<
 /// holds, and `calamine` never reads it. The number is read more leniently
 /// than `calamine` reads it (a sign or trailing text still counts), so every
 /// value it would reserve by is measured.
-fn shared_string_count(xml: &[u8]) -> u64 {
-    let text = String::from_utf8_lossy(xml);
-    let mut reader = quick_xml::Reader::from_str(&text);
+///
+/// The XML is read with the settings `calamine` reads it with (end tags not
+/// matched against start tags, comments not checked, `<sst/>` as a start), so
+/// markup only a stricter reader rejects cannot hide the `sst` element from
+/// this check while `calamine` still finds it. Markup both reject before the
+/// `sst` element is an error: nothing is measured, so nothing is let through.
+fn shared_string_count(xml: &[u8]) -> Result<u64, String> {
+    let mut reader = quick_xml::Reader::from_reader(xml);
+    let config = reader.config_mut();
+    config.check_end_names = false;
+    config.check_comments = false;
+    config.expand_empty_elements = true;
+    config.trim_text(false);
+    let mut buffer = Vec::new();
     loop {
-        match reader.read_event() {
+        buffer.clear();
+        match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(start) | quick_xml::events::Event::Empty(start))
                 if start.local_name().into_inner() == "sst" =>
             {
-                return start
+                return Ok(start
                     .attributes()
                     .with_checks(false)
                     .flatten()
                     .filter(|attr| attr.key.local_name().into_inner() == "uniqueCount")
                     .map(|attr| leading_number(&attr.value))
                     .max()
-                    .unwrap_or(0);
+                    .unwrap_or(0));
             }
-            Ok(quick_xml::events::Event::Eof) | Err(_) => return 0,
+            Ok(quick_xml::events::Event::Eof) => return Ok(0),
+            Err(error) => return Err(error.to_string()),
             Ok(_) => {}
         }
     }
@@ -870,7 +889,39 @@ fn render_sheet(
         );
         rows.push(cells);
     }
-    let mut text = format!("{heading}\n\n{}", markdown_table(&rows));
+    // Cells are cut so one row always fits in one call: a row longer than
+    // that could only be read in part, with no row to resume at.
+    let data_columns = usize::try_from(widest - column_from).unwrap_or(usize::MAX) + 1;
+    let ceiling = super::max_chars_ceiling();
+    let one_column_cell = ceiling * 5 / 6;
+    let per_cell = if data_columns == 1 {
+        one_column_cell
+    } else {
+        (ceiling * 2 / 3).min(super::MAX_ROW_LINE_CHARS) / data_columns
+    };
+    let (table, first_cut) = markdown_table(&rows, per_cell);
+    // Said before the table, so a call that ends inside the table still says
+    // it.
+    let cut_note = first_cut.map_or_else(String::new, |cut| {
+        if data_columns == 1 {
+            return format!(
+                "[cells longer than {per_cell} characters are cut, marked [...]; read_document shows no more of them]\n\n"
+            );
+        }
+        // Column 0 of the table is the row number.
+        let column =
+            column_from.saturating_add(u32::try_from(cut).unwrap_or(1).saturating_sub(1));
+        let keep_rows = options
+            .rows
+            .map(str::trim)
+            .filter(|rows| !rows.is_empty())
+            .map_or_else(String::new, |rows| format!(" rows=\"{rows}\""));
+        format!(
+            "[cells longer than {per_cell} characters are cut, marked [...]; one column at a time shows up to {one_column_cell} characters a cell, such as pages=\"{selector}\" columns=\"{}\"{keep_rows}]\n\n",
+            column_name(column)
+        )
+    });
+    let mut text = format!("{heading}\n\n{cut_note}{table}");
 
     let mut notes = Vec::new();
     let keep_columns = options
@@ -947,6 +998,11 @@ fn is_blank(cell: &Data) -> bool {
 fn cell_text(cell: &Data) -> String {
     match cell {
         Data::Float(value) => format_number(*value),
+        // A time of day (h:mm and the like) has no date part: Excel keeps it
+        // on day zero, which is not a date anyone entered.
+        Data::DateTime(value) if value.is_datetime() && (0.0..1.0).contains(&value.as_f64()) => {
+            time_of_day(value.as_f64())
+        }
         Data::DateTime(value) if value.is_datetime() => {
             let (year, month, day, hour, minute, second, _) = value.to_ymd_hms_milli();
             if (hour, minute, second) == (0, 0, 0) {
@@ -955,9 +1011,45 @@ fn cell_text(cell: &Data) -> String {
                 format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
             }
         }
-        Data::DateTime(value) => format_number(value.as_f64()),
+        // A duration ([h]:mm): days as a fraction, shown as hours.
+        Data::DateTime(value) => duration(value.as_f64()),
         other => other.to_string(),
     }
+}
+
+/// `days` (a fraction of a day) to the nearest second, as `HH:MM`, or
+/// `HH:MM:SS` when the seconds are not zero.
+fn time_of_day(days: f64) -> String {
+    let seconds = whole_seconds(days).min(24 * 60 * 60 - 1);
+    let (hour, minute, second) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if second == 0 {
+        format!("{hour:02}:{minute:02}")
+    } else {
+        format!("{hour:02}:{minute:02}:{second:02}")
+    }
+}
+
+/// `days` as hours, minutes and seconds (`8:00:00`, `36:30:00`, `-1:15:00`):
+/// the hours run past 24, as Excel shows a `[h]:mm` duration.
+fn duration(days: f64) -> String {
+    if !days.is_finite() {
+        return format_number(days);
+    }
+    let seconds = whole_seconds(days.abs());
+    let sign = if days < 0.0 && seconds > 0 { "-" } else { "" };
+    format!(
+        "{sign}{}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
+/// `days` (not negative) in whole seconds, rounded, saturating.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn whole_seconds(days: f64) -> u64 {
+    // `as` saturates: a NaN is 0 and a huge value u64::MAX.
+    (days * 86_400.0).round() as u64
 }
 
 fn format_number(value: f64) -> String {

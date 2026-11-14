@@ -1,7 +1,7 @@
 //! Zip packages and XML walking shared by the DOCX and PPTX readers.
 
 use std::fs::File;
-use std::io::Read as _;
+use std::io::{Read as _, Seek as _};
 use std::path::Path;
 
 use quick_xml::events::Event;
@@ -25,7 +25,23 @@ pub(super) struct Package {
 impl Package {
     /// Opens `path` as a zip package holding a `kind` ("Word document").
     pub(super) fn open(path: &Path, kind: &'static str) -> Result<Self, String> {
-        let file = File::open(path).map_err(|error| format!("cannot open the file: {error}"))?;
+        let mut file =
+            File::open(path).map_err(|error| format!("cannot open the file: {error}"))?;
+        // Text under a document name (an export saved as .docx) goes to
+        // read_file, judged by the same test read_file uses.
+        let mut head = Vec::new();
+        (&mut file)
+            .take(8192)
+            .read_to_end(&mut head)
+            .map_err(|error| format!("cannot open the file: {error}"))?;
+        let extension = path.extension().map_or_else(String::new, |extension| {
+            extension.to_string_lossy().into_owned()
+        });
+        if !runtime::has_document_signature(&extension, &head) && super::looks_like_text(&head) {
+            return Err(super::text_file_error(path));
+        }
+        file.rewind()
+            .map_err(|error| format!("cannot open the file: {error}"))?;
         let archive = zip::ZipArchive::new(file).map_err(|_| {
             format!("this is not a readable {kind}: the file is damaged, password protected or in an older format")
         })?;

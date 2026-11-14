@@ -78,20 +78,30 @@ fn the_worker_reads_a_document_and_reports_errors_as_json() {
     assert!(markdown.contains("Hello from the worker"), "{markdown}");
 
     // A worker whose parent goes away (stdin closes) stops at once rather
-    // than finishing its read for no one.
-    let mut child = Command::new(neuron())
-        .arg(tools::DOCUMENT_WORKER_ARG)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start worker");
-    let mut stdin = child.stdin.take().expect("stdin");
-    stdin.write_all(&request).expect("send request");
-    drop(stdin);
-    let status = child.wait().expect("worker exit");
-    // Either it answered first (0) or it saw its parent go first (4).
-    assert!(matches!(status.code(), Some(0 | 4)), "{status:?}");
+    // than finishing its read for no one. The read is held for 20 seconds
+    // (a debug-build test delay), so only the stdin watch can end it early;
+    // without it the worker would answer (exit 0) after the delay.
+    if cfg!(debug_assertions) {
+        let started = std::time::Instant::now();
+        let mut child = Command::new(neuron())
+            .arg(tools::DOCUMENT_WORKER_ARG)
+            .env(tools::DOCUMENT_WORKER_TEST_DELAY_VAR, "20000")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start worker");
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin.write_all(&request).expect("send request");
+        drop(stdin);
+        let status = child.wait().expect("worker exit");
+        let elapsed = started.elapsed();
+        assert_eq!(status.code(), Some(4), "{status:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the worker stopped only after {elapsed:?}"
+        );
+    }
 
     // A bad request is an error reply, not a crash.
     let output = Command::new(neuron())

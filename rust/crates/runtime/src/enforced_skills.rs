@@ -128,7 +128,7 @@ fn private_fallback_root(skills: &[EnforcedSkill]) -> io::Result<PathBuf> {
             return Ok(existing.clone());
         }
     }
-    let created = create_private_dir()?;
+    let created = create_private_dir(&std::env::temp_dir())?;
     let lock = fs::File::create(created.join(OWNER_LOCK))?;
     lock.lock()?;
     write_skill_files(&created, skills)?;
@@ -210,10 +210,9 @@ fn same_owner(path: &Path, ours: &Path) -> bool {
     }
 }
 
-/// A new, empty folder in the temp folder, made by this call: creation
-/// fails rather than reuse a path that already exists.
-fn create_private_dir() -> io::Result<PathBuf> {
-    let base = std::env::temp_dir();
+/// A new, empty folder in `base` (the temp folder, outside tests), made by
+/// this call: creation fails rather than reuse a path that already exists.
+fn create_private_dir(base: &Path) -> io::Result<PathBuf> {
     for _ in 0..16 {
         let path = base.join(format!(
             "{FALLBACK_PREFIX}{}-{:016x}",
@@ -429,7 +428,7 @@ mod tests {
         // This process holds its folder's lock, so no other run removes it.
         assert!(!is_stale_fallback(&fallback));
         // A folder that already exists is never taken over.
-        let another = create_private_dir().unwrap();
+        let another = create_private_dir(&std::env::temp_dir()).unwrap();
         assert_ne!(another, fallback);
         fs::remove_dir_all(another).unwrap();
         fs::remove_dir_all(root).unwrap();
@@ -438,9 +437,18 @@ mod tests {
     #[test]
     fn fallback_folders_of_ended_processes_are_removed() {
         let skills = compiled_enforced_skills();
+        // A folder of its own, not the shared temp folder: another test's
+        // first fallback clears the temp folder of ended processes' folders,
+        // and would take this test's folders with them.
+        let base = std::env::temp_dir().join(format!(
+            "neuron-test-fallbacks-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        fs::create_dir_all(&base).unwrap();
         // An ended process's folder: its lock file is there but nobody
         // holds it.
-        let ended = create_private_dir().unwrap();
+        let ended = create_private_dir(&base).unwrap();
         let free = fs::File::create(ended.join(OWNER_LOCK)).unwrap();
         write_skill_files(&ended, &skills).unwrap();
         // A free lock made a moment ago may belong to a process about to
@@ -450,7 +458,7 @@ mod tests {
             .unwrap();
         drop(free);
         // A running process's folder: its lock is held.
-        let running = create_private_dir().unwrap();
+        let running = create_private_dir(&base).unwrap();
         let held = fs::File::create(running.join(OWNER_LOCK)).unwrap();
         // Old, so only the held lock keeps it.
         held.set_modified(SystemTime::now() - Duration::from_secs(3_600))
@@ -458,20 +466,18 @@ mod tests {
         held.lock().unwrap();
         write_skill_files(&running, &skills).unwrap();
         // A folder just made, before its lock: too young to touch.
-        let young = create_private_dir().unwrap();
+        let young = create_private_dir(&base).unwrap();
         assert!(is_stale_fallback(&ended));
         assert!(!is_stale_fallback(&running));
         assert!(!is_stale_fallback(&young));
 
-        let ours = create_private_dir().unwrap();
+        let ours = create_private_dir(&base).unwrap();
         remove_stale_fallbacks(&ours);
         assert!(!ended.exists(), "{}", ended.display());
         assert!(running.join("reading-documents").join("SKILL.md").is_file());
         assert!(young.is_dir());
         drop(held);
-        for path in [running, young, ours] {
-            fs::remove_dir_all(path).unwrap();
-        }
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

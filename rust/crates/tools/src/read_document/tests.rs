@@ -642,9 +642,13 @@ fn bad_input_gets_short_clear_errors() {
     let error = read_document(&fake_pdf, None, None).expect_err("not a pdf");
     assert!(error.contains("%PDF header is missing"), "{error}");
 
-    let not_zip = write(&dir, "broken.docx", b"definitely not a zip");
+    // Binary bytes: text named .docx is sent to read_file instead.
+    let not_zip = write(&dir, "broken.docx", b"definitely\0not a zip");
     let error = read_document(&not_zip, None, None).expect_err("not a zip");
     assert!(error.contains("not a readable Word document"), "{error}");
+    let text_docx = write(&dir, "notes.docx", b"definitely not a zip");
+    let error = read_document(&text_docx, None, None).expect_err("text");
+    assert!(error.contains("read it with read_file"), "{error}");
 
     let no_body = write(
         &dir,

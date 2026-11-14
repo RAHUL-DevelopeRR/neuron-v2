@@ -602,6 +602,10 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
     // Tables nested past MAX_TABLE_NESTING, still open.
     let mut ignored_tables = 0usize;
     let mut in_properties = false;
+    let mut in_cell_properties = false;
+    let mut in_row_properties = false;
+    // Tracked changes' copies of old cell or row properties, still open.
+    let mut property_changes = 0usize;
     let mut in_section = false;
     let mut in_text = false;
     let mut skip_depth = 0usize;
@@ -755,6 +759,46 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
             Node::Open { name: "tc", .. } if ignored_tables == 0 => {
                 if let Some(table) = tables.last_mut() {
                     table.start_cell();
+                }
+            }
+            // Cell and row properties: where a row's cells sit on the
+            // table's grid. A tracked change's copy of the old properties
+            // is not the current layout.
+            Node::Open { name: "tcPr", .. } => in_cell_properties = true,
+            Node::Close { name: "tcPr" } => in_cell_properties = false,
+            Node::Open { name: "trPr", .. } => in_row_properties = true,
+            Node::Close { name: "trPr" } => in_row_properties = false,
+            Node::Open {
+                name: "tcPrChange" | "trPrChange",
+                ..
+            } => property_changes += 1,
+            Node::Close {
+                name: "tcPrChange" | "trPrChange",
+            } => property_changes = property_changes.saturating_sub(1),
+            Node::Open {
+                name: name @ ("gridSpan" | "gridBefore" | "gridAfter"),
+                attrs,
+            } if ignored_tables == 0 && property_changes == 0 => {
+                let count = attr(attrs, "w:val")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if let Some(table) = tables.last_mut() {
+                    match name {
+                        "gridSpan" if in_cell_properties => table.set_cell_span(count),
+                        "gridBefore" if in_row_properties => table.skip_columns(count),
+                        "gridAfter" if in_row_properties => table.set_row_grid_after(count),
+                        _ => {}
+                    }
+                }
+            }
+            Node::Close { name: "tc" } if ignored_tables == 0 => {
+                if let Some(table) = tables.last_mut() {
+                    table.end_cell();
+                }
+            }
+            Node::Close { name: "tr" } if ignored_tables == 0 => {
+                if let Some(table) = tables.last_mut() {
+                    table.end_row();
                 }
             }
             Node::Close { name: "tbl" } => {

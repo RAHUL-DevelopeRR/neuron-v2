@@ -27,7 +27,8 @@
 //! characters on Windows), so a path that is not valid Unicode reads too.
 //!
 //! Outside the CLI (the tools crate's own tests, other embedders) no worker
-//! is registered and the read runs in this process.
+//! is registered and the read runs in this process. The CLI never does
+//! that: when it cannot find its own binary, `read_document` is refused.
 //!
 //! Follow-up: on Linux and macOS the child has no memory limit of its own
 //! yet (an `RLIMIT_AS` needs `unsafe` code in `pre_exec`); the timeout and
@@ -63,12 +64,73 @@ const MAX_REPLY_BYTES: u64 = 8 * 1024 * 1024;
 /// Bytes of request a worker reads from stdin.
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 
-static WORKER: OnceLock<PathBuf> = OnceLock::new();
+/// Where reads run, once the CLI has said.
+#[derive(Debug)]
+enum Worker {
+    /// In a child process started from this binary.
+    Exe(PathBuf),
+    /// Nowhere: the CLI could not find its own binary, and it never parses
+    /// documents in its own process.
+    Missing,
+}
+
+static WORKER: OnceLock<Worker> = OnceLock::new();
 
 /// Makes `read_document` run each read in `exe` (the CLI's own binary,
 /// which must handle [`WORKER_ARG`] through [`run_worker`]).
 pub fn use_worker(exe: PathBuf) {
-    let _ = WORKER.set(exe);
+    let _ = WORKER.set(Worker::Exe(exe));
+}
+
+/// Makes `read_document` run each read in this program's own binary (for
+/// the CLI, which handles [`WORKER_ARG`] through [`run_worker`]). The binary
+/// is found by [`std::env::current_exe`], else by the program name it was
+/// started with; when neither finds it, every read is refused rather than
+/// run in this process without the worker's limits.
+pub fn use_own_binary_as_worker() {
+    let found = std::env::current_exe().ok().or_else(|| {
+        resolve_program(
+            &std::env::args_os().next()?,
+            std::env::var_os("PATH").as_deref(),
+            std::env::current_dir().ok().as_deref(),
+        )
+    });
+    let _ = WORKER.set(found.map_or(Worker::Missing, Worker::Exe));
+}
+
+/// The file `program` (a program name as it was started, `argv[0]`) names:
+/// a path, against `cwd` when relative, or a bare name looked up in `path`
+/// (with `.exe` added on Windows). `None` when no such file exists.
+fn resolve_program(
+    program: &std::ffi::OsStr,
+    path: Option<&std::ffi::OsStr>,
+    cwd: Option<&Path>,
+) -> Option<PathBuf> {
+    let program = Path::new(program);
+    if program.as_os_str().is_empty() {
+        return None;
+    }
+    let candidates = |base: PathBuf| {
+        let mut found = vec![base.clone()];
+        if cfg!(windows) && base.extension().is_none() {
+            found.push(base.with_extension("exe"));
+        }
+        found
+    };
+    if program.is_absolute() {
+        return candidates(program.to_path_buf())
+            .into_iter()
+            .find(|candidate| candidate.is_file());
+    }
+    if program.components().count() > 1 {
+        return candidates(cwd?.join(program))
+            .into_iter()
+            .find(|candidate| candidate.is_file());
+    }
+    std::env::split_paths(path?)
+        .filter(|dir| dir.is_absolute())
+        .flat_map(|dir| candidates(dir.join(program)))
+        .find(|candidate| candidate.is_file())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -158,14 +220,30 @@ pub(crate) fn read(
     options: &Options<'_>,
     cancel: &CancellationToken,
 ) -> Result<String, String> {
+    read_with(WORKER.get(), path, options, cancel)
+}
+
+/// [`read`] with `worker` as the registered worker.
+fn read_with(
+    worker: Option<&Worker>,
+    path: &Path,
+    options: &Options<'_>,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
     if cancel.is_cancelled() {
         return Err(CANCELLED.to_string());
     }
-    match WORKER.get() {
-        Some(exe) => read_in_worker(exe, path, options, WORKER_TIMEOUT, cancel),
+    match worker {
+        Some(Worker::Exe(exe)) => read_in_worker(exe, path, options, WORKER_TIMEOUT, cancel),
+        // The CLI never parses in its own process: a hostile file could
+        // take it down.
+        Some(Worker::Missing) => Err(WORKER_MISSING.to_string()),
         None => super::read_document(path, options),
     }
 }
+
+/// The error for a read in a CLI that could not find its own binary.
+pub(crate) const WORKER_MISSING: &str = "read_document is unavailable: the reader process could not be located (documents are read in a separate copy of this program, and the path to this program could not be found)";
 
 /// The error for a read stopped because its turn was cancelled.
 pub(crate) const CANCELLED: &str = "read_document was cancelled";
@@ -414,6 +492,21 @@ fn with_containment_note(text: String, uncontained: Option<&str>) -> String {
     }
 }
 
+/// Debug builds only: the worker waits this many milliseconds before it
+/// reads, so a test can hold a read in progress (to check that a worker
+/// whose parent goes away stops). Release builds ignore it.
+pub const TEST_DELAY_VAR: &str = "NEURON_TEST_READ_DOCUMENT_DELAY_MS";
+
+fn test_read_delay() {
+    #[cfg(debug_assertions)]
+    if let Some(millis) = std::env::var(TEST_DELAY_VAR)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(millis.min(60_000)));
+    }
+}
+
 /// The worker side: reads one request from stdin, reads the document and
 /// writes the reply to stdout. Returns the process exit code. The worker
 /// stops itself when it runs [`WORKER_GRACE`] past [`WORKER_TIMEOUT`] or
@@ -444,6 +537,7 @@ pub fn run_worker() -> i32 {
                 columns: request.columns.as_deref(),
                 max_chars: request.max_chars,
             };
+            test_read_delay();
             match super::read_document(&path_from_units(request.path), &options) {
                 Ok(markdown) => serde_json::json!({ "ok": markdown }),
                 Err(error) => serde_json::json!({ "error": error }),
@@ -674,6 +768,71 @@ mod tests {
             started.elapsed()
         );
         assert!(error.contains("reading took longer"), "{error}");
+    }
+
+    #[test]
+    fn a_cli_that_cannot_find_its_binary_refuses_reads_instead_of_parsing_in_process() {
+        let dir = std::env::temp_dir().join(format!(
+            "neuron-worker-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("notes.pdf");
+        std::fs::write(&path, "plain text").expect("write");
+        let error = super::read_with(
+            Some(&super::Worker::Missing),
+            &path,
+            &super::Options::default(),
+            &CancellationToken::new(),
+        )
+        .expect_err("refused");
+        assert_eq!(error, super::WORKER_MISSING);
+        assert!(error.contains("could not be located"), "{error}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_program_name_is_resolved_when_the_binary_path_is_unknown() {
+        use std::ffi::OsStr;
+        let dir = std::env::temp_dir().join(format!(
+            "neuron-worker-argv0-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).expect("dir");
+        let name = if cfg!(windows) {
+            "neuron.exe"
+        } else {
+            "neuron"
+        };
+        let exe = bin.join(name);
+        std::fs::write(&exe, b"binary").expect("write");
+        let resolve = super::resolve_program;
+        // An absolute path, and a relative one against the starting folder.
+        assert_eq!(resolve(exe.as_os_str(), None, None), Some(exe.clone()));
+        let relative = std::path::Path::new("bin").join(name);
+        assert_eq!(
+            resolve(relative.as_os_str(), None, Some(&dir)),
+            Some(dir.join(&relative))
+        );
+        assert_eq!(resolve(relative.as_os_str(), None, None), None);
+        // A bare name is looked up on PATH; relative PATH entries are not.
+        let path =
+            std::env::join_paths([std::path::Path::new("relative"), bin.as_path()]).expect("path");
+        assert_eq!(
+            resolve(OsStr::new("neuron"), Some(&path), None),
+            Some(exe.clone())
+        );
+        assert_eq!(resolve(OsStr::new("neuron"), None, None), None);
+        assert_eq!(resolve(OsStr::new("missing"), Some(&path), None), None);
+        assert_eq!(resolve(OsStr::new(""), Some(&path), Some(&dir)), None);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

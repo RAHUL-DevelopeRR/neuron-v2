@@ -24,6 +24,8 @@ mod hostile_tests;
 #[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
+mod review_tests;
+#[cfg(test)]
 pub(crate) mod tests;
 
 use std::fmt::Write as _;
@@ -565,8 +567,10 @@ pub(crate) fn table_cell(text: &str) -> String {
 /// after the header with no text are left out, and a table with no text
 /// gives an empty string. At most [`MAX_TABLE_COLUMNS`] columns and about
 /// [`MAX_TABLE_CHARS`] characters are built, so a hostile table of empty
-/// cells cannot grow into gigabytes.
-pub(crate) fn markdown_table(rows: &[Vec<String>]) -> String {
+/// cells cannot grow into gigabytes. Each body cell keeps at most
+/// `per_cell` characters (after escaping) and ends in [`CUT_MARK`] when cut;
+/// the second value is the first column (0-based) a cell was cut in.
+pub(crate) fn markdown_table(rows: &[Vec<String>], per_cell: usize) -> (String, Option<usize>) {
     let filled = |cell: &String| !cell.trim().is_empty();
     let columns = rows
         .iter()
@@ -575,18 +579,30 @@ pub(crate) fn markdown_table(rows: &[Vec<String>]) -> String {
         .map_or(0, |last| last + 1)
         .min(MAX_TABLE_COLUMNS);
     if columns == 0 {
-        return String::new();
+        return (String::new(), None);
     }
-    let line = |row: &[String]| {
+    let mut first_cut: Option<usize> = None;
+    let mut line = |row: &[String], per_cell: usize| {
         let mut cells = row
             .iter()
             .take(columns)
-            .map(|cell| table_cell(cell))
+            .enumerate()
+            .map(|(column, cell)| {
+                let (text, cut) = cut_escaped(table_cell(cell), per_cell);
+                if cut {
+                    first_cut = Some(first_cut.map_or(column, |first| first.min(column)));
+                }
+                text
+            })
             .collect::<Vec<_>>();
         cells.resize(columns, String::new());
         format!("| {} |", cells.join(" | "))
     };
-    let mut out = format!("{}\n|{}", line(&rows[0]), " --- |".repeat(columns));
+    let mut out = format!(
+        "{}\n|{}",
+        line(&rows[0], usize::MAX),
+        " --- |".repeat(columns)
+    );
     let body = rows[1..]
         .iter()
         .filter(|row| row.iter().take(columns).any(filled))
@@ -601,9 +617,9 @@ pub(crate) fn markdown_table(rows: &[Vec<String>]) -> String {
             break;
         }
         out.push('\n');
-        out.push_str(&line(row));
+        out.push_str(&line(row, per_cell));
     }
-    out
+    (out, first_cut)
 }
 
 /// Characters of text one cell of a document table keeps while the XML is
@@ -611,7 +627,7 @@ pub(crate) fn markdown_table(rows: &[Vec<String>]) -> String {
 pub(crate) const MAX_CELL_CHARS: usize = 4_000;
 /// Characters one rendered row of a document table takes at most: the cells
 /// of a wide row are cut shorter so the whole line fits.
-const MAX_ROW_LINE_CHARS: usize = 24_000;
+pub(crate) const MAX_ROW_LINE_CHARS: usize = 24_000;
 /// Characters of the header row repeated over each continued part.
 const MAX_REPEATED_HEADER_CHARS: usize = 2_000;
 /// Characters a part may take with its header and first row: past this the
@@ -630,9 +646,14 @@ const CONTINUED: &str = "(table continued)\n\n";
 /// One cell as Markdown, cut to `max_chars` characters (after escaping)
 /// without splitting an escape.
 fn cut_cell(text: &str, max_chars: usize) -> String {
-    let escaped = table_cell(text);
+    cut_escaped(table_cell(text), max_chars).0
+}
+
+/// `escaped` (a cell already escaped) cut to `max_chars` characters without
+/// splitting an escape, ending in [`CUT_MARK`] when cut; and whether it was.
+fn cut_escaped(escaped: String, max_chars: usize) -> (String, bool) {
     if escaped.chars().count() <= max_chars {
-        return escaped;
+        return (escaped, false);
     }
     let mut kept = take_chars(&escaped, max_chars).to_string();
     for partial in ["<br", "<b", "<", "\\"] {
@@ -642,7 +663,7 @@ fn cut_cell(text: &str, max_chars: usize) -> String {
         }
     }
     kept.push_str(CUT_MARK);
-    kept
+    (kept, true)
 }
 
 /// `row` as one Markdown table line of `columns` cells, each at most
@@ -792,11 +813,18 @@ pub(crate) struct TableBuilder {
     cell_chars: usize,
     /// Rows were dropped.
     cut: bool,
+    /// Grid columns the current cell covers past its first (a merged cell),
+    /// added as empty cells when it ends.
+    cell_span_rest: usize,
+    /// Grid columns left empty after the current row's last cell.
+    row_grid_after: usize,
 }
 
 impl TableBuilder {
     pub(crate) fn start_row(&mut self, page: usize) {
         self.skip_cell = true;
+        self.cell_span_rest = 0;
+        self.row_grid_after = 0;
         if self.rows.len() >= MAX_TABLE_ROWS {
             self.skip_row = true;
             self.cut = true;
@@ -818,6 +846,45 @@ impl TableBuilder {
                 row.push(String::new());
                 self.skip_cell = false;
             }
+        }
+    }
+
+    /// The current cell covers `span` grid columns (a horizontally merged
+    /// cell): the columns past its first are added, empty, when it ends, so
+    /// the cells after it stay under their own headers.
+    pub(crate) fn set_cell_span(&mut self, span: usize) {
+        self.cell_span_rest = span.saturating_sub(1);
+    }
+
+    /// Ends the current cell, adding the empty columns it spans.
+    pub(crate) fn end_cell(&mut self) {
+        let rest = std::mem::take(&mut self.cell_span_rest);
+        self.skip_columns(rest);
+    }
+
+    /// The current row leaves its last `count` grid columns empty: they are
+    /// added when the row ends.
+    pub(crate) fn set_row_grid_after(&mut self, count: usize) {
+        self.row_grid_after = count;
+    }
+
+    /// Ends the current row, adding the empty columns it leaves at its end.
+    pub(crate) fn end_row(&mut self) {
+        let after = std::mem::take(&mut self.row_grid_after);
+        self.skip_columns(after);
+    }
+
+    /// Adds `count` empty cells to the current row (grid columns no cell of
+    /// the row starts in), within [`MAX_TABLE_COLUMNS`]. Text that follows
+    /// before the next cell starts is dropped.
+    pub(crate) fn skip_columns(&mut self, count: usize) {
+        if count == 0 || self.skip_row {
+            return;
+        }
+        self.skip_cell = true;
+        if let Some(row) = self.rows.last_mut() {
+            let room = MAX_TABLE_COLUMNS.saturating_sub(row.len());
+            row.extend(std::iter::repeat_n(String::new(), count.min(room)));
         }
     }
 
