@@ -151,6 +151,9 @@ fn push_char(text: &mut String, ch: char) {
     }
 }
 
+/// The base encodings [`named`] knows.
+pub(super) const NAMED: [&str; 3] = ["WinAnsiEncoding", "MacRomanEncoding", "StandardEncoding"];
+
 /// The table of a named base encoding; `None` for a name this does not
 /// know, which reads as Windows-1252 like a font without one.
 pub(super) fn named(name: &str) -> Option<CodeTable> {
@@ -418,8 +421,14 @@ fn glyph_char(name: &str) -> Option<char> {
 /// The text a glyph name stands for, as the Adobe Glyph List reads names:
 /// anything after a period is dropped, components joined by `_` are read
 /// one by one, and `uniXXXX` may hold several characters. `None` when any
-/// part is unknown.
+/// part is unknown, and for a name longer than [`MAX_NAME_BYTES`] or one
+/// standing for more than [`MAX_NAME_CHARS`] characters, which no font
+/// uses: a font's table holds 256 of them, so a long name repeated would
+/// take far more memory than the file.
 pub(super) fn glyph_text(name: &str) -> Option<String> {
+    if name.len() > MAX_NAME_BYTES {
+        return None;
+    }
     let name = name.split('.').next().filter(|base| !base.is_empty())?;
     let mut text = String::new();
     for part in name.split('_') {
@@ -436,8 +445,14 @@ pub(super) fn glyph_text(name: &str) -> Option<String> {
             push_char(&mut text, glyph_char(part)?);
         }
     }
-    (!text.is_empty()).then_some(text)
+    (!text.is_empty() && text.chars().count() <= MAX_NAME_CHARS).then_some(text)
 }
+
+/// Bytes of the longest glyph name read.
+const MAX_NAME_BYTES: usize = 128;
+/// Characters one glyph name may stand for, as many as one code of a
+/// `ToUnicode` map may.
+const MAX_NAME_CHARS: usize = 32;
 
 #[cfg(test)]
 mod tests {
@@ -468,6 +483,12 @@ mod tests {
         for name in [".notdef", "g123", "uniD800", "cid1234", ""] {
             assert_eq!(glyph_text(name), None, "{name}");
         }
+        // Names no font uses, which would stand for long text.
+        let long = format!("uni{}", "4E00".repeat(1_000));
+        assert_eq!(glyph_text(&long), None);
+        assert_eq!(glyph_text(&format!("f{}", "_f".repeat(40))), None);
+        let most = format!("uni{}", "0041".repeat(31));
+        assert_eq!(glyph_text(&most).as_deref(), Some("A".repeat(31).as_str()));
     }
 
     #[test]

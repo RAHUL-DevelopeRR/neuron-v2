@@ -10,12 +10,12 @@ use super::pdf::fixtures;
 use super::tests::{docx, package, rels, temp_dir, write};
 use super::{Budget, Options, Selection, DEFAULT_MAX_CHARS};
 
-fn read(path: &Path, options: &Options<'_>) -> Result<String, String> {
+pub(super) fn read(path: &Path, options: &Options<'_>) -> Result<String, String> {
     super::read_document(path, options)
 }
 
 /// A one-sheet `.xlsx` holding `rows`, with `extra` parts.
-fn workbook(rows: &str, extra: &[(&str, String)]) -> Vec<u8> {
+pub(super) fn workbook(rows: &str, extra: &[(&str, String)]) -> Vec<u8> {
     let workbook = r#"<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
     let sheet = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{rows}</sheetData></worksheet>"#
@@ -134,7 +134,7 @@ fn cells_kept_before_a_wider_column_appears_are_cut_to_the_final_width() {
 
 /// A compound file (512-byte sectors) holding one stream, with as many
 /// allocation sectors as the stream needs.
-fn compound_file(name: &str, stream: &[u8]) -> Vec<u8> {
+pub(super) fn compound_file(name: &str, stream: &[u8]) -> Vec<u8> {
     const FREE: u32 = 0xFFFF_FFFF;
     const END: u32 = 0xFFFF_FFFE;
     let mut stream = stream.to_vec();
@@ -210,7 +210,7 @@ fn compound_file(name: &str, stream: &[u8]) -> Vec<u8> {
     file
 }
 
-fn biff(kind: u16, data: &[u8]) -> Vec<u8> {
+pub(super) fn biff(kind: u16, data: &[u8]) -> Vec<u8> {
     let mut record = kind.to_le_bytes().to_vec();
     record.extend_from_slice(&u16::try_from(data.len()).expect("record").to_le_bytes());
     record.extend_from_slice(data);
@@ -266,7 +266,7 @@ fn sst(strings: &[(String, u16)], part: usize) -> Vec<u8> {
 
 /// A BIFF8 workbook stream: `globals` records, then one sheet of
 /// `sheet_records`.
-fn workbook_stream(globals: &[u8], sheet_records: &[Vec<u8>]) -> Vec<u8> {
+pub(super) fn workbook_stream(globals: &[u8], sheet_records: &[Vec<u8>]) -> Vec<u8> {
     let bof = |kind: u16| {
         let mut data = vec![0u8; 16];
         data[..2].copy_from_slice(&0x0600u16.to_le_bytes());
@@ -440,7 +440,7 @@ fn a_row_shares_its_room_with_the_cells_that_hold_text() {
     assert_eq!(super::fair_share(vec![9_000; 4], 24_000), 6_000);
 }
 
-fn read_pdf(bytes: &[u8]) -> String {
+pub(super) fn read_pdf(bytes: &[u8]) -> String {
     let document = super::pdf::read_bytes(
         bytes,
         &Selection::default(),

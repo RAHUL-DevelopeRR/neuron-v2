@@ -304,6 +304,13 @@ fn check_workbook(stream: &[u8], max_cells: u64, max_text_bytes: u64) -> Result<
     // offset of its records, and holds the shared string table.
     let mut offsets = Vec::new();
     let mut strings = Vec::new();
+    // Characters of each defined name (Lbl), in the order formulas number
+    // them, and of the longest sheet name.
+    let mut names = Vec::new();
+    let mut longest_sheet = 0u8;
+    // calamine reads formula tokens by the BIFF version of the last BOF
+    // record here.
+    let mut pre_biff8 = false;
     // UTF-8 bytes one character of a string may become: up to 3 from UTF-16
     // (the BIFF8 code page); another code page reads each of the 2 bytes
     // `calamine` makes of a character as one character.
@@ -314,7 +321,16 @@ fn check_workbook(stream: &[u8], max_cells: u64, max_text_bytes: u64) -> Result<
                 if let Some(offset) = u32_at(data, 0) {
                     offsets.push(index(offset));
                 }
+                longest_sheet = longest_sheet.max(data.get(6).copied().unwrap_or(0));
             }
+            0x0809 => {
+                if let Some(version) = u16_at(data, 0) {
+                    pre_biff8 =
+                        matches!(version, 0x0002 | 0x0007 | 0x0200 | 0x0300 | 0x0400 | 0x0500)
+                            || (version == 0 && u16_at(data, 2) == Some(0x1000));
+                }
+            }
+            0x0018 => names.push(data.get(3).copied().unwrap_or(0)),
             0x0042 => {
                 if !matches!(u16_at(data, 0), Some(1200 | 1201)) {
                     bytes_per_char = 6;
@@ -330,6 +346,17 @@ fn check_workbook(stream: &[u8], max_cells: u64, max_text_bytes: u64) -> Result<
         return Err(damaged("it lists too many sheets"));
     }
     offsets.sort_unstable();
+    let globals = Globals {
+        strings: &strings,
+        names: names
+            .iter()
+            .map(|chars| u64::from(*chars) * bytes_per_char)
+            .collect(),
+        // A sheet calamine cannot find reads as `#REF`.
+        sheet_bytes: (u64::from(longest_sheet) * bytes_per_char).max(4),
+        bytes_per_char,
+        pre_biff8,
+    };
     let mut total = 0u64;
     let mut text = 0u64;
     let mut previous_end = 0usize;
@@ -339,13 +366,15 @@ fn check_workbook(stream: &[u8], max_cells: u64, max_text_bytes: u64) -> Result<
         if offset < previous_end || offset > stream.len() {
             return Err(damaged("its sheets overlap"));
         }
-        let sheet = sheet_cells(&stream[offset..], &strings)?;
+        let sheet = sheet_cells(&stream[offset..], &globals)?;
         previous_end = offset + sheet.length;
         total = total.saturating_add(sheet.cells);
         if total > max_cells {
             return Err(too_large(max_cells));
         }
-        text = text.saturating_add(sheet.chars.saturating_mul(bytes_per_char));
+        text = text
+            .saturating_add(sheet.chars.saturating_mul(bytes_per_char))
+            .saturating_add(sheet.formula_bytes);
         if text > max_text_bytes {
             return Err(too_much_text(max_text_bytes));
         }
@@ -465,14 +494,12 @@ fn shared_strings(data: &[u8], continues: &[&[u8]]) -> Result<Vec<u16>, String> 
     Ok(strings)
 }
 
-/// Characters of an `XLUnicodeString` (a length, then the text) at the start
-/// of `data`: no more than the record holds, as `calamine` decodes only that.
+/// Characters an `XLUnicodeString` (a length, then the text) at the start of
+/// `data` claims: `calamine` reserves room for all of them before it decodes
+/// the ones the record holds, so a record claiming 65,535 characters and
+/// holding none still costs 64 KB.
 fn string_chars(data: Option<&[u8]>) -> u64 {
-    data.and_then(|data| {
-        let count = usize::from(u16_at(data, 0)?);
-        u64::try_from(count.min(data.len())).ok()
-    })
-    .unwrap_or(0)
+    data.and_then(|data| u16_at(data, 0)).map_or(0, u64::from)
 }
 
 /// The smallest box holding a set of cells.
@@ -499,21 +526,39 @@ impl Bounds {
     }
 }
 
+/// What the workbook's globals substream tells about the text of its sheets.
+struct Globals<'a> {
+    /// Characters of each shared string.
+    strings: &'a [u16],
+    /// UTF-8 bytes each defined name may take, in the order formulas number
+    /// them.
+    names: Vec<u64>,
+    /// UTF-8 bytes the longest sheet name may take.
+    sheet_bytes: u64,
+    /// UTF-8 bytes one character of a string may become.
+    bytes_per_char: u64,
+    /// Whether formula tokens are read as BIFF5 and older write them.
+    pre_biff8: bool,
+}
+
 /// What `calamine` builds for one sheet.
 struct SheetSize {
     /// Grid cells it reserves and builds.
     cells: u64,
     /// Characters of text it copies into the cells.
     chars: u64,
+    /// Bytes of formula text it writes out.
+    formula_bytes: u64,
     /// Bytes of the sheet's records.
     length: usize,
 }
 
-/// What `calamine` builds for one sheet whose shared strings are `strings`
-/// characters long. Records are read as `calamine` reads them: the sheet's
-/// own, not those of charts nested inside it.
-fn sheet_cells(sheet: &[u8], strings: &[u16]) -> Result<SheetSize, String> {
+/// What `calamine` builds for one sheet of a workbook whose globals are
+/// `globals`. Records are read as `calamine` reads them: the sheet's own,
+/// not those of charts nested inside it.
+fn sheet_cells(sheet: &[u8], globals: &Globals<'_>) -> Result<SheetSize, String> {
     let mut chars = 0u64;
+    let mut formula_bytes = 0u64;
     let mut values = Bounds::default();
     let mut formulas = Bounds::default();
     // Where the last FORMULA record was: `calamine` places each STRING
@@ -552,7 +597,7 @@ fn sheet_cells(sheet: &[u8], strings: &[u16]) -> Result<SheetSize, String> {
                     // LABELSST: a copy of a shared string, whatever its length.
                     0x00FD if data.len() >= 10 => {
                         let shared = u32_at(data, 6)
-                            .and_then(|at| strings.get(index(at)))
+                            .and_then(|at| globals.strings.get(index(at)))
                             .copied()
                             .unwrap_or(0);
                         chars = chars.saturating_add(u64::from(shared));
@@ -564,9 +609,13 @@ fn sheet_cells(sheet: &[u8], strings: &[u16]) -> Result<SheetSize, String> {
                 formula_at = (row, column);
                 values.add(row, column);
                 formulas.add(row, column);
+                // Every formula's text is kept, even many at one cell.
+                formula_bytes =
+                    formula_bytes.saturating_add(formula_text_bytes(&data[20..], globals));
             }
-            // STRING: a cell at the last formula's position, whatever its
-            // length (a short one only makes calamine fail, which is safe).
+            // STRING: a cell at the last formula's position (A1 before any
+            // formula), whatever its length (a short one only makes calamine
+            // fail, which is safe). Each one is kept, even many at one cell.
             0x0207 => {
                 values.add(formula_at.0, formula_at.1);
                 chars = chars.saturating_add(string_chars(Some(data)));
@@ -592,8 +641,153 @@ fn sheet_cells(sheet: &[u8], strings: &[u16]) -> Result<SheetSize, String> {
     Ok(SheetSize {
         cells,
         chars,
+        formula_bytes,
         length: end,
     })
+}
+
+/// Bytes `calamine` keeps for the text of one formula whose parsed
+/// expression (its length first) is `rgce`. The text starts with room for
+/// `rgce` and grows by doubling; a formula `calamine` cannot read becomes a
+/// short message instead.
+fn formula_text_bytes(rgce: &[u8], globals: &Globals<'_>) -> u64 {
+    /// Bytes of the message that stands for a formula `calamine` cannot read.
+    const UNREADABLE: u64 = 256;
+    let room = u64::try_from(rgce.len()).unwrap_or(u64::MAX);
+    formula_text(rgce, globals).map_or(UNREADABLE, |text| room.max(text.saturating_mul(2)))
+}
+
+/// Bytes of the text `calamine` writes out for the formula tokens in `rgce`,
+/// read the way its `parse_formula` reads them: at least as many as it
+/// writes, or `None` where it would fail. Each token's own text is counted
+/// at its longest, and each may add a comma when a function joins its
+/// arguments.
+fn formula_text(rgce: &[u8], globals: &Globals<'_>) -> Option<u64> {
+    /// Functions in calamine's function table.
+    const FUNCTIONS: u16 = 485;
+    /// Bytes of the longest function name, with room to spare.
+    const FUNCTION_NAME: u64 = 32;
+    /// Bytes of a cell reference such as `$XFD$65536`.
+    const CELL: u64 = 10;
+    /// Bytes of an area such as `$XFD$65536:$XFD$65536`.
+    const AREA: u64 = 21;
+    let pre_biff8 = globals.pre_biff8;
+    let sheet = globals.sheet_bytes;
+    let length = usize::from(u16_at(rgce, 0)?);
+    let mut tokens = rgce.get(2..2 + length)?;
+    // A comma for each token, at most.
+    let mut bytes = u64::try_from(length).unwrap_or(u64::MAX);
+    while let Some((&ptg, rest)) = tokens.split_first() {
+        tokens = rest;
+        // Bytes of the token's operands, and the most text it writes.
+        let (size, text): (usize, u64) = match ptg {
+            // PtgRef3d: `Sheet!$A$1` (its column shifted, up to 4 letters).
+            0x3A | 0x5A | 0x7A => (6, sheet + 12),
+            // PtgArea3d
+            0x3B | 0x5B | 0x7B => (10, sheet + 24),
+            // PtgRefErr3d, PtgAreaErr3d: `Sheet!#REF!`
+            0x3C | 0x5C | 0x7C => (6, sheet + 6),
+            0x3D | 0x5D | 0x7D => (10, sheet + 6),
+            // PtgExp
+            0x01 => (4, 0),
+            // Operators, parentheses and PtgMissArg.
+            0x03..=0x16 => (0, 2),
+            // PtgStr: a quoted string.
+            0x17 => {
+                let chars = usize::from(*tokens.first()?);
+                let size = if pre_biff8 {
+                    1 + chars
+                } else if tokens.get(1)? & 0x1 != 0 {
+                    2 + 2 * chars
+                } else {
+                    2 + chars
+                };
+                (
+                    size,
+                    u64::try_from(chars).ok()? * globals.bytes_per_char + 2,
+                )
+            }
+            0x18 => (5, 0),
+            // PtgAttr: `SUM(...)` or spaces; the others write nothing.
+            0x19 => match *tokens.first()? {
+                0x01 | 0x02 | 0x08 | 0x20 | 0x21 => (3, 0),
+                0x04 => (3 + 2 * (usize::from(u16_at(tokens, 1)?) + 1), 0),
+                0x10 => (3, 5),
+                0x40 | 0x41 => {
+                    if *tokens.get(1)? > 0x06 {
+                        return None;
+                    }
+                    (3, u64::from(*tokens.get(2)?))
+                }
+                _ => return None,
+            },
+            // PtgErr
+            0x1C => {
+                if !matches!(
+                    tokens.first()?,
+                    0x00 | 0x07 | 0x0F | 0x17 | 0x1D | 0x24 | 0x2A | 0x2B
+                ) {
+                    return None;
+                }
+                (1, 13)
+            }
+            // PtgBool, PtgInt
+            0x1D => (1, 5),
+            0x1E => (2, 5),
+            // PtgNum: written out in full, up to hundreds of digits.
+            0x1F => {
+                let value = f64::from_le_bytes(tokens.get(..8)?.try_into().ok()?);
+                (8, display_bytes(value))
+            }
+            // PtgArray
+            0x20 | 0x40 | 0x60 => (7, 10),
+            // PtgFunc, PtgFuncVar: `NAME()`.
+            0x21 | 0x41 | 0x61 => {
+                if u16_at(tokens, 0)? >= FUNCTIONS {
+                    return None;
+                }
+                (2, FUNCTION_NAME + 2)
+            }
+            0x22 | 0x42 | 0x62 => (3, FUNCTION_NAME + 2),
+            // PtgName: the defined name's own text, numbered from 1.
+            0x23 | 0x43 | 0x63 => {
+                let name = u32_at(tokens, 0)?
+                    .checked_sub(1)
+                    .and_then(|at| globals.names.get(index(at)))
+                    .copied()
+                    .unwrap_or(5);
+                (4, name)
+            }
+            // PtgRef, PtgArea, PtgRefErr, PtgAreaErr
+            0x24 | 0x44 | 0x64 => (if pre_biff8 { 3 } else { 4 }, CELL),
+            0x25 | 0x45 | 0x65 => (if pre_biff8 { 6 } else { 8 }, AREA),
+            0x2A | 0x4A | 0x6A => (if pre_biff8 { 3 } else { 4 }, 5),
+            0x2B | 0x4B | 0x6B => (if pre_biff8 { 6 } else { 8 }, 5),
+            // PtgNameX
+            0x39 | 0x59 => (6, 10),
+            _ => return None,
+        };
+        tokens = tokens.get(size..)?;
+        bytes = bytes.saturating_add(text);
+    }
+    Some(bytes)
+}
+
+/// Bytes of `value` written as Rust writes an `f64`: in full, never with an
+/// exponent.
+fn display_bytes(value: f64) -> u64 {
+    struct Count(u64);
+    impl std::fmt::Write for Count {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0 = self
+                .0
+                .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = std::fmt::Write::write_fmt(&mut count, format_args!("{value}"));
+    count.0
 }
 
 /// The cells `calamine` reserves for a DIMENSIONS record, mirroring its

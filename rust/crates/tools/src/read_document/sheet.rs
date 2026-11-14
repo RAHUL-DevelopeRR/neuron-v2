@@ -260,9 +260,13 @@ fn cut_data(value: &Data, keep: usize) -> Data {
     }
 }
 
-/// Cuts `text` to `limit` characters after its leading whitespace (which a
-/// table cell drops); whether anything was cut.
+/// Cuts `text` to `limit` characters of what a table cell shows, which drops
+/// leading and trailing whitespace; whether anything was cut. A cell padded
+/// with spaces (as fixed-width exports write them) is not cut for its
+/// padding.
 fn shorten(text: &mut String, limit: usize) -> bool {
+    let end = text.trim_end().len();
+    text.truncate(end);
     let start = text.len() - text.trim_start().len();
     if text.len() - start <= limit {
         return false;

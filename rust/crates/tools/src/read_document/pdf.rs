@@ -689,6 +689,9 @@ struct Run {
     fonts: HashMap<usize, Rc<Font>>,
     /// The fonts of each resource dictionary, by its address.
     resources: HashMap<usize, Rc<HashMap<String, Rc<Font>>>>,
+    /// Encoding tables of simple fonts, by the address of their `/Encoding`
+    /// object (or the place of a base encoding's name in [`glyphs::NAMED`]).
+    encodings: HashMap<usize, Rc<CodeTable>>,
     /// Form `XObject`s being drawn, to skip one that draws itself.
     forms: Vec<u32>,
 }
@@ -1059,7 +1062,7 @@ impl Pdf {
                     let built = if let Some(built) = run.fonts.get(&font_key) {
                         Rc::clone(built)
                     } else {
-                        let built = Rc::new(self.font(font));
+                        let built = Rc::new(self.font(font, &mut run.encodings));
                         run.fonts.insert(font_key, Rc::clone(&built));
                         built
                     };
@@ -1072,7 +1075,9 @@ impl Pdf {
         fonts
     }
 
-    fn font(&self, dict: &Dict) -> Font {
+    /// The font `dict` describes; `encodings` holds the encoding tables
+    /// built so far, by the address of their `/Encoding` object.
+    fn font(&self, dict: &Dict, encodings: &mut HashMap<usize, Rc<CodeTable>>) -> Font {
         let composite = dict.get("Subtype").and_then(Obj::as_name) == Some("Type0");
         let cmap = self
             .get(dict, "ToUnicode")
@@ -1118,7 +1123,7 @@ impl Pdf {
             encoding: if composite {
                 None
             } else {
-                self.simple_encoding(dict)
+                self.simple_encoding(dict, encodings)
             },
             widths,
             default_width,
@@ -1127,9 +1132,29 @@ impl Pdf {
 
     /// What the codes of a simple font mean by its `/Encoding`: a named base
     /// encoding, or a dictionary of one and its `/Differences`. `None` reads
-    /// codes as Windows-1252.
-    fn simple_encoding(&self, dict: &Dict) -> Option<CodeTable> {
+    /// codes as Windows-1252. Fonts sharing one `/Encoding` object, or
+    /// naming the same base encoding, share one table.
+    fn simple_encoding(
+        &self,
+        dict: &Dict,
+        encodings: &mut HashMap<usize, Rc<CodeTable>>,
+    ) -> Option<Rc<CodeTable>> {
         let encoding = self.get(dict, "Encoding")?;
+        let key = match encoding.as_name() {
+            // The few named tables, by their place in this list.
+            Some(name) => glyphs::NAMED.iter().position(|known| *known == name)?,
+            None => std::ptr::from_ref(encoding) as usize,
+        };
+        if let Some(table) = encodings.get(&key) {
+            return Some(Rc::clone(table));
+        }
+        let table = Rc::new(self.encoding_table(encoding)?);
+        encodings.insert(key, Rc::clone(&table));
+        Some(table)
+    }
+
+    /// The table of one `/Encoding` object.
+    fn encoding_table(&self, encoding: &Obj) -> Option<CodeTable> {
         if let Some(name) = encoding.as_name() {
             return glyphs::named(name);
         }
@@ -1148,10 +1173,11 @@ impl Pdf {
                     Obj::Num(number) => code = Some(to_usize(*number)),
                     Obj::Name(glyph) => {
                         if let Some(at) = code {
-                            if let (Some(slot), Some(text)) =
-                                (table.get_mut(at), glyphs::glyph_text(glyph))
-                            {
-                                *slot = text;
+                            // Names past the last code are not read at all.
+                            if let Some(slot) = table.get_mut(at) {
+                                if let Some(text) = glyphs::glyph_text(glyph) {
+                                    *slot = text;
+                                }
                             }
                             code = Some(at.saturating_add(1));
                         }
@@ -1671,7 +1697,7 @@ struct Font {
     cmap: Option<CMap>,
     /// What a simple font's codes mean when `cmap` does not say: its
     /// `/Encoding`, or Windows-1252 when `None`.
-    encoding: Option<CodeTable>,
+    encoding: Option<Rc<CodeTable>>,
     widths: Widths,
     default_width: f64,
 }

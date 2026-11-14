@@ -29,6 +29,8 @@ mod review_tests;
 #[cfg(test)]
 mod round5_tests;
 #[cfg(test)]
+mod round6_tests;
+#[cfg(test)]
 pub(crate) mod tests;
 
 use std::fmt::Write as _;
