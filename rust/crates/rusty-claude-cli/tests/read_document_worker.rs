@@ -2,7 +2,7 @@
 //! worker argument, and the parent maps its replies and failures.
 
 use std::fmt::Write as _;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -58,18 +58,40 @@ fn the_worker_reads_a_document_and_reports_errors_as_json() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("start worker");
-    let request = serde_json::json!({ "path": path, "pages": "1", "max_chars": 2000 });
+    let request = tools::document_worker_request(&path, Some("1"), Some(2000)).expect("request");
+    // Stdin stays open while the worker reads: it closing means the parent
+    // has gone.
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(&request).expect("send request");
+    let mut stdout = Vec::new();
     child
-        .stdin
+        .stdout
         .take()
-        .expect("stdin")
-        .write_all(request.to_string().as_bytes())
-        .expect("send request");
-    let output = child.wait_with_output().expect("worker output");
-    assert!(output.status.success(), "{output:?}");
-    let reply: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json reply");
+        .expect("stdout")
+        .read_to_end(&mut stdout)
+        .expect("reply");
+    let status = child.wait().expect("worker exit");
+    drop(stdin);
+    assert!(status.success(), "{status:?}");
+    let reply: serde_json::Value = serde_json::from_slice(&stdout).expect("json reply");
     let markdown = reply["ok"].as_str().expect("ok reply");
     assert!(markdown.contains("Hello from the worker"), "{markdown}");
+
+    // A worker whose parent goes away (stdin closes) stops at once rather
+    // than finishing its read for no one.
+    let mut child = Command::new(neuron())
+        .arg(tools::DOCUMENT_WORKER_ARG)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start worker");
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin.write_all(&request).expect("send request");
+    drop(stdin);
+    let status = child.wait().expect("worker exit");
+    // Either it answered first (0) or it saw its parent go first (4).
+    assert!(matches!(status.code(), Some(0 | 4)), "{status:?}");
 
     // A bad request is an error reply, not a crash.
     let output = Command::new(neuron())
@@ -110,7 +132,8 @@ fn reads_through_the_worker_return_markdown_or_the_readers_error() {
 
     // A binary that is not a worker gives an unsafe-read error, not a panic.
     let not_a_worker = if cfg!(windows) {
-        PathBuf::from(std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string()))
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        PathBuf::from(system).join(r"System32\where.exe")
     } else {
         PathBuf::from("/bin/sh")
     };

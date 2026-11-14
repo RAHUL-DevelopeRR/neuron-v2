@@ -60,7 +60,7 @@ pub(super) fn read(
     budget: &mut Budget,
 ) -> Result<Document, String> {
     let data = std::fs::read(path).map_err(|error| format!("cannot open the file: {error}"))?;
-    if find(&data[..data.len().min(1024)], b"%PDF-").is_none() && super::looks_like_text(&data) {
+    if !runtime::has_pdf_header(&data) && super::looks_like_text(&data) {
         return Err(super::text_file_error(path));
     }
     read_bytes(&data, selection, budget)
@@ -72,8 +72,7 @@ pub(super) fn read_bytes(
     selection: &Selection,
     budget: &mut Budget,
 ) -> Result<Document, String> {
-    let head = &data[..data.len().min(1024)];
-    if find(head, b"%PDF-").is_none() {
+    if !runtime::has_pdf_header(data) {
         return Err("this is not a readable PDF document: the %PDF header is missing".to_string());
     }
     let pdf = Pdf::parse(data)?;

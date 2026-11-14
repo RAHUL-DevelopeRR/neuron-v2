@@ -137,10 +137,10 @@ pub use conversation::{
 };
 pub use file_ops::{
     display_path, document_kind, document_named_file_is_text, edit_file, edit_file_in_workspace,
-    glob_search, grep_search, is_blank_search_path, read_file, read_file_in_workspace,
-    readable_file_in_workspace, write_file, write_file_in_workspace, EditFileOutput,
-    GlobSearchOutput, GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk,
-    TextFilePayload, WriteFileOutput, DOCUMENT_KINDS,
+    glob_search, grep_search, has_pdf_header, is_blank_search_path, read_file,
+    read_file_in_workspace, readable_file_in_workspace, write_file, write_file_in_workspace,
+    EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput, ReadFileOutput,
+    StructuredPatchHunk, TextFilePayload, WriteFileOutput, DOCUMENT_KINDS,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hook_matcher::{matcher_matches, validate_matcher, HookCommand, HookSource};

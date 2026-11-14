@@ -107,6 +107,52 @@ fn a_shared_string_table_claiming_billions_of_strings_is_refused() {
 }
 
 #[test]
+fn a_workbook_repeating_a_few_strings_in_many_cells_reads() {
+    // `count` is every string cell in the workbook, `uniqueCount` the table's
+    // entries: a sheet of status columns has millions of one and fifty of the
+    // other, in a table of a few hundred bytes.
+    let dir = temp_dir("sst-repeated");
+    let strings = (0..50)
+        .map(|index| format!("<si><t>S{index}</t></si>"))
+        .collect::<String>();
+    let table = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="2000000" uniqueCount="50">{strings}</sst>"#
+    );
+    let rows = (1..=20)
+        .map(|row| {
+            format!(
+                r#"<row r="{row}"><c r="A{row}" t="s"><v>{}</v></c><c r="B{row}" t="s"><v>{}</v></c></row>"#,
+                row % 50,
+                (row * 7) % 50
+            )
+        })
+        .collect::<String>();
+    let bytes = workbook_with(
+        "worksheets/sheet1.xml",
+        sheet_xml(&rows),
+        vec![("xl/sharedStrings.xml", table)],
+    );
+    let path = write(&dir, "status.xlsx", &bytes);
+    let out = read(&path, None, None).expect("an ordinary workbook reads");
+    assert!(out.contains("| 1 | S1 | S7 |"), "{out}");
+    assert!(out.contains("| 20 | S20 | S40 |"), "{out}");
+    // A writer that puts the cell count in uniqueCount as well still reads.
+    let sloppy = workbook_with(
+        "worksheets/sheet1.xml",
+        sheet_xml(r#"<row r="1"><c r="A1" t="s"><v>0</v></c></row>"#),
+        vec![(
+            "xl/sharedStrings.xml",
+            r#"<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1500000" uniqueCount="1500000"><si><t>hello</t></si></sst>"#
+                .to_string(),
+        )],
+    );
+    let path = write(&dir, "sloppy.xlsx", &sloppy);
+    let out = read(&path, None, None).expect("a modest wrong uniqueCount still reads");
+    assert!(out.contains("| 1 | hello |"), "{out}");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn every_zip_entry_is_measured_whatever_its_extension() {
     let dir = temp_dir("zip-dat");
     // The sheet lives at a path with no XML extension, and unpacks past the
@@ -737,9 +783,9 @@ fn word_table(rows: &[Vec<String>]) -> String {
 #[test]
 fn a_huge_header_over_many_page_broken_rows_is_not_copied_per_page() {
     let dir = temp_dir("table-header-pages");
-    // 64 header cells of 16 KB each, then 50,000 rows that each hold only a
-    // page break: every row starts a page. The header used to be copied and
-    // rendered once per page, about 100 GB.
+    // 64 header cells of 16 KB each, then 50,000 rows that each start a page
+    // and hold some text. The header used to be copied and rendered once per
+    // page, about 100 GB.
     let mut body = String::from("<w:tbl><w:tr>");
     for column in 0..64 {
         let _ = write!(
@@ -749,22 +795,172 @@ fn a_huge_header_over_many_page_broken_rows_is_not_copied_per_page() {
         );
     }
     body.push_str("</w:tr>");
-    for _ in 0..50_000 {
-        body.push_str(r#"<w:tr><w:tc><w:p><w:r><w:br w:type="page"/></w:r></w:p></w:tc></w:tr>"#);
+    for number in 0..50_000 {
+        let _ = write!(
+            body,
+            r#"<w:tr><w:tc><w:p><w:r><w:br w:type="page"/><w:t>row{number}</w:t></w:r></w:p></w:tc></w:tr>"#
+        );
     }
     body.push_str("</w:tbl>");
     let path = write(&dir, "pages.docx", &super::tests::docx(&body));
     let started = Instant::now();
-    let out = read(&path, Some("1"), Some(36_000)).expect("reads");
+    let first = read(&path, Some("1"), Some(36_000)).expect("reads");
+    // The first page holds the header, its cells cut short, once.
+    assert_eq!(first.matches("| h0").count(), 1, "{first:.500}");
+    assert!(first.contains(" [...]"), "{first:.500}");
+    assert!(!first.contains("(table continued)"));
+    // A later page continues the table under a shorter copy of the header.
+    let second = read(&path, Some("2"), Some(36_000)).expect("reads");
     assert!(
         started.elapsed() < Duration::from_secs(60),
         "{:?}",
         started.elapsed()
     );
-    // One header, its cells cut short, and nothing repeated.
-    assert_eq!(out.matches("| h0").count(), 1, "{out:.500}");
-    assert!(out.contains(" [...]"), "{out:.500}");
-    assert!(!out.contains("(table continued)"));
+    assert!(second.contains("(table continued)"), "{second:.500}");
+    assert!(second.contains("| row0 |"), "{second:.500}");
+    let repeated = second
+        .lines()
+        .find(|line| line.starts_with("| h0"))
+        .expect("the header is repeated");
+    assert!(repeated.chars().count() < 4_000, "{}", repeated.len());
+
+    // Every part together stays within the table cap, repeated headers
+    // included, and says that the rest is left out.
+    let mut table = super::TableBuilder::default();
+    table.start_row(1);
+    for column in 0..64 {
+        table.start_cell();
+        table.push_line(&format!("h{column}{}", "x".repeat(16_000)));
+    }
+    for number in 0..50_000 {
+        table.start_row(number + 2);
+        table.start_cell();
+        table.push_line(&format!("row{number}"));
+    }
+    let parts = table.into_parts();
+    assert!(parts.len() > 100, "{}", parts.len());
+    assert!(parts[1].render().starts_with("(table continued)"));
+    let total = parts
+        .iter()
+        .map(super::TablePart::rendered_chars)
+        .sum::<usize>();
+    // The cap holds the header, the rows and the repeated headers; only the
+    // closing note about the rows left out comes on top.
+    let note = parts
+        .last()
+        .and_then(|part| part.note.as_ref())
+        .map_or(0, |note| note.chars().count() + 2);
+    assert!(note > 0 && note < 100, "{note}");
+    assert!(total <= super::MAX_DOCUMENT_TABLE_CHARS + note, "{total}");
+    assert_eq!(
+        parts
+            .iter()
+            .map(|part| part.render().chars().count())
+            .sum::<usize>(),
+        total
+    );
+    let last = parts.last().expect("a part").render();
+    assert!(
+        last.ends_with("more rows of this table are longer than read_document returns]"),
+        "{}",
+        &last[last.len().saturating_sub(200)..]
+    );
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Reads every page of `path` by following the hints, `max_chars` at a time,
+/// and returns all the text; fails when a hint says something cannot be
+/// reached.
+fn read_all_pages(path: &Path, max_chars: usize) -> String {
+    let mut all = String::new();
+    let mut next = "1-".to_string();
+    for _ in 0..1_000 {
+        let out = read(path, Some(&next), Some(max_chars)).expect("reads");
+        assert!(!out.contains("does not fit in one call"), "{out:.500}");
+        assert!(!out.contains("longer than max_chars"), "{out:.500}");
+        all.push_str(&out);
+        let Some((_, hint)) = out.rsplit_once("use pages=\"") else {
+            return all;
+        };
+        let start = hint
+            .split(|ch: char| !ch.is_ascii_digit())
+            .next()
+            .unwrap_or_default();
+        next = format!("{start}-");
+    }
+    panic!("the hints never reached the end");
+}
+
+#[test]
+fn a_long_table_after_a_saved_page_break_can_be_read_to_its_end() {
+    let dir = temp_dir("table-after-break");
+    let mut rows = vec![vec![
+        "Code".to_string(),
+        "Name".to_string(),
+        "Region".to_string(),
+        "Amount".to_string(),
+    ]];
+    for number in 1..=1_000 {
+        rows.push(
+            (0..4)
+                .map(|column| format!("r{number:04}c{column}-{}", "q".repeat(52)))
+                .collect(),
+        );
+    }
+    // An explicit page break, as generated files write between sections,
+    // and no break saved inside the table: the table is all of page 2.
+    let body = format!(
+        r#"<w:p><w:r><w:t>Intro</w:t><w:br w:type="page"/></w:r></w:p>{}"#,
+        word_table(&rows)
+    );
+    let path = write(&dir, "sections.docx", &super::tests::docx(&body));
+    let first = read(&path, Some("1"), Some(36_000)).expect("reads");
+    assert!(first.contains("pages are estimated"), "{first:.500}");
+    let all = read_all_pages(&path, 36_000);
+    let seen = all
+        .lines()
+        .filter(|line| line.starts_with("| r"))
+        .map(|line| line[3..7].parse::<usize>().expect("row number"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(seen.len(), 1_000, "every row is on some page");
+    assert!(seen.contains(&1_000));
+
+    // A short table after the same break keeps the saved page numbers.
+    let body = format!(
+        r#"<w:p><w:r><w:t>Intro</w:t><w:br w:type="page"/></w:r></w:p>{}"#,
+        word_table(&rows[..20])
+    );
+    let path = write(&dir, "short.docx", &super::tests::docx(&body));
+    let second = read(&path, Some("2"), Some(36_000)).expect("reads");
+    assert!(
+        second.contains("follow the page breaks saved"),
+        "{second:.500}"
+    );
+    assert!(second.contains("| r0019c0-"), "{second:.500}");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn a_long_header_and_a_long_first_row_each_fit_in_one_call() {
+    let dir = temp_dir("table-long-start");
+    let header = (0..6)
+        .map(|column| format!("H{column}{}", "a".repeat(4_100)))
+        .collect::<Vec<_>>();
+    let first_row = (0..6)
+        .map(|column| format!("R{column}{}", "b".repeat(4_100)))
+        .collect::<Vec<_>>();
+    let body = format!(
+        "{}<w:p><w:r><w:t>After the table</w:t></w:r></w:p>",
+        word_table(&[header, first_row])
+    );
+    let path = write(&dir, "long-start.docx", &super::tests::docx(&body));
+    let all = read_all_pages(&path, 36_000);
+    let row = all
+        .lines()
+        .find(|line| line.starts_with("| R0"))
+        .expect("the first row is shown");
+    assert!(row.contains("| R5"), "the whole row: {}", row.len());
+    assert!(all.contains("After the table"));
     std::fs::remove_dir_all(dir).ok();
 }
 

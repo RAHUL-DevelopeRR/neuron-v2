@@ -84,10 +84,24 @@ fn check_read_size(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether the file starts like a PDF, a zip package (OOXML, ODF) or an OLE
-/// compound file (`.xls`).
+/// Bytes at the start of a file searched for the `%PDF-` header: readers
+/// accept junk before it, and so does `read_document`.
+const PDF_HEADER_WINDOW: usize = 1024;
+
+/// Whether `bytes` (the start of a file) hold a PDF header within the first
+/// [`PDF_HEADER_WINDOW`] bytes. `read_file` and `read_document` share this
+/// test, so they agree on what is a PDF.
+#[must_use]
+pub fn has_pdf_header(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(PDF_HEADER_WINDOW)]
+        .windows(5)
+        .any(|window| window == b"%PDF-")
+}
+
+/// Whether the file starts like a PDF (see [`has_pdf_header`]), a zip
+/// package (OOXML, ODF) or an OLE compound file (`.xls`).
 fn has_document_magic(path: &Path) -> io::Result<bool> {
-    let mut head = [0u8; 8];
+    let mut head = [0u8; PDF_HEADER_WINDOW];
     let mut file = fs::File::open(path)?;
     let mut read = 0;
     while read < head.len() {
@@ -97,7 +111,7 @@ fn has_document_magic(path: &Path) -> io::Result<bool> {
         }
     }
     let head = &head[..read];
-    Ok(head.starts_with(b"%PDF-")
+    Ok(has_pdf_header(head)
         || head.starts_with(b"PK\x03\x04")
         || head.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]))
 }
@@ -119,7 +133,9 @@ pub fn document_named_file_is_text(bytes: &[u8]) -> bool {
 
 /// `bytes` as text when [`document_named_file_is_text`] says they are:
 /// UTF-16 by its byte order mark, else UTF-8, else Windows-1252 (the usual
-/// code page of such exports).
+/// code page of such exports). Text that is mostly UTF-8 with a few bad
+/// bytes (a cut or joined export) stays UTF-8, with only the bad bytes
+/// replaced, rather than turning every accented letter into two.
 fn decode_document_named_text(bytes: &[u8]) -> Option<String> {
     if bytes.is_empty() {
         return Some(String::new());
@@ -145,8 +161,25 @@ fn decode_document_named_text(bytes: &[u8]) -> Option<String> {
     }
     match std::str::from_utf8(bytes) {
         Ok(text) => Some(text.strip_prefix('\u{feff}').unwrap_or(text).to_string()),
+        Err(_) if mostly_utf8(bytes) => {
+            let text = String::from_utf8_lossy(bytes);
+            Some(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
+        }
         Err(_) => Some(bytes.iter().map(|&byte| windows_1252(byte)).collect()),
     }
+}
+
+/// Whether `bytes`, which are not all valid UTF-8, still read as UTF-8: they
+/// hold valid multibyte characters, at least as many as invalid bytes.
+/// Windows-1252 text almost never forms a valid multibyte sequence.
+fn mostly_utf8(bytes: &[u8]) -> bool {
+    let mut multibyte = 0usize;
+    let mut invalid = 0usize;
+    for chunk in bytes.utf8_chunks() {
+        multibyte += chunk.valid().chars().filter(|ch| ch.len_utf8() > 1).count();
+        invalid += chunk.invalid().len();
+    }
+    multibyte > 0 && multibyte >= invalid
 }
 
 /// One Windows-1252 byte as a character.
@@ -1991,6 +2024,26 @@ mod tests {
             message.contains("paper.pdf is a PDF document; read it with read_document"),
             "{message}"
         );
+        // A PDF header a little way into the file still counts, as it does
+        // for read_document, even when no NUL byte comes early.
+        let shifted = temp_path("shifted-dir").join("shifted.pdf");
+        std::fs::create_dir_all(shifted.parent().expect("parent")).expect("dir");
+        let mut bytes = b"\r\n%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+        bytes.extend(
+            "1 0 obj << /Type /Catalog >> endobj\n"
+                .repeat(300)
+                .as_bytes(),
+        );
+        std::fs::write(&shifted, &bytes).expect("write");
+        let message = read_file(shifted.to_string_lossy().as_ref(), None, None)
+            .expect_err("a PDF")
+            .to_string();
+        assert!(message.contains("read it with read_document"), "{message}");
+        assert!(super::has_pdf_header(&bytes));
+        assert!(!super::has_pdf_header(&[b' '; 2048]));
+        let mut late = vec![b' '; 1024];
+        late.extend(b"%PDF-1.7");
+        assert!(!super::has_pdf_header(&late));
         // A text file with a document extension still reads as text.
         let text = temp_path("text-dir").join("notes.pdf");
         std::fs::create_dir_all(text.parent().expect("parent")).expect("dir");
@@ -2027,6 +2080,19 @@ mod tests {
             let text = content("unicode.xls", &bytes);
             assert!(text.contains("Jos\u{e9}\tM\u{e1}laga"), "{text}");
         }
+        // Mostly UTF-8 with one stray or cut byte stays UTF-8: only the bad
+        // byte is replaced.
+        let mut stray = "Name,City\nJos\u{e9},M\u{e1}laga\n".as_bytes().to_vec();
+        stray.push(0xFF);
+        let text = content("stray.xls", &stray);
+        assert!(text.contains("Jos\u{e9},M\u{e1}laga\n\u{fffd}"), "{text}");
+        let mut cut = "Stra\u{df}e,K\u{f6}ln,Z\u{fc}rich,".as_bytes().to_vec();
+        cut.push("\u{e9}".as_bytes()[0]);
+        let text = content("cut.xls", &cut);
+        assert!(
+            text.starts_with("Stra\u{df}e,K\u{f6}ln,Z\u{fc}rich,"),
+            "{text}"
+        );
         // UTF-8 with a byte order mark loses the mark.
         assert_eq!(
             content("bom.xls", "\u{feff}a,b\n".as_bytes()).trim_end(),

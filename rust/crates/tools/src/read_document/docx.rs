@@ -70,6 +70,26 @@ pub(super) fn read(
     Ok(paginate(parsed, selection, saved_pages, budget))
 }
 
+/// The first of the `pages` saved pages whose blocks, with the page's
+/// `[page N]` label, render to more than `ceiling` characters, if any.
+fn overlong_saved_page(blocks: &[Block], pages: usize, ceiling: usize) -> Option<usize> {
+    /// Room for the `[page N]` label and the blank line after it.
+    const PAGE_LABEL_CHARS: usize = 32;
+    let ceiling = ceiling.saturating_sub(PAGE_LABEL_CHARS);
+    let mut sizes = vec![0usize; pages];
+    for block in blocks {
+        let size = &mut sizes[block.page().clamp(1, pages) - 1];
+        if *size > 0 {
+            *size += 2;
+        }
+        *size += block.chars();
+    }
+    sizes
+        .iter()
+        .position(|size| *size > ceiling)
+        .map(|index| index + 1)
+}
+
 /// `<Pages>46</Pages>` from `docProps/app.xml`.
 fn saved_page_count(xml: &str) -> Option<usize> {
     let mut in_pages = false;
@@ -93,7 +113,15 @@ fn paginate(
     let ParsedBody { blocks, pages } = parsed;
     let mut notes = Vec::new();
     let mut pages_of_blocks: Vec<Vec<String>> = Vec::new();
-    if pages > 1 {
+    // A saved page longer than one call returns (a long table with no break
+    // saved inside it, as generated files often have) could not be read to
+    // its end; such a file is paginated by size instead.
+    let overlong = if pages > 1 {
+        overlong_saved_page(&blocks, pages, super::max_chars_ceiling())
+    } else {
+        None
+    };
+    if pages > 1 && overlong.is_none() {
         pages_of_blocks.resize(pages, Vec::new());
         for block in blocks {
             let page = block.page().clamp(1, pages);
@@ -136,9 +164,14 @@ fn paginate(
             pages_of_blocks.push(current);
         }
         if pages_of_blocks.len() > 1 {
-            let mut note = format!(
-                "the file has no saved page breaks; pages are estimated at about {ESTIMATED_PAGE_CHARS} characters each"
-            );
+            let mut note = match overlong {
+                Some(page) => format!(
+                    "page {page} of the saved page breaks holds more than one call returns, so pages are estimated at about {ESTIMATED_PAGE_CHARS} characters each instead"
+                ),
+                None => format!(
+                    "the file has no saved page breaks; pages are estimated at about {ESTIMATED_PAGE_CHARS} characters each"
+                ),
+            };
             if let Some(saved) = saved_pages {
                 let _ = write!(note, " (Word last counted {saved} pages)");
             }
@@ -489,6 +522,14 @@ impl Block {
         match self {
             Self::Text { page, .. } => *page,
             Self::Table(part) => part.page,
+        }
+    }
+
+    /// Characters of [`Self::into_markdown`], without building it.
+    fn chars(&self) -> usize {
+        match self {
+            Self::Text { markdown, .. } => markdown.chars().count(),
+            Self::Table(part) => part.rendered_chars(),
         }
     }
 

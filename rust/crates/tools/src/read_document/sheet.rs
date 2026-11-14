@@ -267,11 +267,16 @@ fn check_zip(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<(), String>
     Ok(())
 }
 
+/// Shared string counts every table may claim, whatever its size: room for
+/// this many strings is a few tens of megabytes, which the reader can always
+/// spare, so a writer that gets `uniqueCount` wrong still reads.
+const SHARED_STRINGS_ALWAYS_ALLOWED: u64 = 2_000_000;
+
 /// Refuses an `.xlsx` whose shared string table claims more strings than its
-/// bytes can hold: `calamine` reserves room for the claimed count before it
-/// reads one, and a failed reservation aborts the program. Each `<si/>` takes
-/// at least five bytes. Every part named like a shared string table is
-/// checked, wherever the workbook's relationships put it.
+/// bytes can hold: `calamine` reserves room for the claimed `uniqueCount`
+/// before it reads one, and a failed reservation aborts the program. Each
+/// `<si/>` takes at least five bytes. Every part named like a shared string
+/// table is checked, wherever the workbook's relationships put it.
 fn check_shared_strings(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<(), String> {
     let names = archive
         .file_names()
@@ -286,7 +291,8 @@ fn check_shared_strings(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<
             .read_to_end(&mut bytes)
             .map_err(unreadable)?;
         let claimed = shared_string_count(&bytes);
-        if claimed > bytes.len() as u64 / 5 + 16 {
+        let holds = (bytes.len() as u64 / 5 + 16).max(SHARED_STRINGS_ALWAYS_ALLOWED);
+        if claimed > holds {
             return Err(unreadable(
                 "its shared string table claims more strings than it holds",
             ));
@@ -295,8 +301,12 @@ fn check_shared_strings(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<
     Ok(())
 }
 
-/// The `uniqueCount` (or `count`, whichever is larger) of the first `sst`
-/// element, as `calamine` reads it; 0 when there is none.
+/// The `uniqueCount` of the first `sst` element, the one attribute `calamine`
+/// reserves by; 0 when there is none. `count` is left alone: it is the number
+/// of string cells in the whole workbook, routinely far more than the table
+/// holds, and `calamine` never reads it. The number is read more leniently
+/// than `calamine` reads it (a sign or trailing text still counts), so every
+/// value it would reserve by is measured.
 fn shared_string_count(xml: &[u8]) -> u64 {
     let text = String::from_utf8_lossy(xml);
     let mut reader = quick_xml::Reader::from_str(&text);
@@ -309,9 +319,7 @@ fn shared_string_count(xml: &[u8]) -> u64 {
                     .attributes()
                     .with_checks(false)
                     .flatten()
-                    .filter(|attr| {
-                        matches!(attr.key.local_name().into_inner(), "uniqueCount" | "count")
-                    })
+                    .filter(|attr| attr.key.local_name().into_inner() == "uniqueCount")
                     .map(|attr| leading_number(&attr.value))
                     .max()
                     .unwrap_or(0);

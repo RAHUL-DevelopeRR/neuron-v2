@@ -614,6 +614,10 @@ pub(crate) const MAX_CELL_CHARS: usize = 4_000;
 const MAX_ROW_LINE_CHARS: usize = 24_000;
 /// Characters of the header row repeated over each continued part.
 const MAX_REPEATED_HEADER_CHARS: usize = 2_000;
+/// Characters a part may take with its header and first row: past this the
+/// first part holds the header alone and the row starts a continued part,
+/// whose header is short, so no part outgrows one call.
+const MAX_PART_START_CHARS: usize = MAX_ROW_LINE_CHARS + MAX_REPEATED_HEADER_CHARS + 64;
 /// Characters one document table renders to across all its parts, repeated
 /// headers included. Tables are split into parts of about a page, so this
 /// is more than one call returns but every part stays reachable.
@@ -670,12 +674,33 @@ pub(crate) struct TablePart {
 }
 
 impl TablePart {
-    pub(crate) fn render(&self) -> String {
-        let header: &str = if self.continued {
+    fn shown_header(&self) -> &str {
+        if self.continued {
             &self.repeat_header
         } else {
             &self.header
-        };
+        }
+    }
+
+    /// Characters of [`Self::render`], without building it.
+    pub(crate) fn rendered_chars(&self) -> usize {
+        let continued = if self.continued { CONTINUED.len() } else { 0 };
+        let note = self
+            .note
+            .as_ref()
+            .map_or(0, |note| note.chars().count() + 2);
+        continued
+            + self.shown_header().chars().count()
+            + self
+                .lines
+                .iter()
+                .map(|line| line.chars().count() + 1)
+                .sum::<usize>()
+            + note
+    }
+
+    pub(crate) fn render(&self) -> String {
+        let header = self.shown_header();
         let mut out = String::with_capacity(
             header.len() + self.lines.iter().map(|line| line.len() + 1).sum::<usize>() + 32,
         );
@@ -694,9 +719,11 @@ impl TablePart {
         out
     }
 
-    /// The part as parts of about `max_chars` characters of rows each, all
-    /// but the first continuing the table, so no one page has to hold a
-    /// long table (pages estimated by size).
+    /// The part as parts of about `max_chars` characters each, header
+    /// included, all but the first continuing the table, so no one page has
+    /// to hold a long table (pages estimated by size). A first part whose
+    /// header and first row together pass [`MAX_PART_START_CHARS`] holds the
+    /// header alone.
     pub(crate) fn split(self, max_chars: usize) -> Vec<TablePart> {
         let Self {
             page,
@@ -714,18 +741,32 @@ impl TablePart {
             lines,
             note: None,
         };
+        let header_chars = |continued: bool| {
+            if continued {
+                repeat_header.chars().count() + CONTINUED.len()
+            } else {
+                header.chars().count()
+            }
+        };
         let mut parts = Vec::new();
         let mut current = Vec::new();
-        let mut size = 0;
+        let mut size = header_chars(continued);
         for line in lines {
-            if size >= max_chars && !current.is_empty() {
+            let line_chars = line.chars().count() + 1;
+            let first = !continued && parts.is_empty();
+            let full = if current.is_empty() {
+                first && size + line_chars > MAX_PART_START_CHARS
+            } else {
+                size >= max_chars
+            };
+            if full {
                 parts.push(part(
                     continued || !parts.is_empty(),
                     std::mem::take(&mut current),
                 ));
-                size = 0;
+                size = header_chars(true);
             }
-            size += line.chars().count() + 1;
+            size += line_chars;
             current.push(line);
         }
         let mut last = part(continued || !parts.is_empty(), current);

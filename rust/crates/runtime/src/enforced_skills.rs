@@ -10,6 +10,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
@@ -97,22 +98,116 @@ pub fn enforced_skill_root(config_home: &Path) -> io::Result<PathBuf> {
         .or_else(|error| private_fallback_root(&skills).map_err(|_| error))
 }
 
+/// Starts the name of every fallback folder.
+const FALLBACK_PREFIX: &str = "neuron-enforced-";
+/// The file in a fallback folder its process keeps locked while it runs.
+const OWNER_LOCK: &str = ".owner.lock";
+/// How old a fallback folder with no lock file (an older build's, or one
+/// whose process stopped before it made the lock) must be to be removed.
+const UNLOCKED_FALLBACK_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// How old a free lock file must be before its folder counts as abandoned:
+/// a process makes its lock file and locks it a moment later, and a folder
+/// caught in that moment must not be taken for an ended process's.
+const FREE_LOCK_AGE: Duration = Duration::from_secs(60);
+
 /// The fallback folder for enforced skill files: created by this process
 /// under an unguessable name (owner-only on Unix), never a shared or
 /// predictable path another user could fill first, and reused for the rest
 /// of the process while it is still a folder only its owner can reach.
+///
+/// The process keeps [`OWNER_LOCK`] in it locked until it exits (the system
+/// drops the lock then, however the process ends). Each new fallback folder
+/// removes the earlier ones whose lock nobody holds any more, so a config
+/// home that cannot be written leaves at most one folder per running
+/// process behind.
 fn private_fallback_root(skills: &[EnforcedSkill]) -> io::Result<PathBuf> {
-    static ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+    static ROOT: Mutex<Option<(PathBuf, fs::File)>> = Mutex::new(None);
     let mut root = ROOT.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(existing) = root.as_ref() {
+    if let Some((existing, _)) = root.as_ref() {
         if is_private_dir(existing) && write_skill_files(existing, skills).is_ok() {
             return Ok(existing.clone());
         }
     }
     let created = create_private_dir()?;
+    let lock = fs::File::create(created.join(OWNER_LOCK))?;
+    lock.lock()?;
     write_skill_files(&created, skills)?;
-    *root = Some(created.clone());
+    remove_stale_fallbacks(&created);
+    *root = Some((created.clone(), lock));
     Ok(created)
+}
+
+/// Removes the fallback folders next to `ours` that no running process
+/// owns: their lock is free, or they have none and are old. Folders this
+/// user cannot open, or whose owner still runs, are left alone; any failure
+/// just leaves a folder for a later run.
+fn remove_stale_fallbacks(ours: &Path) {
+    let Some(base) = ours.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_fallback = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(FALLBACK_PREFIX));
+        if !is_fallback || path == ours || !is_private_dir(&path) || !same_owner(&path, ours) {
+            continue;
+        }
+        if is_stale_fallback(&path) {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// Whether the fallback folder at `path` belongs to no running process.
+fn is_stale_fallback(path: &Path) -> bool {
+    match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.join(OWNER_LOCK))
+    {
+        // Free to lock, and not just made: its process has ended. The lock
+        // is dropped again before the folder goes.
+        Ok(lock) => older_than(lock.metadata(), FREE_LOCK_AGE) && lock.try_lock().is_ok(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // No lock at all: only an old folder (and only one that holds
+            // nothing but skill files) counts as abandoned.
+            older_than(fs::symlink_metadata(path), UNLOCKED_FALLBACK_AGE)
+                && path.join("reading-documents").is_dir()
+        }
+        Err(_) => false,
+    }
+}
+
+/// Whether `metadata` was last modified at least `age` ago.
+fn older_than(metadata: io::Result<fs::Metadata>, age: Duration) -> bool {
+    metadata
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|elapsed| elapsed >= age)
+}
+
+/// Whether `path` and `ours` have the same owner (always true off Unix,
+/// where the temp folder is the user's own).
+fn same_owner(path: &Path, ours: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (fs::symlink_metadata(path), fs::symlink_metadata(ours)) {
+            (Ok(theirs), Ok(mine)) => theirs.uid() == mine.uid(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, ours);
+        true
+    }
 }
 
 /// A new, empty folder in the temp folder, made by this call: creation
@@ -121,7 +216,7 @@ fn create_private_dir() -> io::Result<PathBuf> {
     let base = std::env::temp_dir();
     for _ in 0..16 {
         let path = base.join(format!(
-            "neuron-enforced-{}-{:016x}",
+            "{FALLBACK_PREFIX}{}-{:016x}",
             std::process::id(),
             rand::random::<u64>()
         ));
@@ -329,13 +424,54 @@ mod tests {
             assert_eq!(mode & 0o777, 0o700);
         }
         // Reused for the rest of the process (other tests share it, so its
-        // files are left in place).
+        // files are left in place while it runs).
         assert_eq!(enforced_skill_root(&config_home).unwrap(), fallback);
+        // This process holds its folder's lock, so no other run removes it.
+        assert!(!is_stale_fallback(&fallback));
         // A folder that already exists is never taken over.
         let another = create_private_dir().unwrap();
         assert_ne!(another, fallback);
         fs::remove_dir_all(another).unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fallback_folders_of_ended_processes_are_removed() {
+        let skills = compiled_enforced_skills();
+        // An ended process's folder: its lock file is there but nobody
+        // holds it.
+        let ended = create_private_dir().unwrap();
+        let free = fs::File::create(ended.join(OWNER_LOCK)).unwrap();
+        write_skill_files(&ended, &skills).unwrap();
+        // A free lock made a moment ago may belong to a process about to
+        // take it, so it is left alone until it is a minute old.
+        assert!(!is_stale_fallback(&ended));
+        free.set_modified(SystemTime::now() - Duration::from_secs(3_600))
+            .unwrap();
+        drop(free);
+        // A running process's folder: its lock is held.
+        let running = create_private_dir().unwrap();
+        let held = fs::File::create(running.join(OWNER_LOCK)).unwrap();
+        // Old, so only the held lock keeps it.
+        held.set_modified(SystemTime::now() - Duration::from_secs(3_600))
+            .unwrap();
+        held.lock().unwrap();
+        write_skill_files(&running, &skills).unwrap();
+        // A folder just made, before its lock: too young to touch.
+        let young = create_private_dir().unwrap();
+        assert!(is_stale_fallback(&ended));
+        assert!(!is_stale_fallback(&running));
+        assert!(!is_stale_fallback(&young));
+
+        let ours = create_private_dir().unwrap();
+        remove_stale_fallbacks(&ours);
+        assert!(!ended.exists(), "{}", ended.display());
+        assert!(running.join("reading-documents").join("SKILL.md").is_file());
+        assert!(young.is_dir());
+        drop(held);
+        for path in [running, young, ours] {
+            fs::remove_dir_all(path).unwrap();
+        }
     }
 
     #[test]
