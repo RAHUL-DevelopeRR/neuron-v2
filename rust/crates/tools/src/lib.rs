@@ -719,6 +719,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                         "type": "string",
                         "description": "Pages, slides or sheets to read, for example \"3\", \"2-5\" or \"1,4-\"; a sheet name also works. Default: all"
                     },
+                    "rows": {
+                        "type": "string",
+                        "description": "Spreadsheets only: sheet rows to read, for example \"501-1000\""
+                    },
+                    "columns": {
+                        "type": "string",
+                        "description": "Spreadsheets only: columns to read, for example \"AO-BZ\""
+                    },
                     "max_chars": {
                         "type": "integer",
                         "minimum": 500,
@@ -2605,7 +2613,15 @@ fn run_read_document(input: ReadDocumentInput) -> Result<String, String> {
     let workspace_root = runtime::workdir::current_dir().map_err(|error| error.to_string())?;
     let path =
         runtime::readable_file_in_workspace(&input.path, &workspace_root).map_err(io_to_string)?;
-    read_document::read_document(&path, input.pages.as_deref(), input.max_chars)
+    read_document::read_document(
+        &path,
+        &read_document::Options {
+            pages: input.pages.as_deref(),
+            rows: input.rows.as_deref(),
+            columns: input.columns.as_deref(),
+            max_chars: input.max_chars,
+        },
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -2732,6 +2748,10 @@ struct ReadDocumentInput {
     path: String,
     #[serde(default, deserialize_with = "deserialize_pages")]
     pages: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_pages")]
+    rows: Option<String>,
+    #[serde(default)]
+    columns: Option<String>,
     max_chars: Option<usize>,
 }
 

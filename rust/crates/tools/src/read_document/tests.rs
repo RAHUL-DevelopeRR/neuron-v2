@@ -6,7 +6,47 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use super::pdf::fixtures;
-use super::{read_document, Selection, DEFAULT_MAX_CHARS};
+use super::{Budget, Options, Selection, DEFAULT_MAX_CHARS};
+
+fn read_document(
+    path: &Path,
+    pages: Option<&str>,
+    max_chars: Option<usize>,
+) -> Result<String, String> {
+    super::read_document(
+        path,
+        &Options {
+            pages,
+            max_chars,
+            ..Options::default()
+        },
+    )
+}
+
+fn read_sheet(
+    path: &Path,
+    pages: Option<&str>,
+    rows: Option<&str>,
+    columns: Option<&str>,
+) -> Result<String, String> {
+    super::read_document(
+        path,
+        &Options {
+            pages,
+            rows,
+            columns,
+            max_chars: Some(100_000),
+        },
+    )
+}
+
+fn read_pdf(bytes: &[u8]) -> Result<super::Document, String> {
+    super::pdf::read_bytes(
+        bytes,
+        &Selection::default(),
+        &mut Budget::new(DEFAULT_MAX_CHARS),
+    )
+}
 
 pub(crate) fn temp_dir(label: &str) -> PathBuf {
     let unique = std::time::SystemTime::now()
@@ -33,15 +73,15 @@ pub(crate) fn package(parts: &[(&str, String)]) -> Vec<u8> {
     writer.finish().expect("finish zip").into_inner()
 }
 
-fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+pub(crate) fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, bytes).expect("write fixture");
     path
 }
 
-const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#;
+pub(crate) const W: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#;
 
-fn docx(body: &str) -> Vec<u8> {
+pub(crate) fn docx(body: &str) -> Vec<u8> {
     let document = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {W}><w:body>{body}<w:sectPr/></w:body></w:document>"#
     );
@@ -50,6 +90,7 @@ fn docx(body: &str) -> Vec<u8> {
 <w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/></w:style>
 <w:style w:type="paragraph" w:styleId="berschrift1"><w:name w:val="heading 1"/><w:pPr><w:outlineLvl w:val="0"/></w:pPr></w:style>
 <w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/></w:style>
+<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/></w:style>
 <w:style w:type="paragraph" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
 </w:styles>"#
     );
@@ -59,6 +100,8 @@ fn docx(body: &str) -> Vec<u8> {
 <w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum>
 <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
 <w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>
+<w:abstractNum w:abstractNumId="2"><w:lvl w:ilvl="0"><w:start w:val="4"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1"/></w:lvl><w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2"/></w:lvl><w:lvl w:ilvl="2"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2.%3"/></w:lvl></w:abstractNum>
+<w:num w:numId="3"><w:abstractNumId w:val="2"/></w:num>
 </w:numbering>"#
     );
     package(&[
@@ -379,7 +422,7 @@ fn many_slides_truncate_at_a_slide_boundary_and_one_long_slide_says_so() {
     std::fs::remove_dir_all(dir).ok();
 }
 
-fn xlsx(sheets: &[(&str, String)]) -> Vec<u8> {
+pub(crate) fn xlsx(sheets: &[(&str, String)]) -> Vec<u8> {
     let entries = sheets
         .iter()
         .enumerate()
@@ -431,12 +474,15 @@ fn xlsx(sheets: &[(&str, String)]) -> Vec<u8> {
     package(&borrowed)
 }
 
-fn row(number: usize, cells: &[&str]) -> String {
+pub(crate) fn row(number: usize, cells: &[&str]) -> String {
     let cells = cells
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            let reference = format!("{}{number}", super::sheet::column_name(index));
+            let reference = format!(
+                "{}{number}",
+                super::sheet::column_name(u32::try_from(index).expect("column"))
+            );
             if value.parse::<f64>().is_ok() {
                 format!("<c r=\"{reference}\"><v>{value}</v></c>")
             } else {
@@ -495,10 +541,33 @@ fn spreadsheets_show_each_sheet_as_a_table_with_caps_and_name_selection() {
     assert!(log.contains("## Sheet 2: Log"), "{log}");
     assert!(log.contains("| 500 | item 500 | 1 |"));
     assert!(!log.contains("| 501 | item 501"));
-    assert!(log.contains("[showing the first 500 of 520 non-empty rows (to row 500)]"));
+    assert!(
+        log.contains("[showing rows 1-500 (500 of 520 non-empty rows); for more use pages=\"2\" rows=\"501-\"]"),
+        "{log}"
+    );
+    // Following the hint reaches the rows past the cap.
+    let rest = read_sheet(&path, Some("2"), Some("501-"), None).expect("rows past the cap");
+    assert!(
+        rest.contains("## Sheet 2: Log (520 rows x 2 columns), rows 501-520"),
+        "{rest}"
+    );
+    assert!(rest.contains("| 501 | item 501 | 1 |"), "{rest}");
+    assert!(rest.contains("| 520 | item 520 | 1 |"), "{rest}");
+    assert!(!rest.contains("| 500 |"), "{rest}");
 
     let wide = read_document(&path, Some("3"), None).expect("wide");
-    assert!(wide.contains("[showing columns A-AN of 45]"), "{wide}");
+    assert!(
+        wide.contains("[showing columns A-AN of A-AS; for more use pages=\"3\" columns=\"AO-AS\"]"),
+        "{wide}"
+    );
+    let right = read_sheet(&path, Some("3"), None, Some("AO-AS")).expect("columns past the cap");
+    assert!(
+        right.contains("| Row | AO | AP | AQ | AR | AS |"),
+        "{right}"
+    );
+    assert!(right.contains("| 1 | 41 | 42 | 43 | 44 | 45 |"), "{right}");
+    let error = read_sheet(&path, Some("3"), Some("x-y"), None).expect_err("bad rows");
+    assert!(error.contains("not a row range"), "{error}");
 
     let error = read_document(&path, Some("Missing"), None).expect_err("no such sheet");
     assert!(error.contains("1 Sales, 2 Log, 3 Wide"), "{error}");
@@ -548,8 +617,7 @@ fn pdf_pages_inside_object_streams_are_found() {
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
         fixtures::stream("", b"BT /F1 12 Tf 72 720 Td (Packed page) Tj ET", true),
     ];
-    let document = super::pdf::read_bytes(&fixtures::assemble(&objects, ""), &Selection::default())
-        .expect("reads");
+    let document = read_pdf(&fixtures::assemble(&objects, "")).expect("reads");
     assert_eq!(document.total, 1);
     assert!(
         document.units[0].markdown.contains("Packed page"),

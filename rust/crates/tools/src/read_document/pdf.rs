@@ -5,45 +5,106 @@
 //! content streams, decoding text through the fonts' `ToUnicode` maps and
 //! following form `XObject`s. Encrypted files are refused; scanned pages without
 //! a text layer come back empty, since no OCR runs.
+//!
+//! The file is treated as hostile: object nesting, the number of parsed
+//! objects, the bytes inflated per call, nested forms, font maps and the
+//! text kept per page all have limits, and the object scan is linear.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::path::Path;
+use std::rc::Rc;
 
-use super::{Document, Selection, Unit};
+use super::{Budget, Document, Selection, Unit};
 
 const KIND: &str = "PDF document";
-/// The largest stream inflated, guarding against compression bombs.
+/// The largest single stream inflated.
 const MAX_STREAM_BYTES: u64 = 64 * 1024 * 1024;
-/// How deep page trees and nested form `XObject`s are followed.
+/// The most bytes decoded (and run) across one call: object streams, page
+/// contents, forms each time they are drawn, and font maps.
+pub(super) const MAX_DECODED_BYTES: u64 = 256 * 1024 * 1024;
+/// How deep page trees and references are followed.
 const MAX_DEPTH: usize = 32;
+/// How deeply form `XObject`s nest.
 const MAX_FORM_DEPTH: usize = 6;
+/// How deeply arrays and dictionaries nest before the rest is skipped.
+pub(super) const MAX_OBJECT_DEPTH: usize = 64;
+/// The most parsed values kept for the whole file.
+pub(super) const MAX_NODES: usize = 4_000_000;
+/// The most objects one object stream may declare.
+const MAX_PACKED_OBJECTS: usize = 100_000;
+/// The most character codes and width entries one font may define.
+pub(super) const MAX_FONT_CODES: usize = 1_000_000;
+/// Values kept while waiting for an operator or `CMap` keyword.
+const MAX_OPERANDS: usize = 64;
+const MAX_PENDING: usize = 100_000;
+/// Graphics states saved with `q` at once.
+const MAX_SAVED_STATES: usize = 256;
+/// Bytes of text kept per page; more than any call returns.
+const MAX_PAGE_TEXT: usize = 1_000_000;
 
-pub(super) fn read(path: &Path, selection: &Selection) -> Result<Document, String> {
+pub(super) fn read(
+    path: &Path,
+    selection: &Selection,
+    budget: &mut Budget,
+) -> Result<Document, String> {
     let data = std::fs::read(path).map_err(|error| format!("cannot open the file: {error}"))?;
-    read_bytes(&data, selection)
+    read_bytes(&data, selection, budget)
 }
 
-pub(super) fn read_bytes(data: &[u8], selection: &Selection) -> Result<Document, String> {
+#[allow(clippy::too_many_lines)]
+pub(super) fn read_bytes(
+    data: &[u8],
+    selection: &Selection,
+    budget: &mut Budget,
+) -> Result<Document, String> {
     let head = &data[..data.len().min(1024)];
     if find(head, b"%PDF-").is_none() {
         return Err("this is not a readable PDF document: the %PDF header is missing".to_string());
     }
-    let pdf = Pdf::parse(data);
+    let pdf = Pdf::parse(data)?;
     if pdf.encrypted {
         return Err(
             "this PDF is encrypted; its text cannot be read without decrypting it first"
                 .to_string(),
         );
     }
+    let mut run = Run::default();
     let pages = pdf.pages();
     let mut notes = Vec::new();
     if pages.is_empty() {
-        // No page tree found: fall back to every text stream as one page.
-        let text = crate::pdf_extract::extract_text_from_bytes(data);
+        // No page tree found: run every content-like stream as one page.
+        let mut sink = TextSink::default();
+        let mut numbers = pdf.objects.keys().copied().collect::<Vec<_>>();
+        numbers.sort_unstable();
+        for number in numbers {
+            let object = &pdf.objects[&number];
+            let Obj::Stream(dict, _) = object else {
+                continue;
+            };
+            // Content streams carry no type; fonts, images and the like do,
+            // and embedded font programs carry their lengths.
+            if ["Type", "Subtype", "Length1", "Length2"]
+                .iter()
+                .any(|key| dict.contains_key(*key))
+            {
+                continue;
+            }
+            if let Some(content) = pdf.decode(object) {
+                if find(&content, b"BT").is_some() {
+                    pdf.run_content(&content, None, &mut sink, &mut run, 0, IDENTITY);
+                    sink.newline();
+                }
+            }
+            if pdf.decoded_all() {
+                break;
+            }
+        }
         notes.push(
             "the page structure could not be read; all text is shown as one page".to_string(),
         );
+        let text = sink.finish();
         let units = if selection.includes(1, None) {
             vec![Unit {
                 number: 1,
@@ -58,32 +119,52 @@ pub(super) fn read_bytes(data: &[u8], selection: &Selection) -> Result<Document,
             total: 1,
             units,
             notes,
+            unread: Vec::new(),
         });
     }
 
     let mut units = Vec::new();
+    let mut unread = Vec::new();
     let mut undecodable = false;
     let mut any_text = false;
+    let mut cut_short = false;
+    let mut stopped_at = None;
     for (index, page) in pages.iter().enumerate() {
         let number = index + 1;
         if !selection.includes(number, None) {
             continue;
         }
+        if budget.is_spent() || stopped_at.is_some() {
+            unread.push(number);
+            continue;
+        }
         let mut sink = TextSink::default();
-        let content = page
-            .contents
-            .iter()
-            .filter_map(|reference| pdf.stream_data(reference))
-            .collect::<Vec<_>>()
-            .join(&b"\n"[..]);
-        pdf.run_content(&content, page.resources, &mut sink, 0);
+        // The same stream listed twice draws the same text twice: decode
+        // each one once.
+        let mut seen = HashSet::new();
+        let mut content = Vec::new();
+        for reference in &page.contents {
+            if let Obj::Ref(object) = reference {
+                if !seen.insert(*object) {
+                    continue;
+                }
+            }
+            if let Some(data) = pdf.stream_data(reference) {
+                content.extend_from_slice(&data);
+                content.push(b'\n');
+            }
+        }
+        pdf.run_content(&content, page.resources, &mut sink, &mut run, 0, IDENTITY);
         undecodable |= sink.undecodable;
+        cut_short |= sink.cut;
         let text = sink.finish();
         any_text |= !text.is_empty();
-        units.push(Unit {
-            number,
-            markdown: page_markdown(number, &text),
-        });
+        let markdown = page_markdown(number, &text);
+        budget.spend(&markdown);
+        units.push(Unit { number, markdown });
+        if pdf.decoded_all() {
+            stopped_at = Some(number);
+        }
     }
     if !units.is_empty() && !any_text {
         notes.push(
@@ -94,12 +175,25 @@ pub(super) fn read_bytes(data: &[u8], selection: &Selection) -> Result<Document,
         notes
             .push("some text could not be decoded because its font has no Unicode map".to_string());
     }
+    if let Some(page) = stopped_at {
+        notes.push(format!(
+            "stopped after page {page}: the file's content unpacks to more than {} MB in one call; ask for later pages with pages=",
+            MAX_DECODED_BYTES / (1024 * 1024)
+        ));
+    }
+    if cut_short {
+        notes.push(
+            "some pages hold more drawing instructions or text than the reader follows; their text may be incomplete"
+                .to_string(),
+        );
+    }
     Ok(Document {
         kind: KIND,
         unit: "page",
         total: pages.len(),
         units,
         notes,
+        unread,
     })
 }
 
@@ -178,11 +272,17 @@ fn is_delimiter(byte: u8) -> bool {
 struct Lexer<'a> {
     data: &'a [u8],
     pos: usize,
+    /// Values built so far, for the file-wide [`MAX_NODES`] limit.
+    nodes: usize,
 }
 
 impl<'a> Lexer<'a> {
     fn new(data: &'a [u8], pos: usize) -> Self {
-        Self { data, pos }
+        Self {
+            data,
+            pos: pos.min(data.len()),
+            nodes: 0,
+        }
     }
 
     fn skip_whitespace(&mut self) {
@@ -331,10 +431,18 @@ impl<'a> Lexer<'a> {
     /// The object starting at the next token.
     fn object(&mut self) -> Option<Obj> {
         let token = self.next_token()?;
-        self.object_from(token)
+        self.object_from(token, 0)
     }
 
-    fn object_from(&mut self, token: Token) -> Option<Obj> {
+    /// The object that starts with `token`, nested `depth` containers deep.
+    /// Past [`MAX_OBJECT_DEPTH`] a container is skipped without recursing
+    /// and stands as `null`, so no input can exhaust the stack.
+    fn object_from(&mut self, token: Token, depth: usize) -> Option<Obj> {
+        self.nodes += 1;
+        if matches!(token, Token::DictOpen | Token::ArrayOpen) && depth >= MAX_OBJECT_DEPTH {
+            self.skip_container();
+            return Some(Obj::Null);
+        }
         Some(match token {
             Token::Num(value) => {
                 // `12 0 R` is a reference.
@@ -363,7 +471,7 @@ impl<'a> Lexer<'a> {
                             if next == Token::DictClose {
                                 break;
                             }
-                            if let Some(value) = self.object_from(next) {
+                            if let Some(value) = self.object_from(next, depth + 1) {
                                 dict.insert(key, value);
                             }
                         }
@@ -378,7 +486,7 @@ impl<'a> Lexer<'a> {
                     match self.next_token()? {
                         Token::ArrayClose => break,
                         other => {
-                            if let Some(item) = self.object_from(other) {
+                            if let Some(item) = self.object_from(other, depth + 1) {
                                 items.push(item);
                             }
                         }
@@ -393,6 +501,24 @@ impl<'a> Lexer<'a> {
             },
             Token::DictClose | Token::ArrayClose => Obj::Null,
         })
+    }
+
+    /// Skips to the end of the container just opened, counting brackets
+    /// instead of recursing.
+    fn skip_container(&mut self) {
+        let mut open = 1usize;
+        while let Some(token) = self.next_token() {
+            match token {
+                Token::ArrayOpen | Token::DictOpen => open += 1,
+                Token::ArrayClose | Token::DictClose => {
+                    open -= 1;
+                    if open == 0 {
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -467,6 +593,41 @@ fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .rposition(|window| window == needle)
 }
 
+/// Finds the next `needle` at or after positions that only move forward,
+/// remembering the last hit and where a search found nothing, so a scan of
+/// the whole file stays linear however often it asks.
+struct Finder {
+    needle: &'static [u8],
+    found: Option<usize>,
+    none_from: usize,
+}
+
+impl Finder {
+    fn new(needle: &'static [u8]) -> Self {
+        Self {
+            needle,
+            found: None,
+            none_from: usize::MAX,
+        }
+    }
+
+    fn next(&mut self, data: &[u8], from: usize) -> Option<usize> {
+        if let Some(found) = self.found.filter(|found| *found >= from) {
+            return Some(found);
+        }
+        if from >= self.none_from || from > data.len() {
+            return None;
+        }
+        if let Some(offset) = find(&data[from..], self.needle) {
+            self.found = Some(from + offset);
+            self.found
+        } else {
+            self.none_from = from;
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The document
 
@@ -474,6 +635,8 @@ struct Pdf {
     objects: HashMap<u32, Obj>,
     trailer: Dict,
     encrypted: bool,
+    /// Bytes still allowed to be decoded in this call.
+    decode_left: Cell<u64>,
 }
 
 struct Page<'a> {
@@ -481,11 +644,34 @@ struct Page<'a> {
     resources: Option<&'a Dict>,
 }
 
+/// What one call caches and tracks while running content streams.
+#[derive(Default)]
+struct Run {
+    /// Fonts by the address of their dictionary, built once per call.
+    fonts: HashMap<usize, Rc<Font>>,
+    /// The fonts of each resource dictionary, by its address.
+    resources: HashMap<usize, Rc<HashMap<String, Rc<Font>>>>,
+    /// Form `XObject`s being drawn, to skip one that draws itself.
+    forms: Vec<u32>,
+}
+
+fn too_complex() -> String {
+    "this PDF is too complex to read safely: it holds more objects than read_document follows"
+        .to_string()
+}
+
 impl Pdf {
     #[allow(clippy::too_many_lines)]
-    fn parse(data: &[u8]) -> Self {
+    fn parse(data: &[u8]) -> Result<Self, String> {
         let mut objects = HashMap::new();
         let mut cursor = 0;
+        let mut nodes = 0usize;
+        // Bytes lexed while looking for objects; a damaged file can make the
+        // same bytes be read again from many starting points, so stop well
+        // before that turns quadratic.
+        let mut scanned = 0usize;
+        let lex_limit = data.len().saturating_mul(8).saturating_add(1 << 20);
+        let mut endstreams = Finder::new(b"endstream");
         while let Some(found) = find(&data[cursor..], b"obj") {
             let at = cursor + found;
             cursor = at + 3;
@@ -501,91 +687,145 @@ impl Pdf {
             let Some(number) = object_number_before(data, at) else {
                 continue;
             };
+            if scanned > lex_limit {
+                break;
+            }
             let mut lexer = Lexer::new(data, at + 3);
-            let Some(object) = lexer.object() else {
+            let object = lexer.object();
+            scanned = scanned.saturating_add(lexer.pos - (at + 3));
+            nodes = nodes.saturating_add(lexer.nodes);
+            if nodes > MAX_NODES {
+                return Err(too_complex());
+            }
+            let Some(object) = object else {
                 continue;
             };
-            if matches!(lexer.next_token(), Some(Token::Keyword(ref word)) if word == "stream") {
-                let start = skip_eol(data, lexer.pos);
-                let declared = object
-                    .as_dict()
-                    .and_then(|dict| dict.get("Length"))
-                    .and_then(Obj::as_num)
-                    .map(to_usize);
-                let end = declared
-                    .filter(|length| {
-                        start + length <= data.len()
-                            && data[start + length..]
-                                .iter()
-                                .position(|byte| !is_whitespace(*byte))
-                                .is_some_and(|offset| {
-                                    data[start + length + offset..].starts_with(b"endstream")
-                                })
-                    })
-                    .map(|length| start + length)
-                    .or_else(|| {
-                        find(&data[start..], b"endstream").map(|offset| {
-                            let mut end = start + offset;
-                            while end > start && matches!(data[end - 1], b'\r' | b'\n') {
-                                end -= 1;
-                            }
-                            end
+            match lexer.next_token() {
+                Some(Token::Keyword(ref word)) if word == "stream" => {
+                    let start = skip_eol(data, lexer.pos);
+                    let declared = object
+                        .as_dict()
+                        .and_then(|dict| dict.get("Length"))
+                        .and_then(Obj::as_num)
+                        .map(to_usize);
+                    let end = declared
+                        .and_then(|length| {
+                            let end = start.checked_add(length).filter(|end| *end <= data.len())?;
+                            let offset =
+                                data[end..].iter().position(|byte| !is_whitespace(*byte))?;
+                            data[end + offset..]
+                                .starts_with(b"endstream")
+                                .then_some(end)
                         })
-                    });
-                let Some(end) = end else {
-                    continue;
-                };
-                let dict = match object {
-                    Obj::Dict(dict) => dict,
-                    _ => Dict::new(),
-                };
-                objects.insert(number, Obj::Stream(dict, data[start..end].to_vec()));
-                cursor = end;
-            } else {
-                objects.insert(number, object);
+                        .or_else(|| {
+                            endstreams.next(data, start).map(|found| {
+                                let mut end = found;
+                                while end > start && matches!(data[end - 1], b'\r' | b'\n') {
+                                    end -= 1;
+                                }
+                                end
+                            })
+                        });
+                    let Some(end) = end else {
+                        continue;
+                    };
+                    let dict = match object {
+                        Obj::Dict(dict) => dict,
+                        _ => Dict::new(),
+                    };
+                    objects.insert(number, Obj::Stream(dict, data[start..end].to_vec()));
+                    cursor = end;
+                }
+                Some(Token::Keyword(ref word)) if word == "endobj" => {
+                    objects.insert(number, object);
+                    // A well-formed object: anything inside it is not another.
+                    cursor = lexer.pos;
+                }
+                _ => {
+                    objects.insert(number, object);
+                }
             }
         }
 
+        let mut pdf = Self {
+            objects,
+            trailer: Dict::new(),
+            encrypted: false,
+            decode_left: Cell::new(MAX_DECODED_BYTES),
+        };
+
         // Objects packed into object streams (PDF 1.5 and later).
-        let packed = objects
+        let packed = pdf
+            .objects
             .values()
-            .filter_map(|object| match object {
-                Obj::Stream(dict, _)
-                    if dict.get("Type").and_then(Obj::as_name) == Some("ObjStm") =>
-                {
-                    Some(object.clone())
-                }
-                _ => None,
+            .filter(|object| {
+                matches!(object, Obj::Stream(dict, _)
+                    if dict.get("Type").and_then(Obj::as_name) == Some("ObjStm"))
             })
+            .cloned()
             .collect::<Vec<_>>();
+        let mut unpacked = Vec::new();
         for stream in packed {
-            let Some(decoded) = decode_stream(&stream) else {
+            let Some(decoded) = pdf.decode(&stream) else {
                 continue;
             };
             let Some(dict) = stream.as_dict() else {
                 continue;
             };
-            let count = dict.get("N").and_then(Obj::as_num).map_or(0, to_usize);
+            let count = dict
+                .get("N")
+                .and_then(Obj::as_num)
+                .map_or(0, to_usize)
+                .min(MAX_PACKED_OBJECTS);
             let first = dict.get("First").and_then(Obj::as_num).map_or(0, to_usize);
             if first > decoded.len() {
                 continue;
             }
+            // The header pairs object numbers with offsets. Offsets must rise,
+            // and each object is read only up to the next one, so no byte of
+            // the stream is parsed twice.
             let mut header = Lexer::new(&decoded[..first], 0);
+            let mut entries: Vec<(u32, usize)> = Vec::new();
             for _ in 0..count {
                 let (Some(Token::Num(number)), Some(Token::Num(offset))) =
                     (header.next_token(), header.next_token())
                 else {
                     break;
                 };
-                let number = to_u32(number);
-                if objects.contains_key(&number) {
+                let Some(start) = first.checked_add(to_usize(offset)) else {
+                    break;
+                };
+                if start > decoded.len() || entries.last().is_some_and(|(_, last)| start <= *last) {
+                    break;
+                }
+                entries.push((to_u32(number), start));
+            }
+            for (index, (number, start)) in entries.iter().enumerate() {
+                let end = entries
+                    .get(index + 1)
+                    .map_or(decoded.len(), |(_, next)| *next);
+                if pdf.objects.contains_key(number) {
                     continue;
                 }
-                let mut lexer = Lexer::new(&decoded, first + to_usize(offset));
-                if let Some(object) = lexer.object() {
-                    objects.insert(number, object);
+                let mut lexer = Lexer::new(&decoded[..end], *start);
+                let object = lexer.object();
+                nodes = nodes.saturating_add(lexer.nodes);
+                if nodes > MAX_NODES {
+                    return Err(too_complex());
+                }
+                if let Some(object) = object {
+                    unpacked.push((*number, object));
                 }
             }
+        }
+        for (number, object) in unpacked {
+            pdf.objects.entry(number).or_insert(object);
+        }
+        if pdf.decoded_all() {
+            return Err(format!(
+                "this PDF unpacks to more than {} MB, more than read_document reads",
+                MAX_DECODED_BYTES / (1024 * 1024)
+            ));
         }
 
         // The newest trailer: a classic `trailer` dictionary or an xref stream.
@@ -597,7 +837,7 @@ impl Pdf {
             })
             .unwrap_or_default();
         let mut encrypted = trailer.contains_key("Encrypt");
-        for object in objects.values() {
+        for object in pdf.objects.values() {
             if let Obj::Stream(dict, _) = object {
                 if dict.get("Type").and_then(Obj::as_name) == Some("XRef") {
                     encrypted |= dict.contains_key("Encrypt");
@@ -609,11 +849,62 @@ impl Pdf {
                 }
             }
         }
-        Self {
-            objects,
-            trailer,
-            encrypted,
+        pdf.trailer = trailer;
+        pdf.encrypted = encrypted;
+        Ok(pdf)
+    }
+
+    /// Whether the decode budget for this call is used up.
+    fn decoded_all(&self) -> bool {
+        self.decode_left.get() == 0
+    }
+
+    /// The decoded bytes of a stream object, charged to this call's budget;
+    /// `None` for filters this reader does not handle (images mostly) or once
+    /// the budget is spent.
+    fn decode(&self, object: &Obj) -> Option<Vec<u8>> {
+        let Obj::Stream(dict, raw) = object else {
+            return None;
+        };
+        let filters = match dict.get("Filter") {
+            None => Vec::new(),
+            Some(Obj::Name(name)) => vec![name.as_str()],
+            Some(Obj::Array(names)) => names.iter().filter_map(Obj::as_name).collect(),
+            Some(_) => return None,
+        };
+        let mut data = self.charge(raw.clone())?;
+        for filter in filters {
+            let decoded = match filter {
+                "FlateDecode" | "Fl" => {
+                    inflate(&data, MAX_STREAM_BYTES.min(self.decode_left.get()))?
+                }
+                "ASCIIHexDecode" | "AHx" => {
+                    let end = data
+                        .iter()
+                        .position(|byte| *byte == b'>')
+                        .unwrap_or(data.len());
+                    hex_decode(&data[..end])
+                }
+                "ASCII85Decode" | "A85" => ascii85(&data),
+                _ => return None,
+            };
+            data = self.charge(decoded)?;
         }
+        Some(data)
+    }
+
+    /// Takes `data`'s length off the budget, cutting it to what is left.
+    fn charge(&self, mut data: Vec<u8>) -> Option<Vec<u8>> {
+        let left = self.decode_left.get();
+        if left == 0 {
+            return None;
+        }
+        let allowed = usize::try_from(left).unwrap_or(usize::MAX);
+        if data.len() > allowed {
+            data.truncate(allowed);
+        }
+        self.decode_left.set(left - data.len() as u64);
+        Some(data)
     }
 
     fn resolve<'a>(&'a self, mut object: &'a Obj) -> &'a Obj {
@@ -700,22 +991,37 @@ impl Pdf {
     }
 
     fn stream_data(&self, object: &Obj) -> Option<Vec<u8>> {
-        decode_stream(self.resolve(object))
+        self.decode(self.resolve(object))
     }
 
-    fn fonts(&self, resources: Option<&Dict>) -> HashMap<String, Font> {
+    /// The fonts of a resource dictionary, built once per dictionary and
+    /// once per font for the whole call.
+    fn fonts(&self, resources: Option<&Dict>, run: &mut Run) -> Rc<HashMap<String, Rc<Font>>> {
+        let key = resources.map_or(0, |resources| std::ptr::from_ref(resources) as usize);
+        if let Some(fonts) = run.resources.get(&key) {
+            return Rc::clone(fonts);
+        }
         let mut fonts = HashMap::new();
-        let Some(font_dict) = resources
+        if let Some(font_dict) = resources
             .and_then(|resources| self.get(resources, "Font"))
             .and_then(Obj::as_dict)
-        else {
-            return fonts;
-        };
-        for (name, font) in font_dict {
-            if let Some(font) = self.resolve(font).as_dict() {
-                fonts.insert(name.clone(), self.font(font));
+        {
+            for (name, font) in font_dict {
+                if let Some(font) = self.resolve(font).as_dict() {
+                    let font_key = std::ptr::from_ref(font) as usize;
+                    let built = if let Some(built) = run.fonts.get(&font_key) {
+                        Rc::clone(built)
+                    } else {
+                        let built = Rc::new(self.font(font));
+                        run.fonts.insert(font_key, Rc::clone(&built));
+                        built
+                    };
+                    fonts.insert(name.clone(), built);
+                }
             }
         }
+        let fonts = Rc::new(fonts);
+        run.resources.insert(key, Rc::clone(&fonts));
         fonts
     }
 
@@ -723,10 +1029,10 @@ impl Pdf {
         let composite = dict.get("Subtype").and_then(Obj::as_name) == Some("Type0");
         let cmap = self
             .get(dict, "ToUnicode")
-            .and_then(decode_stream)
+            .and_then(|object| self.decode(object))
             .map(|data| CMap::parse(&data))
-            .filter(|cmap| !cmap.map.is_empty());
-        let mut widths = HashMap::new();
+            .filter(|cmap| !cmap.is_empty());
+        let mut widths = Widths::default();
         let mut default_width = if composite { 1000.0 } else { 500.0 };
         if composite {
             if let Some(Obj::Array(descendants)) = self.get(dict, "DescendantFonts") {
@@ -748,13 +1054,17 @@ impl Pdf {
                 .and_then(Obj::as_num)
                 .map_or(0, to_u32);
             if let Some(Obj::Array(entries)) = self.get(dict, "Widths") {
-                for (offset, width) in entries.iter().enumerate() {
+                for (offset, width) in entries.iter().take(MAX_FONT_CODES).enumerate() {
                     if let Some(width) = self.resolve(width).as_num() {
-                        widths.insert(first + u32::try_from(offset).unwrap_or(0), width);
+                        widths.codes.insert(
+                            first.saturating_add(u32::try_from(offset).unwrap_or(0)),
+                            width,
+                        );
                     }
                 }
             }
         }
+        widths.ranges.sort_by_key(|range| range.0);
         Font {
             two_byte: composite,
             cmap,
@@ -764,9 +1074,11 @@ impl Pdf {
     }
 
     /// The `W` array of a CID font: `c [w1 w2 ...]` and `c_first c_last w`.
-    fn cid_widths(&self, entries: &[Obj], widths: &mut HashMap<u32, f64>) {
+    /// Ranges are kept as ranges, not one entry per code.
+    fn cid_widths(&self, entries: &[Obj], widths: &mut Widths) {
         let mut index = 0;
-        while index < entries.len() {
+        let mut defined = 0usize;
+        while index < entries.len() && defined < MAX_FONT_CODES {
             let Some(first) = self.resolve(&entries[index]).as_num().map(to_u32) else {
                 break;
             };
@@ -774,21 +1086,23 @@ impl Pdf {
                 Some(Obj::Array(list)) => {
                     for (offset, width) in list.iter().enumerate() {
                         if let Some(width) = self.resolve(width).as_num() {
-                            widths.insert(first + u32::try_from(offset).unwrap_or(0), width);
+                            widths.codes.insert(
+                                first.saturating_add(u32::try_from(offset).unwrap_or(0)),
+                                width,
+                            );
                         }
                     }
+                    defined += list.len().max(1);
                     index += 2;
                 }
                 Some(Obj::Num(last)) => {
-                    let last = to_u32(*last).min(first.saturating_add(65_535));
                     if let Some(width) = entries
                         .get(index + 2)
                         .and_then(|width| self.resolve(width).as_num())
                     {
-                        for code in first..=last {
-                            widths.insert(code, width);
-                        }
+                        widths.ranges.push((first, to_u32(*last).max(first), width));
                     }
+                    defined += 1;
                     index += 3;
                 }
                 _ => break,
@@ -796,28 +1110,63 @@ impl Pdf {
         }
     }
 
-    /// Runs a content stream, writing its text to `sink`.
+    /// Runs a content stream, writing its text to `sink`. `ctm` is the
+    /// transformation in force when the stream starts.
     #[allow(clippy::too_many_lines)]
     fn run_content(
         &self,
         data: &[u8],
         resources: Option<&Dict>,
         sink: &mut TextSink,
+        run: &mut Run,
         depth: usize,
+        ctm: Matrix,
     ) {
-        let fonts = self.fonts(resources);
-        let mut state = TextState::default();
+        let fonts = self.fonts(resources, run);
+        let mut state = TextState {
+            ctm,
+            ..TextState::default()
+        };
+        let mut saved: Vec<Matrix> = Vec::new();
         let mut lexer = Lexer::new(data, 0);
         let mut operands: Vec<Obj> = Vec::new();
         while let Some(token) = lexer.next_token() {
+            if sink.cut {
+                return;
+            }
             let Token::Keyword(operator) = token else {
-                if let Some(operand) = lexer.object_from(token) {
+                if operands.len() >= MAX_OPERANDS {
+                    // No operator takes this many; keep only the latest.
+                    operands.drain(..MAX_OPERANDS / 2);
+                }
+                if let Some(operand) = lexer.object_from(token, 0) {
                     operands.push(operand);
                 }
                 continue;
             };
             let number = |index: usize| operands.get(index).and_then(Obj::as_num).unwrap_or(0.0);
             match operator.as_str() {
+                "q" => {
+                    if saved.len() < MAX_SAVED_STATES {
+                        saved.push(state.ctm);
+                    }
+                }
+                "Q" => {
+                    if let Some(ctm) = saved.pop() {
+                        state.ctm = ctm;
+                    }
+                }
+                "cm" => {
+                    let matrix = [
+                        number(0),
+                        number(1),
+                        number(2),
+                        number(3),
+                        number(4),
+                        number(5),
+                    ];
+                    state.ctm = multiply(&matrix, &state.ctm);
+                }
                 "BT" => state.begin_text(),
                 "Tf" => {
                     state.font = operands.first().and_then(Obj::as_name).map(str::to_string);
@@ -840,26 +1189,22 @@ impl Pdf {
                 ]),
                 "Tj" => {
                     if let Some(Obj::Str(bytes)) = operands.last() {
-                        state.show(
-                            bytes,
-                            fonts.get(state.font.as_deref().unwrap_or_default()),
-                            sink,
-                        );
+                        let font = fonts.get(state.font.as_deref().unwrap_or_default());
+                        state.show(bytes, font.map(AsRef::as_ref), sink);
                     }
                 }
                 "'" | "\"" => {
                     state.next_line();
                     if let Some(Obj::Str(bytes)) = operands.last() {
-                        state.show(
-                            bytes,
-                            fonts.get(state.font.as_deref().unwrap_or_default()),
-                            sink,
-                        );
+                        let font = fonts.get(state.font.as_deref().unwrap_or_default());
+                        state.show(bytes, font.map(AsRef::as_ref), sink);
                     }
                 }
                 "TJ" => {
                     if let Some(Obj::Array(items)) = operands.last() {
-                        let font = fonts.get(state.font.as_deref().unwrap_or_default());
+                        let font = fonts
+                            .get(state.font.as_deref().unwrap_or_default())
+                            .map(AsRef::as_ref);
                         for item in items {
                             match item {
                                 Obj::Str(bytes) => state.show(bytes, font, sink),
@@ -870,30 +1215,82 @@ impl Pdf {
                     }
                 }
                 "Do" if depth < MAX_FORM_DEPTH => {
-                    let form = operands.first().and_then(Obj::as_name).and_then(|name| {
-                        resources
-                            .and_then(|resources| self.get(resources, "XObject"))
-                            .and_then(Obj::as_dict)
-                            .and_then(|xobjects| self.get(xobjects, name))
-                    });
-                    if let Some(form @ Obj::Stream(dict, _)) = form {
-                        if dict.get("Subtype").and_then(Obj::as_name) == Some("Form") {
-                            if let Some(content) = decode_stream(form) {
-                                let inner = self
-                                    .get(dict, "Resources")
-                                    .and_then(Obj::as_dict)
-                                    .or(resources);
-                                sink.newline();
-                                self.run_content(&content, inner, sink, depth + 1);
-                                sink.newline();
-                            }
-                        }
-                    }
+                    self.draw_form(&operands, resources, sink, run, depth, state.ctm);
                 }
                 "BI" => skip_inline_image(&mut lexer),
                 _ => {}
             }
             operands.clear();
+        }
+    }
+
+    /// `/Name Do` for a form `XObject`: runs its content with its own
+    /// resources and matrix. A form already being drawn is skipped, so a
+    /// form that draws itself ends at once; the decode budget bounds the
+    /// rest.
+    fn draw_form(
+        &self,
+        operands: &[Obj],
+        resources: Option<&Dict>,
+        sink: &mut TextSink,
+        run: &mut Run,
+        depth: usize,
+        ctm: Matrix,
+    ) {
+        let Some(entry) = operands.first().and_then(Obj::as_name).and_then(|name| {
+            resources
+                .and_then(|resources| self.get(resources, "XObject"))
+                .and_then(Obj::as_dict)
+                .and_then(|xobjects| xobjects.get(name))
+        }) else {
+            return;
+        };
+        let number = match entry {
+            Obj::Ref(number) => Some(*number),
+            _ => None,
+        };
+        if number.is_some_and(|number| run.forms.contains(&number)) {
+            return;
+        }
+        let form = self.resolve(entry);
+        let Obj::Stream(dict, _) = form else {
+            return;
+        };
+        if dict.get("Subtype").and_then(Obj::as_name) != Some("Form") {
+            return;
+        }
+        let Some(content) = self.decode(form) else {
+            return;
+        };
+        let inner = self
+            .get(dict, "Resources")
+            .and_then(Obj::as_dict)
+            .or(resources);
+        let matrix = match self.get(dict, "Matrix") {
+            Some(Obj::Array(values)) if values.len() == 6 => {
+                let mut matrix = IDENTITY;
+                for (slot, value) in matrix.iter_mut().zip(values) {
+                    *slot = self.resolve(value).as_num().unwrap_or(0.0);
+                }
+                matrix
+            }
+            _ => IDENTITY,
+        };
+        if let Some(number) = number {
+            run.forms.push(number);
+        }
+        sink.newline();
+        self.run_content(
+            &content,
+            inner,
+            sink,
+            run,
+            depth + 1,
+            multiply(&matrix, &ctm),
+        );
+        sink.newline();
+        if number.is_some() {
+            run.forms.pop();
         }
     }
 }
@@ -962,47 +1359,18 @@ fn skip_inline_image(lexer: &mut Lexer<'_>) {
     lexer.pos = data.len();
 }
 
-/// The decoded bytes of a stream object, or `None` for filters this reader
-/// does not handle (images mostly).
-fn decode_stream(object: &Obj) -> Option<Vec<u8>> {
-    let Obj::Stream(dict, raw) = object else {
-        return None;
-    };
-    let filters = match dict.get("Filter") {
-        None => Vec::new(),
-        Some(Obj::Name(name)) => vec![name.as_str()],
-        Some(Obj::Array(names)) => names.iter().filter_map(Obj::as_name).collect(),
-        Some(_) => return None,
-    };
-    let mut data = raw.clone();
-    for filter in filters {
-        data = match filter {
-            "FlateDecode" | "Fl" => inflate(&data)?,
-            "ASCIIHexDecode" | "AHx" => {
-                let end = data
-                    .iter()
-                    .position(|byte| *byte == b'>')
-                    .unwrap_or(data.len());
-                hex_decode(&data[..end])
-            }
-            "ASCII85Decode" | "A85" => ascii85(&data),
-            _ => return None,
-        };
-    }
-    Some(data)
-}
-
-fn inflate(data: &[u8]) -> Option<Vec<u8>> {
+/// Inflates zlib (or raw deflate) data, up to `limit` bytes.
+fn inflate(data: &[u8], limit: u64) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let zlib = flate2::read::ZlibDecoder::new(data)
-        .take(MAX_STREAM_BYTES)
+        .take(limit)
         .read_to_end(&mut out);
     if zlib.is_ok() || !out.is_empty() {
         return Some(out);
     }
     out.clear();
     flate2::read::DeflateDecoder::new(data)
-        .take(MAX_STREAM_BYTES)
+        .take(limit)
         .read_to_end(&mut out)
         .ok()
         .map(|_| out)
@@ -1042,20 +1410,27 @@ fn ascii85(data: &[u8]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 // Fonts and text
 
-/// A `ToUnicode` map: character code to text.
+/// A `ToUnicode` map: character code to text. `bfrange` entries that count
+/// up from a start text stay ranges and are decoded on lookup, so a few
+/// lines cannot expand into billions of entries.
 #[derive(Debug, Default)]
 struct CMap {
     code_bytes: usize,
     map: HashMap<u32, String>,
+    /// `(low, high, UTF-16 text of low)`, sorted by `low`.
+    ranges: Vec<(u32, u32, Vec<u16>)>,
 }
 
 impl CMap {
-    #[allow(clippy::too_many_lines)]
     fn parse(data: &[u8]) -> Self {
         let mut cmap = Self::default();
         let mut lexer = Lexer::new(data, 0);
         let mut pending: Vec<Obj> = Vec::new();
+        let mut defined = 0usize;
         while let Some(token) = lexer.next_token() {
+            if defined >= MAX_FONT_CODES {
+                break;
+            }
             match token {
                 Token::Keyword(word) => {
                     match word.as_str() {
@@ -1069,6 +1444,7 @@ impl CMap {
                                 if let [Obj::Str(code), Obj::Str(text)] = pair {
                                     cmap.note_width(code.len());
                                     cmap.map.insert(code_value(code), utf16(text));
+                                    defined += 1;
                                 }
                             }
                         }
@@ -1076,7 +1452,11 @@ impl CMap {
                             for triple in pending.chunks(3) {
                                 if let [Obj::Str(low), Obj::Str(high), target] = triple {
                                     cmap.note_width(low.len());
-                                    cmap.insert_range(code_value(low), code_value(high), target);
+                                    defined += cmap.insert_range(
+                                        code_value(low),
+                                        code_value(high),
+                                        target,
+                                    );
                                 }
                             }
                         }
@@ -1085,16 +1465,23 @@ impl CMap {
                     pending.clear();
                 }
                 other => {
-                    if let Some(object) = lexer.object_from(other) {
-                        pending.push(object);
+                    if let Some(object) = lexer.object_from(other, 0) {
+                        if pending.len() < MAX_PENDING {
+                            pending.push(object);
+                        }
                     }
                 }
             }
         }
+        cmap.ranges.sort_by_key(|range| range.0);
         if cmap.code_bytes == 0 {
             cmap.code_bytes = 1;
         }
         cmap
+    }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty() && self.ranges.is_empty()
     }
 
     fn note_width(&mut self, width: usize) {
@@ -1103,30 +1490,51 @@ impl CMap {
         }
     }
 
-    fn insert_range(&mut self, low: u32, high: u32, target: &Obj) {
-        let high = high.min(low.saturating_add(65_535));
+    /// Adds one `bfrange` entry; returns how many codes it defined, counted
+    /// against [`MAX_FONT_CODES`].
+    fn insert_range(&mut self, low: u32, high: u32, target: &Obj) -> usize {
+        if high < low {
+            return 0;
+        }
         match target {
             Obj::Str(start) => {
-                let mut units = start
+                let units = start
                     .chunks(2)
                     .map(|pair| u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]))
                     .collect::<Vec<_>>();
-                for code in low..=high {
-                    self.map.insert(code, String::from_utf16_lossy(&units));
-                    if let Some(last) = units.last_mut() {
-                        *last = last.wrapping_add(1);
-                    }
-                }
+                self.ranges.push((low, high, units));
+                1
             }
             Obj::Array(texts) => {
+                let mut count = 0;
                 for (code, text) in (low..=high).zip(texts) {
                     if let Obj::Str(text) = text {
                         self.map.insert(code, utf16(text));
+                        count += 1;
                     }
                 }
+                count
             }
-            _ => {}
+            _ => 0,
         }
+    }
+
+    fn get(&self, code: u32) -> Option<String> {
+        if let Some(text) = self.map.get(&code) {
+            return Some(text.clone());
+        }
+        let index = self.ranges.partition_point(|range| range.0 <= code);
+        let (low, high, start) = self.ranges.get(index.checked_sub(1)?)?;
+        if code > *high {
+            return None;
+        }
+        let mut units = start.clone();
+        if let Some(last) = units.last_mut() {
+            // The offset fits: a range spans at most u32::MAX codes, and
+            // only the low 16 bits move the last unit.
+            *last = last.wrapping_add(u16::try_from((code - low) & 0xffff).unwrap_or(0));
+        }
+        Some(String::from_utf16_lossy(&units))
     }
 }
 
@@ -1145,11 +1553,29 @@ fn utf16(bytes: &[u8]) -> String {
     String::from_utf16_lossy(&units)
 }
 
+/// Glyph widths: single codes, plus CID ranges sorted by their first code.
+#[derive(Debug, Default)]
+struct Widths {
+    codes: HashMap<u32, f64>,
+    ranges: Vec<(u32, u32, f64)>,
+}
+
+impl Widths {
+    fn get(&self, code: u32) -> Option<f64> {
+        if let Some(width) = self.codes.get(&code) {
+            return Some(*width);
+        }
+        let index = self.ranges.partition_point(|range| range.0 <= code);
+        let (_, high, width) = self.ranges.get(index.checked_sub(1)?)?;
+        (code <= *high).then_some(*width)
+    }
+}
+
 #[derive(Debug, Default)]
 struct Font {
     two_byte: bool,
     cmap: Option<CMap>,
-    widths: HashMap<u32, f64>,
+    widths: Widths,
     default_width: f64,
 }
 
@@ -1166,14 +1592,10 @@ impl Font {
         let mut decodable = true;
         for chunk in bytes.chunks(code_bytes.max(1)) {
             let code = code_value(chunk);
-            width += self
-                .widths
-                .get(&code)
-                .copied()
-                .unwrap_or(self.default_width);
+            width += self.widths.get(code).unwrap_or(self.default_width);
             match &self.cmap {
-                Some(cmap) => match cmap.map.get(&code) {
-                    Some(mapped) => text.push_str(mapped),
+                Some(cmap) => match cmap.get(code) {
+                    Some(mapped) => text.push_str(&mapped),
                     None if !self.two_byte => {
                         text.push(win_ansi(u8::try_from(code).unwrap_or(b'?')));
                     }
@@ -1202,7 +1624,37 @@ fn win_ansi(byte: u8) -> char {
     }
 }
 
+/// An affine matrix `[a b c d e f]` as PDF writes them.
+type Matrix = [f64; 6];
+
+const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+
+/// `first` then `second`: the matrix PDF's `cm` makes from `first` (the
+/// operand) and `second` (the current transformation).
+fn multiply(first: &Matrix, second: &Matrix) -> Matrix {
+    let [a1, b1, c1, d1, e1, f1] = *first;
+    let [a2, b2, c2, d2, e2, f2] = *second;
+    [
+        a1 * a2 + b1 * c2,
+        a1 * b2 + b1 * d2,
+        c1 * a2 + d1 * c2,
+        c1 * b2 + d1 * d2,
+        e1 * a2 + f1 * c2 + e2,
+        e1 * b2 + f1 * d2 + f2,
+    ]
+}
+
+fn apply(matrix: &Matrix, x: f64, y: f64) -> (f64, f64) {
+    (
+        x * matrix[0] + y * matrix[2] + matrix[4],
+        x * matrix[1] + y * matrix[3] + matrix[5],
+    )
+}
+
 /// Where text goes on the page, enough to tell line breaks and word gaps.
+/// Positions are compared on the page (after the current transformation),
+/// so text placed with `cm` (a common way to lay out table cells) still
+/// gets its spaces and line breaks.
 #[derive(Debug)]
 struct TextState {
     font: Option<String>,
@@ -1212,8 +1664,10 @@ struct TextState {
     line: [f64; 6],
     /// Current x in user space after the last shown text.
     cursor_x: f64,
-    last_y: Option<f64>,
-    last_end_x: f64,
+    /// The current transformation matrix.
+    ctm: Matrix,
+    /// Page y of the last text, and page x where it ended.
+    last: Option<(f64, f64)>,
 }
 
 impl Default for TextState {
@@ -1222,23 +1676,23 @@ impl Default for TextState {
             font: None,
             font_size: 12.0,
             leading: 0.0,
-            line: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            line: IDENTITY,
             cursor_x: 0.0,
-            last_y: None,
-            last_end_x: 0.0,
+            ctm: IDENTITY,
+            last: None,
         }
     }
 }
 
 impl TextState {
     fn begin_text(&mut self) {
-        self.line = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        self.line = IDENTITY;
         self.cursor_x = 0.0;
     }
 
-    fn scale(&self) -> f64 {
-        let scale = self.line[0].hypot(self.line[1]);
-        if scale > 0.0 {
+    fn scale(matrix: &Matrix) -> f64 {
+        let scale = matrix[0].hypot(matrix[1]);
+        if scale > 0.0 && scale.is_finite() {
             scale
         } else {
             1.0
@@ -1270,8 +1724,14 @@ impl TextState {
         self.cursor_x = matrix[4];
     }
 
+    /// One em in user space.
     fn em(&self) -> f64 {
-        self.font_size.abs().max(0.1) * self.scale()
+        self.font_size.abs().max(0.1) * Self::scale(&self.line)
+    }
+
+    /// The current text position on the page.
+    fn page_point(&self) -> (f64, f64) {
+        apply(&self.ctm, self.cursor_x, self.y())
     }
 
     fn show(&mut self, bytes: &[u8], font: Option<&Font>, sink: &mut TextSink) {
@@ -1281,11 +1741,12 @@ impl TextState {
         };
         let font = font.unwrap_or(&fallback);
         let (text, width) = font.decode(bytes);
-        let em = self.em();
-        if let Some(last_y) = self.last_y {
-            if (self.y() - last_y).abs() > em * 0.5 {
+        let page_em = self.em() * Self::scale(&self.ctm);
+        let (x, y) = self.page_point();
+        if let Some((last_y, last_end_x)) = self.last {
+            if (y - last_y).abs() > page_em * 0.5 {
                 sink.newline();
-            } else if self.cursor_x - self.last_end_x > em * 0.15 {
+            } else if x - last_end_x > page_em * 0.15 {
                 sink.space();
             }
         }
@@ -1293,9 +1754,8 @@ impl TextState {
             Some(text) => sink.push(&text),
             None => sink.undecodable = true,
         }
-        self.cursor_x += width / 1000.0 * em;
-        self.last_end_x = self.cursor_x;
-        self.last_y = Some(self.y());
+        self.cursor_x += width / 1000.0 * self.em();
+        self.last = Some((y, self.page_point().0));
     }
 
     /// A `TJ` number: moves left by `adjust` thousandths of an em.
@@ -1303,7 +1763,10 @@ impl TextState {
         self.cursor_x -= adjust / 1000.0 * self.em();
         if adjust < -180.0 {
             sink.space();
-            self.last_end_x = self.cursor_x;
+            let x = self.page_point().0;
+            if let Some((_, end_x)) = self.last.as_mut() {
+                *end_x = x;
+            }
         }
     }
 }
@@ -1312,10 +1775,16 @@ impl TextState {
 struct TextSink {
     text: String,
     undecodable: bool,
+    /// The page held more text than [`MAX_PAGE_TEXT`]; the rest is dropped.
+    cut: bool,
 }
 
 impl TextSink {
     fn push(&mut self, text: &str) {
+        if self.text.len() + text.len() > MAX_PAGE_TEXT {
+            self.cut = true;
+            return;
+        }
         self.text.push_str(text);
     }
 
@@ -1386,12 +1855,15 @@ pub(super) mod fixtures {
         pdf
     }
 
+    pub(crate) fn compress(data: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(data).expect("compress");
+        encoder.finish().expect("finish")
+    }
+
     pub(crate) fn stream(dict: &str, data: &[u8], compress: bool) -> Vec<u8> {
         let (data, filter) = if compress {
-            let mut encoder =
-                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-            encoder.write_all(data).expect("compress");
-            (encoder.finish().expect("finish"), " /Filter /FlateDecode")
+            (self::compress(data), " /Filter /FlateDecode")
         } else {
             (data.to_vec(), "")
         };
@@ -1399,6 +1871,24 @@ pub(super) mod fixtures {
         out.extend_from_slice(&data);
         out.extend_from_slice(b"\nendstream");
         out
+    }
+
+    /// One page drawing `content` with Helvetica as `/F1` and `xobjects` as
+    /// the page's `/XObject` dictionary entries (objects from 5 on are
+    /// `extra`).
+    pub(crate) fn one_page(content: &[u8], xobjects: &str, extra: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /XObject << {xobjects} >> >> >>"
+            )
+            .into_bytes(),
+            stream("", content, true),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ];
+        objects.extend(extra);
+        assemble(&objects, "")
     }
 
     /// Three pages: plain text in Helvetica; a two-byte font decoded through a

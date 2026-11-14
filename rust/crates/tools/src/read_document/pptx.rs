@@ -4,11 +4,15 @@
 use std::path::Path;
 
 use super::xml::{attr, part_dir, relationships, rels_path, resolve_target, walk, Node, Package};
-use super::{markdown_table, Document, Selection, Unit};
+use super::{markdown_table, Budget, Document, Selection, Unit};
 
 const KIND: &str = "PowerPoint presentation";
 
-pub(super) fn read(path: &Path, selection: &Selection) -> Result<Document, String> {
+pub(super) fn read(
+    path: &Path,
+    selection: &Selection,
+    budget: &mut Budget,
+) -> Result<Document, String> {
     let mut package = Package::open(path, KIND)?;
     let presentation = package
         .read_part("ppt/presentation.xml")?
@@ -41,9 +45,15 @@ pub(super) fn read(path: &Path, selection: &Selection) -> Result<Document, Strin
         .collect::<Vec<_>>();
 
     let mut units = Vec::new();
+    let mut unread = Vec::new();
     for (index, part) in slide_parts.iter().enumerate() {
         let number = index + 1;
         if !selection.includes(number, None) {
+            continue;
+        }
+        if budget.is_spent() {
+            // Enough text for this call: name the rest without reading it.
+            unread.push(number);
             continue;
         }
         let markdown = match package.read_part(part)? {
@@ -54,6 +64,7 @@ pub(super) fn read(path: &Path, selection: &Selection) -> Result<Document, Strin
             }
             None => format!("## Slide {number}\n\n(the slide is missing from the file)"),
         };
+        budget.spend(&markdown);
         units.push(Unit { number, markdown });
     }
     Ok(Document {
@@ -62,6 +73,7 @@ pub(super) fn read(path: &Path, selection: &Selection) -> Result<Document, Strin
         total: slide_parts.len(),
         units,
         notes: Vec::new(),
+        unread,
     })
 }
 
