@@ -2356,6 +2356,20 @@ struct SkillRoot {
     origin: SkillOrigin,
 }
 
+impl SkillRoot {
+    /// Whether the skill folder `folder` may load from this root: the
+    /// enforced root holds only the enforced skills, whatever else is there.
+    fn admits(&self, folder: &std::ffi::OsStr) -> bool {
+        self.admits_name(&folder.to_string_lossy())
+    }
+
+    /// Whether a skill named `name` may load from this root.
+    fn admits_name(&self, name: &str) -> bool {
+        self.source != DefinitionSource::Enforced
+            || runtime::enforced_skills::is_enforced_skill(name)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InstalledSkill {
     invocation_name: String,
@@ -2737,7 +2751,7 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
             let entry = entry?;
             match root.origin {
                 SkillOrigin::SkillsDir => {
-                    if !entry.path().is_dir() {
+                    if !entry.path().is_dir() || !root.admits(&entry.file_name()) {
                         continue;
                     }
                     let skill_path = entry.path().join("SKILL.md");
@@ -2746,10 +2760,12 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
                     }
                     let contents = fs::read_to_string(&skill_path)?;
                     let (name, _) = parse_skill_frontmatter(&contents);
-                    entries.push((
-                        name.unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
-                        skill_path,
-                    ));
+                    let name =
+                        name.unwrap_or_else(|| entry.file_name().to_string_lossy().to_string());
+                    if !root.admits_name(&name) {
+                        continue;
+                    }
+                    entries.push((name, skill_path));
                 }
                 SkillOrigin::LegacyCommandsDir => {
                     let path = entry.path();
@@ -3666,7 +3682,7 @@ fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSumma
             let entry = entry?;
             match root.origin {
                 SkillOrigin::SkillsDir => {
-                    if !entry.path().is_dir() {
+                    if !entry.path().is_dir() || !root.admits(&entry.file_name()) {
                         continue;
                     }
                     let skill_path = entry.path().join("SKILL.md");
@@ -3675,9 +3691,13 @@ fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSumma
                     }
                     let contents = fs::read_to_string(skill_path)?;
                     let (name, description) = parse_skill_frontmatter(&contents);
+                    let name =
+                        name.unwrap_or_else(|| entry.file_name().to_string_lossy().to_string());
+                    if !root.admits_name(&name) {
+                        continue;
+                    }
                     root_skills.push(SkillSummary {
-                        name: name
-                            .unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
+                        name,
                         description,
                         source: root.source,
                         shadowed_by: None,
@@ -6395,6 +6415,38 @@ mod tests {
             ),
             "{report}"
         );
+        // A folder someone else put next to the enforced skills is not
+        // loaded as enforced: only the enforced skills' own names are.
+        let enforced_root = enforced
+            .parent()
+            .and_then(Path::parent)
+            .expect("enforced root")
+            .to_path_buf();
+        write_skill(&enforced_root, "planted", "Planted skill");
+        // A folder of another name claiming an enforced skill's name.
+        fs::create_dir_all(enforced_root.join("disguised")).expect("disguised");
+        fs::write(
+            enforced_root.join("disguised").join("SKILL.md"),
+            "---\nname: reading-documents\ndescription: Disguised\n---\n\n# disguised\n",
+        )
+        .expect("write disguised");
+        assert!(resolve_skill_path(&workspace, "planted").is_err());
+        assert_eq!(
+            resolve_skill_path(&workspace, "reading-documents").expect("resolves"),
+            enforced
+        );
+        let planted = load_skills_from_roots(&super::discover_skill_roots(&workspace))
+            .expect("registry loads");
+        let enforced_listed = planted
+            .iter()
+            .filter(|skill| skill.source == DefinitionSource::Enforced)
+            .collect::<Vec<_>>();
+        assert_eq!(enforced_listed.len(), 1, "{planted:?}");
+        assert_eq!(enforced_listed[0].name, "reading-documents");
+        assert_ne!(enforced_listed[0].description.as_deref(), Some("Disguised"));
+        fs::remove_dir_all(enforced_root.join("planted")).expect("cleanup");
+        fs::remove_dir_all(enforced_root.join("disguised")).expect("cleanup");
+
         let json = super::render_skills_report_json(&skills);
         assert_eq!(json["warnings"].as_array().map(Vec::len), Some(1));
         assert_eq!(

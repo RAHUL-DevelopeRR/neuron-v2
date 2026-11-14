@@ -102,6 +102,67 @@ fn has_document_magic(path: &Path) -> io::Result<bool> {
         || head.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]))
 }
 
+/// Whether `bytes` start with a UTF-16 byte order mark.
+#[must_use]
+fn has_utf16_bom(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF])
+}
+
+/// Whether a file with a document extension (and no document signature) is
+/// really text: UTF-16 with a byte order mark, or no NUL byte in its first
+/// 8 KB. `read_document` uses the same test to send such files to
+/// `read_file`.
+#[must_use]
+pub fn document_named_file_is_text(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && (has_utf16_bom(bytes) || !bytes[..bytes.len().min(8192)].contains(&0))
+}
+
+/// `bytes` as text when [`document_named_file_is_text`] says they are:
+/// UTF-16 by its byte order mark, else UTF-8, else Windows-1252 (the usual
+/// code page of such exports).
+fn decode_document_named_text(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    if !document_named_file_is_text(bytes) {
+        return None;
+    }
+    if has_utf16_bom(bytes) {
+        let little_endian = bytes[0] == 0xFF;
+        let (pairs, _) = bytes[2..].as_chunks::<2>();
+        let units = pairs.iter().map(|&pair| {
+            if little_endian {
+                u16::from_le_bytes(pair)
+            } else {
+                u16::from_be_bytes(pair)
+            }
+        });
+        return Some(
+            char::decode_utf16(units)
+                .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+                .collect(),
+        );
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Some(text.strip_prefix('\u{feff}').unwrap_or(text).to_string()),
+        Err(_) => Some(bytes.iter().map(|&byte| windows_1252(byte)).collect()),
+    }
+}
+
+/// One Windows-1252 byte as a character.
+fn windows_1252(byte: u8) -> char {
+    const HIGH: [u16; 32] = [
+        0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
+        0x2039, 0x0152, 0x008D, 0x017D, 0x008F, 0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022,
+        0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+    ];
+    match byte {
+        0x80..=0x9F => char::from_u32(u32::from(HIGH[usize::from(byte - 0x80)]))
+            .unwrap_or(char::REPLACEMENT_CHARACTER),
+        _ => char::from(byte),
+    }
+}
+
 /// Check whether a file appears to contain binary content by examining
 /// the first chunk for NUL bytes.
 fn is_binary_file(path: &Path) -> io::Result<bool> {
@@ -364,20 +425,24 @@ pub fn read_file(
         }
     }
 
-    // Detect binary files
-    if is_binary_file(&absolute_path)? {
-        return Err(match kind {
-            Some(kind) => use_read_document(kind),
-            None => io::Error::new(io::ErrorKind::InvalidData, "file appears to be binary"),
-        });
-    }
-
-    let content = match (fs::read_to_string(&absolute_path), kind) {
-        (Ok(content), _) => content,
-        (Err(error), Some(kind)) if error.kind() == io::ErrorKind::InvalidData => {
-            return Err(use_read_document(kind));
+    let content = if let Some(kind) = kind {
+        // Text under a document extension (many "export to Excel" features
+        // write CSV or HTML as .xls, in the system code page or UTF-16):
+        // read it as text, judged the way read_document judges it, so the
+        // two tools never send a file back and forth.
+        match decode_document_named_text(&fs::read(&absolute_path)?) {
+            Some(content) => content,
+            None => return Err(use_read_document(kind)),
         }
-        (Err(error), _) => return Err(error),
+    } else {
+        // Detect binary files
+        if is_binary_file(&absolute_path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file appears to be binary",
+            ));
+        }
+        fs::read_to_string(&absolute_path)?
     };
     let lines: Vec<&str> = content.lines().collect();
     let start_index = offset.unwrap_or(0).min(lines.len());
@@ -1932,6 +1997,52 @@ mod tests {
         std::fs::create_dir_all(text.parent().expect("parent")).expect("dir");
         std::fs::write(&text, "plain text").expect("write");
         assert!(read_file(text.to_string_lossy().as_ref(), None, None).is_ok());
+    }
+
+    #[test]
+    fn text_exports_named_as_documents_read_as_text_in_any_encoding() {
+        let dir = temp_path("legacy-text");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let content = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).expect("write");
+            read_file(path.to_string_lossy().as_ref(), None, None)
+                .unwrap_or_else(|error| panic!("{name} reads as text: {error}"))
+                .file
+                .content
+        };
+        // Windows-1252, as ERP "export to Excel" features write it: not
+        // UTF-8, so it used to bounce between read_file and read_document.
+        for name in ["export.xls", "export.pdf", "export.docx"] {
+            let text = content(name, b"Name,City\nJos\xe9,M\xe1laga \x80 5\n");
+            assert!(text.contains("Jos\u{e9},M\u{e1}laga \u{20ac} 5"), "{text}");
+        }
+        // UTF-16 "Unicode Text" saved as .xls, both byte orders.
+        let mut little = vec![0xFF, 0xFE];
+        let mut big = vec![0xFE, 0xFF];
+        for unit in "Name\tCity\r\nJos\u{e9}\tM\u{e1}laga\r\n".encode_utf16() {
+            little.extend(unit.to_le_bytes());
+            big.extend(unit.to_be_bytes());
+        }
+        for bytes in [little, big] {
+            let text = content("unicode.xls", &bytes);
+            assert!(text.contains("Jos\u{e9}\tM\u{e1}laga"), "{text}");
+        }
+        // UTF-8 with a byte order mark loses the mark.
+        assert_eq!(
+            content("bom.xls", "\u{feff}a,b\n".as_bytes()).trim_end(),
+            "a,b"
+        );
+        assert!(super::document_named_file_is_text(b"\xFF\xFEa\0"));
+        assert!(!super::document_named_file_is_text(b"ab\0cd"));
+        // Binary bytes without a document signature still go to read_document.
+        let path = dir.join("broken.xls");
+        std::fs::write(&path, b"\x01\x02\0\0garbage").expect("write");
+        let message = read_file(path.to_string_lossy().as_ref(), None, None)
+            .expect_err("not text")
+            .to_string();
+        assert!(message.contains("read it with read_document"), "{message}");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

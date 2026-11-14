@@ -1654,7 +1654,8 @@ fn execute_tool_with_enforcer_and_cancel(
         }
         "read_document" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<ReadDocumentInput>(input).and_then(run_read_document)
+            from_value::<ReadDocumentInput>(input)
+                .and_then(|input| run_read_document(input, cancel))
         }
         "write_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -2609,7 +2610,10 @@ fn run_read_file(input: ReadFileInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_read_document(input: ReadDocumentInput) -> Result<String, String> {
+fn run_read_document(
+    input: ReadDocumentInput,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
     let workspace_root = runtime::workdir::current_dir().map_err(|error| error.to_string())?;
     let path =
         runtime::readable_file_in_workspace(&input.path, &workspace_root).map_err(io_to_string)?;
@@ -2623,6 +2627,7 @@ fn run_read_document(input: ReadDocumentInput) -> Result<String, String> {
             columns: input.columns.as_deref(),
             max_chars: input.max_chars,
         },
+        cancel,
     )
 }
 

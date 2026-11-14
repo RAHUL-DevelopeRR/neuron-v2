@@ -718,3 +718,160 @@ fn max_chars_stays_under_the_runtimes_tool_result_limit() {
     assert!(super::max_chars_ceiling() <= 36_000);
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// A Word table of `rows` (each a list of cell texts) inside a body.
+fn word_table(rows: &[Vec<String>]) -> String {
+    let rows = rows
+        .iter()
+        .map(|cells| {
+            let cells = cells
+                .iter()
+                .map(|text| format!("<w:tc><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:tc>"))
+                .collect::<String>();
+            format!("<w:tr>{cells}</w:tr>")
+        })
+        .collect::<String>();
+    format!("<w:tbl>{rows}</w:tbl>")
+}
+
+#[test]
+fn a_huge_header_over_many_page_broken_rows_is_not_copied_per_page() {
+    let dir = temp_dir("table-header-pages");
+    // 64 header cells of 16 KB each, then 50,000 rows that each hold only a
+    // page break: every row starts a page. The header used to be copied and
+    // rendered once per page, about 100 GB.
+    let mut body = String::from("<w:tbl><w:tr>");
+    for column in 0..64 {
+        let _ = write!(
+            body,
+            "<w:tc><w:p><w:r><w:t>h{column}{}</w:t></w:r></w:p></w:tc>",
+            "x".repeat(16_000)
+        );
+    }
+    body.push_str("</w:tr>");
+    for _ in 0..50_000 {
+        body.push_str(r#"<w:tr><w:tc><w:p><w:r><w:br w:type="page"/></w:r></w:p></w:tc></w:tr>"#);
+    }
+    body.push_str("</w:tbl>");
+    let path = write(&dir, "pages.docx", &super::tests::docx(&body));
+    let started = Instant::now();
+    let out = read(&path, Some("1"), Some(36_000)).expect("reads");
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "{:?}",
+        started.elapsed()
+    );
+    // One header, its cells cut short, and nothing repeated.
+    assert_eq!(out.matches("| h0").count(), 1, "{out:.500}");
+    assert!(out.contains(" [...]"), "{out:.500}");
+    assert!(!out.contains("(table continued)"));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn table_cells_and_tables_are_capped_while_they_are_built() {
+    let mut table = super::TableBuilder::default();
+    table.start_row(1);
+    table.start_cell();
+    table.push_line("Header");
+    for _ in 0..400 {
+        table.start_row(1);
+        table.start_cell();
+        table.push_line(&"y".repeat(3_000));
+        // Past the cell's cap: dropped.
+        table.push_line(&"z".repeat(3_000));
+        table.push_line("never");
+    }
+    let parts = table.into_parts();
+    assert_eq!(parts.len(), 1);
+    let markdown = parts[0].render();
+    assert!(!markdown.contains("never"));
+    let first_row = markdown.lines().nth(2).expect("a body row");
+    assert!(first_row.ends_with(" [...] |"), "{first_row:.80}");
+    assert!(first_row.chars().count() < super::MAX_CELL_CHARS + 20);
+    // All parts together stay within the table cap, with a note.
+    assert!(markdown.chars().count() <= 1_000_200, "{}", markdown.len());
+    assert!(
+        markdown.ends_with("more rows of this table are longer than read_document returns]"),
+        "{}",
+        &markdown[markdown.len() - 200..]
+    );
+}
+
+#[test]
+fn every_row_of_a_long_table_without_saved_page_breaks_can_be_read() {
+    let dir = temp_dir("table-estimated");
+    let mut rows = vec![vec![
+        "Code".to_string(),
+        "Name".to_string(),
+        "Region".to_string(),
+        "Amount".to_string(),
+    ]];
+    for number in 1..=1_500 {
+        rows.push(
+            (0..4)
+                .map(|column| format!("r{number:04}c{column}-{}", "q".repeat(22)))
+                .collect(),
+        );
+    }
+    let body = format!(
+        "<w:p><w:r><w:t>Ledger</w:t></w:r></w:p>{}",
+        word_table(&rows)
+    );
+    let path = write(&dir, "ledger.docx", &super::tests::docx(&body));
+    let first = read(&path, Some("1"), Some(36_000)).expect("reads");
+    let total = first
+        .split(", ")
+        .find_map(|part| part.strip_suffix(" pages"))
+        .and_then(|count| count.parse::<usize>().ok())
+        .unwrap_or_else(|| panic!("a page count: {first:.300}"));
+    assert!(total > 20, "the table spans estimated pages: {total}");
+    let mut seen = std::collections::BTreeSet::new();
+    for page in 1..=total {
+        let out = read(&path, Some(&page.to_string()), Some(36_000)).expect("reads");
+        assert!(!out.contains("does not fit in one call"), "page {page}");
+        assert!(!out.contains("[truncated"), "page {page}: {out:.300}");
+        if page > 1 {
+            assert!(out.contains("(table continued)"), "page {page}");
+            assert!(
+                out.contains("| Code | Name | Region | Amount |"),
+                "page {page}"
+            );
+        }
+        for line in out.lines().filter(|line| line.starts_with("| r")) {
+            seen.insert(line[3..7].parse::<usize>().expect("row number"));
+        }
+    }
+    assert_eq!(seen.len(), 1_500, "every row is on some page");
+    assert!(seen.contains(&1_500));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn utf16_and_legacy_text_named_as_documents_point_at_read_file() {
+    let dir = temp_dir("utf16-text");
+    let mut utf16 = vec![0xFF, 0xFE];
+    for unit in "Name\tCity\r\nJos\u{e9}\tM\u{e1}laga\r\n".encode_utf16() {
+        utf16.extend(unit.to_le_bytes());
+    }
+    for name in ["unicode.xls", "unicode.pdf"] {
+        let path = write(&dir, name, &utf16);
+        let error = read(&path, None, None).expect_err("text, not a document");
+        assert!(error.contains("read it with read_file"), "{error}");
+        // And read_file reads it: the two tools agree.
+        let text = runtime::read_file(path.to_string_lossy().as_ref(), None, None)
+            .expect("read_file reads it")
+            .file
+            .content;
+        assert!(text.contains("Jos\u{e9}\tM\u{e1}laga"), "{text}");
+    }
+    let path = write(&dir, "export.xls", b"Name,City\nJos\xe9,M\xe1laga\n");
+    let error = read(&path, None, None).expect_err("text, not a document");
+    assert!(error.contains("read it with read_file"), "{error}");
+    let text = runtime::read_file(path.to_string_lossy().as_ref(), None, None)
+        .expect("read_file reads it")
+        .file
+        .content;
+    assert!(text.contains("Jos\u{e9},M\u{e1}laga"), "{text}");
+    std::fs::remove_dir_all(dir).ok();
+}

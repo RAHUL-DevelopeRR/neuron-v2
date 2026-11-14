@@ -179,11 +179,8 @@ fn parse_slide(xml: &str) -> Result<Slide, String> {
             if text.is_empty() {
                 return;
             }
-            if let Some(cell) = tables.last_mut().and_then(TableBuilder::cell_mut) {
-                if !cell.is_empty() {
-                    cell.push('\n');
-                }
-                cell.push_str(&text);
+            if let Some(table) = tables.last_mut() {
+                table.push_line(&text);
             } else if let Some(shape) = shapes.last_mut() {
                 shape.paragraphs.push((level, text));
             }

@@ -6,8 +6,8 @@
 //! So the CLI runs each read in a copy of itself ([`WORKER_ARG`]): the parent
 //! has already checked the path against the workspace and the permissions,
 //! sends the request as JSON on stdin and reads one JSON reply from stdout.
-//! The parent kills a child that runs past [`WORKER_TIMEOUT`], caps what it
-//! reads back, and turns a crash, an abort or a kill into a tool error. On
+//! The parent kills a child that runs past [`WORKER_TIMEOUT`] or whose turn
+//! is cancelled (Esc), caps what it reads back, and turns a crash, an abort or a kill into a tool error. On
 //! Windows the child also runs in a Job Object with a memory limit
 //! ([`WORKER_MEMORY_BYTES`]) and no room to start other processes.
 //!
@@ -24,6 +24,7 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use runtime::cancel::CancellationToken;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -59,13 +60,24 @@ struct Request {
 }
 
 /// Reads `path` (already checked against the workspace and size limits):
-/// in a worker process when one is registered, else in this process.
-pub(crate) fn read(path: &Path, options: &Options<'_>) -> Result<String, String> {
+/// in a worker process when one is registered, else in this process. A
+/// cancelled `cancel` stops the worker at once.
+pub(crate) fn read(
+    path: &Path,
+    options: &Options<'_>,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
+    if cancel.is_cancelled() {
+        return Err(CANCELLED.to_string());
+    }
     match WORKER.get() {
-        Some(exe) => read_in_worker(exe, path, options, WORKER_TIMEOUT),
+        Some(exe) => read_in_worker(exe, path, options, WORKER_TIMEOUT, cancel),
         None => super::read_document(path, options),
     }
 }
+
+/// The error for a read stopped because its turn was cancelled.
+pub(crate) const CANCELLED: &str = "read_document was cancelled";
 
 /// Reads `path` in a child process started from `exe`.
 pub(crate) fn read_in_worker(
@@ -73,6 +85,7 @@ pub(crate) fn read_in_worker(
     path: &Path,
     options: &Options<'_>,
     timeout: Duration,
+    cancel: &CancellationToken,
 ) -> Result<String, String> {
     let request = Request {
         path: path.to_path_buf(),
@@ -84,7 +97,7 @@ pub(crate) fn read_in_worker(
     let input = serde_json::to_vec(&request).map_err(|error| unsafe_read(&error.to_string()))?;
     let mut command = Command::new(exe);
     command.arg(WORKER_ARG);
-    let output = run_child(command, &input, timeout)?;
+    let output = run_child(command, &input, timeout, cancel)?;
     let reply: Value = serde_json::from_slice(&output)
         .map_err(|_| unsafe_read("the reader sent back an unreadable reply"))?;
     if let Some(markdown) = reply.get("ok").and_then(Value::as_str) {
@@ -113,6 +126,7 @@ pub fn read_document_with_worker(
             ..Options::default()
         },
         WORKER_TIMEOUT,
+        &CancellationToken::new(),
     )
 }
 
@@ -121,17 +135,26 @@ fn unsafe_read(reason: &str) -> String {
 }
 
 /// Runs `command` with `input` on stdin and returns its stdout, enforcing
-/// `timeout`, [`MAX_REPLY_BYTES`] and (on Windows) the memory limit. Any way
-/// the child ends other than exiting with status 0 is an error.
+/// `timeout`, `cancel`, [`MAX_REPLY_BYTES`] and (on Windows) the memory
+/// limit. Any way the child ends other than exiting with status 0 is an
+/// error.
 pub(crate) fn run_child(
     mut command: Command,
     input: &[u8],
     timeout: Duration,
+    cancel: &CancellationToken,
 ) -> Result<Vec<u8>, String> {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // Its own process group, so a Ctrl-C in the terminal reaches the agent,
+    // which cancels the read, instead of killing the reader mid-way.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -178,6 +201,14 @@ pub(crate) fn run_child(
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
+            Ok(None) if cancel.is_cancelled() => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(reader) = reader {
+                    let _ = reader.join();
+                }
+                return Err(CANCELLED.to_string());
+            }
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -250,7 +281,8 @@ pub fn run_worker() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::run_child;
+    use super::{run_child, CANCELLED};
+    use runtime::cancel::CancellationToken;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -278,7 +310,13 @@ mod tests {
             command
         };
         let started = Instant::now();
-        let error = run_child(sleeper, b"", Duration::from_millis(500)).expect_err("killed");
+        let error = run_child(
+            sleeper,
+            b"",
+            Duration::from_millis(500),
+            &CancellationToken::new(),
+        )
+        .expect_err("killed");
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "killed promptly"
@@ -291,16 +329,73 @@ mod tests {
 
     #[test]
     fn a_child_that_fails_or_answers_nonsense_is_an_error() {
-        let error = run_child(shell("exit 3"), b"", Duration::from_secs(20)).expect_err("fails");
+        let error = run_child(
+            shell("exit 3"),
+            b"",
+            Duration::from_secs(20),
+            &CancellationToken::new(),
+        )
+        .expect_err("fails");
         assert!(
             error.contains(
                 "could not read this document safely: the reader stopped unexpectedly (code 3)"
             ),
             "{error}"
         );
-        let output = run_child(shell("echo hello"), b"", Duration::from_secs(20)).expect("runs");
+        let output = run_child(
+            shell("echo hello"),
+            b"",
+            Duration::from_secs(20),
+            &CancellationToken::new(),
+        )
+        .expect("runs");
         assert!(String::from_utf8_lossy(&output).contains("hello"));
         assert!(serde_json::from_slice::<serde_json::Value>(&output).is_err());
+    }
+
+    fn sleeper() -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("ping.exe");
+            command.args(["-n", "30", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        }
+    }
+
+    #[test]
+    fn a_cancelled_turn_stops_the_child_at_once() {
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let error =
+            run_child(sleeper(), b"", Duration::from_secs(30), &cancel).expect_err("cancelled");
+        canceller.join().expect("canceller");
+        assert_eq!(error, CANCELLED);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "stopped well before the timeout: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_read_cancelled_before_it_starts_does_nothing() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = super::read(
+            std::path::Path::new("missing.docx"),
+            &super::Options::default(),
+            &cancel,
+        )
+        .expect_err("cancelled");
+        assert_eq!(error, CANCELLED);
     }
 
     #[test]
@@ -310,6 +405,7 @@ mod tests {
         let error = super::read(
             std::path::Path::new("missing.docx"),
             &super::Options::default(),
+            &CancellationToken::new(),
         )
         .expect_err("no such file");
         assert!(

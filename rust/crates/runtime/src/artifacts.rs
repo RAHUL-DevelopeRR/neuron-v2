@@ -324,9 +324,10 @@ pub fn enabled_from_env() -> bool {
     })
 }
 
-/// A tool `output` longer than `limit` bytes is stored whole in `store` and comes back
-/// as `cap(output)` followed by a note naming the artifact. Shorter outputs, or any
-/// output when the store refuses it, come back as `cap(output)`.
+/// A tool `output` longer than `limit` characters (the unit `cap` cuts in) is stored
+/// whole in `store` and comes back as `cap(output)` followed by a note naming the
+/// artifact. Shorter outputs, or any output when the store refuses it, come back as
+/// `cap(output)`.
 pub fn offload_tool_result(
     store: Option<&mut ArtifactStore>,
     tool_name: &str,
@@ -337,7 +338,10 @@ pub fn offload_tool_result(
     let Some(store) = store else {
         return cap(output);
     };
-    if output.len() <= limit {
+    // Bytes first, which is cheap and never fewer than the characters; then the
+    // characters, so non-ASCII output that `cap` leaves whole gets no note
+    // saying parts were left out.
+    if output.len() <= limit || output.chars().count() <= limit {
         return cap(output);
     }
     match store.put(
@@ -562,6 +566,29 @@ mod tests {
             offload_tool_result(Some(&mut tiny), "bash", output.clone(), 100, cap),
             output[..20]
         );
+    }
+
+    #[test]
+    fn non_ascii_output_under_the_limit_in_characters_is_not_offloaded() {
+        let root = TempRoot::new("offload-chars");
+        let mut store = ArtifactStore::open(&root.0, "s1").unwrap();
+        // 60 characters, 120 bytes of UTF-8: within a 100 character limit.
+        let cyrillic = "\u{416}".repeat(60);
+        let cap = |text: String| text.chars().take(100).collect::<String>();
+        let out = offload_tool_result(
+            Some(&mut store),
+            "read_document",
+            cyrillic.clone(),
+            100,
+            cap,
+        );
+        assert_eq!(out, cyrillic);
+        assert_eq!(store.list(), []);
+        // Past the limit in characters it is still offloaded.
+        let long = "\u{416}".repeat(150);
+        let out = offload_tool_result(Some(&mut store), "read_document", long, 100, cap);
+        assert!(out.contains("saved as artifact"), "{out}");
+        assert_eq!(store.list().len(), 1);
     }
 
     #[test]

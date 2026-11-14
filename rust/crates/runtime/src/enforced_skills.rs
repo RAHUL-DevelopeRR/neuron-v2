@@ -9,6 +9,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use sha2::{Digest, Sha256};
 
@@ -67,6 +68,13 @@ pub fn enforced_skill_root_for(
     let root = config_home
         .join("enforced-skills")
         .join(format!("{:x}", digest.finalize()));
+    write_skill_files(&root, skills)?;
+    Ok(root)
+}
+
+/// Writes each skill's files under `root/<name>/`, leaving files that
+/// already hold the right contents alone.
+fn write_skill_files(root: &Path, skills: &[EnforcedSkill]) -> io::Result<()> {
     for skill in skills {
         for (relative, contents) in &skill.files {
             let target = root.join(&skill.name).join(relative);
@@ -76,24 +84,83 @@ pub fn enforced_skill_root_for(
             }
         }
     }
-    Ok(root)
+    Ok(())
 }
 
 /// [`enforced_skill_root_for`] with the active enforced skills. When
-/// `config_home` cannot be written, the files go under the temp folder
-/// instead, so an enforced skill still wins over a project skill of its name.
+/// `config_home` cannot be written, the files go into a private folder this
+/// process creates under the temp folder ([`private_fallback_root`]), so an
+/// enforced skill still wins over a project skill of its name.
 pub fn enforced_skill_root(config_home: &Path) -> io::Result<PathBuf> {
     let skills = active_enforced_skills();
-    enforced_skill_root_for(config_home, &skills).or_else(|error| {
-        let user = std::env::var("USERNAME")
-            .or_else(|_| std::env::var("USER"))
-            .unwrap_or_default()
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .collect::<String>();
-        let fallback = std::env::temp_dir().join(format!("neuron-{user}"));
-        enforced_skill_root_for(&fallback, &skills).map_err(|_| error)
-    })
+    enforced_skill_root_for(config_home, &skills)
+        .or_else(|error| private_fallback_root(&skills).map_err(|_| error))
+}
+
+/// The fallback folder for enforced skill files: created by this process
+/// under an unguessable name (owner-only on Unix), never a shared or
+/// predictable path another user could fill first, and reused for the rest
+/// of the process while it is still a folder only its owner can reach.
+fn private_fallback_root(skills: &[EnforcedSkill]) -> io::Result<PathBuf> {
+    static ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+    let mut root = ROOT.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(existing) = root.as_ref() {
+        if is_private_dir(existing) && write_skill_files(existing, skills).is_ok() {
+            return Ok(existing.clone());
+        }
+    }
+    let created = create_private_dir()?;
+    write_skill_files(&created, skills)?;
+    *root = Some(created.clone());
+    Ok(created)
+}
+
+/// A new, empty folder in the temp folder, made by this call: creation
+/// fails rather than reuse a path that already exists.
+fn create_private_dir() -> io::Result<PathBuf> {
+    let base = std::env::temp_dir();
+    for _ in 0..16 {
+        let path = base.join(format!(
+            "neuron-enforced-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not create a private folder for the enforced skills",
+    ))
+}
+
+/// Whether `path` is still a real folder (not a link) that, on Unix, only
+/// its owner can reach.
+fn is_private_dir(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 /// The system prompt section naming the enforced skills, one short line each.
@@ -233,6 +300,44 @@ mod tests {
             .join("reading-documents")
             .join("SKILL.md")
             .is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_temp_fallback_is_a_private_folder_no_one_else_can_prepare() {
+        let root = temp_root("private-fallback");
+        fs::create_dir_all(&root).unwrap();
+        let config_home = root.join("config");
+        fs::write(&config_home, "not a folder").unwrap();
+        // The old fallback was temp/neuron-<user>/enforced-skills/<hash>:
+        // another user could create it first and add skills of their own.
+        let user = std::env::var("USERNAME")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_default();
+        let predictable = std::env::temp_dir().join(format!("neuron-{user}"));
+        let fallback = enforced_skill_root(&config_home).expect("temp fallback");
+        assert!(
+            !fallback.starts_with(&predictable),
+            "{}",
+            fallback.display()
+        );
+        let name = fallback.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("neuron-enforced-"), "{name}");
+        assert!(name.len() > "neuron-enforced-".len() + 16, "{name}");
+        assert!(is_private_dir(&fallback));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&fallback).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        // Reused for the rest of the process (other tests share it, so its
+        // files are left in place).
+        assert_eq!(enforced_skill_root(&config_home).unwrap(), fallback);
+        // A folder that already exists is never taken over.
+        let another = create_private_dir().unwrap();
+        assert_ne!(another, fallback);
+        fs::remove_dir_all(another).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -637,7 +637,8 @@ fn bad_input_gets_short_clear_errors() {
     let error = read_document(&encrypted, None, None).expect_err("encrypted");
     assert!(error.contains("encrypted"), "{error}");
 
-    let fake_pdf = write(&dir, "fake.pdf", b"hello there");
+    // Binary bytes: text named .pdf is sent to read_file instead.
+    let fake_pdf = write(&dir, "fake.pdf", b"hello\0there");
     let error = read_document(&fake_pdf, None, None).expect_err("not a pdf");
     assert!(error.contains("%PDF header is missing"), "{error}");
 
@@ -664,7 +665,8 @@ fn bad_input_gets_short_clear_errors() {
     let error = read_document(&bad_xml, None, None).expect_err("damaged xml");
     assert!(error.contains("damaged XML"), "{error}");
 
-    let not_book = write(&dir, "broken.xlsx", b"nope");
+    // Binary bytes: text named .xlsx is sent to read_file instead.
+    let not_book = write(&dir, "broken.xlsx", b"no\0pe");
     let error = read_document(&not_book, None, None).expect_err("not a workbook");
     assert!(error.contains("not a readable spreadsheet"), "{error}");
 

@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use super::xml::{attr, walk, Node, Package};
-use super::{Budget, Document, Selection, TableBuilder, Unit};
+use super::{Budget, Document, Selection, TableBuilder, TablePart, Unit};
 
 const KIND: &str = "Word document";
 
@@ -96,7 +96,8 @@ fn paginate(
     if pages > 1 {
         pages_of_blocks.resize(pages, Vec::new());
         for block in blocks {
-            pages_of_blocks[block.page.clamp(1, pages) - 1].push(block.markdown);
+            let page = block.page().clamp(1, pages);
+            pages_of_blocks[page - 1].push(block.into_markdown());
         }
         let mut note = "page numbers follow the page breaks saved with the file".to_string();
         match saved_pages {
@@ -113,13 +114,23 @@ fn paginate(
     } else {
         let mut current: Vec<String> = Vec::new();
         let mut size = 0;
-        for block in blocks {
+        // A long table is split into parts of about a page, so every row
+        // lands on a page one call can return.
+        let markdown = blocks.into_iter().flat_map(|block| match block {
+            Block::Text { markdown, .. } => vec![markdown],
+            Block::Table(part) => part
+                .split(ESTIMATED_PAGE_CHARS)
+                .iter()
+                .map(TablePart::render)
+                .collect(),
+        });
+        for markdown in markdown {
             if size >= ESTIMATED_PAGE_CHARS && !current.is_empty() {
                 pages_of_blocks.push(std::mem::take(&mut current));
                 size = 0;
             }
-            size += block.markdown.chars().count();
-            current.push(block.markdown);
+            size += markdown.chars().count();
+            current.push(markdown);
         }
         if !current.is_empty() || pages_of_blocks.is_empty() {
             pages_of_blocks.push(current);
@@ -464,9 +475,29 @@ struct Paragraph {
 }
 
 #[derive(Debug)]
-struct Block {
-    page: usize,
-    markdown: String,
+enum Block {
+    Text {
+        page: usize,
+        markdown: String,
+    },
+    /// The rows of a table that start on one page.
+    Table(TablePart),
+}
+
+impl Block {
+    fn page(&self) -> usize {
+        match self {
+            Self::Text { page, .. } => *page,
+            Self::Table(part) => part.page,
+        }
+    }
+
+    fn into_markdown(self) -> String {
+        match self {
+            Self::Text { markdown, .. } => markdown,
+            Self::Table(part) => part.render(),
+        }
+    }
 }
 
 struct ParsedBody {
@@ -648,15 +679,10 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
                 let text = paragraph.text.trim();
                 if !text.is_empty() {
                     if let Some(table) = tables.last_mut() {
-                        if let Some(cell) = table.cell_mut() {
-                            if !cell.is_empty() {
-                                cell.push('\n');
-                            }
-                            cell.push_str(text);
-                        }
+                        table.push_line(text);
                     } else {
                         pager.section_page_empty = false;
-                        blocks.push(Block {
+                        blocks.push(Block::Text {
                             page: paragraph.page,
                             markdown: render_paragraph(
                                 &paragraph,
@@ -700,20 +726,14 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
                 };
                 if let Some(parent) = tables.last_mut() {
                     // A table inside a cell joins the cell as plain text.
-                    let flat = table.flatten();
-                    if let Some(cell) = parent.cell_mut() {
-                        if !cell.is_empty() {
-                            cell.push('\n');
-                        }
-                        cell.push_str(&flat);
-                    }
+                    parent.push_line(&table.flatten());
                     return;
                 }
                 // One block per page the table's rows start on, so a long
                 // table's later rows are on the pages Word put them.
-                for (page, markdown) in table.into_blocks() {
+                for part in table.into_parts() {
                     pager.section_page_empty = false;
-                    blocks.push(Block { page, markdown });
+                    blocks.push(Block::Table(part));
                 }
             }
             _ => {}

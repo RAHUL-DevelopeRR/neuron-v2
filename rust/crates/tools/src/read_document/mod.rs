@@ -324,9 +324,11 @@ pub(crate) fn text_file_error(path: &Path) -> String {
     )
 }
 
-/// Whether `data` looks like text: no NUL byte in its first 8 KB.
+/// Whether `data` looks like text: UTF-16 with a byte order mark, or no NUL
+/// byte in its first 8 KB. `read_file` reads exactly these files as text
+/// (in any of their usual encodings), so the two tools agree.
 pub(crate) fn looks_like_text(data: &[u8]) -> bool {
-    !data.is_empty() && !data[..data.len().min(8192)].contains(&0)
+    runtime::document_named_file_is_text(data)
 }
 
 /// `names` as `1 A, 2 B, ...`, at most [`MAX_LISTED_SHEETS`] of them, each
@@ -604,17 +606,149 @@ pub(crate) fn markdown_table(rows: &[Vec<String>]) -> String {
     out
 }
 
+/// Characters of text one cell of a document table keeps while the XML is
+/// walked; the rest is dropped and the cell ends in [`CUT_MARK`].
+pub(crate) const MAX_CELL_CHARS: usize = 4_000;
+/// Characters one rendered row of a document table takes at most: the cells
+/// of a wide row are cut shorter so the whole line fits.
+const MAX_ROW_LINE_CHARS: usize = 24_000;
+/// Characters of the header row repeated over each continued part.
+const MAX_REPEATED_HEADER_CHARS: usize = 2_000;
+/// Characters one document table renders to across all its parts, repeated
+/// headers included. Tables are split into parts of about a page, so this
+/// is more than one call returns but every part stays reachable.
+const MAX_DOCUMENT_TABLE_CHARS: usize = 1_000_000;
+/// Marks a cell whose text was cut.
+const CUT_MARK: &str = " [...]";
+/// Starts each part of a table after the first.
+const CONTINUED: &str = "(table continued)\n\n";
+
+/// One cell as Markdown, cut to `max_chars` characters (after escaping)
+/// without splitting an escape.
+fn cut_cell(text: &str, max_chars: usize) -> String {
+    let escaped = table_cell(text);
+    if escaped.chars().count() <= max_chars {
+        return escaped;
+    }
+    let mut kept = take_chars(&escaped, max_chars).to_string();
+    for partial in ["<br", "<b", "<", "\\"] {
+        if kept.ends_with(partial) {
+            kept.truncate(kept.len() - partial.len());
+            break;
+        }
+    }
+    kept.push_str(CUT_MARK);
+    kept
+}
+
+/// `row` as one Markdown table line of `columns` cells, each at most
+/// `per_cell` characters.
+fn row_line(row: &[String], columns: usize, per_cell: usize) -> String {
+    let mut cells = row
+        .iter()
+        .take(columns)
+        .map(|cell| cut_cell(cell, per_cell))
+        .collect::<Vec<_>>();
+    cells.resize(columns, String::new());
+    format!("| {} |", cells.join(" | "))
+}
+
+/// The rows of a document table that start on one page, rendered: the
+/// header lines are shared by every part of the table, not copied.
+#[derive(Debug, Clone)]
+pub(crate) struct TablePart {
+    pub(crate) page: usize,
+    /// Header row and separator line, for the first part.
+    header: std::sync::Arc<str>,
+    /// A shorter copy for the parts after it.
+    repeat_header: std::sync::Arc<str>,
+    /// The part continues the table: it starts with [`CONTINUED`].
+    continued: bool,
+    lines: Vec<String>,
+    /// A note after the last row ("more rows are left out").
+    note: Option<String>,
+}
+
+impl TablePart {
+    pub(crate) fn render(&self) -> String {
+        let header: &str = if self.continued {
+            &self.repeat_header
+        } else {
+            &self.header
+        };
+        let mut out = String::with_capacity(
+            header.len() + self.lines.iter().map(|line| line.len() + 1).sum::<usize>() + 32,
+        );
+        if self.continued {
+            out.push_str(CONTINUED);
+        }
+        out.push_str(header);
+        for line in &self.lines {
+            out.push('\n');
+            out.push_str(line);
+        }
+        if let Some(note) = &self.note {
+            out.push_str("\n\n");
+            out.push_str(note);
+        }
+        out
+    }
+
+    /// The part as parts of about `max_chars` characters of rows each, all
+    /// but the first continuing the table, so no one page has to hold a
+    /// long table (pages estimated by size).
+    pub(crate) fn split(self, max_chars: usize) -> Vec<TablePart> {
+        let Self {
+            page,
+            header,
+            repeat_header,
+            continued,
+            lines,
+            note,
+        } = self;
+        let part = |continued: bool, lines: Vec<String>| TablePart {
+            page,
+            header: header.clone(),
+            repeat_header: repeat_header.clone(),
+            continued,
+            lines,
+            note: None,
+        };
+        let mut parts = Vec::new();
+        let mut current = Vec::new();
+        let mut size = 0;
+        for line in lines {
+            if size >= max_chars && !current.is_empty() {
+                parts.push(part(
+                    continued || !parts.is_empty(),
+                    std::mem::take(&mut current),
+                ));
+                size = 0;
+            }
+            size += line.chars().count() + 1;
+            current.push(line);
+        }
+        let mut last = part(continued || !parts.is_empty(), current);
+        last.note = note;
+        parts.push(last);
+        parts
+    }
+}
+
 /// A table being read out of a document: rows of cells, each row with the
-/// page it starts on, kept within [`MAX_TABLE_ROWS`] and
-/// [`MAX_TABLE_COLUMNS`] while the XML is walked.
+/// page it starts on, kept within [`MAX_TABLE_ROWS`], [`MAX_TABLE_COLUMNS`]
+/// and [`MAX_CELL_CHARS`] while the XML is walked.
 #[derive(Debug, Default)]
 pub(crate) struct TableBuilder {
     pub(crate) rows: Vec<Vec<String>>,
     /// The page each row starts on (documents with pages).
     pages: Vec<usize>,
-    /// The current row or cell is past a limit; its text is dropped.
+    /// The current row or cell is past a limit (or the cell is full); its
+    /// text is dropped.
     skip_row: bool,
     skip_cell: bool,
+    /// Characters in the current cell.
+    cell_chars: usize,
     /// Rows were dropped.
     cut: bool,
 }
@@ -634,6 +768,7 @@ impl TableBuilder {
 
     pub(crate) fn start_cell(&mut self) {
         self.skip_cell = true;
+        self.cell_chars = 0;
         if self.skip_row {
             return;
         }
@@ -645,12 +780,26 @@ impl TableBuilder {
         }
     }
 
-    /// The cell text goes into, unless the cell is past a limit.
-    pub(crate) fn cell_mut(&mut self) -> Option<&mut String> {
+    /// Adds `text` to the current cell, on a line of its own when the cell
+    /// already has text, keeping at most [`MAX_CELL_CHARS`] characters.
+    pub(crate) fn push_line(&mut self, text: &str) {
         if self.skip_cell || self.skip_row {
-            return None;
+            return;
         }
-        self.rows.last_mut().and_then(|row| row.last_mut())
+        let Some(cell) = self.rows.last_mut().and_then(|row| row.last_mut()) else {
+            return;
+        };
+        if !cell.is_empty() {
+            cell.push('\n');
+            self.cell_chars += 1;
+        }
+        let kept = take_chars(text, MAX_CELL_CHARS.saturating_sub(self.cell_chars));
+        cell.push_str(kept);
+        self.cell_chars += kept.chars().count();
+        if kept.len() < text.len() {
+            cell.push_str(CUT_MARK);
+            self.skip_cell = true;
+        }
     }
 
     /// A page break inside the table: a row with no text yet starts on
@@ -667,58 +816,119 @@ impl TableBuilder {
         }
     }
 
-    /// The table as plain text, for a table nested in a cell.
+    /// The table as plain text, for a table nested in a cell: no more than
+    /// the cell it goes into can keep.
     pub(crate) fn flatten(&self) -> String {
-        self.rows
+        let mut out = String::new();
+        'rows: for (index, row) in self.rows.iter().enumerate() {
+            if index > 0 {
+                out.push_str("; ");
+            }
+            for (column, cell) in row.iter().enumerate() {
+                if column > 0 {
+                    out.push_str(" / ");
+                }
+                out.push_str(cell);
+                // Bytes: at least MAX_CELL_CHARS characters.
+                if out.len() > MAX_CELL_CHARS * 4 {
+                    break 'rows;
+                }
+            }
+        }
+        out
+    }
+
+    /// The table as rendered parts, one per page its rows start on, each
+    /// after the first repeating the header row. Rows with no text are left
+    /// out, and all parts together stay within [`MAX_DOCUMENT_TABLE_CHARS`].
+    pub(crate) fn into_parts(self) -> Vec<TablePart> {
+        let Self {
+            rows, pages, cut, ..
+        } = self;
+        let filled = |cell: &String| !cell.trim().is_empty();
+        let columns = rows
             .iter()
-            .map(|row| row.join(" / "))
-            .collect::<Vec<_>>()
-            .join("; ")
+            .filter_map(|row| row.iter().rposition(filled))
+            .max()
+            .map_or(0, |last| last + 1)
+            .min(MAX_TABLE_COLUMNS);
+        let Some(first) = rows.first() else {
+            return Vec::new();
+        };
+        if columns == 0 {
+            return Vec::new();
+        }
+        let per_cell = (MAX_ROW_LINE_CHARS / columns).min(MAX_CELL_CHARS);
+        let separator = " --- |".repeat(columns);
+        let header: std::sync::Arc<str> =
+            format!("{}\n|{separator}", row_line(first, columns, per_cell)).into();
+        let repeat_per_cell = (MAX_REPEATED_HEADER_CHARS / columns).clamp(16, per_cell.max(16));
+        let repeat_header: std::sync::Arc<str> = format!(
+            "{}\n|{separator}",
+            row_line(first, columns, repeat_per_cell)
+        )
+        .into();
+        let repeat_cost = repeat_header.chars().count() + CONTINUED.len();
+        let mut total = header.chars().count();
+        let mut parts = vec![TablePart {
+            page: pages[0],
+            header: header.clone(),
+            repeat_header: repeat_header.clone(),
+            continued: false,
+            lines: Vec::new(),
+            note: None,
+        }];
+        let body = rows
+            .iter()
+            .zip(&pages)
+            .skip(1)
+            .filter(|(row, _)| row.iter().take(columns).any(filled))
+            .collect::<Vec<_>>();
+        let mut note = None;
+        for (index, (row, page)) in body.iter().enumerate() {
+            let line = row_line(row, columns, per_cell);
+            let current = parts.last().map_or(0, |part| part.page);
+            let new_part = **page > current;
+            let cost = line.chars().count() + 1 + if new_part { repeat_cost } else { 0 };
+            if total + cost > MAX_DOCUMENT_TABLE_CHARS {
+                note = Some(format!(
+                    "[{} more rows of this table are longer than read_document returns]",
+                    body.len() - index
+                ));
+                break;
+            }
+            total += cost;
+            if new_part {
+                parts.push(TablePart {
+                    page: **page,
+                    header: header.clone(),
+                    repeat_header: repeat_header.clone(),
+                    continued: true,
+                    lines: Vec::new(),
+                    note: None,
+                });
+            }
+            if let Some(part) = parts.last_mut() {
+                part.lines.push(line);
+            }
+        }
+        if note.is_none() && cut {
+            note = Some(format!(
+                "[the table has more than {MAX_TABLE_ROWS} rows; the rest is left out]"
+            ));
+        }
+        if let Some(last) = parts.last_mut() {
+            last.note = note;
+        }
+        parts
     }
 
     /// The table as Markdown blocks, one per page its rows start on, each
     /// after the first repeating the header row: `(page, markdown)`.
     pub(crate) fn into_blocks(self) -> Vec<(usize, String)> {
-        let Self {
-            rows, pages, cut, ..
-        } = self;
-        let Some(header) = rows.first().cloned() else {
-            return Vec::new();
-        };
-        let mut parts: Vec<(usize, Vec<Vec<String>>)> = Vec::new();
-        for (row, page) in rows.into_iter().zip(pages) {
-            match parts.last_mut() {
-                Some((current, part)) if *current >= page => part.push(row),
-                _ => {
-                    let mut part = Vec::new();
-                    if !parts.is_empty() {
-                        part.push(header.clone());
-                    }
-                    part.push(row);
-                    parts.push((page, part));
-                }
-            }
-        }
-        let count = parts.len();
-        parts
+        self.into_parts()
             .into_iter()
-            .enumerate()
-            .filter_map(|(index, (page, rows))| {
-                let mut markdown = markdown_table(&rows);
-                if markdown.is_empty() {
-                    return None;
-                }
-                if index > 0 {
-                    markdown = format!("(table continued)\n\n{markdown}");
-                }
-                if cut && index + 1 == count {
-                    let _ = write!(
-                        markdown,
-                        "\n\n[the table has more than {MAX_TABLE_ROWS} rows; the rest is left out]"
-                    );
-                }
-                Some((page, markdown))
-            })
+            .map(|part| (part.page, part.render()))
             .collect()
     }
 
