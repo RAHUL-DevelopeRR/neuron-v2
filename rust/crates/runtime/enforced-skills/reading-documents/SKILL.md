@@ -12,3 +12,4 @@ Neuron reads .docx, .pptx, .xlsx, .xlsm, .xlsb, .xls, .ods and .pdf files itself
 - Big sheets show up to 500 rows and 40 columns at a time. Read the rest with `rows` (such as `rows="501-1000"`) and `columns` (such as `columns="AO-BZ"`), as the hint under the table says.
 - Never write or run a script (Python, PowerShell, Node, unzip and the like) to read these files, and do not open them with `read_file`.
 - When `read_document` reports a problem (encrypted, damaged, too large, or a scanned PDF without text), tell the user what it said instead of working around it.
+- When `read_document` says a file is really text and to use `read_file`, do that.

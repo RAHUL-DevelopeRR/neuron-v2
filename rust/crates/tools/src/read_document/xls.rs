@@ -5,13 +5,18 @@
 //! reserving room for the grid the sheet's DIMENSIONS record claims. Two
 //! cells far apart, or one false claim, would ask for more memory than the
 //! machine has, and a failed allocation aborts the program. This reads the
-//! compound file's `Workbook` stream itself, walks the same records
-//! `calamine` will, and refuses workbooks whose grids pass a limit.
+//! compound file's `Workbook` stream itself, picking it the way `calamine`'s
+//! `cfb.rs` does, walks the same records `calamine` will, and refuses
+//! workbooks whose grids pass a limit.
 
 const SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 /// Sector ids at or above this are markers (free, end of chain, ...).
 const FIRST_MARKER: u32 = 0xFFFF_FFFA;
 const NO_STREAM: u32 = 0xFFFF_FFFF;
+/// Streams shorter than this live in the mini stream (`calamine` uses this
+/// fixed cutoff, not the header's).
+const MINI_STREAM_CUTOFF: usize = 4096;
+const MINI_SECTOR: usize = 64;
 /// Sheets one workbook may list.
 const MAX_SHEETS: usize = 4_096;
 
@@ -27,8 +32,13 @@ fn damaged(detail: &str) -> String {
 /// it hold more than `max_cells` cells in all.
 pub(super) fn check(data: &[u8], max_cells: u64) -> Result<(), String> {
     let compound = Compound::open(data)?;
-    let stream = compound.workbook_stream()?;
-    check_workbook(&stream, max_cells)
+    // `calamine` reads `Workbook` and, when that fails for any reason,
+    // `Book`: both are checked when present.
+    let streams = compound.workbook_streams()?;
+    for stream in streams {
+        check_workbook(&stream, max_cells)?;
+    }
+    Ok(())
 }
 
 fn u16_at(data: &[u8], at: usize) -> Option<u16> {
@@ -154,64 +164,92 @@ impl<'a> Compound<'a> {
         Ok(out)
     }
 
-    /// The `Workbook` (or older `Book`) stream.
-    fn workbook_stream(&self) -> Result<Vec<u8>, String> {
+    /// The `Workbook` and older `Book` streams that are present, found as
+    /// `calamine` finds them: the directory read as a flat list in file
+    /// order, each name decoded from all 64 name bytes and cut at the first
+    /// NUL, the first entry of a matching name taken whatever its type.
+    fn workbook_streams(&self) -> Result<Vec<Vec<u8>>, String> {
         let directory = self.read(u32_at(self.data, 0x30).unwrap_or(NO_STREAM), None)?;
         let (entries, _) = directory.as_chunks::<128>();
-        let size_of = |entry: &[u8]| -> usize {
-            let low = u32_at(entry, 0x78).unwrap_or(0);
-            let high = if self.sector_size == 512 {
-                0
-            } else {
-                u32_at(entry, 0x7C).unwrap_or(0)
-            };
-            usize::try_from((u64::from(high) << 32) | u64::from(low)).unwrap_or(usize::MAX)
-        };
-        let name_of = |entry: &[u8]| -> String {
-            let length = usize::from(u16_at(entry, 0x40).unwrap_or(0)).min(64);
-            let units = (0..length.saturating_sub(2) / 2)
+        let name_of = |entry: &[u8; 128]| -> String {
+            let units = (0..32)
                 .filter_map(|unit| u16_at(entry, unit * 2))
                 .collect::<Vec<_>>();
-            String::from_utf16_lossy(&units)
+            let mut name = String::from_utf16_lossy(&units);
+            if let Some(end) = name.find('\0') {
+                name.truncate(end);
+            }
+            name
         };
-        let workbook = ["Workbook", "Book"]
+        let found = ["Workbook", "Book"]
             .iter()
-            .find_map(|wanted| {
-                entries.iter().find(|entry| {
-                    entry[0x42] == 2 && name_of(entry.as_slice()).eq_ignore_ascii_case(wanted)
-                })
+            .filter_map(|wanted| {
+                entries
+                    .iter()
+                    .find(|entry| name_of(entry).eq_ignore_ascii_case(wanted))
             })
-            .ok_or_else(|| {
+            .collect::<Vec<_>>();
+        if found.is_empty() {
+            return Err(
                 "this is not a readable spreadsheet: the file is password protected or not an Excel workbook"
-                    .to_string()
-            })?;
-        let start = u32_at(workbook, 0x74).unwrap_or(NO_STREAM);
-        let size = size_of(workbook);
-        let cutoff = index(u32_at(self.data, 0x38).unwrap_or(4096));
-        if size >= cutoff {
+                    .to_string(),
+            );
+        }
+        found
+            .into_iter()
+            .map(|entry| self.entry_stream(entry, entries))
+            .collect()
+    }
+
+    /// The size a directory entry gives its stream.
+    fn size_of(&self, entry: &[u8]) -> usize {
+        let low = u32_at(entry, 0x78).unwrap_or(0);
+        let high = if self.sector_size == 512 {
+            0
+        } else {
+            u32_at(entry, 0x7C).unwrap_or(0)
+        };
+        usize::try_from((u64::from(high) << 32) | u64::from(low)).unwrap_or(usize::MAX)
+    }
+
+    /// The bytes of the stream `entry` names. A small stream is read from
+    /// the mini stream of the first directory entry, as `calamine` does; one
+    /// that would need bytes past that mini stream (which `calamine` would
+    /// take from elsewhere in the file) is refused.
+    fn entry_stream(&self, entry: &[u8], entries: &[[u8; 128]]) -> Result<Vec<u8>, String> {
+        let start = u32_at(entry, 0x74).unwrap_or(NO_STREAM);
+        let size = self.size_of(entry);
+        if size >= MINI_STREAM_CUTOFF {
             return self.read(start, Some(size));
         }
-        // Small streams live in the mini stream, in 64-byte sectors.
+        let mini_fat_sectors = index(u32_at(self.data, 0x40).unwrap_or(0));
         let root = entries
-            .iter()
-            .find(|entry| entry[0x42] == 5)
+            .first()
             .ok_or_else(|| damaged("the root entry is missing"))?;
-        let mini_stream =
-            self.read(u32_at(root, 0x74).unwrap_or(NO_STREAM), Some(size_of(root)))?;
-        let mini_fat_bytes = self.read(u32_at(self.data, 0x3C).unwrap_or(NO_STREAM), None)?;
+        if mini_fat_sectors == 0 {
+            return Err(damaged("a small stream has no mini stream"));
+        }
+        let mini_stream = self.read(
+            u32_at(root, 0x74).unwrap_or(NO_STREAM),
+            Some(self.size_of(root)),
+        )?;
+        let mini_fat_bytes = self.read(
+            u32_at(self.data, 0x3C).unwrap_or(NO_STREAM),
+            Some(mini_fat_sectors.saturating_mul(self.sector_size)),
+        )?;
         let mini_fat = (0..mini_fat_bytes.len() / 4)
             .filter_map(|slot| u32_at(&mini_fat_bytes, slot * 4))
             .collect::<Vec<_>>();
         let mut out = Vec::new();
         for id in Self::chain(start, &mini_fat)? {
-            let begin = index(id)
-                .checked_mul(64)
-                .filter(|begin| *begin < mini_stream.len())
-                .ok_or_else(|| damaged("a mini stream sector is missing"))?;
-            out.extend_from_slice(&mini_stream[begin..(begin + 64).min(mini_stream.len())]);
             if out.len() >= size {
                 break;
             }
+            let begin = index(id)
+                .checked_mul(MINI_SECTOR)
+                .filter(|begin| begin + MINI_SECTOR <= mini_stream.len())
+                .ok_or_else(|| damaged("a mini stream sector is missing"))?;
+            out.extend_from_slice(&mini_stream[begin..begin + MINI_SECTOR]);
         }
         if out.len() < size {
             return Err(damaged("a stream is cut short"));
@@ -306,6 +344,9 @@ impl Bounds {
 fn sheet_cells(sheet: &[u8]) -> Result<(u64, usize), String> {
     let mut values = Bounds::default();
     let mut formulas = Bounds::default();
+    // Where the last FORMULA record was: `calamine` places each STRING
+    // record (a formula's text result) there, at A1 before any formula.
+    let mut formula_at = (0u32, 0u32);
     let mut reserved = 0u64;
     let mut seen_sheet_start = false;
     let mut nested = 0usize;
@@ -335,9 +376,13 @@ fn sheet_cells(sheet: &[u8]) -> Result<(u64, usize), String> {
                 values.add(row, column);
             }
             0x0006 if data.len() >= 20 => {
+                formula_at = (row, column);
                 values.add(row, column);
                 formulas.add(row, column);
             }
+            // STRING: a cell at the last formula's position, whatever its
+            // length (a short one only makes calamine fail, which is safe).
+            0x0207 => values.add(formula_at.0, formula_at.1),
             // MULRK: one row, a run of columns.
             0x00BD if data.len() >= 6 => {
                 let last = u32::from(u16_at(data, data.len() - 2).unwrap_or(0));

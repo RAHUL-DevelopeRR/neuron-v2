@@ -9,7 +9,11 @@
 //! - `.xls` and `.ods` workbooks, which `calamine` lays out whole while it
 //!   opens them, are measured first ([`super::xls`], [`check_ods`]) and
 //!   refused when their grids would be too large;
-//! - every zip part is measured inflated before `calamine` reads it.
+//! - every zip part is measured inflated before `calamine` reads it, and an
+//!   `.xlsx` shared string table must hold the strings it claims
+//!   ([`check_shared_strings`]), since `calamine` reserves room for them;
+//! - one call streams at most [`MAX_SCANNED_CELLS`] cells for at most
+//!   [`SCAN_TIME_LIMIT`]; sheets past that are named as unread.
 //!
 //! The file is read once, checked, and parsed from those same bytes.
 
@@ -17,12 +21,16 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{Cursor, Read as _};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use calamine::{Data, Ods, Reader, Xls, Xlsb, Xlsx};
 
 use super::xls;
 use super::xml::{attr, walk, Node};
-use super::{markdown_table, Budget, Document, Options, Selection, Unit};
+use super::{
+    looks_like_text, markdown_table, sheet_listing, text_file_error, Budget, Document, Options,
+    Selection, Unit,
+};
 
 const KIND: &str = "spreadsheet";
 
@@ -43,6 +51,16 @@ const MAX_WORKBOOK_BYTES: u64 = 512 * 1024 * 1024;
 /// The column limit of `.ods` rows, as `calamine` applies it.
 const ODS_MAX_COLUMNS: u64 = 16_384;
 const ODS_MAX_ROWS: u64 = 1_048_576;
+/// Bytes `calamine` may hold for an `.ods` workbook's cells: each cell's
+/// value and formula text, copied once per repeat, plus the cell itself.
+const MAX_ODS_BYTES: u64 = 512 * 1024 * 1024;
+/// Bytes counted per `.ods` cell for the cell itself.
+const ODS_CELL_BYTES: u64 = 32;
+/// Cells (blank ones too) streamed across all sheets in one call: a sheet
+/// is read once or twice per call, and many sheets can name the same part.
+const MAX_SCANNED_CELLS: u64 = 100_000_000;
+/// Time spent streaming sheets in one call before the rest is left unread.
+const SCAN_TIME_LIMIT: Duration = Duration::from_secs(15);
 
 type Bytes = Cursor<Vec<u8>>;
 
@@ -67,6 +85,9 @@ impl Book {
                 .map_err(unreadable);
         }
         if !data.starts_with(b"PK") {
+            if looks_like_text(&data) {
+                return Err(text_file_error(path));
+            }
             return Err(unreadable("not a zip package or an Excel 97-2003 file"));
         }
         let kind = {
@@ -88,6 +109,8 @@ impl Book {
             check_zip(&mut archive)?;
             if kind == "ods" {
                 check_ods(&mut archive)?;
+            } else {
+                check_shared_strings(&mut archive)?;
             }
             kind
         };
@@ -119,11 +142,13 @@ impl Book {
     }
 
     /// Calls `visit` with each non-blank cell of sheet `name`: row, column
-    /// (both 0-based) and value. Streamed formats are read again each call.
+    /// (both 0-based) and value. Streamed formats are read again each call,
+    /// and every cell streamed counts against `work`.
     fn scan(
         &mut self,
         name: &str,
         grid: Option<&calamine::Range<Data>>,
+        work: &mut Work,
         visit: &mut dyn FnMut(u32, u32, &Data),
     ) -> Result<(), String> {
         let mut emit = |row: u32, column: u32, value: Data| {
@@ -135,6 +160,7 @@ impl Book {
             Self::Xlsx(book) => {
                 let mut cells = book.worksheet_cells_reader(name).map_err(cannot_read)?;
                 while let Some(cell) = cells.next_cell().map_err(cannot_read)? {
+                    work.cell()?;
                     let (row, column) = cell.get_position();
                     emit(row, column, cell.get_value().clone().into());
                 }
@@ -142,6 +168,7 @@ impl Book {
             Self::Xlsb(book) => {
                 let mut cells = book.worksheet_cells_reader(name).map_err(cannot_read)?;
                 while let Some(cell) = cells.next_cell().map_err(cannot_read)? {
+                    work.cell()?;
                     let (row, column) = cell.get_position();
                     emit(row, column, cell.get_value().clone().into());
                 }
@@ -167,8 +194,45 @@ fn cannot_read(error: impl std::fmt::Display) -> String {
     format!("this sheet cannot be read: {error}")
 }
 
-/// Measures every XML and binary part inflated (the sizes the zip claims
-/// can lie) before `calamine` reads any of them.
+/// The work spent streaming sheets in one call.
+struct Work {
+    cells: u64,
+    started: Instant,
+}
+
+impl Work {
+    fn new() -> Self {
+        Self {
+            cells: 0,
+            started: Instant::now(),
+        }
+    }
+
+    /// Whether this call has streamed all it may.
+    fn is_spent(&self) -> bool {
+        self.cells > MAX_SCANNED_CELLS || self.started.elapsed() > SCAN_TIME_LIMIT
+    }
+
+    /// Counts one streamed cell; an error once the call's work is spent.
+    fn cell(&mut self) -> Result<(), String> {
+        self.cells += 1;
+        if self.cells > MAX_SCANNED_CELLS
+            || (self.cells.is_multiple_of(4096) && self.started.elapsed() > SCAN_TIME_LIMIT)
+        {
+            self.cells = self.cells.max(MAX_SCANNED_CELLS + 1);
+            return Err(
+                "this sheet takes more work than one call allows; ask for it on its own with pages="
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Measures every part inflated (the sizes the zip claims can lie) before
+/// `calamine` reads any of them. Every entry counts, whatever its name:
+/// `calamine` finds the workbook and its sheets through relationships, which
+/// can point at any path.
 fn check_zip(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<(), String> {
     let mut total = 0u64;
     for position in 0..archive.len() {
@@ -177,11 +241,7 @@ fn check_zip(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<(), String>
             .name()
             .map(|name| name.to_ascii_lowercase())
             .unwrap_or_default();
-        let extension = Path::new(&name)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default();
-        if entry.is_dir() || !matches!(extension, "xml" | "bin" | "rels") {
+        if entry.is_dir() {
             continue;
         }
         let limit = if name.contains("worksheets/") {
@@ -207,42 +267,158 @@ fn check_zip(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<(), String>
     Ok(())
 }
 
+/// Refuses an `.xlsx` whose shared string table claims more strings than its
+/// bytes can hold: `calamine` reserves room for the claimed count before it
+/// reads one, and a failed reservation aborts the program. Each `<si/>` takes
+/// at least five bytes. Every part named like a shared string table is
+/// checked, wherever the workbook's relationships put it.
+fn check_shared_strings(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<(), String> {
+    let names = archive
+        .file_names()
+        .filter_map(|name| name.ok().map(std::borrow::Cow::into_owned))
+        .filter(|name| name.to_ascii_lowercase().ends_with("sharedstrings.xml"))
+        .collect::<Vec<_>>();
+    for name in names {
+        let mut entry = archive.by_name(&name).map_err(unreadable)?;
+        let mut bytes = Vec::new();
+        (&mut entry)
+            .take(MAX_OTHER_PART_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(unreadable)?;
+        let claimed = shared_string_count(&bytes);
+        if claimed > bytes.len() as u64 / 5 + 16 {
+            return Err(unreadable(
+                "its shared string table claims more strings than it holds",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The `uniqueCount` (or `count`, whichever is larger) of the first `sst`
+/// element, as `calamine` reads it; 0 when there is none.
+fn shared_string_count(xml: &[u8]) -> u64 {
+    let text = String::from_utf8_lossy(xml);
+    let mut reader = quick_xml::Reader::from_str(&text);
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(start) | quick_xml::events::Event::Empty(start))
+                if start.local_name().into_inner() == "sst" =>
+            {
+                return start
+                    .attributes()
+                    .with_checks(false)
+                    .flatten()
+                    .filter(|attr| {
+                        matches!(attr.key.local_name().into_inner(), "uniqueCount" | "count")
+                    })
+                    .map(|attr| leading_number(&attr.value))
+                    .max()
+                    .unwrap_or(0);
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => return 0,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// The digits at the start of `value` (after an optional sign) as a number,
+/// saturating; 0 when there are none.
+fn leading_number(value: &str) -> u64 {
+    let value = value.trim_start();
+    let value = value.strip_prefix('+').unwrap_or(value);
+    value
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .fold(0u64, |number, digit| {
+            number
+                .saturating_mul(10)
+                .saturating_add(u64::from(digit - b'0'))
+        })
+}
+
+/// One row element of an `.ods` table as `calamine` reads it.
+#[derive(Default, Clone, Copy)]
+struct OdsRow {
+    repeats: u64,
+    /// Cells pushed for one copy of the row.
+    pushed: u64,
+    /// Empty cells waiting for a later cell (`calamine` stores them only then).
+    waiting: u64,
+    /// Whether any cell holds a value.
+    filled: bool,
+    /// Value and formula text of one copy of the row, in bytes.
+    bytes: u64,
+}
+
 /// One table of an `.ods` file as `calamine` will build it.
 #[derive(Default)]
 struct OdsTable {
-    /// Each row element: repeat count, cells pushed, whether any holds a value.
-    rows: Vec<(u64, u64, bool)>,
+    rows: Vec<OdsRow>,
     total_rows: u64,
 }
 
 impl OdsTable {
-    /// Cells `calamine` allocates for this table: the cells it reads, then
-    /// the grid it expands them into.
-    fn cells(&self) -> u64 {
-        let read = self.rows.iter().map(|(_, pushed, _)| *pushed).sum::<u64>();
+    /// Cells and bytes `calamine` allocates for this table: the cells it
+    /// reads, then the grid it expands them into, each repeated row copied
+    /// with its text.
+    fn size(&self) -> (u64, u64) {
+        let read = self.rows.iter().map(|row| row.pushed).sum::<u64>();
+        let read_bytes = self
+            .rows
+            .iter()
+            .map(|row| row.bytes)
+            .fold(0u64, u64::saturating_add);
         let width = self
             .rows
             .iter()
-            .filter(|(_, _, filled)| *filled)
-            .map(|(_, pushed, _)| *pushed)
+            .filter(|row| row.filled)
+            .map(|row| row.pushed)
             .max()
             .unwrap_or(0);
-        let first = self.rows.iter().position(|(_, _, filled)| *filled);
-        let last = self.rows.iter().rposition(|(_, _, filled)| *filled);
-        let grid = match (first, last) {
-            (Some(first), Some(last)) => self.rows[first..=last]
-                .iter()
-                .map(|(repeats, _, _)| repeats.saturating_mul(width))
-                .fold(0u64, u64::saturating_add),
-            _ => 0,
+        let first = self.rows.iter().position(|row| row.filled);
+        let last = self.rows.iter().rposition(|row| row.filled);
+        let (grid, grid_bytes) = match (first, last) {
+            (Some(first), Some(last)) => {
+                self.rows[first..=last]
+                    .iter()
+                    .fold((0u64, 0u64), |(cells, bytes), row| {
+                        (
+                            cells.saturating_add(row.repeats.saturating_mul(width)),
+                            bytes.saturating_add(row.repeats.saturating_mul(row.bytes)),
+                        )
+                    })
+            }
+            _ => (0, 0),
         };
-        read.saturating_add(grid)
+        let cells = read.saturating_add(grid);
+        let bytes = cells
+            .saturating_mul(ODS_CELL_BYTES)
+            .saturating_add(read_bytes)
+            .saturating_add(grid_bytes);
+        (cells, bytes)
     }
 }
 
+/// Attributes `calamine` reads a cell's value or formula from; a cell with
+/// any of them counts as holding a value.
+const ODS_VALUE_ATTRIBUTES: &[&str] = &[
+    "office:value",
+    "office:string-value",
+    "office:date-value",
+    "office:time-value",
+    "office:boolean-value",
+    "office:value-type",
+    "table:formula",
+];
+
 /// Refuses an `.ods` file whose tables `calamine` would expand past
-/// [`MAX_GRID_CELLS`]: repeated rows and cells let a few bytes describe
-/// millions of cells, and `calamine` expands them while opening the file.
+/// [`MAX_GRID_CELLS`] cells or [`MAX_ODS_BYTES`]: repeated rows and cells let
+/// a few bytes describe millions of cells (or copies of one long text), and
+/// `calamine` expands them while opening the file. A cell counts as holding
+/// a value when it carries any attribute `calamine` reads one from, or any
+/// content.
+#[allow(clippy::too_many_lines)]
 fn check_ods(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<(), String> {
     let mut entry = archive.by_name("content.xml").map_err(unreadable)?;
     let mut bytes = Vec::new();
@@ -253,39 +429,50 @@ fn check_ods(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<(), String>
     let xml = String::from_utf8_lossy(&bytes);
 
     let mut total = 0u64;
+    let mut total_bytes = 0u64;
     let mut table: Option<OdsTable> = None;
-    // The row being read: repeats, cells pushed, empty cells waiting, filled.
-    let mut row: Option<(u64, u64, u64, bool)> = None;
-    // The cell being read: depth inside it, repeats, holds a value.
-    let mut cell: Option<(usize, u64, bool)> = None;
-    let repeats = |attrs: &[(String, String)], key: &str| {
+    let mut row: Option<OdsRow> = None;
+    // The cell being read: depth inside it, repeats, holds a value, bytes.
+    let mut cell: Option<(usize, u64, bool, u64)> = None;
+    let number = |attrs: &[(String, String)], key: &str| {
         attr(attrs, key)
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or(1)
     };
     walk(&xml, |node| {
-        if let Some((depth, _, filled)) = cell.as_mut() {
+        if let Some((depth, _, filled, bytes)) = cell.as_mut() {
             match node {
-                Node::Open { .. } => {
+                Node::Open { name, attrs } => {
                     *depth += 1;
                     *filled = true;
+                    // `<text:s text:c="N"/>` is N spaces.
+                    let added = if name == "s" {
+                        number(attrs, "text:c")
+                    } else {
+                        1
+                    };
+                    *bytes = bytes.saturating_add(added);
                 }
-                Node::Text(text) => *filled |= !text.trim().is_empty(),
+                Node::Text(text) => {
+                    *filled |= !text.trim().is_empty();
+                    *bytes = bytes.saturating_add(text.len() as u64);
+                }
                 Node::Close { .. } => {
                     *depth -= 1;
                     if *depth == 0 {
-                        let (_, count, filled) = cell.take().unwrap_or_default();
-                        if let Some((_, pushed, waiting, row_filled)) = row.as_mut() {
+                        let (_, count, filled, bytes) = cell.take().unwrap_or_default();
+                        if let Some(row) = row.as_mut() {
                             // Empty cells are only stored once a later cell
                             // follows them, as calamine does.
-                            *pushed += (*waiting).min(ODS_MAX_COLUMNS - *pushed);
-                            *waiting = 0;
-                            let count = count.min(ODS_MAX_COLUMNS - *pushed);
+                            row.pushed += row.waiting.min(ODS_MAX_COLUMNS - row.pushed);
+                            row.waiting = 0;
+                            let count = count.min(ODS_MAX_COLUMNS - row.pushed);
                             if filled {
-                                *pushed += count;
-                                *row_filled = true;
+                                row.pushed += count;
+                                row.filled = true;
+                                row.bytes = row.bytes.saturating_add(count.saturating_mul(bytes));
                             } else {
-                                *waiting = count;
+                                row.waiting = count;
                             }
                         }
                     }
@@ -297,39 +484,56 @@ fn check_ods(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Result<(), String>
             Node::Open { name: "table", .. } => table = Some(OdsTable::default()),
             Node::Close { name: "table" } => {
                 if let Some(done) = table.take() {
-                    total = total.saturating_add(done.cells());
+                    let (cells, bytes) = done.size();
+                    total = total.saturating_add(cells);
+                    total_bytes = total_bytes.saturating_add(bytes);
                 }
             }
             Node::Open {
                 name: "table-row",
                 attrs,
             } => {
-                row = Some((repeats(attrs, "table:number-rows-repeated"), 0, 0, false));
+                row = Some(OdsRow {
+                    repeats: number(attrs, "table:number-rows-repeated"),
+                    ..OdsRow::default()
+                });
             }
             Node::Close { name: "table-row" } => {
-                if let (Some((count, pushed, _, filled)), Some(table)) =
-                    (row.take(), table.as_mut())
-                {
-                    let count = count.min(ODS_MAX_ROWS.saturating_sub(table.total_rows));
-                    table.total_rows += count;
-                    table.rows.push((count, pushed, filled));
+                if let (Some(mut done), Some(table)) = (row.take(), table.as_mut()) {
+                    done.repeats = done
+                        .repeats
+                        .min(ODS_MAX_ROWS.saturating_sub(table.total_rows));
+                    table.total_rows += done.repeats;
+                    table.rows.push(done);
                 }
             }
             Node::Open {
                 name: "table-cell" | "covered-table-cell",
                 attrs,
             } if row.is_some() => {
-                let filled = attr(attrs, "office:value-type").is_some()
-                    || attr(attrs, "table:formula").is_some();
-                cell = Some((1, repeats(attrs, "table:number-columns-repeated"), filled));
+                let values = ODS_VALUE_ATTRIBUTES
+                    .iter()
+                    .filter_map(|key| attr(attrs, key))
+                    .collect::<Vec<_>>();
+                let bytes = values
+                    .iter()
+                    .map(|value| value.len() as u64)
+                    .fold(0u64, u64::saturating_add);
+                cell = Some((
+                    1,
+                    number(attrs, "table:number-columns-repeated"),
+                    !values.is_empty(),
+                    bytes,
+                ));
             }
             _ => {}
         }
     })
     .map_err(unreadable)?;
-    if total > MAX_GRID_CELLS {
+    if total > MAX_GRID_CELLS || total_bytes > MAX_ODS_BYTES {
         return Err(format!(
-            "this .ods workbook lays its sheets out over more than {MAX_GRID_CELLS} cells, more than read_document reads; save it as .xlsx and read that instead"
+            "this .ods workbook lays its sheets out over more than {MAX_GRID_CELLS} cells or {} MB, more than read_document reads; save it as .xlsx and read that instead",
+            MAX_ODS_BYTES / (1024 * 1024)
         ));
     }
     Ok(())
@@ -421,20 +625,33 @@ pub(super) fn read(
         Some(pages) => Selection::parse_with_names(pages, &names)?,
         None => Selection::default(),
     };
+    let selectors = sheet_selectors(&names);
     let mut units = Vec::new();
     let mut unread = Vec::new();
     let mut matched_names = 0;
+    let mut work = Work::new();
+    let mut work_spent = false;
     for (index, name) in names.iter().enumerate() {
         let number = index + 1;
         if !selection.includes(number, Some(name)) {
             continue;
         }
         matched_names += 1;
-        if budget.is_spent() {
+        if budget.is_spent() || (work.is_spent() && !units.is_empty()) {
+            work_spent |= !budget.is_spent();
             unread.push(number);
             continue;
         }
-        let markdown = match render_sheet(&mut book, number, name, window, options) {
+        let selector = selectors
+            .iter()
+            .find(|(unit, _)| *unit == number)
+            .map_or_else(|| number.to_string(), |(_, name)| name.clone());
+        let sheet = SheetRef {
+            number,
+            name,
+            selector: &selector,
+        };
+        let markdown = match render_sheet(&mut book, &sheet, window, options, &mut work) {
             Ok(markdown) => markdown,
             Err(error) => format!("## Sheet {number}: {name}\n\n({error})"),
         };
@@ -442,25 +659,20 @@ pub(super) fn read(
         units.push(Unit { number, markdown });
     }
     if matched_names == 0 && selection.has_names() {
-        let listing = names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| format!("{} {name}", index + 1))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!("no sheet matches pages; the sheets are: {listing}"));
+        return Err(format!(
+            "no sheet matches pages; the sheets are: {}",
+            sheet_listing(&names)
+        ));
     }
     let mut notes = Vec::new();
     if names.len() > 1 {
-        notes.push(format!(
-            "sheets: {}",
-            names
-                .iter()
-                .enumerate()
-                .map(|(index, name)| format!("{} {name}", index + 1))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        notes.push(format!("sheets: {}", sheet_listing(&names)));
+    }
+    if work_spent {
+        notes.push(
+            "stopped early: these sheets take more work than one call allows; ask for the rest with pages="
+                .to_string(),
+        );
     }
     Ok((
         Document {
@@ -470,9 +682,37 @@ pub(super) fn read(
             units,
             notes,
             unread,
+            selectors,
         },
         selection,
     ))
+}
+
+/// Sheets whose position is also the name of another sheet, with the name
+/// that selects them instead: `pages` matches names before positions, so
+/// `pages="2"` opens a sheet named "2" wherever it is.
+fn sheet_selectors(names: &[String]) -> Vec<(usize, String)> {
+    names
+        .iter()
+        .enumerate()
+        .filter_map(|(index, name)| {
+            let position = (index + 1).to_string();
+            let taken = names
+                .iter()
+                .enumerate()
+                .any(|(other, other_name)| other != index && other_name.trim() == position);
+            let name = name.trim();
+            (taken && !name.is_empty() && !name.contains([',', '"']))
+                .then(|| (index + 1, name.to_string()))
+        })
+        .collect()
+}
+
+/// One sheet: its position, name and how `pages=` selects it.
+struct SheetRef<'a> {
+    number: usize,
+    name: &'a str,
+    selector: &'a str,
 }
 
 /// Which rows hold a value, as bits.
@@ -511,17 +751,22 @@ impl RowSet {
 #[allow(clippy::too_many_lines)]
 fn render_sheet(
     book: &mut Book,
-    number: usize,
-    name: &str,
+    sheet: &SheetRef<'_>,
     window: Window,
     options: &Options<'_>,
+    work: &mut Work,
 ) -> Result<String, String> {
+    let SheetRef {
+        number,
+        name,
+        selector,
+    } = *sheet;
     let grid = book.grid(name)?;
 
     // First pass: where the values are.
     let mut used = RowSet::default();
     let mut bounds: Option<(u32, u32, u32, u32)> = None;
-    book.scan(name, grid.as_ref(), &mut |row, column, _| {
+    book.scan(name, grid.as_ref(), work, &mut |row, column, _| {
         used.insert(row);
         bounds = Some(match bounds {
             None => (row, row, column, column),
@@ -590,7 +835,7 @@ fn render_sheet(
     // Second pass: the values in the window, at most rows x columns shown.
     let mut values: BTreeMap<(u32, u32), String> = BTreeMap::new();
     if column_from <= column_to {
-        book.scan(name, grid.as_ref(), &mut |row, column, value| {
+        book.scan(name, grid.as_ref(), work, &mut |row, column, value| {
             if (first_row..=last_row).contains(&row)
                 && (column_from..=last_column).contains(&column)
             {
@@ -634,7 +879,7 @@ fn render_sheet(
             }
         });
         notes.push(format!(
-            "showing rows {}-{} ({} of {} non-empty rows); for more use pages=\"{number}\" rows=\"{}-{end}\"{keep_columns}",
+            "showing rows {}-{} ({} of {} non-empty rows); for more use pages=\"{selector}\" rows=\"{}-{end}\"{keep_columns}",
             first_row + 1,
             last_row + 1,
             shown_rows.len(),
@@ -649,7 +894,7 @@ fn render_sheet(
             .filter(|rows| !rows.is_empty())
             .map_or_else(String::new, |rows| format!(" rows=\"{rows}\""));
         notes.push(format!(
-            "showing columns {}-{} of {}-{}; for more use pages=\"{number}\" columns=\"{}-{}\"{keep_rows}",
+            "showing columns {}-{} of {}-{}; for more use pages=\"{selector}\" columns=\"{}-{}\"{keep_rows}",
             column_name(column_from),
             column_name(last_column),
             column_name(left),

@@ -221,7 +221,7 @@ fn docx_without_page_breaks_gets_estimated_pages_and_a_truncation_hint() {
 
 const P: &str = r#"xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main""#;
 
-fn shape(placeholder: Option<&str>, paragraphs: &[(u32, &str)]) -> String {
+pub(crate) fn shape(placeholder: Option<&str>, paragraphs: &[(u32, &str)]) -> String {
     let ph = placeholder.map_or_else(String::new, |kind| format!("<p:ph type=\"{kind}\"/>"));
     let body = paragraphs
         .iter()
@@ -234,13 +234,13 @@ fn shape(placeholder: Option<&str>, paragraphs: &[(u32, &str)]) -> String {
     )
 }
 
-fn slide(attrs: &str, shapes: &str) -> String {
+pub(crate) fn slide(attrs: &str, shapes: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><p:sld {P} {attrs}><p:cSld><p:spTree>{shapes}</p:spTree></p:cSld></p:sld>"#
     )
 }
 
-fn rels(entries: &[(&str, &str, &str)]) -> String {
+pub(crate) fn rels(entries: &[(&str, &str, &str)]) -> String {
     let body = entries
         .iter()
         .map(|(id, kind, target)| {
@@ -256,7 +256,7 @@ fn rels(entries: &[(&str, &str, &str)]) -> String {
 
 /// A presentation of `slides` (each a slide XML), in order, with notes for
 /// the first slide.
-fn pptx(slides: &[String], first_notes: Option<&str>) -> Vec<u8> {
+pub(crate) fn pptx(slides: &[String], first_notes: Option<&str>) -> Vec<u8> {
     let ids = (0..slides.len())
         .map(|index| {
             format!(
@@ -315,7 +315,7 @@ fn pptx(slides: &[String], first_notes: Option<&str>) -> Vec<u8> {
     package(&borrowed)
 }
 
-fn table_frame(rows: &[&[&str]]) -> String {
+pub(crate) fn table_frame(rows: &[&[&str]]) -> String {
     let body = rows
         .iter()
         .map(|row| {

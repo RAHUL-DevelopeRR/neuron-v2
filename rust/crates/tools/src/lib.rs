@@ -730,8 +730,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "max_chars": {
                         "type": "integer",
                         "minimum": 500,
-                        "maximum": 100_000,
-                        "description": "Most characters to return (default 12000); longer output ends with a hint naming the pages to read next"
+                        "maximum": 36_000,
+                        "description": "Most characters to return (default 12000, at most 36000); longer output ends with a hint naming the pages to read next"
                     }
                 },
                 "required": ["path"],
@@ -2613,7 +2613,9 @@ fn run_read_document(input: ReadDocumentInput) -> Result<String, String> {
     let workspace_root = runtime::workdir::current_dir().map_err(|error| error.to_string())?;
     let path =
         runtime::readable_file_in_workspace(&input.path, &workspace_root).map_err(io_to_string)?;
-    read_document::read_document(
+    // In the CLI this runs in a child process with a time (and on Windows a
+    // memory) limit; the workspace and permission checks above stay here.
+    read_document::worker::read(
         &path,
         &read_document::Options {
             pages: input.pages.as_deref(),
@@ -8448,6 +8450,10 @@ pub mod lane_completion;
 pub mod pdf_extract;
 mod powershell;
 mod read_document;
+pub use read_document::worker::{
+    read_document_with_worker, run_worker as run_document_worker,
+    use_worker as use_document_worker, WORKER_ARG as DOCUMENT_WORKER_ARG,
+};
 #[cfg(test)]
 mod safety_tests;
 mod web_fetch;

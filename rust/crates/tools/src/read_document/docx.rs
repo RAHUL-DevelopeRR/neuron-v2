@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use super::xml::{attr, walk, Node, Package};
-use super::{markdown_table, Budget, Document, Selection, Unit};
+use super::{Budget, Document, Selection, TableBuilder, Unit};
 
 const KIND: &str = "Word document";
 
@@ -19,6 +19,14 @@ pub(super) const ESTIMATED_PAGE_CHARS: usize = 3_000;
 
 /// List levels Word supports (`w:ilvl` 0 to 8).
 const LEVELS: usize = 9;
+/// Characters kept of a list level's label template (`w:lvlText`); real
+/// ones look like `"%1.%2."`.
+const MAX_LEVEL_TEXT_CHARS: usize = 64;
+/// Characters of one list label.
+const MAX_LABEL_CHARS: usize = 64;
+/// Tables nested inside table cells that are kept apart; deeper tables add
+/// their text to the deepest kept cell.
+const MAX_TABLE_NESTING: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StyleKind {
@@ -158,6 +166,7 @@ fn paginate(
         units,
         notes,
         unread,
+        selectors: Vec::new(),
     }
 }
 
@@ -311,7 +320,9 @@ fn parse_numbering(xml: &str) -> Result<Numbering, String> {
             let value = attr(attrs, "w:val").unwrap_or_default();
             match name {
                 "numFmt" => entry.format = value.to_string(),
-                "lvlText" => entry.text = Some(value.to_string()),
+                "lvlText" => {
+                    entry.text = Some(value.chars().take(MAX_LEVEL_TEXT_CHARS).collect());
+                }
                 _ => entry.start = value.parse().unwrap_or(1),
             }
         }
@@ -364,6 +375,9 @@ impl Counters {
         let mut label = String::new();
         let mut chars = template.chars().peekable();
         while let Some(ch) = chars.next() {
+            if label.len() > MAX_LABEL_CHARS * 4 {
+                break;
+            }
             let digit = chars.peek().and_then(|next| next.to_digit(10));
             match (ch, digit) {
                 ('%', Some(digit @ 1..=9)) => {
@@ -378,7 +392,11 @@ impl Counters {
                 _ => label.push(ch),
             }
         }
-        let label = label.trim().to_string();
+        let label = label
+            .trim()
+            .chars()
+            .take(MAX_LABEL_CHARS)
+            .collect::<String>();
         (!label.is_empty()).then_some(label)
     }
 }
@@ -445,12 +463,6 @@ struct Paragraph {
     text: String,
 }
 
-#[derive(Debug, Default)]
-struct Table {
-    page: usize,
-    rows: Vec<Vec<String>>,
-}
-
 #[derive(Debug)]
 struct Block {
     page: usize,
@@ -514,7 +526,9 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
     let mut counters = Counters::default();
     let mut blocks = Vec::new();
     let mut paragraphs: Vec<Paragraph> = Vec::new();
-    let mut tables: Vec<Table> = Vec::new();
+    let mut tables: Vec<TableBuilder> = Vec::new();
+    // Tables nested past MAX_TABLE_NESTING, still open.
+    let mut ignored_tables = 0usize;
     let mut in_properties = false;
     let mut in_section = false;
     let mut in_text = false;
@@ -593,6 +607,9 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
                 Some("page") => {
                     if !pager.rendered_breaks {
                         pager.new_page(&mut paragraphs);
+                        if let Some(table) = tables.first_mut() {
+                            table.page_break(pager.page);
+                        }
                     }
                 }
                 Some("column") => {}
@@ -613,7 +630,13 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
             Node::Open {
                 name: "lastRenderedPageBreak",
                 ..
-            } if pager.rendered_breaks => pager.rendered_break(&mut paragraphs),
+            } if pager.rendered_breaks => {
+                pager.rendered_break(&mut paragraphs);
+                // A row that starts on the new page belongs to it.
+                if let Some(table) = tables.first_mut() {
+                    table.page_break(pager.page);
+                }
+            }
             Node::Close { name: "p" } => {
                 let Some(paragraph) = paragraphs.pop() else {
                     return;
@@ -625,7 +648,7 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
                 let text = paragraph.text.trim();
                 if !text.is_empty() {
                     if let Some(table) = tables.last_mut() {
-                        if let Some(cell) = table.rows.last_mut().and_then(|row| row.last_mut()) {
+                        if let Some(cell) = table.cell_mut() {
                             if !cell.is_empty() {
                                 cell.push('\n');
                             }
@@ -650,33 +673,35 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
                     pager.section_break();
                 }
             }
-            Node::Open { name: "tbl", .. } => tables.push(Table {
-                page: pager.page,
-                rows: Vec::new(),
-            }),
-            Node::Open { name: "tr", .. } => {
-                if let Some(table) = tables.last_mut() {
-                    table.rows.push(Vec::new());
+            Node::Open { name: "tbl", .. } => {
+                if tables.len() >= MAX_TABLE_NESTING {
+                    ignored_tables += 1;
+                } else {
+                    tables.push(TableBuilder::default());
                 }
             }
-            Node::Open { name: "tc", .. } => {
-                if let Some(row) = tables.last_mut().and_then(|table| table.rows.last_mut()) {
-                    row.push(String::new());
+            Node::Open { name: "tr", .. } if ignored_tables == 0 => {
+                if let Some(table) = tables.last_mut() {
+                    table.start_row(pager.page);
+                }
+            }
+            Node::Open { name: "tc", .. } if ignored_tables == 0 => {
+                if let Some(table) = tables.last_mut() {
+                    table.start_cell();
                 }
             }
             Node::Close { name: "tbl" } => {
+                if ignored_tables > 0 {
+                    ignored_tables -= 1;
+                    return;
+                }
                 let Some(table) = tables.pop() else {
                     return;
                 };
                 if let Some(parent) = tables.last_mut() {
                     // A table inside a cell joins the cell as plain text.
-                    let flat = table
-                        .rows
-                        .iter()
-                        .map(|row| row.join(" / "))
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    if let Some(cell) = parent.rows.last_mut().and_then(|row| row.last_mut()) {
+                    let flat = table.flatten();
+                    if let Some(cell) = parent.cell_mut() {
                         if !cell.is_empty() {
                             cell.push('\n');
                         }
@@ -684,13 +709,11 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
                     }
                     return;
                 }
-                let markdown = markdown_table(&table.rows);
-                if !markdown.is_empty() {
+                // One block per page the table's rows start on, so a long
+                // table's later rows are on the pages Word put them.
+                for (page, markdown) in table.into_blocks() {
                     pager.section_page_empty = false;
-                    blocks.push(Block {
-                        page: table.page,
-                        markdown,
-                    });
+                    blocks.push(Block { page, markdown });
                 }
             }
             _ => {}

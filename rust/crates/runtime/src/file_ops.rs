@@ -84,6 +84,24 @@ fn check_read_size(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether the file starts like a PDF, a zip package (OOXML, ODF) or an OLE
+/// compound file (`.xls`).
+fn has_document_magic(path: &Path) -> io::Result<bool> {
+    let mut head = [0u8; 8];
+    let mut file = fs::File::open(path)?;
+    let mut read = 0;
+    while read < head.len() {
+        match io::Read::read(&mut file, &mut head[read..])? {
+            0 => break,
+            count => read += count,
+        }
+    }
+    let head = &head[..read];
+    Ok(head.starts_with(b"%PDF-")
+        || head.starts_with(b"PK\x03\x04")
+        || head.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]))
+}
+
 /// Check whether a file appears to contain binary content by examining
 /// the first chunk for NUL bytes.
 fn is_binary_file(path: &Path) -> io::Result<bool> {
@@ -328,19 +346,39 @@ pub fn read_file(
     let absolute_path = normalize_path(path)?;
     check_read_size(&absolute_path)?;
 
-    // Detect binary files
-    if is_binary_file(&absolute_path)? {
-        let message = match document_kind(&absolute_path) {
-            Some(kind) => format!(
+    let kind = document_kind(&absolute_path);
+    let use_read_document = |kind: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
                 "{} is a {kind}; read it with read_document (read_file reads text files only)",
                 file_label(&absolute_path)
             ),
-            None => "file appears to be binary".to_string(),
-        };
-        return Err(io::Error::new(io::ErrorKind::InvalidData, message));
+        )
+    };
+    // A real document by its first bytes, even when they hold no NUL (a PDF
+    // can start with kilobytes of plain text).
+    if let Some(kind) = kind {
+        if has_document_magic(&absolute_path)? {
+            return Err(use_read_document(kind));
+        }
     }
 
-    let content = fs::read_to_string(&absolute_path)?;
+    // Detect binary files
+    if is_binary_file(&absolute_path)? {
+        return Err(match kind {
+            Some(kind) => use_read_document(kind),
+            None => io::Error::new(io::ErrorKind::InvalidData, "file appears to be binary"),
+        });
+    }
+
+    let content = match (fs::read_to_string(&absolute_path), kind) {
+        (Ok(content), _) => content,
+        (Err(error), Some(kind)) if error.kind() == io::ErrorKind::InvalidData => {
+            return Err(use_read_document(kind));
+        }
+        (Err(error), _) => return Err(error),
+    };
     let lines: Vec<&str> = content.lines().collect();
     let start_index = offset.unwrap_or(0).min(lines.len());
     let window = limit.unwrap_or(DEFAULT_READ_LINE_LIMIT);
@@ -1876,6 +1914,19 @@ mod tests {
             assert!(message.contains(name), "{message}");
             assert!(!message.contains("appears to be binary"), "{message}");
         }
+        // A PDF whose first kilobytes are plain text is still a PDF.
+        let ascii_pdf = temp_path("ascii-pdf-dir").join("paper.pdf");
+        std::fs::create_dir_all(ascii_pdf.parent().expect("parent")).expect("dir");
+        let mut bytes = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'a', 9000));
+        std::fs::write(&ascii_pdf, &bytes).expect("write");
+        let message = read_file(ascii_pdf.to_string_lossy().as_ref(), None, None)
+            .expect_err("a PDF is not text")
+            .to_string();
+        assert!(
+            message.contains("paper.pdf is a PDF document; read it with read_document"),
+            "{message}"
+        );
         // A text file with a document extension still reads as text.
         let text = temp_path("text-dir").join("notes.pdf");
         std::fs::create_dir_all(text.parent().expect("parent")).expect("dir");

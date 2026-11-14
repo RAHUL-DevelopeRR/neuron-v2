@@ -229,6 +229,17 @@ type RuntimePluginStateBuildOutput = (
 );
 
 fn main() {
+    // Hidden: one read_document parse in a child process, so a hostile file
+    // cannot crash or hang the agent (see `tools::run_document_worker`).
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == tools::DOCUMENT_WORKER_ARG)
+    {
+        std::process::exit(tools::run_document_worker());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        tools::use_document_worker(exe);
+    }
     if let Err(error) = run() {
         let message = error.to_string();
         // When --output-format json is active, emit errors as JSON so downstream

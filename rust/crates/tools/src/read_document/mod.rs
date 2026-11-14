@@ -6,34 +6,65 @@
 //!
 //! Every reader treats the file as hostile: inflated sizes, object counts,
 //! nesting depth and the work spent per call are all capped, and a panic in
-//! a parser ends the call with an error instead of the program.
+//! a parser ends the call with an error instead of the program. In the CLI
+//! the parse also runs in a child process ([`worker`]) with a time limit (and
+//! on Windows a memory limit), so a file that gets past those caps still
+//! cannot crash or hang the agent.
 
 mod docx;
 mod pdf;
 mod pptx;
 mod sheet;
+pub(crate) mod worker;
 mod xls;
 mod xml;
 
 #[cfg(test)]
 mod hostile_tests;
 #[cfg(test)]
+mod regression_tests;
+#[cfg(test)]
 pub(crate) mod tests;
 
+use std::fmt::Write as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 
 /// Characters returned when the caller gives no `max_chars`: sized for small
 /// context windows.
 pub(crate) const DEFAULT_MAX_CHARS: usize = 12_000;
-/// The most characters one call returns.
-pub(crate) const MAX_MAX_CHARS: usize = 100_000;
+/// The most characters one call returns. The runtime cuts every tool result
+/// to its own limit (40,000 characters by default), so this stays under that
+/// with room for the header and the hint; see [`max_chars_ceiling`].
+pub(crate) const MAX_MAX_CHARS: usize = 36_000;
+/// Room kept under the runtime's tool result limit for the header and hint.
+const HEADER_ROOM: usize = 4_000;
 /// The fewest characters one call returns, whatever `max_chars` says.
 const MIN_MAX_CHARS: usize = 500;
+/// Columns a Markdown table keeps; further cells are dropped.
+pub(crate) const MAX_TABLE_COLUMNS: usize = 64;
+/// Rows one table read from a document keeps; further rows are dropped.
+pub(crate) const MAX_TABLE_ROWS: usize = 50_000;
+/// Characters one rendered table may take; more than any call returns.
+const MAX_TABLE_CHARS: usize = 200_000;
+/// Sheet names listed in a note or error; the rest are counted.
+const MAX_LISTED_SHEETS: usize = 50;
+/// Characters of one sheet name in such a listing.
+const MAX_LISTED_NAME_CHARS: usize = 64;
+
+/// The largest `max_chars` a call honours: [`MAX_MAX_CHARS`], or less when
+/// the runtime's tool result limit (`NEURON_MAX_TOOL_RESULT_CHARS`) is lower,
+/// so what is returned is never cut again in the middle.
+pub(crate) fn max_chars_ceiling() -> usize {
+    let runtime_limit = runtime::context_manager::ContextPolicy::from_env().max_tool_result_chars;
+    runtime_limit
+        .saturating_sub(HEADER_ROOM)
+        .clamp(MIN_MAX_CHARS, MAX_MAX_CHARS)
+}
 
 /// A document as pages, slides or sheets, of which only the selected ones are
 /// filled in.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct Document {
     /// What the file is, as the header names it ("Word document").
     pub(crate) kind: &'static str,
@@ -48,6 +79,37 @@ pub(crate) struct Document {
     /// Selected units left unbuilt because earlier ones already filled the
     /// character budget; the truncation hint names them.
     pub(crate) unread: Vec<usize>,
+    /// Units that hints must name by something other than their number: a
+    /// sheet whose position is also another sheet's name is named by its own
+    /// name, since `pages` matches names first.
+    pub(crate) selectors: Vec<(usize, String)>,
+}
+
+impl Document {
+    /// How `pages=` names unit `number`.
+    fn selector(&self, number: usize) -> String {
+        self.selectors
+            .iter()
+            .find(|(unit, _)| *unit == number)
+            .map_or_else(|| number.to_string(), |(_, name)| name.clone())
+    }
+
+    /// `numbers` as a `pages=` value: ranges, with a unit that has a
+    /// selector of its own named by it.
+    fn pages_value(&self, numbers: &[usize]) -> String {
+        if self.selectors.is_empty() {
+            return compact_ranges(numbers);
+        }
+        let (named, plain): (Vec<usize>, Vec<usize>) = numbers
+            .iter()
+            .partition(|number| self.selectors.iter().any(|(unit, _)| unit == *number));
+        let mut parts = Vec::new();
+        if !plain.is_empty() {
+            parts.push(compact_ranges(&plain));
+        }
+        parts.extend(named.into_iter().map(|number| self.selector(number)));
+        parts.join(",")
+    }
 }
 
 #[derive(Debug)]
@@ -211,10 +273,11 @@ fn read_unguarded(path: &Path, options: &Options<'_>) -> Result<String, String> 
     if sheet_only && !spreadsheet {
         return Err("rows and columns only apply to spreadsheets".to_string());
     }
+    let ceiling = max_chars_ceiling();
     let max_chars = options
         .max_chars
         .unwrap_or(DEFAULT_MAX_CHARS)
-        .clamp(MIN_MAX_CHARS, MAX_MAX_CHARS);
+        .clamp(MIN_MAX_CHARS, ceiling);
     let mut budget = Budget::new(max_chars);
     let (document, selection) = if spreadsheet {
         sheet::read(path, options, &mut budget)?
@@ -246,7 +309,46 @@ fn read_unguarded(path: &Path, options: &Options<'_>) -> Result<String, String> 
         };
         (document, selection)
     };
-    render(path, &document, &selection, options, max_chars)
+    render(path, &document, &selection, options, max_chars, ceiling)
+}
+
+/// The error for a file whose bytes are text although its extension names a
+/// document: many "export to Excel" features write HTML or CSV as `.xls`.
+pub(crate) fn text_file_error(path: &Path) -> String {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    format!(
+        "{name} is a text file (such as HTML, CSV or tab-separated values) despite its extension; read it with read_file"
+    )
+}
+
+/// Whether `data` looks like text: no NUL byte in its first 8 KB.
+pub(crate) fn looks_like_text(data: &[u8]) -> bool {
+    !data.is_empty() && !data[..data.len().min(8192)].contains(&0)
+}
+
+/// `names` as `1 A, 2 B, ...`, at most [`MAX_LISTED_SHEETS`] of them, each
+/// cut to [`MAX_LISTED_NAME_CHARS`] characters.
+pub(crate) fn sheet_listing(names: &[String]) -> String {
+    let mut listing = names
+        .iter()
+        .take(MAX_LISTED_SHEETS)
+        .enumerate()
+        .map(|(index, name)| {
+            let mut shown = name.chars().take(MAX_LISTED_NAME_CHARS).collect::<String>();
+            if name.chars().count() > MAX_LISTED_NAME_CHARS {
+                shown.push_str("...");
+            }
+            format!("{} {shown}", index + 1)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > MAX_LISTED_SHEETS {
+        let _ = write!(listing, ", and {} more", names.len() - MAX_LISTED_SHEETS);
+    }
+    listing
 }
 
 fn plural(unit: &str, count: usize) -> String {
@@ -285,6 +387,7 @@ fn render(
     selection: &Selection,
     options: &Options<'_>,
     max_chars: usize,
+    ceiling: usize,
 ) -> Result<String, String> {
     let name = path.file_name().map_or_else(
         || path.display().to_string(),
@@ -345,7 +448,7 @@ fn render(
         }
         return Ok(format!(
             "{header}\n\n{body}\n\n[truncated: more follows, use pages=\"{}\"]",
-            compact_ranges(unread)
+            document.pages_value(unread)
         ));
     }
     let more = if unread.is_empty() { "" } else { "at least " };
@@ -364,7 +467,7 @@ fn render(
             shown,
             format!(
                 "[truncated: {more}{remaining} more chars, use pages=\"{}\"]",
-                compact_ranges(&rest)
+                document.pages_value(&rest)
             ),
         )
     } else {
@@ -382,10 +485,23 @@ fn render(
         let next = if rest.is_empty() {
             String::new()
         } else {
-            format!(", or pages=\"{}\" for what follows", compact_ranges(&rest))
+            format!(
+                ", or pages=\"{}\" for what follows",
+                document.pages_value(&rest)
+            )
         };
         let resume_row = if document.unit == "sheet" {
-            last_table_row(&shown)
+            // A line cut in the middle is not a complete row: resume at it.
+            let complete = body
+                .as_bytes()
+                .get(shown.len())
+                .is_none_or(|byte| *byte == b'\n');
+            let lines = if complete {
+                shown.as_str()
+            } else {
+                shown.rfind('\n').map_or("", |end| &shown[..end])
+            };
+            last_table_row(lines)
         } else {
             None
         };
@@ -398,12 +514,12 @@ fn render(
                 .map_or_else(String::new, |columns| format!(" columns=\"{columns}\""));
             format!(
                 "[truncated: {more}{remaining} more chars; continue with pages=\"{}\" rows=\"{}-\"{columns}{next}]",
-                numbers[0],
+                document.selector(numbers[0]),
                 row + 1
             )
-        } else if max_chars < MAX_MAX_CHARS {
+        } else if max_chars < ceiling {
             format!(
-                "[truncated: {more}{remaining} more chars; {unit_name} alone is longer than max_chars, call again with a larger max_chars (up to {MAX_MAX_CHARS}){next}]"
+                "[truncated: {more}{remaining} more chars; {unit_name} alone is longer than max_chars, call again with a larger max_chars (up to {ceiling}){next}]"
             )
         } else {
             format!(
@@ -443,18 +559,175 @@ pub(crate) fn table_cell(text: &str) -> String {
 }
 
 /// Rows as a Markdown table whose first row is the header. Short rows are
-/// padded; an empty table gives an empty string.
+/// padded; columns empty in every row are left off the right edge, rows
+/// after the header with no text are left out, and a table with no text
+/// gives an empty string. At most [`MAX_TABLE_COLUMNS`] columns and about
+/// [`MAX_TABLE_CHARS`] characters are built, so a hostile table of empty
+/// cells cannot grow into gigabytes.
 pub(crate) fn markdown_table(rows: &[Vec<String>]) -> String {
-    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let filled = |cell: &String| !cell.trim().is_empty();
+    let columns = rows
+        .iter()
+        .filter_map(|row| row.iter().rposition(filled))
+        .max()
+        .map_or(0, |last| last + 1)
+        .min(MAX_TABLE_COLUMNS);
     if columns == 0 {
         return String::new();
     }
     let line = |row: &[String]| {
-        let mut cells = row.iter().map(|cell| table_cell(cell)).collect::<Vec<_>>();
+        let mut cells = row
+            .iter()
+            .take(columns)
+            .map(|cell| table_cell(cell))
+            .collect::<Vec<_>>();
         cells.resize(columns, String::new());
         format!("| {} |", cells.join(" | "))
     };
-    let mut lines = vec![line(&rows[0]), format!("|{}", " --- |".repeat(columns))];
-    lines.extend(rows[1..].iter().map(|row| line(row)));
-    lines.join("\n")
+    let mut out = format!("{}\n|{}", line(&rows[0]), " --- |".repeat(columns));
+    let body = rows[1..]
+        .iter()
+        .filter(|row| row.iter().take(columns).any(filled))
+        .collect::<Vec<_>>();
+    for (index, row) in body.iter().enumerate() {
+        if out.len() > MAX_TABLE_CHARS {
+            let _ = write!(
+                out,
+                "\n\n[{} more rows of this table are longer than read_document returns]",
+                body.len() - index
+            );
+            break;
+        }
+        out.push('\n');
+        out.push_str(&line(row));
+    }
+    out
+}
+
+/// A table being read out of a document: rows of cells, each row with the
+/// page it starts on, kept within [`MAX_TABLE_ROWS`] and
+/// [`MAX_TABLE_COLUMNS`] while the XML is walked.
+#[derive(Debug, Default)]
+pub(crate) struct TableBuilder {
+    pub(crate) rows: Vec<Vec<String>>,
+    /// The page each row starts on (documents with pages).
+    pages: Vec<usize>,
+    /// The current row or cell is past a limit; its text is dropped.
+    skip_row: bool,
+    skip_cell: bool,
+    /// Rows were dropped.
+    cut: bool,
+}
+
+impl TableBuilder {
+    pub(crate) fn start_row(&mut self, page: usize) {
+        self.skip_cell = true;
+        if self.rows.len() >= MAX_TABLE_ROWS {
+            self.skip_row = true;
+            self.cut = true;
+            return;
+        }
+        self.skip_row = false;
+        self.rows.push(Vec::new());
+        self.pages.push(page);
+    }
+
+    pub(crate) fn start_cell(&mut self) {
+        self.skip_cell = true;
+        if self.skip_row {
+            return;
+        }
+        if let Some(row) = self.rows.last_mut() {
+            if row.len() < MAX_TABLE_COLUMNS {
+                row.push(String::new());
+                self.skip_cell = false;
+            }
+        }
+    }
+
+    /// The cell text goes into, unless the cell is past a limit.
+    pub(crate) fn cell_mut(&mut self) -> Option<&mut String> {
+        if self.skip_cell || self.skip_row {
+            return None;
+        }
+        self.rows.last_mut().and_then(|row| row.last_mut())
+    }
+
+    /// A page break inside the table: a row with no text yet starts on
+    /// `page`.
+    pub(crate) fn page_break(&mut self, page: usize) {
+        let empty = self
+            .rows
+            .last()
+            .is_some_and(|row| row.iter().all(|cell| cell.trim().is_empty()));
+        if empty {
+            if let Some(last) = self.pages.last_mut() {
+                *last = page;
+            }
+        }
+    }
+
+    /// The table as plain text, for a table nested in a cell.
+    pub(crate) fn flatten(&self) -> String {
+        self.rows
+            .iter()
+            .map(|row| row.join(" / "))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// The table as Markdown blocks, one per page its rows start on, each
+    /// after the first repeating the header row: `(page, markdown)`.
+    pub(crate) fn into_blocks(self) -> Vec<(usize, String)> {
+        let Self {
+            rows, pages, cut, ..
+        } = self;
+        let Some(header) = rows.first().cloned() else {
+            return Vec::new();
+        };
+        let mut parts: Vec<(usize, Vec<Vec<String>>)> = Vec::new();
+        for (row, page) in rows.into_iter().zip(pages) {
+            match parts.last_mut() {
+                Some((current, part)) if *current >= page => part.push(row),
+                _ => {
+                    let mut part = Vec::new();
+                    if !parts.is_empty() {
+                        part.push(header.clone());
+                    }
+                    part.push(row);
+                    parts.push((page, part));
+                }
+            }
+        }
+        let count = parts.len();
+        parts
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, (page, rows))| {
+                let mut markdown = markdown_table(&rows);
+                if markdown.is_empty() {
+                    return None;
+                }
+                if index > 0 {
+                    markdown = format!("(table continued)\n\n{markdown}");
+                }
+                if cut && index + 1 == count {
+                    let _ = write!(
+                        markdown,
+                        "\n\n[the table has more than {MAX_TABLE_ROWS} rows; the rest is left out]"
+                    );
+                }
+                Some((page, markdown))
+            })
+            .collect()
+    }
+
+    /// The table as one Markdown table, for documents without pages.
+    pub(crate) fn into_markdown(self) -> String {
+        self.into_blocks()
+            .into_iter()
+            .map(|(_, markdown)| markdown)
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
 }

@@ -32,6 +32,16 @@ const MAX_FORM_DEPTH: usize = 6;
 pub(super) const MAX_OBJECT_DEPTH: usize = 64;
 /// The most parsed values kept for the whole file.
 pub(super) const MAX_NODES: usize = 4_000_000;
+/// The most values one object (or one content stream operand) is built
+/// from; the rest of it is skipped. Checked while the object is built, so a
+/// single huge array cannot fill memory before any limit is looked at.
+pub(super) const MAX_OBJECT_NODES: usize = 1_000_000;
+/// Page tree nodes visited, pages included.
+pub(super) const MAX_PAGE_TREE_NODES: usize = 1_000_000;
+/// UTF-16 units one `ToUnicode` entry maps a code to (ligatures need a few).
+const MAX_MAPPED_UNITS: usize = 32;
+/// Whitespace allowed between a stream's declared end and `endstream`.
+const MAX_STREAM_END_GAP: usize = 64;
 /// The most objects one object stream may declare.
 const MAX_PACKED_OBJECTS: usize = 100_000;
 /// The most character codes and width entries one font may define.
@@ -50,6 +60,9 @@ pub(super) fn read(
     budget: &mut Budget,
 ) -> Result<Document, String> {
     let data = std::fs::read(path).map_err(|error| format!("cannot open the file: {error}"))?;
+    if find(&data[..data.len().min(1024)], b"%PDF-").is_none() && super::looks_like_text(&data) {
+        return Err(super::text_file_error(path));
+    }
     read_bytes(&data, selection, budget)
 }
 
@@ -120,6 +133,7 @@ pub(super) fn read_bytes(
             units,
             notes,
             unread: Vec::new(),
+            selectors: Vec::new(),
         });
     }
 
@@ -194,6 +208,7 @@ pub(super) fn read_bytes(
         units,
         notes,
         unread,
+        selectors: Vec::new(),
     })
 }
 
@@ -274,6 +289,8 @@ struct Lexer<'a> {
     pos: usize,
     /// Values built so far, for the file-wide [`MAX_NODES`] limit.
     nodes: usize,
+    /// Values built for the object being read, for [`MAX_OBJECT_NODES`].
+    object_nodes: usize,
 }
 
 impl<'a> Lexer<'a> {
@@ -282,7 +299,13 @@ impl<'a> Lexer<'a> {
             data,
             pos: pos.min(data.len()),
             nodes: 0,
+            object_nodes: 0,
         }
+    }
+
+    /// Whether the object being read already has [`MAX_OBJECT_NODES`] values.
+    fn object_full(&self) -> bool {
+        self.object_nodes >= MAX_OBJECT_NODES
     }
 
     fn skip_whitespace(&mut self) {
@@ -436,10 +459,17 @@ impl<'a> Lexer<'a> {
 
     /// The object that starts with `token`, nested `depth` containers deep.
     /// Past [`MAX_OBJECT_DEPTH`] a container is skipped without recursing
-    /// and stands as `null`, so no input can exhaust the stack.
+    /// and stands as `null`, so no input can exhaust the stack; past
+    /// [`MAX_OBJECT_NODES`] values the rest of the object is skipped.
     fn object_from(&mut self, token: Token, depth: usize) -> Option<Obj> {
+        if depth == 0 {
+            self.object_nodes = 0;
+        }
         self.nodes += 1;
-        if matches!(token, Token::DictOpen | Token::ArrayOpen) && depth >= MAX_OBJECT_DEPTH {
+        self.object_nodes += 1;
+        if matches!(token, Token::DictOpen | Token::ArrayOpen)
+            && (depth >= MAX_OBJECT_DEPTH || self.object_full())
+        {
             self.skip_container();
             return Some(Obj::Null);
         }
@@ -464,6 +494,10 @@ impl<'a> Lexer<'a> {
             Token::DictOpen => {
                 let mut dict = Dict::new();
                 loop {
+                    if self.object_full() {
+                        self.skip_container();
+                        break;
+                    }
                     match self.next_token()? {
                         Token::DictClose => break,
                         Token::Name(key) => {
@@ -483,6 +517,10 @@ impl<'a> Lexer<'a> {
             Token::ArrayOpen => {
                 let mut items = Vec::new();
                 loop {
+                    if self.object_full() {
+                        self.skip_container();
+                        break;
+                    }
                     match self.next_token()? {
                         Token::ArrayClose => break,
                         other => {
@@ -711,8 +749,12 @@ impl Pdf {
                     let end = declared
                         .and_then(|length| {
                             let end = start.checked_add(length).filter(|end| *end <= data.len())?;
-                            let offset =
-                                data[end..].iter().position(|byte| !is_whitespace(*byte))?;
+                            // Only an end of line belongs there; a long run
+                            // of whitespace is not scanned again per header.
+                            let offset = data[end..]
+                                .iter()
+                                .take(MAX_STREAM_END_GAP)
+                                .position(|byte| !is_whitespace(*byte))?;
                             data[end + offset..]
                                 .starts_with(b"endstream")
                                 .then_some(end)
@@ -947,31 +989,36 @@ impl Pdf {
         pages
     }
 
+    /// Walks the page tree. Every node and every `Kids` array is visited
+    /// once, known by its address (whether it is referenced or written
+    /// inline), and at most [`MAX_PAGE_TREE_NODES`] nodes are visited, so a
+    /// tree whose nodes share their kids cannot fan out exponentially.
     fn collect_pages<'a>(
         &'a self,
         node: &'a Obj,
         inherited: Option<&'a Dict>,
         pages: &mut Vec<Page<'a>>,
-        seen: &mut HashSet<u32>,
+        seen: &mut HashSet<usize>,
         depth: usize,
     ) {
-        if depth > MAX_DEPTH {
+        if depth > MAX_DEPTH || seen.len() >= MAX_PAGE_TREE_NODES {
             return;
-        }
-        if let Obj::Ref(number) = node {
-            if !seen.insert(*number) {
-                return;
-            }
         }
         let Some(dict) = self.resolve(node).as_dict() else {
             return;
         };
+        if !seen.insert(std::ptr::from_ref(dict) as usize) {
+            return;
+        }
         let resources = self
             .get(dict, "Resources")
             .and_then(Obj::as_dict)
             .or(inherited);
         let kind = dict.get("Type").and_then(Obj::as_name);
         if let (Some(Obj::Array(kids)), false) = (self.get(dict, "Kids"), kind == Some("Page")) {
+            if !seen.insert(std::ptr::from_ref(kids) as usize) {
+                return;
+            }
             for kid in kids {
                 self.collect_pages(kid, resources, pages, seen, depth + 1);
             }
@@ -1443,7 +1490,7 @@ impl CMap {
                             for pair in pending.chunks(2) {
                                 if let [Obj::Str(code), Obj::Str(text)] = pair {
                                     cmap.note_width(code.len());
-                                    cmap.map.insert(code_value(code), utf16(text));
+                                    cmap.map.insert(code_value(code), mapped_text(text));
                                     defined += 1;
                                 }
                             }
@@ -1500,6 +1547,7 @@ impl CMap {
             Obj::Str(start) => {
                 let units = start
                     .chunks(2)
+                    .take(MAX_MAPPED_UNITS)
                     .map(|pair| u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]))
                     .collect::<Vec<_>>();
                 self.ranges.push((low, high, units));
@@ -1509,7 +1557,7 @@ impl CMap {
                 let mut count = 0;
                 for (code, text) in (low..=high).zip(texts) {
                     if let Obj::Str(text) = text {
-                        self.map.insert(code, utf16(text));
+                        self.map.insert(code, mapped_text(text));
                         count += 1;
                     }
                 }
@@ -1545,9 +1593,12 @@ fn code_value(bytes: &[u8]) -> u32 {
         .fold(0u32, |acc, byte| (acc << 8) | u32::from(*byte))
 }
 
-fn utf16(bytes: &[u8]) -> String {
+/// The text a `ToUnicode` entry maps to (UTF-16BE), at most
+/// [`MAX_MAPPED_UNITS`] units: one code never stands for more.
+fn mapped_text(bytes: &[u8]) -> String {
     let units = bytes
         .chunks(2)
+        .take(MAX_MAPPED_UNITS)
         .map(|pair| u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]))
         .collect::<Vec<_>>();
     String::from_utf16_lossy(&units)
@@ -1581,8 +1632,9 @@ struct Font {
 
 impl Font {
     /// The text of `bytes` and its width in thousandths of the font size.
-    /// `None` text means the codes have no Unicode meaning to recover.
-    fn decode(&self, bytes: &[u8]) -> (Option<String>, f64) {
+    /// `None` text means the codes have no Unicode meaning to recover. Text
+    /// stops growing past `limit` bytes; the flag says it was cut.
+    fn decode(&self, bytes: &[u8], limit: usize) -> (Option<String>, f64, bool) {
         let code_bytes = self
             .cmap
             .as_ref()
@@ -1590,9 +1642,14 @@ impl Font {
         let mut text = String::new();
         let mut width = 0.0;
         let mut decodable = true;
+        let mut cut = false;
         for chunk in bytes.chunks(code_bytes.max(1)) {
             let code = code_value(chunk);
             width += self.widths.get(code).unwrap_or(self.default_width);
+            if text.len() > limit {
+                cut = true;
+                continue;
+            }
             match &self.cmap {
                 Some(cmap) => match cmap.get(code) {
                     Some(mapped) => text.push_str(&mapped),
@@ -1605,7 +1662,7 @@ impl Font {
                 None => text.extend(chunk.iter().map(|byte| win_ansi(*byte))),
             }
         }
-        (decodable.then_some(text), width)
+        (decodable.then_some(text), width, cut)
     }
 }
 
@@ -1740,7 +1797,9 @@ impl TextState {
             ..Font::default()
         };
         let font = font.unwrap_or(&fallback);
-        let (text, width) = font.decode(bytes);
+        let room = MAX_PAGE_TEXT.saturating_sub(sink.text.len());
+        let (text, width, cut) = font.decode(bytes, room);
+        sink.cut |= cut;
         let page_em = self.em() * Self::scale(&self.ctm);
         let (x, y) = self.page_point();
         if let Some((last_y, last_end_x)) = self.last {

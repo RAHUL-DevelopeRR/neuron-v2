@@ -3974,8 +3974,8 @@ fn enforced_shadow_warnings(skills: &[SkillSummary]) -> Vec<String> {
         .collect()
 }
 
-/// Warnings about project or user skills that an enforced skill overrides, for
-/// showing at startup.
+/// Warnings about project or user skills that an enforced skill overrides:
+/// the same lines `/skills` shows, for a caller that lists them elsewhere.
 #[must_use]
 pub fn enforced_skill_shadow_warnings(cwd: &Path) -> Vec<String> {
     load_skills_from_roots(&discover_skill_roots(cwd))

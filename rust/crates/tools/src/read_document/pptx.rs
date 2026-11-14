@@ -1,10 +1,11 @@
 //! `PowerPoint` presentations (`.pptx`): each slide with its title, text,
 //! tables and speaker notes, in presentation order.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use super::xml::{attr, part_dir, relationships, rels_path, resolve_target, walk, Node, Package};
-use super::{markdown_table, Budget, Document, Selection, Unit};
+use super::{Budget, Document, Selection, TableBuilder, Unit};
 
 const KIND: &str = "PowerPoint presentation";
 
@@ -35,12 +36,18 @@ pub(super) fn read(
             }
         }
     })?;
+    // Relationship id to target, the first of each id winning: one lookup
+    // per slide id, not a scan of every relationship.
+    let mut targets: HashMap<&str, &str> = HashMap::with_capacity(rels.len());
+    for (rel_id, _, target) in &rels {
+        targets.entry(rel_id.as_str()).or_insert(target.as_str());
+    }
     let slide_parts = slide_ids
         .iter()
         .filter_map(|id| {
-            rels.iter()
-                .find(|(rel_id, _, _)| rel_id == id)
-                .map(|(_, _, target)| resolve_target("ppt", target))
+            targets
+                .get(id.as_str())
+                .map(|target| resolve_target("ppt", target))
         })
         .collect::<Vec<_>>();
 
@@ -60,7 +67,7 @@ pub(super) fn read(
             Some(xml) => {
                 let slide = parse_slide(&xml)?;
                 let notes = read_notes(&mut package, part)?;
-                render_slide(number, &slide, notes.as_deref())
+                render_slide(number, slide, notes.as_deref())
             }
             None => format!("## Slide {number}\n\n(the slide is missing from the file)"),
         };
@@ -74,6 +81,7 @@ pub(super) fn read(
         units,
         notes: Vec::new(),
         unread,
+        selectors: Vec::new(),
     })
 }
 
@@ -120,13 +128,13 @@ struct Slide {
 #[derive(Debug)]
 enum Content {
     Shape(usize),
-    Table(Vec<Vec<String>>),
+    Table(TableBuilder),
 }
 
 fn parse_slide(xml: &str) -> Result<Slide, String> {
     let mut slide = Slide::default();
     let mut shapes: Vec<Shape> = Vec::new();
-    let mut tables: Vec<Vec<Vec<String>>> = Vec::new();
+    let mut tables: Vec<TableBuilder> = Vec::new();
     let mut paragraph: Option<(usize, String)> = None;
     let mut in_text = false;
     walk(xml, |node| match node {
@@ -171,11 +179,7 @@ fn parse_slide(xml: &str) -> Result<Slide, String> {
             if text.is_empty() {
                 return;
             }
-            if let Some(cell) = tables
-                .last_mut()
-                .and_then(|table| table.last_mut())
-                .and_then(|row| row.last_mut())
-            {
+            if let Some(cell) = tables.last_mut().and_then(TableBuilder::cell_mut) {
                 if !cell.is_empty() {
                     cell.push('\n');
                 }
@@ -184,15 +188,15 @@ fn parse_slide(xml: &str) -> Result<Slide, String> {
                 shape.paragraphs.push((level, text));
             }
         }
-        Node::Open { name: "tbl", .. } => tables.push(Vec::new()),
+        Node::Open { name: "tbl", .. } => tables.push(TableBuilder::default()),
         Node::Open { name: "tr", .. } => {
             if let Some(table) = tables.last_mut() {
-                table.push(Vec::new());
+                table.start_row(0);
             }
         }
         Node::Open { name: "tc", .. } => {
-            if let Some(row) = tables.last_mut().and_then(|table| table.last_mut()) {
-                row.push(String::new());
+            if let Some(table) = tables.last_mut() {
+                table.start_cell();
             }
         }
         Node::Close { name: "tbl" } => {
@@ -209,7 +213,7 @@ fn is_title(shape: &Shape) -> bool {
     matches!(shape.placeholder.as_deref(), Some("title" | "ctrTitle"))
 }
 
-fn render_slide(number: usize, slide: &Slide, notes: Option<&str>) -> String {
+fn render_slide(number: usize, slide: Slide, notes: Option<&str>) -> String {
     let title = slide
         .shapes
         .iter()
@@ -230,10 +234,10 @@ fn render_slide(number: usize, slide: &Slide, notes: Option<&str>) -> String {
         lines.push("(hidden slide)".to_string());
     }
     let mut body = Vec::new();
-    for content in &slide.order {
+    for content in slide.order {
         match content {
             Content::Shape(index) => {
-                let shape = &slide.shapes[*index];
+                let shape = &slide.shapes[index];
                 if is_title(shape)
                     || matches!(
                         shape.placeholder.as_deref(),
@@ -263,8 +267,8 @@ fn render_slide(number: usize, slide: &Slide, notes: Option<&str>) -> String {
                     body.push(text);
                 }
             }
-            Content::Table(rows) => {
-                let table = markdown_table(rows);
+            Content::Table(table) => {
+                let table = table.into_markdown();
                 if !table.is_empty() {
                     body.push(table);
                 }

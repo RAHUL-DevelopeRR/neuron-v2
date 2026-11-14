@@ -79,9 +79,21 @@ pub fn enforced_skill_root_for(
     Ok(root)
 }
 
-/// [`enforced_skill_root_for`] with the active enforced skills.
+/// [`enforced_skill_root_for`] with the active enforced skills. When
+/// `config_home` cannot be written, the files go under the temp folder
+/// instead, so an enforced skill still wins over a project skill of its name.
 pub fn enforced_skill_root(config_home: &Path) -> io::Result<PathBuf> {
-    enforced_skill_root_for(config_home, &active_enforced_skills())
+    let skills = active_enforced_skills();
+    enforced_skill_root_for(config_home, &skills).or_else(|error| {
+        let user = std::env::var("USERNAME")
+            .or_else(|_| std::env::var("USER"))
+            .unwrap_or_default()
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>();
+        let fallback = std::env::temp_dir().join(format!("neuron-{user}"));
+        enforced_skill_root_for(&fallback, &skills).map_err(|_| error)
+    })
 }
 
 /// The system prompt section naming the enforced skills, one short line each.
@@ -102,12 +114,14 @@ pub fn enforced_skill_section(skills: &[EnforcedSkill]) -> Option<String> {
 
 /// Every skill section of the system prompt: the enforced skills, which no
 /// setting turns off, then the bundled defaults unless `"defaultSkills": false`.
+/// Writing the enforced skill files is best effort: the section itself needs
+/// no file, so a config home that cannot be written does not stop the prompt.
 pub fn skill_prompt_sections(
     config: &RuntimeConfig,
     config_home: &Path,
 ) -> io::Result<Vec<String>> {
     let skills = active_enforced_skills();
-    enforced_skill_root_for(config_home, &skills)?;
+    let _ = enforced_skill_root(config_home);
     let mut sections = enforced_skill_section(&skills)
         .into_iter()
         .collect::<Vec<_>>();
@@ -191,6 +205,35 @@ mod tests {
         assert!(!is_enforced_skill("ponytail"));
         let section = enforced_skill_section(&compiled_enforced_skills()).unwrap();
         assert!(section.chars().count() < 250, "{section}");
+    }
+
+    #[test]
+    fn an_unwritable_config_home_does_not_stop_the_prompt() {
+        let root = temp_root("unwritable");
+        fs::create_dir_all(&root).unwrap();
+        // A file where the config folder should be: nothing can be written
+        // under it.
+        let config_home = root.join("config");
+        fs::write(&config_home, "not a folder").unwrap();
+        // Bundled skills off: the case that used to write nothing at all.
+        let settings_home = root.join("settings");
+        fs::create_dir_all(&settings_home).unwrap();
+        fs::write(
+            settings_home.join("settings.json"),
+            r#"{"defaultSkills":false}"#,
+        )
+        .unwrap();
+        let loader = ConfigLoader::new(&root, &settings_home);
+        let sections = skill_prompt_sections(&loader.load().unwrap(), &config_home)
+            .expect("the prompt still builds");
+        assert!(sections[0].starts_with("# Neuron enforced skills"));
+        // The skill files land in the temp folder instead.
+        let fallback = enforced_skill_root(&config_home).expect("temp fallback");
+        assert!(fallback
+            .join("reading-documents")
+            .join("SKILL.md")
+            .is_file());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
