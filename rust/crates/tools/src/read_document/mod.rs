@@ -12,6 +12,7 @@
 //! cannot crash or hang the agent.
 
 mod docx;
+mod glyphs;
 mod pdf;
 mod pptx;
 mod sheet;
@@ -25,6 +26,8 @@ mod hostile_tests;
 mod regression_tests;
 #[cfg(test)]
 mod review_tests;
+#[cfg(test)]
+mod round5_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -643,12 +646,6 @@ const CUT_MARK: &str = " [...]";
 /// Starts each part of a table after the first.
 const CONTINUED: &str = "(table continued)\n\n";
 
-/// One cell as Markdown, cut to `max_chars` characters (after escaping)
-/// without splitting an escape.
-fn cut_cell(text: &str, max_chars: usize) -> String {
-    cut_escaped(table_cell(text), max_chars).0
-}
-
 /// `escaped` (a cell already escaped) cut to `max_chars` characters without
 /// splitting an escape, ending in [`CUT_MARK`] when cut; and whether it was.
 fn cut_escaped(escaped: String, max_chars: usize) -> (String, bool) {
@@ -666,16 +663,51 @@ fn cut_escaped(escaped: String, max_chars: usize) -> (String, bool) {
     (kept, true)
 }
 
-/// `row` as one Markdown table line of `columns` cells, each at most
-/// `per_cell` characters.
-fn row_line(row: &[String], columns: usize, per_cell: usize) -> String {
-    let mut cells = row
+/// `row` as one Markdown table line of `columns` cells whose text takes
+/// about `line_chars` characters at most. The room goes to the cells that
+/// hold text, not to grid columns: a merged Word cell is padded with empty
+/// cells, one per grid column it covers, and those must not shrink the cell
+/// they pad. Short cells keep all their text and leave the rest of the room
+/// to the long ones; no cell keeps more than [`MAX_CELL_CHARS`].
+fn row_line(row: &[String], columns: usize, line_chars: usize) -> String {
+    let escaped = row
         .iter()
         .take(columns)
-        .map(|cell| cut_cell(cell, per_cell))
+        .map(|cell| table_cell(cell))
+        .collect::<Vec<_>>();
+    let per_cell = fair_share(
+        escaped
+            .iter()
+            .filter(|cell| !cell.is_empty())
+            .map(|cell| cell.chars().count())
+            .collect(),
+        line_chars,
+    )
+    .min(MAX_CELL_CHARS);
+    let mut cells = escaped
+        .into_iter()
+        .map(|cell| cut_escaped(cell, per_cell).0)
         .collect::<Vec<_>>();
     cells.resize(columns, String::new());
     format!("| {} |", cells.join(" | "))
+}
+
+/// The most characters each of cells as long as `lengths` may keep so that
+/// together they keep at most `room`: cells shorter than their share keep
+/// their whole length, and what they leave is shared among the longer ones.
+/// `usize::MAX` when every cell fits whole.
+fn fair_share(mut lengths: Vec<usize>, room: usize) -> usize {
+    lengths.sort_unstable();
+    let count = lengths.len();
+    let mut left = room;
+    for (index, length) in lengths.into_iter().enumerate() {
+        let share = left / (count - index);
+        if length > share {
+            return share;
+        }
+        left -= length;
+    }
+    usize::MAX
 }
 
 /// The rows of a document table that start on one page, rendered: the
@@ -966,14 +998,15 @@ impl TableBuilder {
         if columns == 0 {
             return Vec::new();
         }
-        let per_cell = (MAX_ROW_LINE_CHARS / columns).min(MAX_CELL_CHARS);
         let separator = " --- |".repeat(columns);
-        let header: std::sync::Arc<str> =
-            format!("{}\n|{separator}", row_line(first, columns, per_cell)).into();
-        let repeat_per_cell = (MAX_REPEATED_HEADER_CHARS / columns).clamp(16, per_cell.max(16));
+        let header: std::sync::Arc<str> = format!(
+            "{}\n|{separator}",
+            row_line(first, columns, MAX_ROW_LINE_CHARS)
+        )
+        .into();
         let repeat_header: std::sync::Arc<str> = format!(
             "{}\n|{separator}",
-            row_line(first, columns, repeat_per_cell)
+            row_line(first, columns, MAX_REPEATED_HEADER_CHARS)
         )
         .into();
         let repeat_cost = repeat_header.chars().count() + CONTINUED.len();
@@ -994,7 +1027,7 @@ impl TableBuilder {
             .collect::<Vec<_>>();
         let mut note = None;
         for (index, (row, page)) in body.iter().enumerate() {
-            let line = row_line(row, columns, per_cell);
+            let line = row_line(row, columns, MAX_ROW_LINE_CHARS);
             let current = parts.last().map_or(0, |part| part.page);
             let new_part = **page > current;
             let cost = line.chars().count() + 1 + if new_part { repeat_cost } else { 0 };

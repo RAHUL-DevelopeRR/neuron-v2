@@ -12,6 +12,10 @@
 //! - every zip part is measured inflated before `calamine` reads it, and an
 //!   `.xlsx` shared string table must hold the strings it claims
 //!   ([`check_shared_strings`]), since `calamine` reserves room for them;
+//! - text is cut to what a table cell can show as each cell is read, so one
+//!   long shared string that thousands of cells point at is never copied
+//!   whole per cell (`.xls` cells, which `calamine` copies while opening,
+//!   are measured by [`super::xls`]);
 //! - one call streams at most [`MAX_SCANNED_CELLS`] cells for at most
 //!   [`SCAN_TIME_LIMIT`]; sheets past that are named as unread.
 //!
@@ -23,7 +27,7 @@ use std::io::{Cursor, Read as _};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use calamine::{Data, Ods, Reader, Xls, Xlsb, Xlsx};
+use calamine::{Data, DataRef, Ods, Reader, Xls, Xlsb, Xlsx};
 
 use super::xls;
 use super::xml::{attr, walk, Node};
@@ -148,7 +152,9 @@ impl Book {
 
     /// Calls `visit` with each non-blank cell of sheet `name`: row, column
     /// (both 0-based) and value. Streamed formats are read again each call,
-    /// and every cell streamed counts against `work`.
+    /// and every cell streamed counts against `work`. Text is cut to
+    /// [`scan_chars`] characters as it is read, so a long shared string that
+    /// many cells point at is never copied whole per cell.
     fn scan(
         &mut self,
         name: &str,
@@ -156,6 +162,8 @@ impl Book {
         work: &mut Work,
         visit: &mut dyn FnMut(u32, u32, &Data),
     ) -> Result<(), String> {
+        let keep = scan_chars();
+        let mut last = None;
         let mut emit = |row: u32, column: u32, value: Data| {
             if row < MAX_ROW && !is_blank(&value) {
                 visit(row, column, &value);
@@ -167,7 +175,7 @@ impl Book {
                 while let Some(cell) = cells.next_cell().map_err(cannot_read)? {
                     work.cell()?;
                     let (row, column) = cell.get_position();
-                    emit(row, column, cell.get_value().clone().into());
+                    emit(row, column, cut_ref(cell.get_value(), keep, &mut last));
                 }
             }
             Self::Xlsb(book) => {
@@ -175,7 +183,7 @@ impl Book {
                 while let Some(cell) = cells.next_cell().map_err(cannot_read)? {
                     work.cell()?;
                     let (row, column) = cell.get_position();
-                    emit(row, column, cell.get_value().clone().into());
+                    emit(row, column, cut_ref(cell.get_value(), keep, &mut last));
                 }
             }
             Self::Xls(_) | Self::Ods(_) => {
@@ -186,12 +194,85 @@ impl Book {
                         let column = u32::try_from(column)
                             .unwrap_or(u32::MAX)
                             .saturating_add(left);
-                        emit(row, column, value.clone());
+                        emit(row, column, cut_data(value, keep));
                     }
                 }
             }
         }
         Ok(())
+    }
+}
+
+/// Characters of a text cell kept while a sheet is scanned: more than any
+/// cell shows, so a cut cell is still seen to be cut. A cell is blank when
+/// these first characters are (it would show as blank either way).
+fn scan_chars() -> usize {
+    super::max_chars_ceiling() + 1
+}
+
+/// The first `keep` characters of `text`, copied.
+fn cut_text(text: &str, keep: usize) -> String {
+    if text.len() <= keep {
+        return text.to_string();
+    }
+    super::take_chars(text, keep).to_string()
+}
+
+/// The last long shared string cut while a sheet is scanned, known by its
+/// address and length: many cells pointing at one string are cut once.
+struct SharedCut {
+    key: (usize, usize),
+    text: String,
+}
+
+/// A streamed cell as a value, its text cut to `keep` characters without
+/// copying the rest: a shared string is borrowed from the one table entry
+/// every cell using it points at.
+fn cut_ref(value: &DataRef<'_>, keep: usize, last: &mut Option<SharedCut>) -> Data {
+    match value {
+        DataRef::SharedString(text) if text.len() > keep => {
+            let key = (text.as_ptr().addr(), text.len());
+            if let Some(cut) = last.as_ref().filter(|cut| cut.key == key) {
+                return Data::String(cut.text.clone());
+            }
+            let cut = cut_text(text, keep);
+            *last = Some(SharedCut {
+                key,
+                text: cut.clone(),
+            });
+            Data::String(cut)
+        }
+        DataRef::SharedString(text) => Data::String(cut_text(text, keep)),
+        DataRef::String(text) => Data::String(cut_text(text, keep)),
+        DataRef::DateTimeIso(text) => Data::DateTimeIso(cut_text(text, keep)),
+        DataRef::DurationIso(text) => Data::DurationIso(cut_text(text, keep)),
+        other => other.clone().into(),
+    }
+}
+
+/// A grid cell as a value, its text cut to `keep` characters.
+fn cut_data(value: &Data, keep: usize) -> Data {
+    match value {
+        Data::String(text) => Data::String(cut_text(text, keep)),
+        Data::DateTimeIso(text) => Data::DateTimeIso(cut_text(text, keep)),
+        Data::DurationIso(text) => Data::DurationIso(cut_text(text, keep)),
+        other => other.clone(),
+    }
+}
+
+/// Cuts `text` to `limit` characters after its leading whitespace (which a
+/// table cell drops); whether anything was cut.
+fn shorten(text: &mut String, limit: usize) -> bool {
+    let start = text.len() - text.trim_start().len();
+    if text.len() - start <= limit {
+        return false;
+    }
+    match text[start..].char_indices().nth(limit) {
+        Some((at, _)) => {
+            text.truncate(start + at);
+            true
+        }
+        None => false,
     }
 }
 
@@ -859,19 +940,48 @@ fn render_sheet(
         column_from
     };
 
-    // Second pass: the values in the window, at most rows x columns shown.
-    let mut values: BTreeMap<(u32, u32), String> = BTreeMap::new();
+    // Cells are cut so one row always fits in one call: a row longer than
+    // that could only be read in part, with no row to resume at. The fewer
+    // columns hold values, the more of each cell is shown.
+    let ceiling = super::max_chars_ceiling();
+    let one_column_cell = ceiling * 5 / 6;
+    let cell_limit = |widest: u32| {
+        let data_columns = usize::try_from(widest - column_from).unwrap_or(usize::MAX) + 1;
+        if data_columns == 1 {
+            one_column_cell
+        } else {
+            (ceiling * 2 / 3).min(super::MAX_ROW_LINE_CHARS) / data_columns
+        }
+    };
+
+    // Second pass: the values in the window, at most rows x columns shown,
+    // each kept no longer than it can be shown (and whether it was cut), so
+    // a sheet of long cells holds no more than about one table of text.
+    let mut values: BTreeMap<(u32, u32), (String, bool)> = BTreeMap::new();
+    let mut widest: Option<u32> = None;
     if column_from <= column_to {
         book.scan(name, grid.as_ref(), work, &mut |row, column, value| {
-            if (first_row..=last_row).contains(&row)
-                && (column_from..=last_column).contains(&column)
+            if !(first_row..=last_row).contains(&row)
+                || !(column_from..=last_column).contains(&column)
             {
-                values.insert((row, column), cell_text(value));
+                return;
             }
+            // A value further right leaves less of each cell to show: the
+            // cells kept so far are cut to that.
+            if widest.is_none_or(|widest| column > widest) {
+                widest = Some(column);
+                let limit = cell_limit(column);
+                for (text, cut) in values.values_mut() {
+                    *cut |= shorten(text, limit);
+                }
+            }
+            let mut text = cell_text(value);
+            let cut = shorten(&mut text, cell_limit(widest.unwrap_or(column)));
+            values.insert((row, column), (text, cut));
         })?;
     }
     // Columns empty in every shown row are left off the right edge.
-    let Some(widest) = values.keys().map(|(_, column)| *column).max() else {
+    let Some(widest) = widest else {
         return Ok(format!(
             "{heading}\n\n(no values in these columns; the sheet has values in columns {}-{})",
             column_name(left),
@@ -883,22 +993,21 @@ fn render_sheet(
     let mut rows = vec![header];
     for &row in shown_rows {
         let mut cells = vec![(row + 1).to_string()];
-        cells.extend(
-            (column_from..=widest)
-                .map(|column| values.get(&(row, column)).cloned().unwrap_or_default()),
-        );
+        cells.extend((column_from..=widest).map(|column| {
+            values
+                .remove(&(row, column))
+                .map_or_else(String::new, |(mut text, cut)| {
+                    // Marked so the table still sees the cell as cut.
+                    if cut {
+                        text.push_str(super::CUT_MARK);
+                    }
+                    text
+                })
+        }));
         rows.push(cells);
     }
-    // Cells are cut so one row always fits in one call: a row longer than
-    // that could only be read in part, with no row to resume at.
     let data_columns = usize::try_from(widest - column_from).unwrap_or(usize::MAX) + 1;
-    let ceiling = super::max_chars_ceiling();
-    let one_column_cell = ceiling * 5 / 6;
-    let per_cell = if data_columns == 1 {
-        one_column_cell
-    } else {
-        (ceiling * 2 / 3).min(super::MAX_ROW_LINE_CHARS) / data_columns
-    };
+    let per_cell = cell_limit(widest);
     let (table, first_cut) = markdown_table(&rows, per_cell);
     // Said before the table, so a call that ends inside the table still says
     // it.

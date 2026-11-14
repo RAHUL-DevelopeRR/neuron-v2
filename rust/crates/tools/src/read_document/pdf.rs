@@ -16,6 +16,7 @@ use std::io::Read as _;
 use std::path::Path;
 use std::rc::Rc;
 
+use super::glyphs::{self, win_ansi, CodeTable};
 use super::{Budget, Document, Selection, Unit};
 
 const KIND: &str = "PDF document";
@@ -1114,9 +1115,52 @@ impl Pdf {
         Font {
             two_byte: composite,
             cmap,
+            encoding: if composite {
+                None
+            } else {
+                self.simple_encoding(dict)
+            },
             widths,
             default_width,
         }
+    }
+
+    /// What the codes of a simple font mean by its `/Encoding`: a named base
+    /// encoding, or a dictionary of one and its `/Differences`. `None` reads
+    /// codes as Windows-1252.
+    fn simple_encoding(&self, dict: &Dict) -> Option<CodeTable> {
+        let encoding = self.get(dict, "Encoding")?;
+        if let Some(name) = encoding.as_name() {
+            return glyphs::named(name);
+        }
+        let encoding = encoding.as_dict()?;
+        let mut table = self
+            .get(encoding, "BaseEncoding")
+            .and_then(Obj::as_name)
+            .and_then(glyphs::named)
+            .unwrap_or_else(glyphs::default_table);
+        if let Some(Obj::Array(differences)) = self.get(encoding, "Differences") {
+            // `code /name1 /name2 ...`: names for consecutive codes.
+            let mut code: Option<usize> = None;
+            // 256 names and their codes fit many times over.
+            for entry in differences.iter().take(4_096) {
+                match self.resolve(entry) {
+                    Obj::Num(number) => code = Some(to_usize(*number)),
+                    Obj::Name(glyph) => {
+                        if let Some(at) = code {
+                            if let (Some(slot), Some(text)) =
+                                (table.get_mut(at), glyphs::glyph_text(glyph))
+                            {
+                                *slot = text;
+                            }
+                            code = Some(at.saturating_add(1));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some(table)
     }
 
     /// The `W` array of a CID font: `c [w1 w2 ...]` and `c_first c_last w`.
@@ -1625,6 +1669,9 @@ impl Widths {
 struct Font {
     two_byte: bool,
     cmap: Option<CMap>,
+    /// What a simple font's codes mean when `cmap` does not say: its
+    /// `/Encoding`, or Windows-1252 when `None`.
+    encoding: Option<CodeTable>,
     widths: Widths,
     default_width: f64,
 }
@@ -1653,30 +1700,31 @@ impl Font {
                 Some(cmap) => match cmap.get(code) {
                     Some(mapped) => text.push_str(&mapped),
                     None if !self.two_byte => {
-                        text.push(win_ansi(u8::try_from(code).unwrap_or(b'?')));
+                        self.push_simple(&mut text, u8::try_from(code).unwrap_or(b'?'));
                     }
                     None => {}
                 },
                 None if self.two_byte => decodable = false,
-                None => text.extend(chunk.iter().map(|byte| win_ansi(*byte))),
+                None => {
+                    for byte in chunk {
+                        self.push_simple(&mut text, *byte);
+                    }
+                }
             }
         }
         (decodable.then_some(text), width, cut)
     }
-}
 
-/// A single-byte code read as Windows-1252, the usual simple-font encoding.
-fn win_ansi(byte: u8) -> char {
-    const HIGH: [char; 32] = [
-        '\u{20ac}', '\u{fffd}', '\u{201a}', '\u{0192}', '\u{201e}', '\u{2026}', '\u{2020}',
-        '\u{2021}', '\u{02c6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{fffd}',
-        '\u{017d}', '\u{fffd}', '\u{fffd}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}',
-        '\u{2022}', '\u{2013}', '\u{2014}', '\u{02dc}', '\u{2122}', '\u{0161}', '\u{203a}',
-        '\u{0153}', '\u{fffd}', '\u{017e}', '\u{0178}',
-    ];
-    match byte {
-        0x80..=0x9f => HIGH[usize::from(byte - 0x80)],
-        _ => char::from(byte),
+    /// The text of one code of a simple font, by its encoding.
+    fn push_simple(&self, text: &mut String, byte: u8) {
+        match self
+            .encoding
+            .as_ref()
+            .and_then(|table| table.get(usize::from(byte)))
+        {
+            Some(mapped) => text.push_str(mapped),
+            None => text.push(win_ansi(byte)),
+        }
     }
 }
 

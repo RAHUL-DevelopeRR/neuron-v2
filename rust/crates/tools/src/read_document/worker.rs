@@ -84,18 +84,44 @@ pub fn use_worker(exe: PathBuf) {
 
 /// Makes `read_document` run each read in this program's own binary (for
 /// the CLI, which handles [`WORKER_ARG`] through [`run_worker`]). The binary
-/// is found by [`std::env::current_exe`], else by the program name it was
-/// started with; when neither finds it, every read is refused rather than
-/// run in this process without the worker's limits.
+/// is found as [`own_binary`] says; when it cannot be found, every read is
+/// refused rather than run in this process without the worker's limits.
 pub fn use_own_binary_as_worker() {
-    let found = std::env::current_exe().ok().or_else(|| {
-        resolve_program(
-            &std::env::args_os().next()?,
-            std::env::var_os("PATH").as_deref(),
-            std::env::current_dir().ok().as_deref(),
-        )
-    });
+    let found = own_binary(
+        RUNNING_IMAGE.map(Path::new),
+        std::env::current_exe().ok(),
+        || {
+            resolve_program(
+                &std::env::args_os().next()?,
+                std::env::var_os("PATH").as_deref(),
+                std::env::current_dir().ok().as_deref(),
+            )
+        },
+    );
     let _ = WORKER.set(found.map_or(Worker::Missing, Worker::Exe));
+}
+
+/// A path that names the running program's own image even after its file is
+/// replaced or deleted (an upgrade renames a new binary over it): started
+/// from there, a worker is always this same version.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const RUNNING_IMAGE: Option<&str> = Some("/proc/self/exe");
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const RUNNING_IMAGE: Option<&str> = None;
+
+/// The binary to start workers from: `running_image` when the system has
+/// one, else `current_exe` while that file still exists (on Linux it can
+/// name a file that is gone, `/path/neuron (deleted)`), else what `by_name`
+/// finds from the program name.
+fn own_binary(
+    running_image: Option<&Path>,
+    current_exe: Option<PathBuf>,
+    by_name: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(image) = running_image.filter(|image| image.is_file()) {
+        return Some(image.to_path_buf());
+    }
+    current_exe.filter(|exe| exe.is_file()).or_else(by_name)
 }
 
 /// The file `program` (a program name as it was started, `argv[0]`) names:
@@ -832,6 +858,51 @@ mod tests {
         assert_eq!(resolve(OsStr::new("neuron"), None, None), None);
         assert_eq!(resolve(OsStr::new("missing"), Some(&path), None), None);
         assert_eq!(resolve(OsStr::new(""), Some(&path), Some(&dir)), None);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_binary_replaced_while_running_still_starts_workers() {
+        let dir = std::env::temp_dir().join(format!(
+            "neuron-worker-replaced-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let installed = dir.join("neuron");
+        std::fs::write(&installed, b"binary").expect("write");
+        // What Linux reports once the running file is renamed over.
+        let gone = dir.join("neuron (deleted)");
+
+        // The running image wins whenever the system has one.
+        assert_eq!(
+            super::own_binary(Some(&installed), Some(gone.clone()), || None),
+            Some(installed.clone())
+        );
+        // A binary path that no longer exists falls back to the program name.
+        assert_eq!(
+            super::own_binary(None, Some(gone.clone()), || Some(installed.clone())),
+            Some(installed.clone())
+        );
+        assert_eq!(
+            super::own_binary(Some(&gone), Some(gone.clone()), || None),
+            None
+        );
+        // An existing binary path is used as it is.
+        assert_eq!(
+            super::own_binary(None, Some(installed.clone()), || None),
+            Some(installed.clone())
+        );
+        if cfg!(any(target_os = "linux", target_os = "android")) {
+            assert_eq!(
+                super::RUNNING_IMAGE,
+                Some("/proc/self/exe"),
+                "Linux starts workers from the running image"
+            );
+            assert!(std::path::Path::new("/proc/self/exe").is_file());
+        }
         std::fs::remove_dir_all(dir).ok();
     }
 

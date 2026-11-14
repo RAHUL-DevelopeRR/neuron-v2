@@ -8,8 +8,17 @@
 //! compound file's `Workbook` stream itself, picking it the way `calamine`'s
 //! `cfb.rs` does, walks the same records `calamine` will, and refuses
 //! workbooks whose grids pass a limit.
+//!
+//! Text is measured too: every cell that points at a shared string gets its
+//! own copy of that string while `calamine` opens the file, so one string of
+//! 65,535 characters named by many small records would ask for far more
+//! memory than the file's size suggests. The shared string table is walked
+//! for each string's length, and workbooks whose cells would copy more than
+//! [`MAX_TEXT_BYTES`] of text are refused.
 
 const SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+/// Bytes of text `calamine` may copy into the cells of one workbook.
+pub(super) const MAX_TEXT_BYTES: u64 = 256 * 1024 * 1024;
 /// Sector ids at or above this are markers (free, end of chain, ...).
 const FIRST_MARKER: u32 = 0xFFFF_FFFA;
 const NO_STREAM: u32 = 0xFFFF_FFFF;
@@ -29,14 +38,20 @@ fn damaged(detail: &str) -> String {
 }
 
 /// Refuses `data` (an `.xls` file) when the grids `calamine` would build for
-/// it hold more than `max_cells` cells in all.
+/// it hold more than `max_cells` cells in all, or its cells would copy more
+/// than [`MAX_TEXT_BYTES`] of text.
 pub(super) fn check(data: &[u8], max_cells: u64) -> Result<(), String> {
+    check_with(data, max_cells, MAX_TEXT_BYTES)
+}
+
+/// [`check`] with a text limit of `max_text_bytes`.
+pub(super) fn check_with(data: &[u8], max_cells: u64, max_text_bytes: u64) -> Result<(), String> {
     let compound = Compound::open(data)?;
     // `calamine` reads `Workbook` and, when that fails for any reason,
     // `Book`: both are checked when present.
     let streams = compound.workbook_streams()?;
     for stream in streams {
-        check_workbook(&stream, max_cells)?;
+        check_workbook(&stream, max_cells, max_text_bytes)?;
     }
     Ok(())
 }
@@ -277,17 +292,36 @@ fn too_large(max_cells: u64) -> String {
     )
 }
 
-fn check_workbook(stream: &[u8], max_cells: u64) -> Result<(), String> {
+fn too_much_text(max_text_bytes: u64) -> String {
+    format!(
+        "this .xls workbook copies more than {} MB of text into its cells, more than read_document reads; save it as .xlsx and read that instead",
+        max_text_bytes / (1024 * 1024)
+    )
+}
+
+fn check_workbook(stream: &[u8], max_cells: u64, max_text_bytes: u64) -> Result<(), String> {
     // The globals substream lists each sheet (BoundSheet8) with the stream
-    // offset of its records.
+    // offset of its records, and holds the shared string table.
     let mut offsets = Vec::new();
-    for (kind, data, _) in records(stream) {
+    let mut strings = Vec::new();
+    // UTF-8 bytes one character of a string may become: up to 3 from UTF-16
+    // (the BIFF8 code page); another code page reads each of the 2 bytes
+    // `calamine` makes of a character as one character.
+    let mut bytes_per_char = 3u64;
+    for (kind, data, after) in records(stream) {
         match kind {
             0x0085 => {
                 if let Some(offset) = u32_at(data, 0) {
                     offsets.push(index(offset));
                 }
             }
+            0x0042 => {
+                if !matches!(u16_at(data, 0), Some(1200 | 1201)) {
+                    bytes_per_char = 6;
+                }
+            }
+            // SST: calamine keeps the last one.
+            0x00FC => strings = shared_strings(data, &continues(stream, after))?,
             0x000A => break,
             _ => {}
         }
@@ -297,6 +331,7 @@ fn check_workbook(stream: &[u8], max_cells: u64) -> Result<(), String> {
     }
     offsets.sort_unstable();
     let mut total = 0u64;
+    let mut text = 0u64;
     let mut previous_end = 0usize;
     for offset in offsets {
         // calamine parses each listed sheet from its offset; sheets that
@@ -304,14 +339,140 @@ fn check_workbook(stream: &[u8], max_cells: u64) -> Result<(), String> {
         if offset < previous_end || offset > stream.len() {
             return Err(damaged("its sheets overlap"));
         }
-        let (cells, length) = sheet_cells(&stream[offset..])?;
-        previous_end = offset + length;
-        total = total.saturating_add(cells);
+        let sheet = sheet_cells(&stream[offset..], &strings)?;
+        previous_end = offset + sheet.length;
+        total = total.saturating_add(sheet.cells);
         if total > max_cells {
             return Err(too_large(max_cells));
         }
+        text = text.saturating_add(sheet.chars.saturating_mul(bytes_per_char));
+        if text > max_text_bytes {
+            return Err(too_much_text(max_text_bytes));
+        }
     }
     Ok(())
+}
+
+/// The CONTINUE records right after the record that ends at `at`, as
+/// `calamine` joins them to it.
+fn continues(stream: &[u8], mut at: usize) -> Vec<&[u8]> {
+    let mut found = Vec::new();
+    while stream.len().saturating_sub(at) > 4 && u16_at(stream, at) == Some(0x003C) {
+        let Some(length) = u16_at(stream, at + 2).map(usize::from) else {
+            break;
+        };
+        let Some(data) = stream.get(at + 4..at + 4 + length) else {
+            break;
+        };
+        found.push(data);
+        at += 4 + length;
+    }
+    found
+}
+
+/// A record and the CONTINUE records after it, read as one, the way
+/// `calamine` reads a shared string table.
+struct Continued<'a> {
+    data: &'a [u8],
+    rest: std::slice::Iter<'a, &'a [u8]>,
+}
+
+impl Continued<'_> {
+    /// Moves on to the next CONTINUE record; false when there is none.
+    fn next_part(&mut self) -> bool {
+        match self.rest.next() {
+            Some(data) => {
+                self.data = data;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn skip(&mut self, mut count: usize) -> Result<(), String> {
+        while count > 0 {
+            if self.data.is_empty() && !self.next_part() {
+                return Err(sst_damaged());
+            }
+            let step = count.min(self.data.len());
+            self.data = &self.data[step..];
+            count -= step;
+        }
+        Ok(())
+    }
+}
+
+fn sst_damaged() -> String {
+    damaged("its shared string table is cut short")
+}
+
+/// The length in characters of each string in a shared string table (SST)
+/// whose record holds `data`, followed by `continues`, read as `calamine`
+/// reads it. A table `calamine` would fail on is refused here, which reads
+/// the same as calamine's own failure would.
+fn shared_strings(data: &[u8], continues: &[&[u8]]) -> Result<Vec<u16>, String> {
+    let mut record = Continued {
+        data: data.get(8..).ok_or_else(sst_damaged)?,
+        rest: continues.iter(),
+    };
+    let mut strings = Vec::new();
+    while !record.data.is_empty() || record.next_part() {
+        // XLUnicodeRichExtendedString: an empty part is an empty string.
+        if record.data.is_empty() {
+            strings.push(0);
+            continue;
+        }
+        let (Some(count), Some(&flags)) = (u16_at(record.data, 0), record.data.get(2)) else {
+            return Err(sst_damaged());
+        };
+        record.data = &record.data[3..];
+        let mut runs = 0usize;
+        if flags & 0x8 != 0 {
+            runs = usize::from(u16_at(record.data, 0).ok_or_else(sst_damaged)?);
+            record.data = &record.data[2..];
+        }
+        let mut extra = 0usize;
+        if flags & 0x4 != 0 {
+            let size = u32_at(record.data, 0).ok_or_else(sst_damaged)?;
+            // calamine reads it as signed: a negative size skips past the end.
+            extra = usize::try_from(i32::from_le_bytes(size.to_le_bytes())).unwrap_or(usize::MAX);
+            record.data = &record.data[4..];
+        }
+        // The characters, one or two bytes each, running on into the next
+        // CONTINUE record (which starts with its own width flag).
+        let mut left = usize::from(count);
+        let mut wide = flags & 0x1 != 0;
+        while left > 0 {
+            let width = if wide { 2 } else { 1 };
+            let taken = (record.data.len() / width).min(left);
+            record.data = &record.data[taken * width..];
+            left -= taken;
+            if left > 0 {
+                if !record.next_part() {
+                    return Err(sst_damaged());
+                }
+                let Some(&part_flags) = record.data.first() else {
+                    return Err(sst_damaged());
+                };
+                wide = part_flags & 0x1 != 0;
+                record.data = &record.data[1..];
+            }
+        }
+        record.skip(runs.saturating_mul(4))?;
+        record.skip(extra)?;
+        strings.push(count);
+    }
+    Ok(strings)
+}
+
+/// Characters of an `XLUnicodeString` (a length, then the text) at the start
+/// of `data`: no more than the record holds, as `calamine` decodes only that.
+fn string_chars(data: Option<&[u8]>) -> u64 {
+    data.and_then(|data| {
+        let count = usize::from(u16_at(data, 0)?);
+        u64::try_from(count.min(data.len())).ok()
+    })
+    .unwrap_or(0)
 }
 
 /// The smallest box holding a set of cells.
@@ -338,10 +499,21 @@ impl Bounds {
     }
 }
 
-/// The grid cells `calamine` reserves and builds for one sheet, and the
-/// bytes of the sheet's records. Records are read as `calamine` reads them:
-/// the sheet's own, not those of charts nested inside it.
-fn sheet_cells(sheet: &[u8]) -> Result<(u64, usize), String> {
+/// What `calamine` builds for one sheet.
+struct SheetSize {
+    /// Grid cells it reserves and builds.
+    cells: u64,
+    /// Characters of text it copies into the cells.
+    chars: u64,
+    /// Bytes of the sheet's records.
+    length: usize,
+}
+
+/// What `calamine` builds for one sheet whose shared strings are `strings`
+/// characters long. Records are read as `calamine` reads them: the sheet's
+/// own, not those of charts nested inside it.
+fn sheet_cells(sheet: &[u8], strings: &[u16]) -> Result<SheetSize, String> {
+    let mut chars = 0u64;
     let mut values = Bounds::default();
     let mut formulas = Bounds::default();
     // Where the last FORMULA record was: `calamine` places each STRING
@@ -374,6 +546,19 @@ fn sheet_cells(sheet: &[u8]) -> Result<(u64, usize), String> {
             0x0200 => reserved = reserved.max(dimensions(data)?),
             0x0203 | 0x0204 | 0x00D6 | 0x0205 | 0x027E | 0x00FD if data.len() >= 4 => {
                 values.add(row, column);
+                match kind {
+                    // LABEL, RSTRING: the text is in the record.
+                    0x0204 | 0x00D6 => chars = chars.saturating_add(string_chars(data.get(6..))),
+                    // LABELSST: a copy of a shared string, whatever its length.
+                    0x00FD if data.len() >= 10 => {
+                        let shared = u32_at(data, 6)
+                            .and_then(|at| strings.get(index(at)))
+                            .copied()
+                            .unwrap_or(0);
+                        chars = chars.saturating_add(u64::from(shared));
+                    }
+                    _ => {}
+                }
             }
             0x0006 if data.len() >= 20 => {
                 formula_at = (row, column);
@@ -382,7 +567,10 @@ fn sheet_cells(sheet: &[u8]) -> Result<(u64, usize), String> {
             }
             // STRING: a cell at the last formula's position, whatever its
             // length (a short one only makes calamine fail, which is safe).
-            0x0207 => values.add(formula_at.0, formula_at.1),
+            0x0207 => {
+                values.add(formula_at.0, formula_at.1);
+                chars = chars.saturating_add(string_chars(Some(data)));
+            }
             // MULRK: one row, a run of columns.
             0x00BD if data.len() >= 6 => {
                 let last = u32::from(u16_at(data, data.len() - 2).unwrap_or(0));
@@ -401,7 +589,11 @@ fn sheet_cells(sheet: &[u8]) -> Result<(u64, usize), String> {
     let cells = reserved
         .saturating_add(values.cells())
         .saturating_add(formulas.cells());
-    Ok((cells, end))
+    Ok(SheetSize {
+        cells,
+        chars,
+        length: end,
+    })
 }
 
 /// The cells `calamine` reserves for a DIMENSIONS record, mirroring its
