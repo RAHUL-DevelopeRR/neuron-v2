@@ -584,7 +584,7 @@ pub fn load_system_prompt(
     let project_context = ProjectContext::discover_with_git(&cwd, current_date.into())?;
     let loader = ConfigLoader::default_for(&cwd);
     let config = loader.load()?;
-    let defaults = crate::default_skills::default_skill_sections(&config, loader.config_home())?;
+    let defaults = crate::enforced_skills::skill_prompt_sections(&config, loader.config_home())?;
     let mut builder = SystemPromptBuilder::new()
         .with_os(os_name, os_version)
         .with_project_context(project_context)

@@ -58,10 +58,16 @@ pub(crate) fn exit_plan_mode(current: PermissionMode) -> PermissionMode {
 /// wrappers are not among them, so no connector runs while planning, whatever its
 /// annotations claim.
 pub(crate) fn plan_mode_tools() -> BTreeSet<String> {
-    ["read_file", "glob_search", "grep_search", "list_directory"]
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect()
+    [
+        "read_file",
+        "read_document",
+        "glob_search",
+        "grep_search",
+        "list_directory",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
 }
 
 /// Wraps a user prompt with the plan-mode instructions.

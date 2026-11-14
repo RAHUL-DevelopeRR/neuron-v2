@@ -2272,10 +2272,13 @@ enum DefinitionSource {
     UserCodex,
     UserClaude,
     Bundled,
+    /// Neuron's enforced skills: always on and never shadowed.
+    Enforced,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DefinitionScope {
+    Enforced,
     Project,
     UserConfigHome,
     UserHome,
@@ -2289,6 +2292,7 @@ impl DefinitionScope {
             Self::UserConfigHome => "User config roots",
             Self::UserHome => "User home roots",
             Self::Bundled => "Bundled defaults",
+            Self::Enforced => "Enforced (always on)",
         }
     }
 }
@@ -2302,6 +2306,7 @@ impl DefinitionSource {
             Self::UserClawConfigHome | Self::UserCodexHome => DefinitionScope::UserConfigHome,
             Self::UserClaw | Self::UserCodex | Self::UserClaude => DefinitionScope::UserHome,
             Self::Bundled => DefinitionScope::Bundled,
+            Self::Enforced => DefinitionScope::Enforced,
         }
     }
 
@@ -3190,6 +3195,18 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
 fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     let mut roots = Vec::new();
 
+    // First, so an enforced skill wins over any project or user skill of its name.
+    if let Ok(enforced) =
+        runtime::enforced_skills::enforced_skill_root(ConfigLoader::default_for(cwd).config_home())
+    {
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::Enforced,
+            enforced,
+            SkillOrigin::SkillsDir,
+        );
+    }
+
     for ancestor in cwd.ancestors() {
         push_unique_skill_root(
             &mut roots,
@@ -3874,8 +3891,18 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
         format!("  {total_active} available skills"),
         String::new(),
     ];
+    let warnings = enforced_shadow_warnings(skills);
+    if !warnings.is_empty() {
+        lines.extend(
+            warnings
+                .iter()
+                .map(|warning| format!("  warning: {warning}")),
+        );
+        lines.push(String::new());
+    }
 
     for scope in [
+        DefinitionScope::Enforced,
         DefinitionScope::Project,
         DefinitionScope::UserConfigHome,
         DefinitionScope::UserHome,
@@ -3923,8 +3950,37 @@ fn render_skills_report_json(skills: &[SkillSummary]) -> Value {
             "active": active,
             "shadowed": skills.len().saturating_sub(active),
         },
+        "warnings": enforced_shadow_warnings(skills),
         "skills": skills.iter().map(skill_summary_json).collect::<Vec<_>>(),
     })
+}
+
+/// One warning per project or user skill ignored because an enforced skill
+/// has its name.
+fn enforced_shadow_warnings(skills: &[SkillSummary]) -> Vec<String> {
+    skills
+        .iter()
+        .filter(|skill| {
+            skill.shadowed_by == Some(DefinitionSource::Enforced)
+                && skill.source != DefinitionSource::Enforced
+        })
+        .map(|skill| {
+            format!(
+                "{} skill `{}` is ignored: Neuron enforces its own skill of that name",
+                skill.source.label(),
+                skill.name
+            )
+        })
+        .collect()
+}
+
+/// Warnings about project or user skills that an enforced skill overrides, for
+/// showing at startup.
+#[must_use]
+pub fn enforced_skill_shadow_warnings(cwd: &Path) -> Vec<String> {
+    load_skills_from_roots(&discover_skill_roots(cwd))
+        .map(|skills| enforced_shadow_warnings(&skills))
+        .unwrap_or_default()
 }
 
 fn render_skill_install_report(skill: &InstalledSkill) -> String {
@@ -4961,6 +5017,7 @@ fn definition_source_id(source: DefinitionSource) -> &'static str {
             "user_claw"
         }
         DefinitionSource::Bundled => "bundled",
+        DefinitionSource::Enforced => "enforced",
     }
 }
 
@@ -6285,6 +6342,69 @@ mod tests {
             resolve_skill_path(&workspace, "/handoff").expect("legacy command should resolve"),
             legacy_commands.join("handoff.md")
         );
+    }
+
+    #[test]
+    fn enforced_skills_win_over_project_skills_of_the_same_name_with_a_warning() {
+        let _guard = env_guard();
+        let workspace = temp_dir("enforced-registry");
+        let original = std::env::var_os("NEURON_CONFIG_HOME");
+        let config_home = workspace.join("config");
+        std::env::set_var("NEURON_CONFIG_HOME", &config_home);
+        fs::create_dir_all(&config_home).expect("config home");
+        // Turning the bundled defaults off leaves enforced skills alone.
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultSkills":false}"#,
+        )
+        .expect("settings");
+
+        let enforced = resolve_skill_path(&workspace, "reading-documents").expect("resolves");
+        assert!(fs::read_to_string(&enforced)
+            .expect("read")
+            .contains("read_document"));
+
+        let project_skills = workspace.join(".claw").join("skills");
+        write_skill(&project_skills, "reading-documents", "Project override");
+        write_skill(&project_skills, "ponytail", "Project Ponytail override");
+        assert_eq!(
+            resolve_skill_path(&workspace, "reading-documents").expect("resolves"),
+            enforced,
+            "a project skill does not shadow an enforced one"
+        );
+        assert_eq!(
+            resolve_skill_path(&workspace, "ponytail").expect("resolves"),
+            project_skills.join("ponytail").join("SKILL.md"),
+            "bundled defaults still yield to project skills"
+        );
+
+        let skills = load_skills_from_roots(&super::discover_skill_roots(&workspace))
+            .expect("registry loads");
+        let project = skills
+            .iter()
+            .find(|skill| {
+                skill.name == "reading-documents" && skill.source == DefinitionSource::ProjectClaw
+            })
+            .expect("project copy listed");
+        assert_eq!(project.shadowed_by, Some(DefinitionSource::Enforced));
+        let report = render_skills_report(&skills);
+        assert!(report.contains("Enforced (always on):"), "{report}");
+        assert!(
+            report.contains(
+                "warning: Project roots skill `reading-documents` is ignored: Neuron enforces its own skill of that name"
+            ),
+            "{report}"
+        );
+        let json = super::render_skills_report_json(&skills);
+        assert_eq!(json["warnings"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            super::enforced_skill_shadow_warnings(&workspace).len(),
+            1,
+            "startup warnings name the ignored skill"
+        );
+
+        restore_env_var("NEURON_CONFIG_HOME", original);
+        fs::remove_dir_all(workspace).expect("cleanup");
     }
 
     #[test]

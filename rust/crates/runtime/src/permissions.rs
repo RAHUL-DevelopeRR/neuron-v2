@@ -870,7 +870,7 @@ impl PermissionPolicy {
                     }
                 }
             }
-            "read_file" => {
+            "read_file" | "read_document" => {
                 if let Some(reason) = input_field(input, &["path", "file_path", "filePath"])
                     .and_then(|path| sensitive_path_reason_resolved(&path, workspace.as_slice()))
                 {
@@ -2424,6 +2424,7 @@ mod tests {
             .with_tool_requirement("WebFetch", PermissionMode::ReadOnly)
             .with_tool_requirement("WebSearch", PermissionMode::ReadOnly)
             .with_tool_requirement("read_file", PermissionMode::ReadOnly)
+            .with_tool_requirement("read_document", PermissionMode::ReadOnly)
             .with_workspace_root(std::env::temp_dir().join("neuron-permissions-workspace"))
             .with_session_approvals(SessionApprovals::isolated())
     }
@@ -2442,11 +2443,17 @@ mod tests {
             policy.authorize("read_file", &read(".env.example"), None),
             PermissionOutcome::Allow
         );
+        assert_eq!(
+            policy.authorize("read_document", &read("docs/plan.docx"), None),
+            PermissionOutcome::Allow
+        );
         for (tool, input) in [
             ("read_file", read(".env")),
             ("read_file", read("services/api/.env.local")),
             ("read_file", read(".neuron/settings.local.json")),
             ("read_file", read(".claw.json")),
+            ("read_document", read(".env")),
+            ("read_document", read(".neuron/settings.local.json")),
             ("grep_search", grep(".env")),
             ("grep_search", grep(".neuron/settings.json")),
         ] {
