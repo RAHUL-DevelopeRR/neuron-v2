@@ -279,26 +279,27 @@ fn comparable_windows_path(raw: &str) -> String {
 }
 
 fn path_starts_with_normalized(path: &Path, root: &Path) -> bool {
-    if path.starts_with(root) {
-        return true;
-    }
+    path.starts_with(root) || windows_path_starts_with(path, root)
+}
 
-    #[cfg(windows)]
-    {
-        let normalize =
-            |value: &Path| comparable_windows_path(&value.to_string_lossy()).to_ascii_lowercase();
-        let path = normalize(path);
-        let mut root = normalize(root);
-        if !root.ends_with('\\') {
-            root.push('\\');
-        }
-        path == root.trim_end_matches('\\') || path.starts_with(&root)
+/// Windows spellings of one folder differ in case and prefix (`\\?\C:\`
+/// against `C:\`), so they are compared in their comparable form.
+#[cfg(windows)]
+fn windows_path_starts_with(path: &Path, root: &Path) -> bool {
+    let normalize =
+        |value: &Path| comparable_windows_path(&value.to_string_lossy()).to_ascii_lowercase();
+    let path = normalize(path);
+    let mut root = normalize(root);
+    if !root.ends_with('\\') {
+        root.push('\\');
     }
+    path == root.trim_end_matches('\\') || path.starts_with(&root)
+}
 
-    #[cfg(not(windows))]
-    {
-        false
-    }
+/// Other systems spell a folder one way, which `Path::starts_with` compares.
+#[cfg(not(windows))]
+fn windows_path_starts_with(_path: &Path, _root: &Path) -> bool {
+    false
 }
 
 /// Text payload returned by file-reading operations.

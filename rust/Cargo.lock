@@ -1875,7 +1875,6 @@ dependencies = [
  "sha2",
  "telemetry",
  "tokio",
- "walkdir",
  "winjob",
  "winsec",
 ]
