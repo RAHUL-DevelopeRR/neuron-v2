@@ -14,6 +14,7 @@
 mod docx;
 mod glyphs;
 mod pdf;
+mod pdf_crypt;
 mod pptx;
 mod sheet;
 pub(crate) mod worker;
@@ -30,6 +31,8 @@ mod review_tests;
 mod round5_tests;
 #[cfg(test)]
 mod round6_tests;
+#[cfg(test)]
+mod round7_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 

@@ -2417,6 +2417,7 @@ dependencies = [
 name = "tools"
 version = "7.0.0-alpha.5"
 dependencies = [
+ "aes",
  "api",
  "calamine",
  "commands",
@@ -2427,6 +2428,7 @@ dependencies = [
  "runtime",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "winjob",
  "zip",

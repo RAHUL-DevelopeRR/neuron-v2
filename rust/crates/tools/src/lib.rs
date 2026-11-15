@@ -251,6 +251,13 @@ impl GlobalToolRegistry {
                     )
                 })?;
                 allowed.insert(canonical.clone());
+                // `read` means reading files, documents included: read_file
+                // sends Office and PDF files to read_document.
+                if normalized == "read"
+                    && canonical_names.iter().any(|name| name == "read_document")
+                {
+                    allowed.insert("read_document".to_string());
+                }
             }
         }
 

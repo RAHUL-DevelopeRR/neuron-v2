@@ -4,12 +4,19 @@
 //! with the file (`lastRenderedPageBreak`) plus section breaks that start a new
 //! page, else explicit page breaks, else about [`ESTIMATED_PAGE_CHARS`]
 //! characters each.
+//!
+//! Footnotes and endnotes are marked where they are referenced (`[^1]`,
+//! endnotes `[^i]`) and their text follows at the end of the page that
+//! references them. `SmartArt` diagrams are read from their data parts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
-use super::xml::{attr, walk, Node, Package};
+use super::xml::{
+    attr, diagram_text, part_dir, relationships, rels_path, render_diagram, resolve_target, walk,
+    Node, Package, MAX_MAIN_PART_BYTES,
+};
 use super::{Budget, Document, Selection, TableBuilder, TablePart, Unit};
 
 const KIND: &str = "Word document";
@@ -27,6 +34,8 @@ const MAX_LABEL_CHARS: usize = 64;
 /// Tables nested inside table cells that are kept apart; deeper tables add
 /// their text to the deepest kept cell.
 const MAX_TABLE_NESTING: usize = 4;
+/// `SmartArt` diagrams read from one document.
+const MAX_DIAGRAMS: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StyleKind {
@@ -50,7 +59,7 @@ pub(super) fn read(
 ) -> Result<Document, String> {
     let mut package = Package::open(path, KIND)?;
     let body = package
-        .read_part("word/document.xml")?
+        .read_part_up_to("word/document.xml", MAX_MAIN_PART_BYTES)?
         .ok_or_else(|| format!("this is not a readable {KIND}: word/document.xml is missing"))?;
     let styles = match package.read_part("word/styles.xml")? {
         Some(xml) => parse_styles(&xml)?,
@@ -66,8 +75,155 @@ pub(super) fn read(
         .ok()
         .flatten()
         .and_then(|xml| saved_page_count(&xml));
-    let parsed = parse_body(&body, &styles, &numbering)?;
-    Ok(paginate(parsed, selection, saved_pages, budget))
+    let mut notes = Vec::new();
+    let diagrams = read_diagrams(&mut package, &mut notes);
+    let mut parsed = parse_body(&body, &styles, &numbering, &diagrams)?;
+    if !parsed.note_refs.is_empty() {
+        add_note_text(&mut package, &mut parsed, &mut notes);
+    }
+    let mut document = paginate(parsed, selection, saved_pages, budget);
+    document.notes.extend(notes);
+    Ok(document)
+}
+
+/// The text of each `SmartArt` diagram the document body links to, by the
+/// relationship id its `dgm:relIds r:dm` names. A diagram that cannot be read
+/// adds a note instead of failing the whole document.
+fn read_diagrams(
+    package: &mut Package,
+    notes: &mut Vec<String>,
+) -> HashMap<String, Vec<(usize, String)>> {
+    const PART: &str = "word/document.xml";
+    let mut diagrams = HashMap::new();
+    let Ok(Some(rels)) = package.read_part(&rels_path(PART)) else {
+        return diagrams;
+    };
+    let Ok(rels) = relationships(&rels) else {
+        return diagrams;
+    };
+    for (id, _, target) in rels
+        .into_iter()
+        .filter(|(_, kind, _)| kind.ends_with("/diagramData"))
+        .take(MAX_DIAGRAMS)
+    {
+        let part = resolve_target(part_dir(PART), &target);
+        match package
+            .read_part(&part)
+            .and_then(|xml| xml.map_or_else(|| Ok(Vec::new()), |xml| diagram_text(&xml)))
+        {
+            Ok(lines) => {
+                diagrams.insert(id, lines);
+            }
+            Err(error) => notes.push(format!("a SmartArt diagram could not be read: {error}")),
+        }
+    }
+    diagrams
+}
+
+/// Adds the text of every footnote and endnote the body references, as
+/// `[^1]: text` blocks at the end of the page that references each.
+fn add_note_text(package: &mut Package, parsed: &mut ParsedBody, notes: &mut Vec<String>) {
+    let mut texts: HashMap<(NoteKind, String), String> = HashMap::new();
+    for (kind, part) in [
+        (NoteKind::Foot, "word/footnotes.xml"),
+        (NoteKind::End, "word/endnotes.xml"),
+    ] {
+        if !parsed.note_refs.iter().any(|note| note.kind == kind) {
+            continue;
+        }
+        match package
+            .read_part(part)
+            .and_then(|xml| xml.map(|xml| parse_notes(&xml)).transpose())
+        {
+            Ok(Some(found)) => {
+                texts.extend(found.into_iter().map(|(id, text)| ((kind, id), text)));
+            }
+            Ok(None) => {}
+            Err(error) => notes.push(format!("the {} could not be read: {error}", kind.plural())),
+        }
+    }
+    let mut missing = 0usize;
+    for note in std::mem::take(&mut parsed.note_refs) {
+        match texts.get(&(note.kind, note.id)) {
+            Some(text) => parsed.blocks.push(Block::Text {
+                page: note.page,
+                markdown: format!("[^{}]: {}", note.label, one_line(text)),
+            }),
+            None => missing += 1,
+        }
+    }
+    if missing > 0 {
+        notes.push(format!(
+            "{missing} footnote or endnote reference(s) have no note text in the file"
+        ));
+    }
+}
+
+/// Note id to its text, from `word/footnotes.xml` or `word/endnotes.xml`.
+/// The separator entries Word keeps there (`w:type` set) are skipped.
+fn parse_notes(xml: &str) -> Result<HashMap<String, String>, String> {
+    let mut found = HashMap::new();
+    let mut current: Option<(String, String)> = None;
+    let mut in_text = false;
+    let mut skip_depth = 0usize;
+    walk(xml, |node| {
+        if skip_depth > 0 {
+            match node {
+                Node::Open { .. } => skip_depth += 1,
+                Node::Close { .. } => skip_depth -= 1,
+                Node::Text(_) => {}
+            }
+            return;
+        }
+        match node {
+            Node::Open {
+                name: "Fallback", ..
+            } => skip_depth = 1,
+            Node::Open {
+                name: "footnote" | "endnote",
+                attrs,
+            } => {
+                current = match (attr(attrs, "w:id"), attr(attrs, "w:type")) {
+                    (Some(id), None | Some("normal")) => Some((id.to_string(), String::new())),
+                    _ => None,
+                };
+            }
+            Node::Close {
+                name: "footnote" | "endnote",
+            } => {
+                if let Some((id, text)) = current.take() {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        found.insert(id, text.to_string());
+                    }
+                }
+            }
+            Node::Open { name: "p", .. } => {
+                if let Some((_, text)) = current.as_mut() {
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                }
+            }
+            Node::Open { name: "t", .. } => in_text = true,
+            Node::Close { name: "t" } => in_text = false,
+            Node::Text(chunk) if in_text => {
+                if let Some((_, text)) = current.as_mut() {
+                    text.push_str(chunk);
+                }
+            }
+            Node::Open {
+                name: "tab" | "br" | "cr",
+                ..
+            } => {
+                if let Some((_, text)) = current.as_mut() {
+                    text.push(' ');
+                }
+            }
+            _ => {}
+        }
+    })?;
+    Ok(found)
 }
 
 /// The first of the `pages` saved pages whose blocks, with the page's
@@ -110,7 +266,7 @@ fn paginate(
     saved_pages: Option<usize>,
     budget: &mut Budget,
 ) -> Document {
-    let ParsedBody { blocks, pages } = parsed;
+    let ParsedBody { blocks, pages, .. } = parsed;
     let mut notes = Vec::new();
     let mut pages_of_blocks: Vec<Vec<String>> = Vec::new();
     // A saved page longer than one call returns (a long table with no break
@@ -313,11 +469,40 @@ impl Default for Level {
 struct Numbering {
     abstract_of: HashMap<String, String>,
     levels: HashMap<(String, usize), Level>,
+    /// List style id to the list definition that holds its levels
+    /// (`w:abstractNum/w:styleLink`).
+    style_links: HashMap<String, String>,
+    /// List definition to the list style it uses (`w:numStyleLink`): its
+    /// levels are those of the definition with that style link.
+    uses_style: HashMap<String, String>,
+    /// A list's restart of one level (`w:num/w:lvlOverride/w:startOverride`):
+    /// `(numId, level)` to the number it starts again at.
+    restarts: HashMap<(String, usize), u32>,
 }
 
 impl Numbering {
     fn level(&self, abstract_id: &str, level: usize) -> Option<&Level> {
         self.levels.get(&(abstract_id.to_string(), level))
+    }
+
+    /// The list definition that holds the levels of `abstract_id`: itself,
+    /// or for one that only names a list style (Word's "Define New List
+    /// Style"), the definition linked to that style, found directly or
+    /// through the style's own numbering.
+    fn resolve(&self, abstract_id: String, styles: &Styles) -> String {
+        let Some(style) = self.uses_style.get(&abstract_id) else {
+            return abstract_id;
+        };
+        if let Some(linked) = self.style_links.get(style) {
+            return linked.clone();
+        }
+        styles
+            .numbering
+            .get(style)
+            .and_then(|(num_id, _)| self.abstract_of.get(num_id))
+            .filter(|linked| **linked != abstract_id && !self.uses_style.contains_key(*linked))
+            .cloned()
+            .unwrap_or(abstract_id)
     }
 
     fn is_bullet(&self, abstract_id: Option<&str>, level: usize) -> bool {
@@ -332,11 +517,52 @@ fn parse_numbering(xml: &str) -> Result<Numbering, String> {
     let mut abstract_id: Option<String> = None;
     let mut level: Option<usize> = None;
     let mut num_id: Option<String> = None;
+    let mut override_level: Option<usize> = None;
     walk(xml, |node| match node {
         Node::Open {
             name: "abstractNum",
             attrs,
         } => abstract_id = attr(attrs, "w:abstractNumId").map(str::to_string),
+        Node::Open {
+            name: name @ ("styleLink" | "numStyleLink"),
+            attrs,
+        } if level.is_none() => {
+            if let (Some(abstract_id), Some(style)) = (&abstract_id, attr(attrs, "w:val")) {
+                if name == "styleLink" {
+                    numbering
+                        .style_links
+                        .entry(style.to_string())
+                        .or_insert_with(|| abstract_id.clone());
+                } else {
+                    numbering
+                        .uses_style
+                        .insert(abstract_id.clone(), style.to_string());
+                }
+            }
+        }
+        Node::Open {
+            name: "lvlOverride",
+            attrs,
+        } if num_id.is_some() => {
+            override_level = attr(attrs, "w:ilvl")
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|level| *level < LEVELS);
+        }
+        Node::Close {
+            name: "lvlOverride",
+        } => override_level = None,
+        Node::Open {
+            name: "startOverride",
+            attrs,
+        } => {
+            if let (Some(num_id), Some(level), Some(start)) = (
+                &num_id,
+                override_level,
+                attr(attrs, "w:val").and_then(|value| value.trim().parse::<u32>().ok()),
+            ) {
+                numbering.restarts.insert((num_id.clone(), level), start);
+            }
+        }
         Node::Close {
             name: "abstractNum",
         } => {
@@ -392,19 +618,37 @@ fn parse_numbering(xml: &str) -> Result<Numbering, String> {
 #[derive(Debug, Default)]
 struct Counters {
     values: HashMap<String, [Option<u32>; LEVELS]>,
+    /// Lists whose restart of a level (`startOverride`) has been applied.
+    restarted: HashSet<(String, usize)>,
 }
 
 impl Counters {
     /// Counts one paragraph at `level` of list `abstract_id` and returns its
-    /// label, such as `"4.3.1"` or `"b)"`; `None` for bullets.
-    fn next(&mut self, numbering: &Numbering, abstract_id: &str, level: usize) -> Option<String> {
+    /// label, such as `"4.3.1"` or `"b)"`; `None` for bullets. A list
+    /// (`num_id`) that restarts this level starts it again the first time
+    /// one of its paragraphs reaches it.
+    fn next(
+        &mut self,
+        numbering: &Numbering,
+        abstract_id: &str,
+        num_id: &str,
+        level: usize,
+    ) -> Option<String> {
         let level = level.min(LEVELS - 1);
+        let restart = numbering
+            .restarts
+            .get(&(num_id.to_string(), level))
+            .copied()
+            .filter(|_| self.restarted.insert((num_id.to_string(), level)));
         let counts = self
             .values
             .entry(abstract_id.to_string())
             .or_insert([None; LEVELS]);
         let start = |level: usize| numbering.level(abstract_id, level).map_or(1, |l| l.start);
-        counts[level] = Some(counts[level].map_or(start(level), |count| count.saturating_add(1)));
+        counts[level] = Some(match restart {
+            Some(value) => value,
+            None => counts[level].map_or(start(level), |count| count.saturating_add(1)),
+        });
         for deeper in counts.iter_mut().skip(level + 1) {
             *deeper = None;
         }
@@ -505,6 +749,34 @@ struct Paragraph {
     /// The paragraph ends a section that starts on a new page.
     section_break: bool,
     text: String,
+    /// `SmartArt` diagrams in the paragraph, by relationship id.
+    diagrams: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NoteKind {
+    Foot,
+    End,
+}
+
+impl NoteKind {
+    fn plural(self) -> &'static str {
+        match self {
+            Self::Foot => "footnotes",
+            Self::End => "endnotes",
+        }
+    }
+}
+
+/// A footnote or endnote reference in the body.
+#[derive(Debug)]
+struct NoteRef {
+    kind: NoteKind,
+    id: String,
+    /// The mark shown in the text: footnotes `1`, `2`, ...; endnotes `i`,
+    /// `ii`, ... as Word numbers them by default.
+    label: String,
+    page: usize,
 }
 
 #[derive(Debug)]
@@ -544,6 +816,8 @@ impl Block {
 struct ParsedBody {
     blocks: Vec<Block>,
     pages: usize,
+    /// Footnote and endnote references, in reading order, each note once.
+    note_refs: Vec<NoteRef>,
 }
 
 /// Page counting while the body is walked.
@@ -586,7 +860,12 @@ impl Pager {
 }
 
 #[allow(clippy::too_many_lines)]
-fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<ParsedBody, String> {
+fn parse_body(
+    xml: &str,
+    styles: &Styles,
+    numbering: &Numbering,
+    diagrams: &HashMap<String, Vec<(usize, String)>>,
+) -> Result<ParsedBody, String> {
     // Word records where pages ended when it last laid the document out; use
     // those when present, else the explicit breaks.
     let mut pager = Pager {
@@ -606,9 +885,15 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
     let mut in_row_properties = false;
     // Tracked changes' copies of old cell or row properties, still open.
     let mut property_changes = 0usize;
+    // Tracked changes' copies of old paragraph, run or section properties,
+    // still open: what the paragraph looked like before, not what it is.
+    let mut paragraph_changes = 0usize;
     let mut in_section = false;
     let mut in_text = false;
     let mut skip_depth = 0usize;
+    let mut note_refs: Vec<NoteRef> = Vec::new();
+    let mut note_labels: HashMap<(NoteKind, String), String> = HashMap::new();
+    let mut note_counts = [0u32; 2];
 
     walk(xml, |node| {
         if skip_depth > 0 {
@@ -624,6 +909,15 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
             Node::Open {
                 name: "Fallback", ..
             } => skip_depth = 1,
+            Node::Open {
+                name: "pPrChange" | "rPrChange" | "sectPrChange" | "numberingChange",
+                ..
+            } => paragraph_changes += 1,
+            Node::Close {
+                name: "pPrChange" | "rPrChange" | "sectPrChange" | "numberingChange",
+            } => paragraph_changes = paragraph_changes.saturating_sub(1),
+            // Inside a tracked change only the old properties are written.
+            _ if paragraph_changes > 0 => {}
             Node::Open { name: "p", .. } => paragraphs.push(Paragraph {
                 page: pager.page,
                 ..Paragraph::default()
@@ -631,6 +925,47 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
             Node::Open { name: "pPr", .. } => in_properties = true,
             Node::Close { name: "pPr" } => in_properties = false,
             Node::Close { name: "sectPr" } => in_section = false,
+            Node::Open {
+                name: name @ ("footnoteReference" | "endnoteReference"),
+                attrs,
+            } => {
+                let Some(id) = attr(attrs, "w:id") else {
+                    return;
+                };
+                let kind = if name == "footnoteReference" {
+                    NoteKind::Foot
+                } else {
+                    NoteKind::End
+                };
+                let label = note_labels
+                    .entry((kind, id.to_string()))
+                    .or_insert_with(|| {
+                        let count = &mut note_counts[usize::from(kind == NoteKind::End)];
+                        *count = count.saturating_add(1);
+                        let label = match kind {
+                            NoteKind::Foot => count.to_string(),
+                            NoteKind::End => roman(*count).to_ascii_lowercase(),
+                        };
+                        note_refs.push(NoteRef {
+                            kind,
+                            id: id.to_string(),
+                            label: label.clone(),
+                            page: pager.page,
+                        });
+                        label
+                    });
+                if let Some(paragraph) = paragraphs.last_mut() {
+                    let _ = write!(paragraph.text, "[^{label}]");
+                }
+            }
+            Node::Open {
+                name: "relIds",
+                attrs,
+            } => {
+                if let (Some(paragraph), Some(id)) = (paragraphs.last_mut(), attr(attrs, "r:dm")) {
+                    paragraph.diagrams.push(id.to_string());
+                }
+            }
             Node::Open { name, attrs } if in_properties => {
                 let value = attr(attrs, "w:val");
                 if name == "pageBreakBefore"
@@ -718,9 +1053,9 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
                     return;
                 };
                 let numbered = numbered(&paragraph, styles, numbering);
-                let label = numbered
-                    .as_ref()
-                    .and_then(|(abstract_id, level)| counters.next(numbering, abstract_id, *level));
+                let label = numbered.as_ref().and_then(|(abstract_id, level, num_id)| {
+                    counters.next(numbering, abstract_id, num_id, *level)
+                });
                 let text = paragraph.text.trim();
                 if !text.is_empty() {
                     if let Some(table) = tables.last_mut() {
@@ -737,6 +1072,21 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
                                 numbered.as_ref(),
                                 label.as_deref(),
                             ),
+                        });
+                    }
+                }
+                for id in &paragraph.diagrams {
+                    let Some(lines) = diagrams.get(id).filter(|lines| !lines.is_empty()) else {
+                        continue;
+                    };
+                    let markdown = render_diagram(lines);
+                    if let Some(table) = tables.last_mut() {
+                        table.push_line(&markdown);
+                    } else {
+                        pager.section_page_empty = false;
+                        blocks.push(Block::Text {
+                            page: paragraph.page,
+                            markdown,
                         });
                     }
                 }
@@ -830,19 +1180,26 @@ fn parse_body(xml: &str, styles: &Styles, numbering: &Numbering) -> Result<Parse
     } else {
         pager.page
     };
+    // A note referenced on a page that a trailing section break opened
+    // belongs to the last real page.
+    for note in &mut note_refs {
+        note.page = note.page.min(page_count);
+    }
     Ok(ParsedBody {
         blocks,
         pages: page_count,
+        note_refs,
     })
 }
 
 /// The list a paragraph belongs to, its own or its style's: abstract list id
-/// and level. `None` when it is not in a list.
+/// (the one holding its levels), level and list id. `None` when it is not in
+/// a list.
 fn numbered(
     paragraph: &Paragraph,
     styles: &Styles,
     numbering: &Numbering,
-) -> Option<(String, usize)> {
+) -> Option<(String, usize, String)> {
     let from_style = paragraph
         .style
         .as_deref()
@@ -859,12 +1216,11 @@ fn numbered(
         .and_then(|level| level.parse::<usize>().ok())
         .unwrap_or(0)
         .min(LEVELS - 1);
-    let abstract_id = numbering
-        .abstract_of
-        .get(num_id)
-        .cloned()
-        .unwrap_or_else(|| format!("num:{num_id}"));
-    Some((abstract_id, level))
+    let abstract_id = numbering.abstract_of.get(num_id).cloned().map_or_else(
+        || format!("num:{num_id}"),
+        |abstract_id| numbering.resolve(abstract_id, styles),
+    );
+    Some((abstract_id, level, num_id.to_string()))
 }
 
 fn render_paragraph(
@@ -872,7 +1228,7 @@ fn render_paragraph(
     text: &str,
     styles: &Styles,
     numbering: &Numbering,
-    numbered: Option<&(String, usize)>,
+    numbered: Option<&(String, usize, String)>,
     label: Option<&str>,
 ) -> String {
     let style = paragraph.style.as_deref().and_then(|style| {
@@ -904,10 +1260,10 @@ fn render_paragraph(
                 .unwrap_or(0)
                 .min(LEVELS - 1)
         },
-        |(_, level)| *level,
+        |(_, level, _)| *level,
     );
     let indent = "  ".repeat(level);
-    if let Some((abstract_id, level)) = numbered {
+    if let Some((abstract_id, level, _)) = numbered {
         let marker = if numbering.is_bullet(Some(abstract_id), *level) {
             "-"
         } else {

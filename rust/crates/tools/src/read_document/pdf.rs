@@ -3,8 +3,14 @@
 //! A small reader of its own: it indexes the file's objects (including those
 //! packed in object streams), walks the page tree, and runs each page's
 //! content streams, decoding text through the fonts' `ToUnicode` maps and
-//! following form `XObject`s. Encrypted files are refused; scanned pages without
-//! a text layer come back empty, since no OCR runs.
+//! following form `XObject`s. Encrypted files that open without a password
+//! (an owner password only) are decrypted; those that need a password are
+//! refused. Scanned pages without a text layer come back empty, since no OCR
+//! runs.
+//!
+//! When a file was saved incrementally, the definition of an object written
+//! later in the file wins, whether it is written directly or packed in an
+//! object stream.
 //!
 //! The file is treated as hostile: object nesting, the number of parsed
 //! objects, the bytes inflated per call, nested forms, font maps and the
@@ -17,6 +23,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use super::glyphs::{self, win_ansi, CodeTable};
+use super::pdf_crypt::{self, Method, Security, Settings};
 use super::{Budget, Document, Selection, Unit};
 
 const KIND: &str = "PDF document";
@@ -77,12 +84,6 @@ pub(super) fn read_bytes(
         return Err("this is not a readable PDF document: the %PDF header is missing".to_string());
     }
     let pdf = Pdf::parse(data)?;
-    if pdf.encrypted {
-        return Err(
-            "this PDF is encrypted; its text cannot be read without decrypting it first"
-                .to_string(),
-        );
-    }
     let mut run = Run::default();
     let pages = pdf.pages();
     let mut notes = Vec::new();
@@ -672,7 +673,6 @@ impl Finder {
 struct Pdf {
     objects: HashMap<u32, Obj>,
     trailer: Dict,
-    encrypted: bool,
     /// Bytes still allowed to be decoded in this call.
     decode_left: Cell<u64>,
 }
@@ -705,6 +705,8 @@ impl Pdf {
     #[allow(clippy::too_many_lines)]
     fn parse(data: &[u8]) -> Result<Self, String> {
         let mut objects = HashMap::new();
+        // Where each object kept in `objects` is defined, and its generation.
+        let mut defined: HashMap<u32, (usize, u16)> = HashMap::new();
         let mut cursor = 0;
         let mut nodes = 0usize;
         // Bytes lexed while looking for objects; a damaged file can make the
@@ -725,7 +727,7 @@ impl Pdf {
             {
                 continue;
             }
-            let Some(number) = object_number_before(data, at) else {
+            let Some((number, generation)) = object_number_before(data, at) else {
                 continue;
             };
             if scanned > lex_limit {
@@ -779,15 +781,18 @@ impl Pdf {
                         _ => Dict::new(),
                     };
                     objects.insert(number, Obj::Stream(dict, data[start..end].to_vec()));
+                    defined.insert(number, (at, generation));
                     cursor = end;
                 }
                 Some(Token::Keyword(ref word)) if word == "endobj" => {
                     objects.insert(number, object);
+                    defined.insert(number, (at, generation));
                     // A well-formed object: anything inside it is not another.
                     cursor = lexer.pos;
                 }
                 _ => {
                     objects.insert(number, object);
+                    defined.insert(number, (at, generation));
                 }
             }
         }
@@ -795,22 +800,70 @@ impl Pdf {
         let mut pdf = Self {
             objects,
             trailer: Dict::new(),
-            encrypted: false,
             decode_left: Cell::new(MAX_DECODED_BYTES),
         };
 
-        // Objects packed into object streams (PDF 1.5 and later).
-        let packed = pdf
+        // The newest trailer: a classic `trailer` dictionary, or the last
+        // cross-reference stream in the file.
+        let classic = rfind(data, b"trailer");
+        let mut trailer = classic
+            .and_then(|at| Lexer::new(data, at + b"trailer".len()).object())
+            .and_then(|object| match object {
+                Obj::Dict(dict) => Some(dict),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let newest_xref = pdf
             .objects
-            .values()
-            .filter(|object| {
+            .iter()
+            .filter(|(_, object)| {
+                matches!(object, Obj::Stream(dict, _)
+                    if dict.get("Type").and_then(Obj::as_name) == Some("XRef"))
+            })
+            .filter_map(|(number, _)| defined.get(number).map(|(at, _)| (*at, *number)))
+            .max();
+        if let Some(Obj::Stream(dict, _)) =
+            newest_xref.and_then(|(_, number)| pdf.objects.get(&number))
+        {
+            let newer =
+                classic.is_none_or(|classic| newest_xref.is_some_and(|(at, _)| at > classic));
+            for key in ["Root", "Encrypt", "ID"] {
+                if let Some(value) = dict.get(key) {
+                    if newer || !trailer.contains_key(key) {
+                        trailer.insert(key.to_string(), value.clone());
+                    }
+                }
+            }
+        }
+
+        if let Some(encrypt) = trailer.get("Encrypt") {
+            let encrypt_number = match encrypt {
+                Obj::Ref(number) => Some(*number),
+                _ => None,
+            };
+            let security = pdf.security(encrypt, &trailer)?;
+            pdf.decrypt_all(&security, &defined, encrypt_number);
+        }
+
+        // Objects packed into object streams (PDF 1.5 and later), oldest
+        // stream first: a stream written later (an incremental save) holds
+        // newer definitions, and a packed object replaces a direct one only
+        // when its stream comes after it in the file.
+        let mut containers = pdf
+            .objects
+            .iter()
+            .filter(|(_, object)| {
                 matches!(object, Obj::Stream(dict, _)
                     if dict.get("Type").and_then(Obj::as_name) == Some("ObjStm"))
             })
-            .cloned()
+            .map(|(number, _)| (defined.get(number).map_or(0, |(at, _)| *at), *number))
             .collect::<Vec<_>>();
+        containers.sort_unstable();
         let mut unpacked = Vec::new();
-        for stream in packed {
+        for (container_at, container) in containers {
+            let Some(stream) = pdf.objects.get(&container).cloned() else {
+                continue;
+            };
             let Some(decoded) = pdf.decode(&stream) else {
                 continue;
             };
@@ -849,7 +902,12 @@ impl Pdf {
                 let end = entries
                     .get(index + 1)
                     .map_or(decoded.len(), |(_, next)| *next);
-                if pdf.objects.contains_key(number) {
+                // A direct definition later in the file is newer.
+                if *number == container
+                    || defined
+                        .get(number)
+                        .is_some_and(|(direct_at, _)| *direct_at > container_at)
+                {
                     continue;
                 }
                 let mut lexer = Lexer::new(&decoded[..end], *start);
@@ -863,8 +921,9 @@ impl Pdf {
                 }
             }
         }
+        // In file order, so the newest definition is the one kept.
         for (number, object) in unpacked {
-            pdf.objects.entry(number).or_insert(object);
+            pdf.objects.insert(number, object);
         }
         if pdf.decoded_all() {
             return Err(format!(
@@ -872,31 +931,95 @@ impl Pdf {
                 MAX_DECODED_BYTES / (1024 * 1024)
             ));
         }
+        pdf.trailer = trailer;
+        Ok(pdf)
+    }
 
-        // The newest trailer: a classic `trailer` dictionary or an xref stream.
-        let mut trailer = rfind(data, b"trailer")
-            .and_then(|at| Lexer::new(data, at + b"trailer".len()).object())
-            .and_then(|object| match object {
-                Obj::Dict(dict) => Some(dict),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let mut encrypted = trailer.contains_key("Encrypt");
-        for object in pdf.objects.values() {
+    /// The security handler of an `/Encrypt` dictionary, unlocked with the
+    /// empty user password; an error when the file needs a password or
+    /// uses a handler this reader does not support.
+    fn security(&self, encrypt: &Obj, trailer: &Dict) -> Result<Security, String> {
+        let Some(dict) = self.resolve(encrypt).as_dict() else {
+            return Err(pdf_crypt::unsupported());
+        };
+        if dict.get("Filter").and_then(Obj::as_name) != Some("Standard") {
+            return Err(pdf_crypt::unsupported());
+        }
+        let number = |key: &str| self.get(dict, key).and_then(Obj::as_num);
+        let bytes = |key: &str| match self.get(dict, key) {
+            Some(Obj::Str(bytes)) => bytes.clone(),
+            _ => Vec::new(),
+        };
+        let version = number("V").map_or(0, to_u32);
+        let revision = number("R").map_or(0, to_u32);
+        let id = match self.get(trailer, "ID") {
+            Some(Obj::Array(ids)) => match ids.first().map(|first| self.resolve(first)) {
+                Some(Obj::Str(id)) => id.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        // Version 4 and 5 name a crypt filter for strings and for streams.
+        let filters = self.get(dict, "CF").and_then(Obj::as_dict);
+        let method = |key: &str| -> Result<Method, String> {
+            let name = self
+                .get(dict, key)
+                .and_then(Obj::as_name)
+                .unwrap_or("Identity");
+            if name == "Identity" {
+                return Ok(Method::Identity);
+            }
+            let cfm = filters
+                .and_then(|filters| self.get(filters, name))
+                .and_then(Obj::as_dict)
+                .and_then(|filter| self.get(filter, "CFM"))
+                .and_then(Obj::as_name);
+            Method::from_cfm(cfm).ok_or_else(pdf_crypt::unsupported)
+        };
+        let (strings, streams) = match version {
+            1 | 2 => (Method::Rc4, Method::Rc4),
+            4 | 5 => (method("StrF")?, method("StmF")?),
+            _ => return Err(pdf_crypt::unsupported()),
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let permissions = number("P").map_or(-1, |value| value as i64 as i32);
+        let settings = Settings {
+            revision,
+            length_bits: number("Length").map(to_u32),
+            owner: bytes("O"),
+            user: bytes("U"),
+            user_key: bytes("UE"),
+            permissions,
+            encrypt_metadata: !matches!(self.get(dict, "EncryptMetadata"), Some(Obj::Bool(false))),
+            id,
+            strings,
+            streams,
+        };
+        Security::open(&settings)
+    }
+
+    /// Decrypts the strings and streams of every object written directly in
+    /// the file, before object streams are unpacked (objects packed in a
+    /// stream are not encrypted again). The `/Encrypt` dictionary and
+    /// cross-reference streams are never encrypted.
+    fn decrypt_all(
+        &mut self,
+        security: &Security,
+        defined: &HashMap<u32, (usize, u16)>,
+        encrypt_number: Option<u32>,
+    ) {
+        for (number, object) in &mut self.objects {
+            if Some(*number) == encrypt_number {
+                continue;
+            }
             if let Obj::Stream(dict, _) = object {
                 if dict.get("Type").and_then(Obj::as_name) == Some("XRef") {
-                    encrypted |= dict.contains_key("Encrypt");
-                    if !trailer.contains_key("Root") {
-                        if let Some(root) = dict.get("Root") {
-                            trailer.insert("Root".to_string(), root.clone());
-                        }
-                    }
+                    continue;
                 }
             }
+            let generation = defined.get(number).map_or(0, |(_, generation)| *generation);
+            decrypt_object(security, *number, generation, object, 0);
         }
-        pdf.trailer = trailer;
-        pdf.encrypted = encrypted;
-        Ok(pdf)
     }
 
     /// Whether the decode budget for this call is used up.
@@ -931,6 +1054,8 @@ impl Pdf {
                     hex_decode(&data[..end])
                 }
                 "ASCII85Decode" | "A85" => ascii85(&data),
+                // The file's own decryption already applied.
+                "Crypt" => continue,
                 _ => return None,
             };
             data = self.charge(decoded)?;
@@ -1117,8 +1242,20 @@ impl Pdf {
             }
         }
         widths.ranges.sort_by_key(|range| range.0);
+        // A predefined Unicode CMap (`UniGB-UCS2-H`, `UniJIS-UTF16-H`, ...)
+        // makes each code its own UTF-16 text; such fonts (iText's standard
+        // CJK fonts) often come without a ToUnicode map.
+        let unicode_codes = composite
+            && cmap.is_none()
+            && self
+                .get(dict, "Encoding")
+                .and_then(Obj::as_name)
+                .is_some_and(|name| {
+                    name.starts_with("Uni") && (name.contains("-UCS2-") || name.contains("-UTF16-"))
+                });
         Font {
             two_byte: composite,
+            unicode_codes,
             cmap,
             encoding: if composite {
                 None
@@ -1411,7 +1548,41 @@ impl Pdf {
     }
 }
 
-fn object_number_before(data: &[u8], at: usize) -> Option<u32> {
+/// Decrypts every string inside `object`, and a stream's data.
+fn decrypt_object(
+    security: &Security,
+    number: u32,
+    generation: u16,
+    object: &mut Obj,
+    depth: usize,
+) {
+    if depth > MAX_OBJECT_DEPTH {
+        return;
+    }
+    match object {
+        Obj::Str(bytes) => *bytes = security.decrypt(number, generation, bytes, false),
+        Obj::Array(items) => {
+            for item in items {
+                decrypt_object(security, number, generation, item, depth + 1);
+            }
+        }
+        Obj::Dict(dict) => {
+            for value in dict.values_mut() {
+                decrypt_object(security, number, generation, value, depth + 1);
+            }
+        }
+        Obj::Stream(dict, data) => {
+            for value in dict.values_mut() {
+                decrypt_object(security, number, generation, value, depth + 1);
+            }
+            *data = security.decrypt(number, generation, data, true);
+        }
+        _ => {}
+    }
+}
+
+/// The object number and generation written before `obj` at `at`.
+fn object_number_before(data: &[u8], at: usize) -> Option<(u32, u16)> {
     let mut index = at;
     let skip_space = |index: &mut usize| {
         let start = *index;
@@ -1430,7 +1601,7 @@ fn object_number_before(data: &[u8], at: usize) -> Option<u32> {
     if !skip_space(&mut index) {
         return None;
     }
-    digits(&mut index)?;
+    let generation = digits(&mut index)?;
     if !skip_space(&mut index) {
         return None;
     }
@@ -1438,7 +1609,14 @@ fn object_number_before(data: &[u8], at: usize) -> Option<u32> {
     if index > 0 && !is_whitespace(data[index - 1]) && !is_delimiter(data[index - 1]) {
         return None;
     }
-    std::str::from_utf8(&data[number]).ok()?.parse().ok()
+    let generation = std::str::from_utf8(&data[generation])
+        .ok()?
+        .parse()
+        .unwrap_or(0);
+    Some((
+        std::str::from_utf8(&data[number]).ok()?.parse().ok()?,
+        generation,
+    ))
 }
 
 fn skip_eol(data: &[u8], mut pos: usize) -> usize {
@@ -1694,6 +1872,9 @@ impl Widths {
 #[derive(Debug, Default)]
 struct Font {
     two_byte: bool,
+    /// A composite font whose codes are UTF-16 text (a predefined Unicode
+    /// `CMap`), read when it has no `ToUnicode` map.
+    unicode_codes: bool,
     cmap: Option<CMap>,
     /// What a simple font's codes mean when `cmap` does not say: its
     /// `/Encoding`, or Windows-1252 when `None`.
@@ -1707,14 +1888,19 @@ impl Font {
     /// `None` text means the codes have no Unicode meaning to recover. Text
     /// stops growing past `limit` bytes; the flag says it was cut.
     fn decode(&self, bytes: &[u8], limit: usize) -> (Option<String>, f64, bool) {
-        let code_bytes = self
-            .cmap
-            .as_ref()
-            .map_or(if self.two_byte { 2 } else { 1 }, |cmap| cmap.code_bytes);
+        // A simple font's codes are one byte each, whatever codespace its
+        // ToUnicode map declares (some writers give it <0000> <FFFF>).
+        let code_bytes = if self.two_byte {
+            self.cmap.as_ref().map_or(2, |cmap| cmap.code_bytes)
+        } else {
+            1
+        };
         let mut text = String::new();
         let mut width = 0.0;
         let mut decodable = true;
         let mut cut = false;
+        // The first half of a UTF-16 surrogate pair, waiting for the second.
+        let mut high_surrogate: Option<u16> = None;
         for chunk in bytes.chunks(code_bytes.max(1)) {
             let code = code_value(chunk);
             width += self.widths.get(code).unwrap_or(self.default_width);
@@ -1730,6 +1916,21 @@ impl Font {
                     }
                     None => {}
                 },
+                None if self.unicode_codes => {
+                    let unit = u16::try_from(code & 0xffff).unwrap_or(0);
+                    let pair = match high_surrogate.take() {
+                        Some(high) => vec![high, unit],
+                        None if (0xD800..0xDC00).contains(&unit) => {
+                            high_surrogate = Some(unit);
+                            continue;
+                        }
+                        None => vec![unit],
+                    };
+                    text.extend(
+                        char::decode_utf16(pair)
+                            .map(|ch| ch.unwrap_or(char::REPLACEMENT_CHARACTER)),
+                    );
+                }
                 None if self.two_byte => decodable = false,
                 None => {
                     for byte in chunk {
@@ -1790,13 +1991,14 @@ struct TextState {
     font: Option<String>,
     font_size: f64,
     leading: f64,
-    /// Text line matrix: scale and origin.
+    /// Text line matrix: scale, rotation and origin.
     line: [f64; 6],
-    /// Current x in user space after the last shown text.
-    cursor_x: f64,
+    /// How far text has advanced along the line since its start, in text
+    /// space (the text matrix is the line matrix moved this far along x).
+    advance: f64,
     /// The current transformation matrix.
     ctm: Matrix,
-    /// Page y of the last text, and page x where it ended.
+    /// The page point where the last text ended.
     last: Option<(f64, f64)>,
 }
 
@@ -1807,7 +2009,7 @@ impl Default for TextState {
             font_size: 12.0,
             leading: 0.0,
             line: IDENTITY,
-            cursor_x: 0.0,
+            advance: 0.0,
             ctm: IDENTITY,
             last: None,
         }
@@ -1817,7 +2019,7 @@ impl Default for TextState {
 impl TextState {
     fn begin_text(&mut self) {
         self.line = IDENTITY;
-        self.cursor_x = 0.0;
+        self.advance = 0.0;
     }
 
     fn scale(matrix: &Matrix) -> f64 {
@@ -1829,15 +2031,11 @@ impl TextState {
         }
     }
 
-    fn y(&self) -> f64 {
-        self.line[5]
-    }
-
     fn move_line(&mut self, tx: f64, ty: f64) {
         let [scale_x, skew_y, skew_x, scale_y, origin_x, origin_y] = self.line;
         self.line[4] = origin_x + tx * scale_x + ty * skew_x;
         self.line[5] = origin_y + tx * skew_y + ty * scale_y;
-        self.cursor_x = self.line[4];
+        self.advance = 0.0;
     }
 
     fn next_line(&mut self) {
@@ -1851,7 +2049,7 @@ impl TextState {
 
     fn set_matrix(&mut self, matrix: [f64; 6]) {
         self.line = matrix;
-        self.cursor_x = matrix[4];
+        self.advance = 0.0;
     }
 
     /// One em in user space.
@@ -1861,7 +2059,25 @@ impl TextState {
 
     /// The current text position on the page.
     fn page_point(&self) -> (f64, f64) {
-        apply(&self.ctm, self.cursor_x, self.y())
+        let (x, y) = apply(&self.line, self.advance, 0.0);
+        apply(&self.ctm, x, y)
+    }
+
+    /// The unit direction text runs in on the page, which a rotated text
+    /// matrix or transformation turns.
+    fn direction(&self) -> (f64, f64) {
+        let (start_x, start_y) = apply(&self.ctm, self.line[4], self.line[5]);
+        let (end_x, end_y) = {
+            let (x, y) = apply(&self.line, 1.0, 0.0);
+            apply(&self.ctm, x, y)
+        };
+        let (dx, dy) = (end_x - start_x, end_y - start_y);
+        let length = dx.hypot(dy);
+        if length > 0.0 && length.is_finite() {
+            (dx / length, dy / length)
+        } else {
+            (1.0, 0.0)
+        }
     }
 
     fn show(&mut self, bytes: &[u8], font: Option<&Font>, sink: &mut TextSink) {
@@ -1875,10 +2091,16 @@ impl TextState {
         sink.cut |= cut;
         let page_em = self.em() * Self::scale(&self.ctm);
         let (x, y) = self.page_point();
-        if let Some((last_y, last_end_x)) = self.last {
-            if (y - last_y).abs() > page_em * 0.5 {
+        if let Some((last_x, last_y)) = self.last {
+            // Measured along the text's direction and across it, so text
+            // set in a rotated matrix breaks lines and words as it reads.
+            let (along_x, along_y) = self.direction();
+            let (dx, dy) = (x - last_x, y - last_y);
+            let along = dx * along_x + dy * along_y;
+            let across = dy * along_x - dx * along_y;
+            if across.abs() > page_em * 0.5 {
                 sink.newline();
-            } else if x - last_end_x > page_em * 0.15 {
+            } else if along > page_em * 0.15 {
                 sink.space();
             }
         }
@@ -1886,18 +2108,18 @@ impl TextState {
             Some(text) => sink.push(&text),
             None => sink.undecodable = true,
         }
-        self.cursor_x += width / 1000.0 * self.em();
-        self.last = Some((y, self.page_point().0));
+        self.advance += width / 1000.0 * self.font_size.abs().max(0.1);
+        self.last = Some(self.page_point());
     }
 
     /// A `TJ` number: moves left by `adjust` thousandths of an em.
     fn adjust(&mut self, adjust: f64, sink: &mut TextSink) {
-        self.cursor_x -= adjust / 1000.0 * self.em();
+        self.advance -= adjust / 1000.0 * self.font_size.abs().max(0.1);
         if adjust < -180.0 {
             sink.space();
-            let x = self.page_point().0;
-            if let Some((_, end_x)) = self.last.as_mut() {
-                *end_x = x;
+            let point = self.page_point();
+            if let Some(last) = self.last.as_mut() {
+                *last = point;
             }
         }
     }

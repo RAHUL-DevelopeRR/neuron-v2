@@ -18,6 +18,17 @@ pub use walk::DEFAULT_SKIPPED_DIRS;
 /// Maximum file size that can be read (10 MB).
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
 
+/// The largest Word or `PowerPoint` file `read_document` opens. A document's
+/// text is a small part of its file (photos, media and fonts are the rest),
+/// and these zip packages stream from disk in the reader's child process,
+/// which inflates only their text parts, under budgets.
+const MAX_STREAMED_DOCUMENT_SIZE: u64 = 200 * 1024 * 1024;
+
+/// The largest PDF or workbook `read_document` opens. These are read whole
+/// into the reader's child process, so they stay well inside its memory
+/// limit.
+const MAX_WHOLE_DOCUMENT_SIZE: u64 = 100 * 1024 * 1024;
+
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
 
@@ -68,20 +79,39 @@ fn file_label(path: &Path) -> String {
     )
 }
 
-/// Refuses files over [`MAX_READ_SIZE`], the limit every reading tool shares.
+/// Refuses files over [`MAX_READ_SIZE`], the limit every text-reading tool
+/// shares.
 fn check_read_size(path: &Path) -> io::Result<()> {
+    check_size(path, MAX_READ_SIZE)
+}
+
+fn check_size(path: &Path, max: u64) -> io::Result<()> {
     let metadata = fs::metadata(path)?;
-    if metadata.len() > MAX_READ_SIZE {
+    if metadata.len() > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "file is too large ({} bytes, max {} bytes)",
                 metadata.len(),
-                MAX_READ_SIZE
+                max
             ),
         ));
     }
     Ok(())
+}
+
+/// The size limit of a file `read_document` opens, by its extension: Word
+/// and `PowerPoint` files stream, PDFs and workbooks are read whole, and
+/// anything else keeps `read_file`'s limit.
+fn document_size_limit(path: &Path) -> u64 {
+    let extension = path
+        .extension()
+        .map_or_default(|extension| extension.to_string_lossy().to_ascii_lowercase());
+    match extension.as_str() {
+        "docx" | "pptx" => MAX_STREAMED_DOCUMENT_SIZE,
+        "pdf" | "xlsx" | "xlsm" | "xlsb" | "xls" | "ods" => MAX_WHOLE_DOCUMENT_SIZE,
+        _ => MAX_READ_SIZE,
+    }
 }
 
 /// Bytes at the start of a file searched for the `%PDF-` header: readers
@@ -1577,8 +1607,10 @@ pub fn read_file_in_workspace(
 }
 
 /// The file `path` names, checked the way `read_file` checks it: inside the
-/// workspace, an existing regular file and within the shared size limit. For
-/// tools that read a file themselves, such as `read_document`.
+/// workspace and an existing regular file. For `read_document`, which reads
+/// the file itself in a contained child process; its size limit is larger
+/// than `read_file`'s for Office and PDF files, whose size is mostly images
+/// and fonts rather than text.
 pub fn readable_file_in_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBuf> {
     let absolute_path = normalize_path(path)?;
     let canonical_root = workspace_root
@@ -1591,7 +1623,7 @@ pub fn readable_file_in_workspace(path: &str, workspace_root: &Path) -> io::Resu
             format!("{} is not a file", absolute_path.display()),
         ));
     }
-    check_read_size(&absolute_path)?;
+    check_size(&absolute_path, document_size_limit(&absolute_path))?;
     Ok(absolute_path)
 }
 
@@ -2197,12 +2229,30 @@ mod tests {
                 .expect_err("a directory is not a file");
         assert!(error.to_string().contains("not a file"));
 
-        let huge = workspace.join("huge.pdf");
-        let file = std::fs::File::create(&huge).expect("create");
-        file.set_len(super::MAX_READ_SIZE + 1).expect("grow");
-        let error = super::readable_file_in_workspace(huge.to_string_lossy().as_ref(), &workspace)
-            .expect_err("over the size limit");
-        assert!(error.to_string().contains("too large"));
+        // Office and PDF files are allowed well past read_file's 10 MB: a
+        // deck of photos or a report with figures is mostly not text.
+        for (name, limit) in [
+            ("deck.pptx", super::MAX_STREAMED_DOCUMENT_SIZE),
+            ("report.DOCX", super::MAX_STREAMED_DOCUMENT_SIZE),
+            ("annual.pdf", super::MAX_WHOLE_DOCUMENT_SIZE),
+            ("book.xlsx", super::MAX_WHOLE_DOCUMENT_SIZE),
+            ("notes.txt", super::MAX_READ_SIZE),
+        ] {
+            let big = workspace.join(name);
+            let file = std::fs::File::create(&big).expect("create");
+            if limit > super::MAX_READ_SIZE {
+                file.set_len(super::MAX_READ_SIZE * 2 + 1).expect("grow");
+                let resolved =
+                    super::readable_file_in_workspace(big.to_string_lossy().as_ref(), &workspace)
+                        .expect("a 20 MB document is read");
+                assert!(resolved.ends_with(name));
+            }
+            file.set_len(limit + 1).expect("grow");
+            let error =
+                super::readable_file_in_workspace(big.to_string_lossy().as_ref(), &workspace)
+                    .expect_err("over the size limit");
+            assert!(error.to_string().contains("too large"), "{name}: {error}");
+        }
         std::fs::remove_dir_all(&workspace).ok();
         std::fs::remove_dir_all(&outside_dir).ok();
     }

@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+aes = "0.8"
 api = { path = "../api" }
 commands = { path = "../commands" }
 calamine = "0.38"
@@ -16,6 +17,7 @@ runtime = { path = "../runtime" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 

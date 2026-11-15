@@ -119,7 +119,7 @@ fn sheet_names_that_look_like_ranges_select_their_sheet() {
     std::fs::remove_dir_all(dir).ok();
 }
 
-fn ods(content_body: &str) -> Vec<u8> {
+pub(super) fn ods(content_body: &str) -> Vec<u8> {
     let content = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" office:version="1.2"><office:body><office:spreadsheet>{content_body}</office:spreadsheet></office:body></office:document-content>"#
     );

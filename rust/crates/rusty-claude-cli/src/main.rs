@@ -748,6 +748,7 @@ fn run_prompt(
     let effective_model = configure_provider_for_model(model)?;
     // A model the gateway cannot serve now is named before the request fails.
     gateway_repl::warn_about_prompt_model(&effective_model);
+    repl_loop::print_skill_shadow_warnings();
     // `cat log | neuron prompt "explain this log"`: what stdin carries is context
     // for the prompt, in any permission mode. A run whose stdin is not a terminal
     // never asks for approval (approvals and questions are refused), so reading
@@ -6519,7 +6520,7 @@ mod tests {
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: Some(
-                    ["glob_search", "read_file", "write_file"]
+                    ["glob_search", "read_document", "read_file", "write_file"]
                         .into_iter()
                         .map(str::to_string)
                         .collect()

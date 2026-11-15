@@ -1,5 +1,6 @@
 //! Zip packages and XML walking shared by the DOCX and PPTX readers.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read as _, Seek as _};
 use std::path::Path;
@@ -10,6 +11,11 @@ use quick_xml::Reader;
 /// The largest XML part read out of a package, decompressed. Guards against
 /// zip bombs: a 10 MB file can claim gigabytes once inflated.
 pub(super) const MAX_PART_BYTES: u64 = 64 * 1024 * 1024;
+/// The largest main part (`word/document.xml`), which holds a whole Word
+/// document: a long report made mostly of tables can pass
+/// [`MAX_PART_BYTES`] while its file stays small. It still counts against
+/// [`MAX_PACKAGE_BYTES`].
+pub(super) const MAX_MAIN_PART_BYTES: u64 = MAX_PACKAGE_BYTES;
 /// The most bytes inflated across all parts read from one package, so many
 /// parts (or many entries sharing the same compressed bytes) cannot add up
 /// to gigabytes.
@@ -69,6 +75,15 @@ impl Package {
 
     /// The text of part `name`, or `None` when the package has no such part.
     pub(super) fn read_part(&mut self, name: &str) -> Result<Option<String>, String> {
+        self.read_part_up_to(name, MAX_PART_BYTES)
+    }
+
+    /// The text of part `name`, inflated to at most `max_part_bytes`.
+    pub(super) fn read_part_up_to(
+        &mut self,
+        name: &str,
+        max_part_bytes: u64,
+    ) -> Result<Option<String>, String> {
         let remaining = self.remaining;
         let too_big = self.too_big();
         let mut entry = match self.archive.by_name(name) {
@@ -86,15 +101,15 @@ impl Package {
         let part_too_big = format!(
             "{name} in this {} unpacks to more than {} MB",
             self.kind,
-            MAX_PART_BYTES / (1024 * 1024)
+            max_part_bytes / (1024 * 1024)
         );
-        if entry.size() > MAX_PART_BYTES {
+        if entry.size() > max_part_bytes {
             return Err(part_too_big);
         }
         if entry.size() > remaining {
             return Err(too_big);
         }
-        let limit = MAX_PART_BYTES.min(remaining);
+        let limit = max_part_bytes.min(remaining);
         let mut bytes = Vec::new();
         entry
             .by_ref()
@@ -108,16 +123,105 @@ impl Package {
             })?;
         let read = bytes.len() as u64;
         if read > limit {
-            return Err(if limit < MAX_PART_BYTES {
+            return Err(if limit < max_part_bytes {
                 too_big
             } else {
                 part_too_big
             });
         }
         self.remaining -= read;
-        let text = String::from_utf8_lossy(&bytes);
-        Ok(Some(text.trim_start_matches('\u{feff}').to_string()))
+        // One copy of a large part at a time: valid UTF-8 is kept as read.
+        let mut text = String::from_utf8(bytes)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+        if text.starts_with('\u{feff}') {
+            text.drain(..'\u{feff}'.len_utf8());
+        }
+        Ok(Some(text))
     }
+}
+
+/// The text of a `SmartArt` diagram's data part (`dgm:dataModel`): each
+/// point's text with its depth below the diagram's root, in saved order.
+/// Presentation, transition and root points carry no text of their own.
+pub(super) fn diagram_text(xml: &str) -> Result<Vec<(usize, String)>, String> {
+    /// Parent links followed to find a point's depth; guards cycles.
+    const MAX_DEPTH: usize = 16;
+    let mut points: Vec<(String, String, String)> = Vec::new();
+    let mut parents: HashMap<String, String> = HashMap::new();
+    let mut current: Option<(String, String, String)> = None;
+    let mut in_run = false;
+    let mut in_text = 0usize;
+    walk(xml, |node| match node {
+        Node::Open { name: "pt", attrs } => {
+            current = Some((
+                attr(attrs, "modelId").unwrap_or_default().to_string(),
+                attr(attrs, "type").unwrap_or("node").to_string(),
+                String::new(),
+            ));
+        }
+        Node::Close { name: "pt" } => {
+            if let Some(point) = current.take() {
+                points.push(point);
+            }
+        }
+        Node::Open { name: "cxn", attrs } => {
+            if matches!(attr(attrs, "type"), None | Some("parOf")) {
+                if let (Some(parent), Some(child)) = (attr(attrs, "srcId"), attr(attrs, "destId")) {
+                    parents.insert(child.to_string(), parent.to_string());
+                }
+            }
+        }
+        Node::Open { name: "p", .. } => {
+            if let Some((_, _, text)) = current.as_mut() {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+            }
+        }
+        Node::Open {
+            name: "r" | "fld", ..
+        } => in_run = true,
+        Node::Close { name: "r" | "fld" } => in_run = false,
+        Node::Open { name: "t", .. } => in_text += 1,
+        Node::Close { name: "t" } => in_text = in_text.saturating_sub(1),
+        Node::Text(chunk) if in_run && in_text > 0 => {
+            if let Some((_, _, text)) = current.as_mut() {
+                text.push_str(chunk);
+            }
+        }
+        _ => {}
+    })?;
+    let kinds: HashMap<&str, &str> = points
+        .iter()
+        .map(|(id, kind, _)| (id.as_str(), kind.as_str()))
+        .collect();
+    let mut lines = Vec::new();
+    for (id, kind, text) in &points {
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() || matches!(kind.as_str(), "pres" | "parTrans" | "sibTrans" | "doc") {
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut at = id.as_str();
+        while let Some(parent) = parents.get(at) {
+            if depth >= MAX_DEPTH || kinds.get(parent.as_str()).is_none_or(|kind| *kind == "doc") {
+                break;
+            }
+            depth += 1;
+            at = parent;
+        }
+        lines.push((depth, text));
+    }
+    Ok(lines)
+}
+
+/// A diagram's text as a bulleted list, indented by depth.
+pub(super) fn render_diagram(lines: &[(usize, String)]) -> String {
+    lines
+        .iter()
+        .map(|(depth, text)| format!("{}- {text}", "  ".repeat((*depth).min(8))))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// One step of an XML walk. Names are local (no namespace prefix); attribute

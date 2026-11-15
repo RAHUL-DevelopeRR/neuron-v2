@@ -1,13 +1,18 @@
 //! `PowerPoint` presentations (`.pptx`): each slide with its title, text,
-//! tables and speaker notes, in presentation order.
+//! tables, `SmartArt` diagrams and speaker notes, in presentation order.
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::xml::{attr, part_dir, relationships, rels_path, resolve_target, walk, Node, Package};
+use super::xml::{
+    attr, diagram_text, part_dir, relationships, rels_path, render_diagram, resolve_target, walk,
+    Node, Package,
+};
 use super::{Budget, Document, Selection, TableBuilder, Unit};
 
 const KIND: &str = "PowerPoint presentation";
+/// `SmartArt` diagrams read from one slide.
+const MAX_SLIDE_DIAGRAMS: usize = 32;
 
 pub(super) fn read(
     path: &Path,
@@ -65,8 +70,14 @@ pub(super) fn read(
         }
         let markdown = match package.read_part(part)? {
             Some(xml) => {
-                let slide = parse_slide(&xml)?;
-                let notes = read_notes(&mut package, part)?;
+                let mut slide = parse_slide(&xml)?;
+                let slide_rels = package
+                    .read_part(&rels_path(part))?
+                    .map(|xml| relationships(&xml))
+                    .transpose()?
+                    .unwrap_or_default();
+                let notes = read_notes(&mut package, part, &slide_rels)?;
+                read_diagrams(&mut package, part, &slide_rels, &mut slide);
                 render_slide(number, slide, notes.as_deref())
             }
             None => format!("## Slide {number}\n\n(the slide is missing from the file)"),
@@ -85,14 +96,45 @@ pub(super) fn read(
     })
 }
 
-fn read_notes(package: &mut Package, slide_part: &str) -> Result<Option<String>, String> {
-    let Some(rels) = package.read_part(&rels_path(slide_part))? else {
-        return Ok(None);
-    };
-    let Some(target) = relationships(&rels)?
-        .into_iter()
+/// Fills in the text of each `SmartArt` diagram on the slide from the data
+/// part its relationship names. One that cannot be read says so in place.
+fn read_diagrams(
+    package: &mut Package,
+    slide_part: &str,
+    rels: &[(String, String, String)],
+    slide: &mut Slide,
+) {
+    for content in &mut slide.order {
+        let Content::Diagram(diagram) = content else {
+            continue;
+        };
+        let Some(target) = rels
+            .iter()
+            .find(|(id, kind, _)| *id == diagram.id && kind.ends_with("/diagramData"))
+            .map(|(_, _, target)| resolve_target(part_dir(slide_part), target))
+        else {
+            continue;
+        };
+        diagram.text = match package
+            .read_part(&target)
+            .and_then(|xml| xml.map_or_else(|| Ok(Vec::new()), |xml| diagram_text(&xml)))
+        {
+            Ok(lines) if lines.is_empty() => None,
+            Ok(lines) => Some(render_diagram(&lines)),
+            Err(error) => Some(format!("(a SmartArt diagram could not be read: {error})")),
+        };
+    }
+}
+
+fn read_notes(
+    package: &mut Package,
+    slide_part: &str,
+    rels: &[(String, String, String)],
+) -> Result<Option<String>, String> {
+    let Some(target) = rels
+        .iter()
         .find(|(_, kind, _)| kind.ends_with("/notesSlide"))
-        .map(|(_, _, target)| resolve_target(part_dir(slide_part), &target))
+        .map(|(_, _, target)| resolve_target(part_dir(slide_part), target))
     else {
         return Ok(None);
     };
@@ -129,6 +171,15 @@ struct Slide {
 enum Content {
     Shape(usize),
     Table(TableBuilder),
+    Diagram(Diagram),
+}
+
+/// A `SmartArt` diagram (`dgm:relIds`): the relationship id of its data
+/// part, and its text once read.
+#[derive(Debug)]
+struct Diagram {
+    id: String,
+    text: Option<String>,
 }
 
 fn parse_slide(xml: &str) -> Result<Slide, String> {
@@ -137,6 +188,7 @@ fn parse_slide(xml: &str) -> Result<Slide, String> {
     let mut tables: Vec<TableBuilder> = Vec::new();
     let mut paragraph: Option<(usize, String)> = None;
     let mut in_text = false;
+    let mut diagrams = 0usize;
     walk(xml, |node| match node {
         Node::Open { name: "sld", attrs } => slide.hidden = attr(attrs, "show") == Some("0"),
         Node::Open { name: "sp", .. } => shapes.push(Shape::default()),
@@ -199,6 +251,18 @@ fn parse_slide(xml: &str) -> Result<Slide, String> {
         Node::Close { name: "tbl" } => {
             if let Some(table) = tables.pop() {
                 slide.order.push(Content::Table(table));
+            }
+        }
+        Node::Open {
+            name: "relIds",
+            attrs,
+        } => {
+            if let Some(id) = attr(attrs, "r:dm").filter(|_| diagrams < MAX_SLIDE_DIAGRAMS) {
+                diagrams += 1;
+                slide.order.push(Content::Diagram(Diagram {
+                    id: id.to_string(),
+                    text: None,
+                }));
             }
         }
         _ => {}
@@ -268,6 +332,11 @@ fn render_slide(number: usize, slide: Slide, notes: Option<&str>) -> String {
                 let table = table.into_markdown();
                 if !table.is_empty() {
                     body.push(table);
+                }
+            }
+            Content::Diagram(diagram) => {
+                if let Some(text) = diagram.text {
+                    body.push(text);
                 }
             }
         }

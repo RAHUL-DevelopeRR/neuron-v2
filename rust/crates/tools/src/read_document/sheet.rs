@@ -27,7 +27,7 @@ use std::io::{Cursor, Read as _};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use calamine::{Data, DataRef, Ods, Reader, Xls, Xlsb, Xlsx};
+use calamine::{Data, DataRef, Ods, Reader, Xls, Xlsb, Xlsx, XlsxFormulaMetadata};
 
 use super::xls;
 use super::xml::{attr, walk, Node};
@@ -69,7 +69,10 @@ const SCAN_TIME_LIMIT: Duration = Duration::from_secs(15);
 type Bytes = Cursor<Vec<u8>>;
 
 enum Book {
-    Xlsx(Xlsx<Bytes>),
+    /// With whether the workbook asks to be recalculated when it opens
+    /// (`calcPr fullCalcOnLoad`), as files written by scripts do: their saved
+    /// formula results are missing or placeholders.
+    Xlsx(Xlsx<Bytes>, bool),
     Xlsb(Xlsb<Bytes>),
     Xls(Xls<Bytes>),
     Ods(Ods<Bytes>),
@@ -121,19 +124,22 @@ impl Book {
             } else {
                 check_shared_strings(&mut archive)?;
             }
-            kind
+            let recalculate = kind == "xlsx" && recalculates_on_load(&mut archive);
+            (kind, recalculate)
         };
         let bytes = Cursor::new(data);
         match kind {
-            "xlsb" => Xlsb::new(bytes).map(Self::Xlsb).map_err(unreadable),
-            "xlsx" => Xlsx::new(bytes).map(Self::Xlsx).map_err(unreadable),
+            ("xlsb", _) => Xlsb::new(bytes).map(Self::Xlsb).map_err(unreadable),
+            ("xlsx", recalculate) => Xlsx::new(bytes)
+                .map(|book| Self::Xlsx(book, recalculate))
+                .map_err(unreadable),
             _ => Ods::new(bytes).map(Self::Ods).map_err(unreadable),
         }
     }
 
     fn sheet_names(&self) -> Vec<String> {
         match self {
-            Self::Xlsx(book) => book.sheet_names(),
+            Self::Xlsx(book, _) => book.sheet_names(),
             Self::Xlsb(book) => book.sheet_names(),
             Self::Xls(book) => book.sheet_names(),
             Self::Ods(book) => book.sheet_names(),
@@ -146,7 +152,7 @@ impl Book {
         match self {
             Self::Xls(book) => book.worksheet_range(name).map(Some).map_err(cannot_read),
             Self::Ods(book) => book.worksheet_range(name).map(Some).map_err(cannot_read),
-            Self::Xlsx(_) | Self::Xlsb(_) => Ok(None),
+            Self::Xlsx(..) | Self::Xlsb(_) => Ok(None),
         }
     }
 
@@ -155,27 +161,61 @@ impl Book {
     /// and every cell streamed counts against `work`. Text is cut to
     /// [`scan_chars`] characters as it is read, so a long shared string that
     /// many cells point at is never copied whole per cell.
+    ///
+    /// An `.xlsx` formula cell with no saved result (or, in a workbook that
+    /// asks to be recalculated, a zero or empty placeholder) shows its
+    /// formula (`=A2*B2`); the count of those is returned.
     fn scan(
         &mut self,
         name: &str,
         grid: Option<&calamine::Range<Data>>,
         work: &mut Work,
         visit: &mut dyn FnMut(u32, u32, &Data),
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         let keep = scan_chars();
         let mut last = None;
+        let mut formulas = 0u64;
         let mut emit = |row: u32, column: u32, value: Data| {
             if row < MAX_ROW && !is_blank(&value) {
                 visit(row, column, &value);
             }
         };
         match self {
-            Self::Xlsx(book) => {
+            Self::Xlsx(book, recalculate) => {
+                let recalculate = *recalculate;
                 let mut cells = book.worksheet_cells_reader(name).map_err(cannot_read)?;
-                while let Some(cell) = cells.next_cell().map_err(cannot_read)? {
+                while let Some(cell) = cells
+                    .next_cell_with_formula_metadata()
+                    .map_err(cannot_read)?
+                {
                     work.cell()?;
-                    let (row, column) = cell.get_position();
-                    emit(row, column, cut_ref(cell.get_value(), keep, &mut last));
+                    let (row, column) = cell.pos;
+                    // No saved result; or, in a workbook that asks to be
+                    // recalculated, the zero or empty text that scripts save
+                    // in place of one. A real result there is kept.
+                    let unsaved = match &cell.value {
+                        DataRef::Empty => true,
+                        DataRef::Float(value) => recalculate && *value == 0.0,
+                        DataRef::Int(value) => recalculate && *value == 0,
+                        DataRef::String(text) => recalculate && text.is_empty(),
+                        DataRef::SharedString(text) => recalculate && text.is_empty(),
+                        _ => false,
+                    };
+                    let formula = match &cell.formula {
+                        Some(
+                            XlsxFormulaMetadata::Normal { formula }
+                            | XlsxFormulaMetadata::Shared { formula, .. },
+                        ) if unsaved && !formula.trim().is_empty() => Some(formula.trim()),
+                        _ => None,
+                    };
+                    let value = match formula {
+                        Some(formula) => {
+                            formulas += 1;
+                            Data::String(cut_text(&format!("={formula}"), keep))
+                        }
+                        None => cut_ref(&cell.value, keep, &mut last),
+                    };
+                    emit(row, column, value);
                 }
             }
             Self::Xlsb(book) => {
@@ -199,8 +239,35 @@ impl Book {
                 }
             }
         }
-        Ok(())
+        Ok(formulas)
     }
+}
+
+/// Whether an `.xlsx` workbook asks to be recalculated when it opens
+/// (`<calcPr fullCalcOnLoad="1"/>` in `xl/workbook.xml`).
+fn recalculates_on_load(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> bool {
+    let Ok(entry) = archive.by_name("xl/workbook.xml") else {
+        return false;
+    };
+    let mut xml = String::new();
+    if entry
+        .take(MAX_OTHER_PART_BYTES)
+        .read_to_string(&mut xml)
+        .is_err()
+    {
+        return false;
+    }
+    let mut recalculate = false;
+    let _ = walk(&xml, |node| {
+        if let Node::Open {
+            name: "calcPr",
+            attrs,
+        } = node
+        {
+            recalculate = matches!(attr(attrs, "fullCalcOnLoad"), Some("1" | "true"));
+        }
+    });
+    recalculate
 }
 
 /// Characters of a text cell kept while a sheet is scanned: more than any
@@ -963,8 +1030,9 @@ fn render_sheet(
     // a sheet of long cells holds no more than about one table of text.
     let mut values: BTreeMap<(u32, u32), (String, bool)> = BTreeMap::new();
     let mut widest: Option<u32> = None;
+    let mut formulas = 0;
     if column_from <= column_to {
-        book.scan(name, grid.as_ref(), work, &mut |row, column, value| {
+        formulas = book.scan(name, grid.as_ref(), work, &mut |row, column, value| {
             if !(first_row..=last_row).contains(&row)
                 || !(column_from..=last_column).contains(&column)
             {
@@ -1037,6 +1105,11 @@ fn render_sheet(
     let mut text = format!("{heading}\n\n{cut_note}{table}");
 
     let mut notes = Vec::new();
+    if formulas > 0 {
+        notes.push(format!(
+            "{formulas} formula cell(s) in this sheet have no calculated result saved in the file (it was written without recalculating, as scripts write workbooks), so their formulas are shown instead of values"
+        ));
+    }
     let keep_columns = options
         .columns
         .map(str::trim)
@@ -1111,6 +1184,10 @@ fn is_blank(cell: &Data) -> bool {
 fn cell_text(cell: &Data) -> String {
     match cell {
         Data::Float(value) => format_number(*value),
+        // OpenDocument times and dates (`PT09H30M00S`, `2024-01-15T09:30:00`),
+        // shown as the Excel ones are.
+        Data::DurationIso(text) => iso_duration(text).unwrap_or_else(|| text.clone()),
+        Data::DateTimeIso(text) => iso_date_time(text),
         // A time of day (h:mm and the like) has no date part: Excel keeps it
         // on day zero, which is not a date anyone entered.
         Data::DateTime(value) if value.is_datetime() && (0.0..1.0).contains(&value.as_f64()) => {
@@ -1165,7 +1242,64 @@ fn whole_seconds(days: f64) -> u64 {
     (days * 86_400.0).round() as u64
 }
 
+/// An ISO-8601 duration as `calamine` reads an `.ods` time
+/// (`PT09H30M00S`, `-PT1H`, `P1DT2H`): a time of day below 24 hours, else
+/// hours past 24 as a duration. `None` when it is not one.
+fn iso_duration(text: &str) -> Option<String> {
+    let text = text.trim();
+    let (negative, rest) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let rest = rest.strip_prefix('P')?;
+    let (date, time) = rest.split_once('T').unwrap_or((rest, ""));
+    let mut seconds = 0.0f64;
+    for (part, units) in [
+        (date, &[('D', 86_400.0)][..]),
+        (time, &[('H', 3_600.0), ('M', 60.0), ('S', 1.0)][..]),
+    ] {
+        let mut number = String::new();
+        for ch in part.chars() {
+            if ch.is_ascii_digit() || ch == '.' {
+                number.push(ch);
+                continue;
+            }
+            let (_, scale) = units.iter().find(|(unit, _)| *unit == ch)?;
+            seconds += number.parse::<f64>().ok()? * scale;
+            number.clear();
+        }
+        if !number.is_empty() {
+            return None;
+        }
+    }
+    let days = seconds / 86_400.0;
+    Some(if !negative && days < 1.0 {
+        time_of_day(days)
+    } else {
+        duration(if negative { -days } else { days })
+    })
+}
+
+/// An ISO-8601 date and time (`2024-01-15T09:30:00`) with a space for the
+/// `T`, and as the date alone at midnight, as Excel dates show.
+fn iso_date_time(text: &str) -> String {
+    let Some((date, time)) = text.trim().split_once('T') else {
+        return text.to_string();
+    };
+    if time.chars().all(|ch| matches!(ch, '0' | ':' | '.')) {
+        date.to_string()
+    } else {
+        format!("{date} {time}")
+    }
+}
+
+/// A number as Excel shows it in a General cell: at most 15 significant
+/// digits, so stored noise such as `1358.0160000000001` reads `1358.016`.
 fn format_number(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    let value = format!("{value:.14e}").parse::<f64>().unwrap_or(value);
     if value.fract() == 0.0 && value.abs() < 1e15 {
         format!("{value:.0}")
     } else {

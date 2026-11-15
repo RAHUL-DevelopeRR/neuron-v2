@@ -2340,6 +2340,11 @@ impl Engine {
         self.send(ready_event());
         self.send_status();
         self.announce_account();
+        if let Ok(cwd) = env::current_dir() {
+            for warning in repl_loop::skill_shadow_warnings(&cwd) {
+                self.notice(&warning);
+            }
+        }
         if !self.cli.runtime.session().messages.is_empty() {
             self.send_transcript();
         }
