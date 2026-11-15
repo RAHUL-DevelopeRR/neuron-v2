@@ -1276,10 +1276,11 @@ Read documents.
         assert_eq!(session, PathBuf::from("s.jsonl"));
         assert_eq!(launch.model.as_deref(), Some("groq/openai/gpt-oss-120b"));
         assert_eq!(launch.permission_mode, Some(PermissionMode::ReadOnly));
+        // read_file brings read_document, which it sends documents to.
         assert_eq!(
             launch.allowed_tools,
             Some(
-                ["read_file", "grep_search"]
+                ["read_file", "read_document", "grep_search"]
                     .into_iter()
                     .map(String::from)
                     .collect()

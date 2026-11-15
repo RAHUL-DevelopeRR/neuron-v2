@@ -45,6 +45,9 @@ impl Method {
 /// The entries of an `/Encrypt` dictionary this handler reads.
 #[derive(Debug, Clone)]
 pub(super) struct Settings {
+    /// The handler version (`/V`), which sets the key length when
+    /// `/Length` is missing.
+    pub(super) version: u32,
     pub(super) revision: u32,
     /// Key length in bits (`/Length`), when given.
     pub(super) length_bits: Option<u32>,
@@ -72,13 +75,11 @@ impl Security {
     /// the file cannot be read.
     pub(super) fn open(settings: &Settings) -> Result<Self, String> {
         let key = match settings.revision {
-            2..=4 => {
-                let key = legacy_key(settings);
-                if !legacy_user_matches(settings, &key) {
-                    return Err(needs_password());
-                }
-                key
-            }
+            2..=4 => legacy_key_lengths(settings)
+                .into_iter()
+                .map(|length| legacy_key(settings, length))
+                .find(|key| legacy_user_matches(settings, key))
+                .ok_or_else(needs_password)?,
             5 | 6 => modern_key(settings)?,
             _ => return Err(unsupported()),
         };
@@ -128,16 +129,26 @@ pub(super) fn unsupported() -> String {
     "this PDF is encrypted with a method read_document does not support; its text cannot be read without decrypting it first".to_string()
 }
 
-/// Algorithm 2: the file key of revisions 2 to 4 for the empty password.
-fn legacy_key(settings: &Settings) -> Vec<u8> {
-    let length = if settings.revision == 2 {
-        5
-    } else {
-        settings
-            .length_bits
-            .map_or(16, |bits| usize::try_from(bits / 8).unwrap_or(16))
-            .clamp(5, 16)
-    };
+/// The key lengths (bytes) to try for revisions 2 to 4, most likely first.
+/// Revision 2 always uses 40 bits. Otherwise `/Length` gives the length;
+/// without it ISO 32000 defaults to 40 bits for versions 1 to 3, and
+/// version 4 means 128 bits. A writer that left `/Length` out may not have
+/// followed the default, so the other length is tried as well, checked
+/// against `/U` like the first.
+fn legacy_key_lengths(settings: &Settings) -> Vec<usize> {
+    if settings.revision == 2 {
+        return vec![5];
+    }
+    match settings.length_bits {
+        Some(bits) => vec![usize::try_from(bits / 8).unwrap_or(16).clamp(5, 16)],
+        None if settings.version >= 4 => vec![16, 5],
+        None => vec![5, 16],
+    }
+}
+
+/// Algorithm 2: the file key of revisions 2 to 4 for the empty password,
+/// `length` bytes long.
+fn legacy_key(settings: &Settings, length: usize) -> Vec<u8> {
     let mut input = PADDING.to_vec();
     input.extend_from_slice(&settings.owner[..settings.owner.len().min(32)]);
     input.extend_from_slice(&settings.permissions.to_le_bytes());
@@ -442,7 +453,9 @@ pub(super) fn md5(data: &[u8]) -> [u8; 16] {
 pub(super) mod fixtures {
     //! Encryption for test files, the inverse of the reader.
 
-    use super::{aes128_cbc_encrypt, legacy_key, md5, rc4, Method, Settings, PADDING};
+    use super::{
+        aes128_cbc_encrypt, legacy_key, legacy_key_lengths, md5, rc4, Method, Settings, PADDING,
+    };
 
     /// Algorithm 2.B for the empty password and `salt`.
     pub(crate) fn hash_2b(salt: &[u8]) -> Vec<u8> {
@@ -464,7 +477,7 @@ pub(super) mod fixtures {
 
     /// The file key of `settings` (revisions 2 to 4).
     pub(crate) fn file_key(settings: &Settings) -> Vec<u8> {
-        legacy_key(settings)
+        legacy_key(settings, legacy_key_lengths(settings)[0])
     }
 
     /// Encrypts `data` of object `number` as the reader expects.

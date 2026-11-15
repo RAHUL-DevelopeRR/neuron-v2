@@ -463,6 +463,11 @@ fn pdfs_with_only_an_owner_password_are_decrypted() {
 fn encrypted_fixture(revision: u32, method: Method) -> Vec<u8> {
     let id = b"0123456789abcdef".to_vec();
     let mut settings = Settings {
+        version: match (revision, method) {
+            (_, Method::Aes128) => 4,
+            (2, _) => 1,
+            _ => 2,
+        },
         revision,
         length_bits: Some(if revision == 2 { 40 } else { 128 }),
         owner: vec![0x5a; 32],

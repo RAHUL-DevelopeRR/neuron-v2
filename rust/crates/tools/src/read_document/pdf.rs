@@ -17,6 +17,7 @@
 //! text kept per page all have limits, and the object scan is linear.
 
 use std::cell::Cell;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::path::Path;
@@ -623,15 +624,6 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .rposition(|window| window == needle)
-}
-
 /// Finds the next `needle` at or after positions that only move forward,
 /// remembering the last hit and where a search found nothing, so a scan of
 /// the whole file stays linear however often it asks.
@@ -715,6 +707,26 @@ impl Pdf {
         let mut scanned = 0usize;
         let lex_limit = data.len().saturating_mul(8).saturating_add(1 << 20);
         let mut endstreams = Finder::new(b"endstream");
+        // Where a stream of `length` bytes from `start` ends, when `endstream`
+        // follows it: only an end of line belongs there, and a long run of
+        // whitespace is not scanned again per header.
+        let stream_end = |start: usize, length: usize| -> Option<usize> {
+            let end = start.checked_add(length).filter(|end| *end <= data.len())?;
+            let offset = data[end..]
+                .iter()
+                .take(MAX_STREAM_END_GAP)
+                .position(|byte| !is_whitespace(*byte))?;
+            data[end + offset..]
+                .starts_with(b"endstream")
+                .then_some(end)
+        };
+        // The data of every stream, in file order, so a `trailer` keyword
+        // inside one (an embedded file) is not taken for the file's own.
+        let mut stream_spans: Vec<(usize, usize)> = Vec::new();
+        // Streams whose `/Length` is an indirect object, read once every
+        // object is known: (stream number, where it is defined, data start,
+        // length object number).
+        let mut indirect_lengths: Vec<(u32, usize, usize, u32)> = Vec::new();
         while let Some(found) = find(&data[cursor..], b"obj") {
             let at = cursor + found;
             cursor = at + 3;
@@ -746,24 +758,10 @@ impl Pdf {
             match lexer.next_token() {
                 Some(Token::Keyword(ref word)) if word == "stream" => {
                     let start = skip_eol(data, lexer.pos);
-                    let declared = object
-                        .as_dict()
-                        .and_then(|dict| dict.get("Length"))
-                        .and_then(Obj::as_num)
-                        .map(to_usize);
+                    let length = object.as_dict().and_then(|dict| dict.get("Length"));
+                    let declared = length.and_then(Obj::as_num).map(to_usize);
                     let end = declared
-                        .and_then(|length| {
-                            let end = start.checked_add(length).filter(|end| *end <= data.len())?;
-                            // Only an end of line belongs there; a long run
-                            // of whitespace is not scanned again per header.
-                            let offset = data[end..]
-                                .iter()
-                                .take(MAX_STREAM_END_GAP)
-                                .position(|byte| !is_whitespace(*byte))?;
-                            data[end + offset..]
-                                .starts_with(b"endstream")
-                                .then_some(end)
-                        })
+                        .and_then(|length| stream_end(start, length))
                         .or_else(|| {
                             endstreams.next(data, start).map(|found| {
                                 let mut end = found;
@@ -776,6 +774,13 @@ impl Pdf {
                     let Some(end) = end else {
                         continue;
                     };
+                    // The end found by `endstream` drops trailing line ends,
+                    // which may be data (encrypted bytes): an indirect
+                    // `/Length` gives the exact end once it is read.
+                    if let Some(Obj::Ref(length)) = length {
+                        indirect_lengths.push((number, at, start, *length));
+                    }
+                    stream_spans.push((start, end));
                     let dict = match object {
                         Obj::Dict(dict) => dict,
                         _ => Dict::new(),
@@ -797,39 +802,77 @@ impl Pdf {
             }
         }
 
+        for (number, at, start, length) in indirect_lengths {
+            if defined.get(&number).map(|(defined_at, _)| *defined_at) != Some(at) {
+                continue;
+            }
+            let Some(end) = objects
+                .get(&length)
+                .and_then(Obj::as_num)
+                .and_then(|length| stream_end(start, to_usize(length)))
+            else {
+                continue;
+            };
+            if let Some(Obj::Stream(_, bytes)) = objects.get_mut(&number) {
+                *bytes = data[start..end].to_vec();
+            }
+        }
+
         let mut pdf = Self {
             objects,
             trailer: Dict::new(),
             decode_left: Cell::new(MAX_DECODED_BYTES),
         };
 
-        // The newest trailer: a classic `trailer` dictionary, or the last
-        // cross-reference stream in the file.
-        let classic = rfind(data, b"trailer");
-        let mut trailer = classic
-            .and_then(|at| Lexer::new(data, at + b"trailer".len()).object())
-            .and_then(|object| match object {
-                Obj::Dict(dict) => Some(dict),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let newest_xref = pdf
-            .objects
-            .iter()
-            .filter(|(_, object)| {
-                matches!(object, Obj::Stream(dict, _)
-                    if dict.get("Type").and_then(Obj::as_name) == Some("XRef"))
-            })
-            .filter_map(|(number, _)| defined.get(number).map(|(at, _)| (*at, *number)))
-            .max();
-        if let Some(Obj::Stream(dict, _)) =
-            newest_xref.and_then(|(_, number)| pdf.objects.get(&number))
-        {
-            let newer =
-                classic.is_none_or(|classic| newest_xref.is_some_and(|(at, _)| at > classic));
-            for key in ["Root", "Encrypt", "ID"] {
-                if let Some(value) = dict.get(key) {
-                    if newer || !trailer.contains_key(key) {
+        // Every trailer in the file: classic `trailer` dictionaries (outside
+        // stream data) and cross-reference streams, by where they are.
+        let mut sections: Vec<(usize, Dict)> = Vec::new();
+        let mut from = 0;
+        while let Some(found) = find(&data[from..], b"trailer") {
+            let at = from + found;
+            from = at + b"trailer".len();
+            let span = stream_spans.partition_point(|(start, _)| *start <= at);
+            if span > 0 && stream_spans[span - 1].1 > at {
+                continue;
+            }
+            let after = data[from..]
+                .iter()
+                .position(|byte| !is_whitespace(*byte))
+                .map_or(data.len(), |offset| from + offset);
+            if data.get(after) != Some(&b'<') || scanned > lex_limit {
+                continue;
+            }
+            let mut lexer = Lexer::new(data, from);
+            let object = lexer.object();
+            scanned = scanned.saturating_add(lexer.pos.saturating_sub(from));
+            nodes = nodes.saturating_add(lexer.nodes);
+            if nodes > MAX_NODES {
+                return Err(too_complex());
+            }
+            if let Some(Obj::Dict(dict)) = object {
+                sections.push((at, dict));
+            }
+        }
+        for (number, object) in &pdf.objects {
+            if let Obj::Stream(dict, _) = object {
+                if dict.get("Type").and_then(Obj::as_name) == Some("XRef") {
+                    if let Some((at, _)) = defined.get(number) {
+                        sections.push((*at, dict.clone()));
+                    }
+                }
+            }
+        }
+        // The newest (last in the file) is the trailer; older ones fill in
+        // what it leaves out. A linearized file's last trailer is often just
+        // `<< /Size N >>`, with `/Root`, `/Encrypt` and `/ID` in the
+        // first-page trailer near the start of the file.
+        sections.sort_unstable_by_key(|(at, _)| Reverse(*at));
+        let mut sections = sections.into_iter();
+        let mut trailer = sections.next().map(|(_, dict)| dict).unwrap_or_default();
+        for (_, older) in sections {
+            for key in ["Root", "Encrypt", "ID", "Info"] {
+                if !trailer.contains_key(key) {
+                    if let Some(value) = older.get(key) {
                         trailer.insert(key.to_string(), value.clone());
                     }
                 }
@@ -983,9 +1026,26 @@ impl Pdf {
         };
         #[allow(clippy::cast_possible_truncation)]
         let permissions = number("P").map_or(-1, |value| value as i64 as i32);
+        // Version 4 may give the key length only in its crypt filter, in
+        // bytes or bits (pdf.js reads values under 40 as bytes).
+        let filter_length = || {
+            let name = self.get(dict, "StmF").and_then(Obj::as_name)?;
+            let length = filters
+                .and_then(|filters| self.get(filters, name))
+                .and_then(Obj::as_dict)
+                .and_then(|filter| self.get(filter, "Length"))
+                .and_then(Obj::as_num)
+                .map(to_u32)?;
+            Some(if length < 40 { length * 8 } else { length })
+        };
+        let length_bits =
+            number("Length")
+                .map(to_u32)
+                .or_else(|| if version == 4 { filter_length() } else { None });
         let settings = Settings {
+            version,
             revision,
-            length_bits: number("Length").map(to_u32),
+            length_bits,
             owner: bytes("O"),
             user: bytes("U"),
             user_key: bytes("UE"),

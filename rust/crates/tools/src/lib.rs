@@ -251,9 +251,11 @@ impl GlobalToolRegistry {
                     )
                 })?;
                 allowed.insert(canonical.clone());
-                // `read` means reading files, documents included: read_file
-                // sends Office and PDF files to read_document.
-                if normalized == "read"
+                // `read` or `read_file` means reading files, documents
+                // included: read_file sends Office and PDF files to
+                // read_document, and read_file permission rules and hooks
+                // cover read_document too.
+                if canonical == "read_file"
                     && canonical_names.iter().any(|name| name == "read_document")
                 {
                     allowed.insert("read_document".to_string());
@@ -2750,7 +2752,12 @@ fn io_to_string(error: std::io::Error) -> String {
     error.to_string()
 }
 
+/// Unknown keys are refused, here and in [`ReadDocumentInput`]: permission
+/// rules match the first of several keys (`command` before `path`), so an
+/// extra `command` key would otherwise let a rule on `path` be matched
+/// against other text while the file named by `path` is read.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadFileInput {
     path: String,
     offset: Option<usize>,
@@ -2758,6 +2765,7 @@ struct ReadFileInput {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadDocumentInput {
     path: String,
     #[serde(default, deserialize_with = "deserialize_pages")]
@@ -8623,6 +8631,53 @@ mod tests {
         assert!(runtime::parallel_tools::is_concurrency_safe_tool(
             "read_document"
         ));
+    }
+
+    #[test]
+    fn an_extra_key_cannot_steer_a_read_rule_away_from_the_path_read() {
+        let _guard = env_guard();
+        let root = temp_path("read-rule-extra-key");
+        fs::create_dir_all(root.join("confidential")).expect("workspace root");
+        fs::write(
+            root.join("confidential").join("board.docx"),
+            crate::read_document::tests::sample_docx(),
+        )
+        .expect("docx");
+        fs::write(root.join("confidential").join("notes.txt"), "secret").expect("text");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let rules = runtime::RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            vec!["read_file(confidential/:*)".to_string()],
+            Vec::new(),
+        );
+        let policy = permission_policy_for_mode(PermissionMode::WorkspaceWrite)
+            .with_permission_rules(&rules);
+        let registry = GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy));
+        let results = [
+            ("read_document", "confidential/board.docx"),
+            ("read_file", "confidential/notes.txt"),
+        ]
+        .map(|(tool, path)| {
+            (
+                tool,
+                registry.execute(tool, &json!({ "path": path })),
+                registry.execute(tool, &json!({ "path": path, "command": "public/x" })),
+            )
+        });
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&root);
+
+        for (tool, plain, steered) in results {
+            let plain = plain.expect_err("the rule denies the path");
+            assert!(plain.contains("denied"), "{tool}: {plain}");
+            let steered = steered.expect_err("an extra key is refused");
+            assert!(steered.contains("unknown field"), "{tool}: {steered}");
+            assert!(!steered.contains("Project Plan"), "{tool}: {steered}");
+            assert!(!steered.contains("secret"), "{tool}: {steered}");
+        }
     }
 
     #[test]

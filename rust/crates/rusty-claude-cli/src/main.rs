@@ -6531,6 +6531,25 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
+        // Naming read_file itself also allows read_document, which read_file
+        // sends Office and PDF files to.
+        let args = vec![
+            "--allowedTools".to_string(),
+            "read_file,grep_search".to_string(),
+        ];
+        let CliAction::Repl { allowed_tools, .. } = parse_args(&args).expect("args should parse")
+        else {
+            panic!("a repl");
+        };
+        assert_eq!(
+            allowed_tools,
+            Some(
+                ["grep_search", "read_document", "read_file"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            )
+        );
     }
 
     #[test]

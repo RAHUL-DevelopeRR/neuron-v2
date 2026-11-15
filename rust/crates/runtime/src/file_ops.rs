@@ -490,7 +490,6 @@ pub fn read_file(
     limit: Option<usize>,
 ) -> io::Result<ReadFileOutput> {
     let absolute_path = normalize_path(path)?;
-    check_read_size(&absolute_path)?;
 
     let kind = document_kind(&absolute_path);
     let use_read_document = |kind: &str| {
@@ -504,11 +503,16 @@ pub fn read_file(
     };
     // A real document by its first bytes, even when they hold no NUL (a PDF
     // can start with kilobytes of plain text).
+    // Checked before read_file's own size limit: read_document opens Office
+    // and PDF files well past it, so a large deck still gets the hint rather
+    // than a size error that suggests it cannot be read at all.
     if let Some(kind) = kind {
         if has_document_magic(&absolute_path)? {
+            check_size(&absolute_path, document_size_limit(&absolute_path))?;
             return Err(use_read_document(kind));
         }
     }
+    check_read_size(&absolute_path)?;
 
     let content = if let Some(kind) = kind {
         // Text under a document extension (many "export to Excel" features
@@ -2044,6 +2048,68 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("binary"));
+    }
+
+    #[test]
+    fn a_large_document_sent_to_read_file_still_points_at_read_document() {
+        let dir = temp_path("large-doc-dir");
+        std::fs::create_dir_all(&dir).expect("dir");
+        // A 30 MB photo-heavy deck: past read_file's limit, within
+        // read_document's, so the hint names read_document, not a size.
+        for (name, header, size) in [
+            ("deck.pptx", &b"PK"[..], 30 * 1024 * 1024),
+            (
+                "annual.pdf",
+                &b"%PDF-1.7
+"[..],
+                super::MAX_READ_SIZE + 1,
+            ),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, header).expect("write");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open")
+                .set_len(size)
+                .expect("grow");
+            let message = read_file(path.to_string_lossy().as_ref(), None, None)
+                .expect_err("a document")
+                .to_string();
+            assert!(message.contains("read it with read_document"), "{message}");
+            assert!(!message.contains("too large"), "{message}");
+        }
+        // Past read_document's own limit the size is what stops it.
+        let huge = dir.join("huge.pptx");
+        std::fs::write(&huge, b"PK").expect("write");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&huge)
+            .expect("open")
+            .set_len(super::MAX_STREAMED_DOCUMENT_SIZE + 1)
+            .expect("grow");
+        let message = read_file(huge.to_string_lossy().as_ref(), None, None)
+            .expect_err("too large")
+            .to_string();
+        assert!(message.contains("too large"), "{message}");
+        // Text under a document extension keeps read_file's 10 MB limit.
+        let export = dir.join("export.xls");
+        std::fs::write(
+            &export, b"a,b,c
+",
+        )
+        .expect("write");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&export)
+            .expect("open")
+            .set_len(super::MAX_READ_SIZE + 1)
+            .expect("grow");
+        let message = read_file(export.to_string_lossy().as_ref(), None, None)
+            .expect_err("too large")
+            .to_string();
+        assert!(message.contains("too large"), "{message}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

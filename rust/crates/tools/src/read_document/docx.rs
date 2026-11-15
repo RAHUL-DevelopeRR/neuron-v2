@@ -7,7 +7,8 @@
 //!
 //! Footnotes and endnotes are marked where they are referenced (`[^1]`,
 //! endnotes `[^i]`) and their text follows at the end of the page that
-//! references them. `SmartArt` diagrams are read from their data parts.
+//! references them (on estimated pages, right after the paragraph or table
+//! that references them). `SmartArt` diagrams are read from their data parts.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -121,7 +122,8 @@ fn read_diagrams(
 }
 
 /// Adds the text of every footnote and endnote the body references, as
-/// `[^1]: text` blocks at the end of the page that references each.
+/// `[^1]: text` blocks placed by [`paginate`] on the page that references
+/// each.
 fn add_note_text(package: &mut Package, parsed: &mut ParsedBody, notes: &mut Vec<String>) {
     let mut texts: HashMap<(NoteKind, String), String> = HashMap::new();
     for (kind, part) in [
@@ -145,10 +147,13 @@ fn add_note_text(package: &mut Package, parsed: &mut ParsedBody, notes: &mut Vec
     let mut missing = 0usize;
     for note in std::mem::take(&mut parsed.note_refs) {
         match texts.get(&(note.kind, note.id)) {
-            Some(text) => parsed.blocks.push(Block::Text {
-                page: note.page,
-                markdown: format!("[^{}]: {}", note.label, one_line(text)),
-            }),
+            Some(text) => parsed.note_blocks.push((
+                note.anchor,
+                Block::Text {
+                    page: note.page,
+                    markdown: format!("[^{}]: {}", note.label, one_line(text)),
+                },
+            )),
             None => missing += 1,
         }
     }
@@ -228,7 +233,11 @@ fn parse_notes(xml: &str) -> Result<HashMap<String, String>, String> {
 
 /// The first of the `pages` saved pages whose blocks, with the page's
 /// `[page N]` label, render to more than `ceiling` characters, if any.
-fn overlong_saved_page(blocks: &[Block], pages: usize, ceiling: usize) -> Option<usize> {
+fn overlong_saved_page<'a>(
+    blocks: impl IntoIterator<Item = &'a Block>,
+    pages: usize,
+    ceiling: usize,
+) -> Option<usize> {
     /// Room for the `[page N]` label and the blank line after it.
     const PAGE_LABEL_CHARS: usize = 32;
     let ceiling = ceiling.saturating_sub(PAGE_LABEL_CHARS);
@@ -244,6 +253,51 @@ fn overlong_saved_page(blocks: &[Block], pages: usize, ceiling: usize) -> Option
         .iter()
         .position(|size| *size > ceiling)
         .map(|index| index + 1)
+}
+
+/// The body's `blocks` with the note blocks placed, and the first of the
+/// `pages` saved pages too long for one call, if any.
+///
+/// A saved page longer than one call returns (a long table with no break
+/// saved inside it, as generated files often have) could not be read to its
+/// end; such a file is paginated by size instead. On saved pages note text
+/// goes at the end of the page that references it. Estimated pages are cut
+/// by size, so each note block (anchored to the index of the block that
+/// references it; anchors rise in reading order) follows that block and
+/// lands on the same page as its mark.
+fn place_notes(
+    blocks: Vec<Block>,
+    note_blocks: Vec<(usize, Block)>,
+    pages: usize,
+) -> (Vec<Block>, Option<usize>) {
+    let overlong = if pages > 1 {
+        overlong_saved_page(
+            blocks
+                .iter()
+                .chain(note_blocks.iter().map(|(_, block)| block)),
+            pages,
+            super::max_chars_ceiling(),
+        )
+    } else {
+        None
+    };
+    if pages > 1 && overlong.is_none() {
+        let blocks = blocks
+            .into_iter()
+            .chain(note_blocks.into_iter().map(|(_, block)| block))
+            .collect();
+        return (blocks, None);
+    }
+    let mut placed = Vec::with_capacity(blocks.len() + note_blocks.len());
+    let mut note_blocks = note_blocks.into_iter().peekable();
+    for (index, block) in blocks.into_iter().enumerate() {
+        placed.push(block);
+        while let Some((_, note)) = note_blocks.next_if(|(anchor, _)| *anchor <= index) {
+            placed.push(note);
+        }
+    }
+    placed.extend(note_blocks.map(|(_, note)| note));
+    (placed, overlong)
 }
 
 /// `<Pages>46</Pages>` from `docProps/app.xml`.
@@ -266,17 +320,15 @@ fn paginate(
     saved_pages: Option<usize>,
     budget: &mut Budget,
 ) -> Document {
-    let ParsedBody { blocks, pages, .. } = parsed;
+    let ParsedBody {
+        blocks,
+        pages,
+        note_blocks,
+        ..
+    } = parsed;
     let mut notes = Vec::new();
     let mut pages_of_blocks: Vec<Vec<String>> = Vec::new();
-    // A saved page longer than one call returns (a long table with no break
-    // saved inside it, as generated files often have) could not be read to
-    // its end; such a file is paginated by size instead.
-    let overlong = if pages > 1 {
-        overlong_saved_page(&blocks, pages, super::max_chars_ceiling())
-    } else {
-        None
-    };
+    let (blocks, overlong) = place_notes(blocks, note_blocks, pages);
     if pages > 1 && overlong.is_none() {
         pages_of_blocks.resize(pages, Vec::new());
         for block in blocks {
@@ -777,6 +829,9 @@ struct NoteRef {
     /// `ii`, ... as Word numbers them by default.
     label: String,
     page: usize,
+    /// The index the block holding the reference takes in the body's
+    /// blocks (the paragraph's, or its table's).
+    anchor: usize,
 }
 
 #[derive(Debug)]
@@ -818,6 +873,9 @@ struct ParsedBody {
     pages: usize,
     /// Footnote and endnote references, in reading order, each note once.
     note_refs: Vec<NoteRef>,
+    /// The `[^1]: text` block of each referenced note, with its reference's
+    /// anchor (see [`NoteRef::anchor`]).
+    note_blocks: Vec<(usize, Block)>,
 }
 
 /// Page counting while the body is walked.
@@ -951,6 +1009,7 @@ fn parse_body(
                             id: id.to_string(),
                             label: label.clone(),
                             page: pager.page,
+                            anchor: blocks.len(),
                         });
                         label
                     });
@@ -1189,6 +1248,7 @@ fn parse_body(
         blocks,
         pages: page_count,
         note_refs,
+        note_blocks: Vec::new(),
     })
 }
 
