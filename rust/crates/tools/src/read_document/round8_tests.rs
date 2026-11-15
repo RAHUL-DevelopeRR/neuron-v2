@@ -14,13 +14,13 @@ use super::Options;
 
 /// How a test file is encrypted.
 #[derive(Clone, Copy)]
-struct Lock {
-    version: u32,
-    revision: u32,
-    method: Method,
-    key_bits: u32,
+pub(super) struct Lock {
+    pub(super) version: u32,
+    pub(super) revision: u32,
+    pub(super) method: Method,
+    pub(super) key_bits: u32,
     /// Whether the `/Encrypt` dictionary carries `/Length`.
-    write_length: bool,
+    pub(super) write_length: bool,
 }
 
 const RC4_128: Lock = Lock {
@@ -31,7 +31,7 @@ const RC4_128: Lock = Lock {
     write_length: true,
 };
 
-const AES_128: Lock = Lock {
+pub(super) const AES_128: Lock = Lock {
     version: 4,
     revision: 4,
     method: Method::Aes128,
@@ -46,7 +46,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The settings of `lock` with an empty user password, and its file key.
-fn unlocked(lock: Lock) -> (Settings, Vec<u8>) {
+pub(super) fn unlocked(lock: Lock) -> (Settings, Vec<u8>) {
     let mut settings = Settings {
         version: lock.version,
         revision: lock.revision,
@@ -72,7 +72,7 @@ fn unlocked(lock: Lock) -> (Settings, Vec<u8>) {
 /// Encrypts the streams of `objects` (numbered from 1) with `lock`, setting
 /// each stream's `/Length` (direct, or the number object an indirect one
 /// names), and adds the `/Encrypt` dictionary. Returns the trailer entries.
-fn encrypt(objects: &mut Vec<Vec<u8>>, lock: Lock) -> String {
+pub(super) fn encrypt(objects: &mut Vec<Vec<u8>>, lock: Lock) -> String {
     let (settings, key) = unlocked(lock);
     let mut lengths = Vec::new();
     for (index, object) in objects.iter_mut().enumerate() {
@@ -175,7 +175,7 @@ fn linearized(objects: &[Vec<u8>], trailer_extra: &str, xref_streams: bool) -> V
     pdf
 }
 
-fn assert_three_pages(out: &str, label: &str) {
+pub(super) fn assert_three_pages(out: &str, label: &str) {
     assert!(out.contains("Quarterly report"), "{label}: {out}");
     assert!(out.contains("Revenue grew (a lot)"), "{label}: {out}");
     assert!(out.contains("Hi"), "{label}: {out}");

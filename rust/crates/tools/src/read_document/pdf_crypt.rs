@@ -90,6 +90,11 @@ impl Security {
         })
     }
 
+    /// Whether streams are encrypted with AES, whose data is whole blocks.
+    pub(super) fn streams_use_aes(&self) -> bool {
+        matches!(self.streams, Method::Aes128 | Method::Aes256)
+    }
+
     /// Decrypts a string (or with `stream`, a stream's data) of object
     /// `number`, generation `generation`.
     pub(super) fn decrypt(

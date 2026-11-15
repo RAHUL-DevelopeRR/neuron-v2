@@ -14,7 +14,7 @@ use super::round5_tests::{read, read_pdf, workbook};
 use super::tests::{package, rels, temp_dir, write, W};
 use super::Options;
 
-fn read_bytes(name: &str, bytes: &[u8]) -> Result<String, String> {
+pub(super) fn read_bytes(name: &str, bytes: &[u8]) -> Result<String, String> {
     let dir = temp_dir("round7");
     let path = write(&dir, name, bytes);
     let out = read(
@@ -30,7 +30,7 @@ fn read_bytes(name: &str, bytes: &[u8]) -> Result<String, String> {
 
 /// A Word document from `body` with `numbering` as its list definitions
 /// and `extra` parts.
-fn word(body: &str, numbering: &str, extra: &[(&str, String)]) -> Vec<u8> {
+pub(super) fn word(body: &str, numbering: &str, extra: &[(&str, String)]) -> Vec<u8> {
     let document = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><w:document {W} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>{body}<w:sectPr/></w:body></w:document>"#
     );
@@ -53,7 +53,7 @@ fn word(body: &str, numbering: &str, extra: &[(&str, String)]) -> Vec<u8> {
     package(&parts)
 }
 
-fn item(num_id: u32, level: u32, text: &str) -> String {
+pub(super) fn item(num_id: u32, level: u32, text: &str) -> String {
     format!(
         "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"{level}\"/><w:numId w:val=\"{num_id}\"/></w:numPr></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"
     )

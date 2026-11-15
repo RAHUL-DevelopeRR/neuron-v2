@@ -727,6 +727,10 @@ impl Pdf {
         // object is known: (stream number, where it is defined, data start,
         // length object number).
         let mut indirect_lengths: Vec<(u32, usize, usize, u32)> = Vec::new();
+        // Streams whose end came from `endstream`, with line ends trimmed
+        // before it: (where the stream is defined, data start, trimmed end,
+        // `endstream`), by stream number.
+        let mut loose_ends: HashMap<u32, (usize, usize, usize, usize)> = HashMap::new();
         while let Some(found) = find(&data[cursor..], b"obj") {
             let at = cursor + found;
             cursor = at + 3;
@@ -760,17 +764,19 @@ impl Pdf {
                     let start = skip_eol(data, lexer.pos);
                     let length = object.as_dict().and_then(|dict| dict.get("Length"));
                     let declared = length.and_then(Obj::as_num).map(to_usize);
-                    let end = declared
-                        .and_then(|length| stream_end(start, length))
-                        .or_else(|| {
-                            endstreams.next(data, start).map(|found| {
-                                let mut end = found;
-                                while end > start && matches!(data[end - 1], b'\r' | b'\n') {
-                                    end -= 1;
-                                }
-                                end
-                            })
-                        });
+                    let end = match declared.and_then(|length| stream_end(start, length)) {
+                        Some(end) => Some(end),
+                        None => endstreams.next(data, start).map(|found| {
+                            let mut end = found;
+                            while end > start && matches!(data[end - 1], b'\r' | b'\n') {
+                                end -= 1;
+                            }
+                            if end < found {
+                                loose_ends.insert(number, (at, start, end, found));
+                            }
+                            end
+                        }),
+                    };
                     let Some(end) = end else {
                         continue;
                     };
@@ -815,6 +821,7 @@ impl Pdf {
             };
             if let Some(Obj::Stream(_, bytes)) = objects.get_mut(&number) {
                 *bytes = data[start..end].to_vec();
+                loose_ends.remove(&number);
             }
         }
 
@@ -885,6 +892,9 @@ impl Pdf {
                 _ => None,
             };
             let security = pdf.security(encrypt, &trailer)?;
+            if security.streams_use_aes() {
+                pdf.restore_aes_tails(data, &loose_ends, &defined);
+            }
             pdf.decrypt_all(&security, &defined, encrypt_number);
         }
 
@@ -1079,6 +1089,31 @@ impl Pdf {
             }
             let generation = defined.get(number).map_or(0, |(_, generation)| *generation);
             decrypt_object(security, *number, generation, object, 0);
+        }
+    }
+
+    /// Gives back the line-end bytes trimmed from the end of a stream whose
+    /// length was not known (none given, or an indirect `/Length` packed in
+    /// an object stream, which is unpacked only after decryption) when they
+    /// complete its last AES block: AES data is always whole 16-byte blocks,
+    /// and without them the last block, and the end of the text, is lost.
+    fn restore_aes_tails(
+        &mut self,
+        data: &[u8],
+        loose_ends: &HashMap<u32, (usize, usize, usize, usize)>,
+        defined: &HashMap<u32, (usize, u16)>,
+    ) {
+        for (number, (at, start, end, endstream)) in loose_ends {
+            if defined.get(number).map(|(defined_at, _)| defined_at) != Some(at) {
+                continue;
+            }
+            let missing = (16 - (end - start) % 16) % 16;
+            if missing == 0 || end + missing > *endstream {
+                continue;
+            }
+            if let Some(Obj::Stream(_, bytes)) = self.objects.get_mut(number) {
+                *bytes = data[*start..end + missing].to_vec();
+            }
         }
     }
 

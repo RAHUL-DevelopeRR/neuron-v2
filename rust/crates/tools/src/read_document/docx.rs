@@ -149,7 +149,7 @@ fn add_note_text(package: &mut Package, parsed: &mut ParsedBody, notes: &mut Vec
         match texts.get(&(note.kind, note.id)) {
             Some(text) => parsed.note_blocks.push((
                 note.anchor,
-                Block::Text {
+                Block::Note {
                     page: note.page,
                     markdown: format!("[^{}]: {}", note.label, one_line(text)),
                 },
@@ -181,8 +181,11 @@ fn parse_notes(xml: &str) -> Result<HashMap<String, String>, String> {
             return;
         }
         match node {
+            // Older drawing copies, and tracked text moved away or deleted
+            // (an empty marker of the same name opens and closes at once).
             Node::Open {
-                name: "Fallback", ..
+                name: "Fallback" | "moveFrom" | "del",
+                ..
             } => skip_depth = 1,
             Node::Open {
                 name: "footnote" | "endnote",
@@ -264,7 +267,9 @@ fn overlong_saved_page<'a>(
 /// goes at the end of the page that references it. Estimated pages are cut
 /// by size, so each note block (anchored to the index of the block that
 /// references it; anchors rise in reading order) follows that block and
-/// lands on the same page as its mark.
+/// lands on the same page as its mark. A table is cut into parts of about a
+/// page here, as [`paginate`] cuts it, and a note referenced from a cell
+/// follows the part that shows its mark.
 fn place_notes(
     blocks: Vec<Block>,
     note_blocks: Vec<(usize, Block)>,
@@ -290,14 +295,55 @@ fn place_notes(
     }
     let mut placed = Vec::with_capacity(blocks.len() + note_blocks.len());
     let mut note_blocks = note_blocks.into_iter().peekable();
+    // Notes referenced from the table being placed, with their marks, not
+    // yet placed after a part that shows the mark.
+    let mut table_notes: Vec<(String, Block)> = Vec::new();
     for (index, block) in blocks.into_iter().enumerate() {
-        placed.push(block);
-        while let Some((_, note)) = note_blocks.next_if(|(anchor, _)| *anchor <= index) {
-            placed.push(note);
+        match block {
+            Block::Table(part) => {
+                while let Some((_, note)) = note_blocks.next_if(|(anchor, _)| *anchor <= index) {
+                    table_notes.push((note_mark(&note), note));
+                }
+                if table_notes.is_empty() {
+                    placed.push(Block::Table(part));
+                    continue;
+                }
+                // `paginate` cuts each part again to the same size, which
+                // leaves these parts as they are.
+                for piece in part.split(ESTIMATED_PAGE_CHARS) {
+                    let shown = piece.render();
+                    placed.push(Block::Table(piece));
+                    let (here, later): (Vec<_>, Vec<_>) = table_notes
+                        .into_iter()
+                        .partition(|(mark, _)| shown.contains(mark.as_str()));
+                    placed.extend(here.into_iter().map(|(_, note)| note));
+                    table_notes = later;
+                }
+            }
+            text => {
+                // A mark the table did not show (its row was left out):
+                // the note follows the table's last part.
+                placed.extend(table_notes.drain(..).map(|(_, note)| note));
+                placed.push(text);
+                while let Some((_, note)) = note_blocks.next_if(|(anchor, _)| *anchor <= index) {
+                    placed.push(note);
+                }
+            }
         }
     }
+    placed.extend(table_notes.into_iter().map(|(_, note)| note));
     placed.extend(note_blocks.map(|(_, note)| note));
     (placed, overlong)
+}
+
+/// The mark (`[^3]`) a `[^3]: text` note block explains.
+fn note_mark(note: &Block) -> String {
+    match note {
+        Block::Text { markdown, .. } | Block::Note { markdown, .. } => markdown
+            .find(']')
+            .map_or_else(String::new, |end| markdown[..=end].to_string()),
+        Block::Table(_) => String::new(),
+    }
 }
 
 /// `<Pages>46</Pages>` from `docProps/app.xml`.
@@ -352,16 +398,18 @@ fn paginate(
         let mut size = 0;
         // A long table is split into parts of about a page, so every row
         // lands on a page one call can return.
+        // A note never starts a page: it stays on the page of its mark.
         let markdown = blocks.into_iter().flat_map(|block| match block {
-            Block::Text { markdown, .. } => vec![markdown],
+            Block::Text { markdown, .. } => vec![(false, markdown)],
+            Block::Note { markdown, .. } => vec![(true, markdown)],
             Block::Table(part) => part
                 .split(ESTIMATED_PAGE_CHARS)
                 .iter()
-                .map(TablePart::render)
+                .map(|part| (false, part.render()))
                 .collect(),
         });
-        for markdown in markdown {
-            if size >= ESTIMATED_PAGE_CHARS && !current.is_empty() {
+        for (note, markdown) in markdown {
+            if size >= ESTIMATED_PAGE_CHARS && !current.is_empty() && !note {
                 pages_of_blocks.push(std::mem::take(&mut current));
                 size = 0;
             }
@@ -800,6 +848,8 @@ struct Paragraph {
     outline: Option<usize>,
     /// The paragraph ends a section that starts on a new page.
     section_break: bool,
+    /// A tracked change moved the paragraph mark away or deleted it.
+    mark_removed: bool,
     text: String,
     /// `SmartArt` diagrams in the paragraph, by relationship id.
     diagrams: Vec<String>,
@@ -840,6 +890,11 @@ enum Block {
         page: usize,
         markdown: String,
     },
+    /// A footnote or endnote's `[^1]: text`, on the page of its mark.
+    Note {
+        page: usize,
+        markdown: String,
+    },
     /// The rows of a table that start on one page.
     Table(TablePart),
 }
@@ -847,7 +902,7 @@ enum Block {
 impl Block {
     fn page(&self) -> usize {
         match self {
-            Self::Text { page, .. } => *page,
+            Self::Text { page, .. } | Self::Note { page, .. } => *page,
             Self::Table(part) => part.page,
         }
     }
@@ -855,14 +910,14 @@ impl Block {
     /// Characters of [`Self::into_markdown`], without building it.
     fn chars(&self) -> usize {
         match self {
-            Self::Text { markdown, .. } => markdown.chars().count(),
+            Self::Text { markdown, .. } | Self::Note { markdown, .. } => markdown.chars().count(),
             Self::Table(part) => part.rendered_chars(),
         }
     }
 
     fn into_markdown(self) -> String {
         match self {
-            Self::Text { markdown, .. } => markdown,
+            Self::Text { markdown, .. } | Self::Note { markdown, .. } => markdown,
             Self::Table(part) => part.render(),
         }
     }
@@ -967,6 +1022,14 @@ fn parse_body(
             Node::Open {
                 name: "Fallback", ..
             } => skip_depth = 1,
+            // Tracked changes not yet accepted: text moved away from here (its
+            // new copy is in a `moveTo`) and deleted runs, whose note marks,
+            // tabs and breaks are no longer in the text. The empty markers of
+            // the same names in a paragraph mark's properties are read below.
+            Node::Open {
+                name: "moveFrom" | "del",
+                ..
+            } if !in_properties => skip_depth = 1,
             Node::Open {
                 name: "pPrChange" | "rPrChange" | "sectPrChange" | "numberingChange",
                 ..
@@ -1052,6 +1115,10 @@ fn parse_body(
                     "numId" => paragraph.num_id = value.map(str::to_string),
                     "ilvl" => paragraph.level = value.map(str::to_string),
                     "outlineLvl" => paragraph.outline = value.and_then(|value| value.parse().ok()),
+                    // The paragraph mark itself was moved away or deleted:
+                    // what is left joins the next paragraph, so it takes no
+                    // list number of its own.
+                    "moveFrom" | "del" => paragraph.mark_removed = true,
                     _ => {}
                 }
             }
@@ -1112,9 +1179,12 @@ fn parse_body(
                     return;
                 };
                 let numbered = numbered(&paragraph, styles, numbering);
-                let label = numbered.as_ref().and_then(|(abstract_id, level, num_id)| {
-                    counters.next(numbering, abstract_id, num_id, *level)
-                });
+                let label = numbered
+                    .as_ref()
+                    .filter(|_| !paragraph.mark_removed)
+                    .and_then(|(abstract_id, level, num_id)| {
+                        counters.next(numbering, abstract_id, num_id, *level)
+                    });
                 let text = paragraph.text.trim();
                 if !text.is_empty() {
                     if let Some(table) = tables.last_mut() {
@@ -1324,12 +1394,15 @@ fn render_paragraph(
     );
     let indent = "  ".repeat(level);
     if let Some((abstract_id, level, _)) = numbered {
-        let marker = if numbering.is_bullet(Some(abstract_id), *level) {
-            "-"
-        } else {
-            label.unwrap_or("1.")
+        if numbering.is_bullet(Some(abstract_id), *level) {
+            return format!("{indent}- {}", one_line(text));
+        }
+        // A level shown without a number (`numFmt` "none", or an empty
+        // `lvlText`) is only indented, as Word shows it.
+        return match label {
+            Some(label) => format!("{indent}{label} {}", one_line(text)),
+            None => format!("{indent}{}", one_line(text)),
         };
-        return format!("{indent}{marker} {}", one_line(text));
     }
     match style {
         Some(StyleKind::Bullet) => format!("{indent}- {}", one_line(text)),
