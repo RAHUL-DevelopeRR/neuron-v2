@@ -18,6 +18,17 @@ pub use walk::DEFAULT_SKIPPED_DIRS;
 /// Maximum file size that can be read (10 MB).
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
 
+/// The largest Word or `PowerPoint` file `read_document` opens. A document's
+/// text is a small part of its file (photos, media and fonts are the rest),
+/// and these zip packages stream from disk in the reader's child process,
+/// which inflates only their text parts, under budgets.
+const MAX_STREAMED_DOCUMENT_SIZE: u64 = 200 * 1024 * 1024;
+
+/// The largest PDF or workbook `read_document` opens. These are read whole
+/// into the reader's child process, so they stay well inside its memory
+/// limit.
+const MAX_WHOLE_DOCUMENT_SIZE: u64 = 100 * 1024 * 1024;
+
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
 
@@ -38,6 +49,203 @@ const DIFF_CONTEXT_LINES: usize = 3;
 
 /// Match locations reported when `old_string` is ambiguous.
 const MAX_REPORTED_MATCH_LINES: usize = 20;
+
+/// File extensions `read_document` converts to Markdown, with what each is.
+pub const DOCUMENT_KINDS: &[(&str, &str)] = &[
+    ("docx", "Word document"),
+    ("pptx", "PowerPoint presentation"),
+    ("xlsx", "spreadsheet"),
+    ("xlsm", "spreadsheet"),
+    ("xlsb", "spreadsheet"),
+    ("xls", "spreadsheet"),
+    ("ods", "spreadsheet"),
+    ("pdf", "PDF document"),
+];
+
+/// What `path` is when `read_document` can read it, judged by its extension.
+#[must_use]
+pub fn document_kind(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    DOCUMENT_KINDS
+        .iter()
+        .find(|(known, _)| *known == extension)
+        .map(|(_, kind)| *kind)
+}
+
+fn file_label(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// Refuses files over [`MAX_READ_SIZE`], the limit every text-reading tool
+/// shares.
+fn check_read_size(path: &Path) -> io::Result<()> {
+    check_size(path, MAX_READ_SIZE)
+}
+
+fn check_size(path: &Path, max: u64) -> io::Result<()> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "file is too large ({} bytes, max {} bytes)",
+                metadata.len(),
+                max
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The size limit of a file `read_document` opens, by its extension: Word
+/// and `PowerPoint` files stream, PDFs and workbooks are read whole, and
+/// anything else keeps `read_file`'s limit.
+fn document_size_limit(path: &Path) -> u64 {
+    let extension = path
+        .extension()
+        .map_or_default(|extension| extension.to_string_lossy().to_ascii_lowercase());
+    match extension.as_str() {
+        "docx" | "pptx" => MAX_STREAMED_DOCUMENT_SIZE,
+        "pdf" | "xlsx" | "xlsm" | "xlsb" | "xls" | "ods" => MAX_WHOLE_DOCUMENT_SIZE,
+        _ => MAX_READ_SIZE,
+    }
+}
+
+/// Bytes at the start of a file searched for the `%PDF-` header: readers
+/// accept junk before it, and so does `read_document`.
+const PDF_HEADER_WINDOW: usize = 1024;
+
+/// Whether `bytes` (the start of a file) hold a PDF header within the first
+/// [`PDF_HEADER_WINDOW`] bytes. `read_file` and `read_document` share this
+/// test, so they agree on what is a PDF.
+#[must_use]
+pub fn has_pdf_header(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(PDF_HEADER_WINDOW)]
+        .windows(5)
+        .any(|window| window == b"%PDF-")
+}
+
+/// The first bytes of an OLE compound file (`.xls`, and Office files that
+/// are password protected).
+const OLE_SIGNATURE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+
+/// Whether `head` (the start of a file) carries the signature `read_document`
+/// reads a file with extension `extension` by: a PDF header (see
+/// [`has_pdf_header`]) for `.pdf`; a zip package (OOXML, ODF) or an OLE
+/// compound file at the very start for every other document kind. Both
+/// tools use this one test, so a file one of them sends to the other is
+/// always read there: text that merely mentions `%PDF-` under a `.xls` name
+/// is text.
+#[must_use]
+pub fn has_document_signature(extension: &str, head: &[u8]) -> bool {
+    if extension.eq_ignore_ascii_case("pdf") {
+        return has_pdf_header(head);
+    }
+    head.starts_with(b"PK\x03\x04")
+        || head.starts_with(b"PK\x05\x06")
+        || head.starts_with(&OLE_SIGNATURE)
+}
+
+/// Whether the file at `path` carries its document signature (see
+/// [`has_document_signature`]).
+fn has_document_magic(path: &Path) -> io::Result<bool> {
+    let mut head = [0u8; PDF_HEADER_WINDOW];
+    let mut file = fs::File::open(path)?;
+    let mut read = 0;
+    while read < head.len() {
+        match io::Read::read(&mut file, &mut head[read..])? {
+            0 => break,
+            count => read += count,
+        }
+    }
+    let extension = path.extension().map_or_else(String::new, |extension| {
+        extension.to_string_lossy().into_owned()
+    });
+    Ok(has_document_signature(&extension, &head[..read]))
+}
+
+/// Whether `bytes` start with a UTF-16 byte order mark.
+#[must_use]
+fn has_utf16_bom(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF])
+}
+
+/// Whether a file with a document extension (and no document signature) is
+/// really text: UTF-16 with a byte order mark, or no NUL byte in its first
+/// 8 KB. `read_document` uses the same test to send such files to
+/// `read_file`.
+#[must_use]
+pub fn document_named_file_is_text(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && (has_utf16_bom(bytes) || !bytes[..bytes.len().min(8192)].contains(&0))
+}
+
+/// `bytes` as text when [`document_named_file_is_text`] says they are:
+/// UTF-16 by its byte order mark, else UTF-8, else Windows-1252 (the usual
+/// code page of such exports). Text that is mostly UTF-8 with a few bad
+/// bytes (a cut or joined export) stays UTF-8, with only the bad bytes
+/// replaced, rather than turning every accented letter into two.
+fn decode_document_named_text(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    if !document_named_file_is_text(bytes) {
+        return None;
+    }
+    if has_utf16_bom(bytes) {
+        let little_endian = bytes[0] == 0xFF;
+        let (pairs, _) = bytes[2..].as_chunks::<2>();
+        let units = pairs.iter().map(|&pair| {
+            if little_endian {
+                u16::from_le_bytes(pair)
+            } else {
+                u16::from_be_bytes(pair)
+            }
+        });
+        return Some(
+            char::decode_utf16(units)
+                .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+                .collect(),
+        );
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Some(text.strip_prefix('\u{feff}').unwrap_or(text).to_string()),
+        Err(_) if mostly_utf8(bytes) => {
+            let text = String::from_utf8_lossy(bytes);
+            Some(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
+        }
+        Err(_) => Some(bytes.iter().map(|&byte| windows_1252(byte)).collect()),
+    }
+}
+
+/// Whether `bytes`, which are not all valid UTF-8, still read as UTF-8: they
+/// hold valid multibyte characters, at least as many as invalid bytes.
+/// Windows-1252 text almost never forms a valid multibyte sequence.
+fn mostly_utf8(bytes: &[u8]) -> bool {
+    let mut multibyte = 0usize;
+    let mut invalid = 0usize;
+    for chunk in bytes.utf8_chunks() {
+        multibyte += chunk.valid().chars().filter(|ch| ch.len_utf8() > 1).count();
+        invalid += chunk.invalid().len();
+    }
+    multibyte > 0 && multibyte >= invalid
+}
+
+/// One Windows-1252 byte as a character.
+fn windows_1252(byte: u8) -> char {
+    const HIGH: [u16; 32] = [
+        0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
+        0x2039, 0x0152, 0x008D, 0x017D, 0x008F, 0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022,
+        0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+    ];
+    match byte {
+        0x80..=0x9F => char::from_u32(u32::from(HIGH[usize::from(byte - 0x80)]))
+            .unwrap_or(char::REPLACEMENT_CHARACTER),
+        _ => char::from(byte),
+    }
+}
 
 /// Check whether a file appears to contain binary content by examining
 /// the first chunk for NUL bytes.
@@ -101,26 +309,27 @@ fn comparable_windows_path(raw: &str) -> String {
 }
 
 fn path_starts_with_normalized(path: &Path, root: &Path) -> bool {
-    if path.starts_with(root) {
-        return true;
-    }
+    path.starts_with(root) || windows_path_starts_with(path, root)
+}
 
-    #[cfg(windows)]
-    {
-        let normalize =
-            |value: &Path| comparable_windows_path(&value.to_string_lossy()).to_ascii_lowercase();
-        let path = normalize(path);
-        let mut root = normalize(root);
-        if !root.ends_with('\\') {
-            root.push('\\');
-        }
-        path == root.trim_end_matches('\\') || path.starts_with(&root)
+/// Windows spellings of one folder differ in case and prefix (`\\?\C:\`
+/// against `C:\`), so they are compared in their comparable form.
+#[cfg(windows)]
+fn windows_path_starts_with(path: &Path, root: &Path) -> bool {
+    let normalize =
+        |value: &Path| comparable_windows_path(&value.to_string_lossy()).to_ascii_lowercase();
+    let path = normalize(path);
+    let mut root = normalize(root);
+    if !root.ends_with('\\') {
+        root.push('\\');
     }
+    path == root.trim_end_matches('\\') || path.starts_with(&root)
+}
 
-    #[cfg(not(windows))]
-    {
-        false
-    }
+/// Other systems spell a folder one way, which `Path::starts_with` compares.
+#[cfg(not(windows))]
+fn windows_path_starts_with(_path: &Path, _root: &Path) -> bool {
+    false
 }
 
 /// Text payload returned by file-reading operations.
@@ -282,28 +491,48 @@ pub fn read_file(
 ) -> io::Result<ReadFileOutput> {
     let absolute_path = normalize_path(path)?;
 
-    // Check file size before reading
-    let metadata = fs::metadata(&absolute_path)?;
-    if metadata.len() > MAX_READ_SIZE {
-        return Err(io::Error::new(
+    let kind = document_kind(&absolute_path);
+    let use_read_document = |kind: &str| {
+        io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "file is too large ({} bytes, max {} bytes)",
-                metadata.len(),
-                MAX_READ_SIZE
+                "{} is a {kind}; read it with read_document (read_file reads text files only)",
+                file_label(&absolute_path)
             ),
-        ));
+        )
+    };
+    // A real document by its first bytes, even when they hold no NUL (a PDF
+    // can start with kilobytes of plain text).
+    // Checked before read_file's own size limit: read_document opens Office
+    // and PDF files well past it, so a large deck still gets the hint rather
+    // than a size error that suggests it cannot be read at all.
+    if let Some(kind) = kind {
+        if has_document_magic(&absolute_path)? {
+            check_size(&absolute_path, document_size_limit(&absolute_path))?;
+            return Err(use_read_document(kind));
+        }
     }
+    check_read_size(&absolute_path)?;
 
-    // Detect binary files
-    if is_binary_file(&absolute_path)? {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "file appears to be binary",
-        ));
-    }
-
-    let content = fs::read_to_string(&absolute_path)?;
+    let content = if let Some(kind) = kind {
+        // Text under a document extension (many "export to Excel" features
+        // write CSV or HTML as .xls, in the system code page or UTF-16):
+        // read it as text, judged the way read_document judges it, so the
+        // two tools never send a file back and forth.
+        match decode_document_named_text(&fs::read(&absolute_path)?) {
+            Some(content) => content,
+            None => return Err(use_read_document(kind)),
+        }
+    } else {
+        // Detect binary files
+        if is_binary_file(&absolute_path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file appears to be binary",
+            ));
+        }
+        fs::read_to_string(&absolute_path)?
+    };
     let lines: Vec<&str> = content.lines().collect();
     let start_index = offset.unwrap_or(0).min(lines.len());
     let window = limit.unwrap_or(DEFAULT_READ_LINE_LIMIT);
@@ -575,8 +804,7 @@ fn reindent(replacement: &str, old_string: &str, matched: &str) -> String {
     let first_line = |text: &str| {
         text.lines()
             .find(|line| !line.trim().is_empty())
-            .map(leading_whitespace)
-            .unwrap_or_default()
+            .map_or_default(leading_whitespace)
             .to_string()
     };
     let (from, to) = (first_line(old_string), first_line(matched));
@@ -1382,6 +1610,27 @@ pub fn read_file_in_workspace(
     read_file(path, offset, limit)
 }
 
+/// The file `path` names, checked the way `read_file` checks it: inside the
+/// workspace and an existing regular file. For `read_document`, which reads
+/// the file itself in a contained child process; its size limit is larger
+/// than `read_file`'s for Office and PDF files, whose size is mostly images
+/// and fonts rather than text.
+pub fn readable_file_in_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBuf> {
+    let absolute_path = normalize_path(path)?;
+    let canonical_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    validate_workspace_boundary(&absolute_path, &canonical_root)?;
+    if !absolute_path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a file", absolute_path.display()),
+        ));
+    }
+    check_size(&absolute_path, document_size_limit(&absolute_path))?;
+    Ok(absolute_path)
+}
+
 /// Write a file with workspace boundary enforcement.
 #[allow(dead_code)]
 pub fn write_file_in_workspace(
@@ -1799,6 +2048,279 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("binary"));
+    }
+
+    #[test]
+    fn a_large_document_sent_to_read_file_still_points_at_read_document() {
+        let dir = temp_path("large-doc-dir");
+        std::fs::create_dir_all(&dir).expect("dir");
+        // A 30 MB photo-heavy deck: past read_file's limit, within
+        // read_document's, so the hint names read_document, not a size.
+        for (name, header, size) in [
+            ("deck.pptx", &b"PK"[..], 30 * 1024 * 1024),
+            (
+                "annual.pdf",
+                &b"%PDF-1.7
+"[..],
+                super::MAX_READ_SIZE + 1,
+            ),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, header).expect("write");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open")
+                .set_len(size)
+                .expect("grow");
+            let message = read_file(path.to_string_lossy().as_ref(), None, None)
+                .expect_err("a document")
+                .to_string();
+            assert!(message.contains("read it with read_document"), "{message}");
+            assert!(!message.contains("too large"), "{message}");
+        }
+        // Past read_document's own limit the size is what stops it.
+        let huge = dir.join("huge.pptx");
+        std::fs::write(&huge, b"PK").expect("write");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&huge)
+            .expect("open")
+            .set_len(super::MAX_STREAMED_DOCUMENT_SIZE + 1)
+            .expect("grow");
+        let message = read_file(huge.to_string_lossy().as_ref(), None, None)
+            .expect_err("too large")
+            .to_string();
+        assert!(message.contains("too large"), "{message}");
+        // Text under a document extension keeps read_file's 10 MB limit.
+        let export = dir.join("export.xls");
+        std::fs::write(
+            &export, b"a,b,c
+",
+        )
+        .expect("write");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&export)
+            .expect("open")
+            .set_len(super::MAX_READ_SIZE + 1)
+            .expect("grow");
+        let message = read_file(export.to_string_lossy().as_ref(), None, None)
+            .expect_err("too large")
+            .to_string();
+        assert!(message.contains("too large"), "{message}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_binary_office_or_pdf_file_points_at_read_document() {
+        for (name, kind) in [
+            ("report.docx", "Word document"),
+            ("deck.PPTX", "PowerPoint presentation"),
+            ("data.xlsx", "spreadsheet"),
+            ("paper.pdf", "PDF document"),
+        ] {
+            let path = temp_path("doc-dir").join(name);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(&path, [b'P', b'K', 3, 4, 0, 0, b'x']).expect("write");
+            let error = read_file(path.to_string_lossy().as_ref(), None, None)
+                .expect_err("documents are not text");
+            let message = error.to_string();
+            assert!(message.contains("read_document"), "{message}");
+            assert!(message.contains(kind), "{message}");
+            assert!(message.contains(name), "{message}");
+            assert!(!message.contains("appears to be binary"), "{message}");
+        }
+        // A PDF whose first kilobytes are plain text is still a PDF.
+        let ascii_pdf = temp_path("ascii-pdf-dir").join("paper.pdf");
+        std::fs::create_dir_all(ascii_pdf.parent().expect("parent")).expect("dir");
+        let mut bytes = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'a', 9000));
+        std::fs::write(&ascii_pdf, &bytes).expect("write");
+        let message = read_file(ascii_pdf.to_string_lossy().as_ref(), None, None)
+            .expect_err("a PDF is not text")
+            .to_string();
+        assert!(
+            message.contains("paper.pdf is a PDF document; read it with read_document"),
+            "{message}"
+        );
+        // A PDF header a little way into the file still counts, as it does
+        // for read_document, even when no NUL byte comes early.
+        let shifted = temp_path("shifted-dir").join("shifted.pdf");
+        std::fs::create_dir_all(shifted.parent().expect("parent")).expect("dir");
+        let mut bytes = b"\r\n%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+        bytes.extend(
+            "1 0 obj << /Type /Catalog >> endobj\n"
+                .repeat(300)
+                .as_bytes(),
+        );
+        std::fs::write(&shifted, &bytes).expect("write");
+        let message = read_file(shifted.to_string_lossy().as_ref(), None, None)
+            .expect_err("a PDF")
+            .to_string();
+        assert!(message.contains("read it with read_document"), "{message}");
+        assert!(super::has_pdf_header(&bytes));
+        assert!(!super::has_pdf_header(&[b' '; 2048]));
+        let mut late = vec![b' '; 1024];
+        late.extend(b"%PDF-1.7");
+        assert!(!super::has_pdf_header(&late));
+        // A text file with a document extension still reads as text.
+        let text = temp_path("text-dir").join("notes.pdf");
+        std::fs::create_dir_all(text.parent().expect("parent")).expect("dir");
+        std::fs::write(&text, "plain text").expect("write");
+        assert!(read_file(text.to_string_lossy().as_ref(), None, None).is_ok());
+    }
+
+    #[test]
+    fn a_pdf_header_counts_only_for_pdf_files() {
+        // A text export that mentions "%PDF-" is still text under any other
+        // document extension: read_document sends it back here, so refusing
+        // it would leave the file unreadable by both tools.
+        let dir = temp_path("pdf-mention");
+        std::fs::create_dir_all(&dir).expect("dir");
+        for name in [
+            "report.xls",
+            "report.xlsx",
+            "report.ods",
+            "report.docx",
+            "report.pptx",
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, "Name,Note\nA,100%PDF-ready\n").expect("write");
+            let output = read_file(path.to_string_lossy().as_ref(), None, None)
+                .unwrap_or_else(|error| panic!("{name} reads as text: {error}"));
+            assert!(output.file.content.contains("100%PDF-ready"), "{name}");
+        }
+        // The same bytes under .pdf hold a PDF header.
+        assert!(super::has_document_signature(
+            "pdf",
+            b"Name,Note\nA,100%PDF-ready\n"
+        ));
+        assert!(!super::has_document_signature(
+            "xls",
+            b"Name,Note\nA,100%PDF-ready\n"
+        ));
+        assert!(super::has_document_signature("XLSX", b"PK\x03\x04rest"));
+        assert!(super::has_document_signature(
+            "xls",
+            &[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0]
+        ));
+        // A CSV whose first column is "PK" is not a zip package.
+        assert!(!super::has_document_signature("xls", b"PK,Name\n1,a\n"));
+        assert!(!super::has_document_signature("pdf", b"PK\x03\x04"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn text_exports_named_as_documents_read_as_text_in_any_encoding() {
+        let dir = temp_path("legacy-text");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let content = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).expect("write");
+            read_file(path.to_string_lossy().as_ref(), None, None)
+                .unwrap_or_else(|error| panic!("{name} reads as text: {error}"))
+                .file
+                .content
+        };
+        // Windows-1252, as ERP "export to Excel" features write it: not
+        // UTF-8, so it used to bounce between read_file and read_document.
+        for name in ["export.xls", "export.pdf", "export.docx"] {
+            let text = content(name, b"Name,City\nJos\xe9,M\xe1laga \x80 5\n");
+            assert!(text.contains("Jos\u{e9},M\u{e1}laga \u{20ac} 5"), "{text}");
+        }
+        // UTF-16 "Unicode Text" saved as .xls, both byte orders.
+        let mut little = vec![0xFF, 0xFE];
+        let mut big = vec![0xFE, 0xFF];
+        for unit in "Name\tCity\r\nJos\u{e9}\tM\u{e1}laga\r\n".encode_utf16() {
+            little.extend(unit.to_le_bytes());
+            big.extend(unit.to_be_bytes());
+        }
+        for bytes in [little, big] {
+            let text = content("unicode.xls", &bytes);
+            assert!(text.contains("Jos\u{e9}\tM\u{e1}laga"), "{text}");
+        }
+        // Mostly UTF-8 with one stray or cut byte stays UTF-8: only the bad
+        // byte is replaced.
+        let mut stray = "Name,City\nJos\u{e9},M\u{e1}laga\n".as_bytes().to_vec();
+        stray.push(0xFF);
+        let text = content("stray.xls", &stray);
+        assert!(text.contains("Jos\u{e9},M\u{e1}laga\n\u{fffd}"), "{text}");
+        let mut cut = "Stra\u{df}e,K\u{f6}ln,Z\u{fc}rich,".as_bytes().to_vec();
+        cut.push("\u{e9}".as_bytes()[0]);
+        let text = content("cut.xls", &cut);
+        assert!(
+            text.starts_with("Stra\u{df}e,K\u{f6}ln,Z\u{fc}rich,"),
+            "{text}"
+        );
+        // UTF-8 with a byte order mark loses the mark.
+        assert_eq!(
+            content("bom.xls", "\u{feff}a,b\n".as_bytes()).trim_end(),
+            "a,b"
+        );
+        assert!(super::document_named_file_is_text(b"\xFF\xFEa\0"));
+        assert!(!super::document_named_file_is_text(b"ab\0cd"));
+        // Binary bytes without a document signature still go to read_document.
+        let path = dir.join("broken.xls");
+        std::fs::write(&path, b"\x01\x02\0\0garbage").expect("write");
+        let message = read_file(path.to_string_lossy().as_ref(), None, None)
+            .expect_err("not text")
+            .to_string();
+        assert!(message.contains("read it with read_document"), "{message}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn readable_file_in_workspace_applies_read_file_checks() {
+        let workspace = temp_path("readable-ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let inside = workspace.join("deck.pptx");
+        std::fs::write(&inside, b"PK").expect("write");
+        let resolved =
+            super::readable_file_in_workspace(inside.to_string_lossy().as_ref(), &workspace)
+                .expect("inside the workspace");
+        assert!(resolved.ends_with("deck.pptx"));
+
+        let outside_dir = temp_path("readable-outside");
+        std::fs::create_dir_all(&outside_dir).expect("outside");
+        let outside = outside_dir.join("secret.pdf");
+        std::fs::write(&outside, b"%PDF").expect("write");
+        let error =
+            super::readable_file_in_workspace(outside.to_string_lossy().as_ref(), &workspace)
+                .expect_err("outside the workspace");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let error =
+            super::readable_file_in_workspace(workspace.to_string_lossy().as_ref(), &workspace)
+                .expect_err("a directory is not a file");
+        assert!(error.to_string().contains("not a file"));
+
+        // Office and PDF files are allowed well past read_file's 10 MB: a
+        // deck of photos or a report with figures is mostly not text.
+        for (name, limit) in [
+            ("deck.pptx", super::MAX_STREAMED_DOCUMENT_SIZE),
+            ("report.DOCX", super::MAX_STREAMED_DOCUMENT_SIZE),
+            ("annual.pdf", super::MAX_WHOLE_DOCUMENT_SIZE),
+            ("book.xlsx", super::MAX_WHOLE_DOCUMENT_SIZE),
+            ("notes.txt", super::MAX_READ_SIZE),
+        ] {
+            let big = workspace.join(name);
+            let file = std::fs::File::create(&big).expect("create");
+            if limit > super::MAX_READ_SIZE {
+                file.set_len(super::MAX_READ_SIZE * 2 + 1).expect("grow");
+                let resolved =
+                    super::readable_file_in_workspace(big.to_string_lossy().as_ref(), &workspace)
+                        .expect("a 20 MB document is read");
+                assert!(resolved.ends_with(name));
+            }
+            file.set_len(limit + 1).expect("grow");
+            let error =
+                super::readable_file_in_workspace(big.to_string_lossy().as_ref(), &workspace)
+                    .expect_err("over the size limit");
+            assert!(error.to_string().contains("too large"), "{name}: {error}");
+        }
+        std::fs::remove_dir_all(&workspace).ok();
+        std::fs::remove_dir_all(&outside_dir).ok();
     }
 
     #[test]

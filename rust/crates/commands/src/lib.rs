@@ -1981,9 +1981,8 @@ fn usage_error(command: &str, argument_hint: &str) -> SlashCommandParseError {
 }
 
 fn command_error(message: &str, command: &str, usage: &str) -> SlashCommandParseError {
-    let detail = render_slash_command_help_detail(command)
-        .map(|detail| format!("\n\n{detail}"))
-        .unwrap_or_default();
+    let detail =
+        render_slash_command_help_detail(command).map_or_default(|detail| format!("\n\n{detail}"));
     SlashCommandParseError::new(format!("{message}\n  Usage            {usage}{detail}"))
 }
 
@@ -2272,10 +2271,13 @@ enum DefinitionSource {
     UserCodex,
     UserClaude,
     Bundled,
+    /// Neuron's enforced skills: always on and never shadowed.
+    Enforced,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DefinitionScope {
+    Enforced,
     Project,
     UserConfigHome,
     UserHome,
@@ -2289,6 +2291,7 @@ impl DefinitionScope {
             Self::UserConfigHome => "User config roots",
             Self::UserHome => "User home roots",
             Self::Bundled => "Bundled defaults",
+            Self::Enforced => "Enforced (always on)",
         }
     }
 }
@@ -2302,6 +2305,7 @@ impl DefinitionSource {
             Self::UserClawConfigHome | Self::UserCodexHome => DefinitionScope::UserConfigHome,
             Self::UserClaw | Self::UserCodex | Self::UserClaude => DefinitionScope::UserHome,
             Self::Bundled => DefinitionScope::Bundled,
+            Self::Enforced => DefinitionScope::Enforced,
         }
     }
 
@@ -2349,6 +2353,20 @@ struct SkillRoot {
     source: DefinitionSource,
     path: PathBuf,
     origin: SkillOrigin,
+}
+
+impl SkillRoot {
+    /// Whether the skill folder `folder` may load from this root: the
+    /// enforced root holds only the enforced skills, whatever else is there.
+    fn admits(&self, folder: &std::ffi::OsStr) -> bool {
+        self.admits_name(&folder.to_string_lossy())
+    }
+
+    /// Whether a skill named `name` may load from this root.
+    fn admits_name(&self, name: &str) -> bool {
+        self.source != DefinitionSource::Enforced
+            || runtime::enforced_skills::is_enforced_skill(name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2732,7 +2750,7 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
             let entry = entry?;
             match root.origin {
                 SkillOrigin::SkillsDir => {
-                    if !entry.path().is_dir() {
+                    if !entry.path().is_dir() || !root.admits(&entry.file_name()) {
                         continue;
                     }
                     let skill_path = entry.path().join("SKILL.md");
@@ -2741,10 +2759,12 @@ pub fn resolve_skill_path(cwd: &Path, skill: &str) -> std::io::Result<PathBuf> {
                     }
                     let contents = fs::read_to_string(&skill_path)?;
                     let (name, _) = parse_skill_frontmatter(&contents);
-                    entries.push((
-                        name.unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
-                        skill_path,
-                    ));
+                    let name =
+                        name.unwrap_or_else(|| entry.file_name().to_string_lossy().to_string());
+                    if !root.admits_name(&name) {
+                        continue;
+                    }
+                    entries.push((name, skill_path));
                 }
                 SkillOrigin::LegacyCommandsDir => {
                     let path = entry.path();
@@ -3189,6 +3209,18 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
 #[allow(clippy::too_many_lines)]
 fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     let mut roots = Vec::new();
+
+    // First, so an enforced skill wins over any project or user skill of its name.
+    if let Ok(enforced) =
+        runtime::enforced_skills::enforced_skill_root(ConfigLoader::default_for(cwd).config_home())
+    {
+        push_unique_skill_root(
+            &mut roots,
+            DefinitionSource::Enforced,
+            enforced,
+            SkillOrigin::SkillsDir,
+        );
+    }
 
     for ancestor in cwd.ancestors() {
         push_unique_skill_root(
@@ -3649,7 +3681,7 @@ fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSumma
             let entry = entry?;
             match root.origin {
                 SkillOrigin::SkillsDir => {
-                    if !entry.path().is_dir() {
+                    if !entry.path().is_dir() || !root.admits(&entry.file_name()) {
                         continue;
                     }
                     let skill_path = entry.path().join("SKILL.md");
@@ -3658,9 +3690,13 @@ fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSumma
                     }
                     let contents = fs::read_to_string(skill_path)?;
                     let (name, description) = parse_skill_frontmatter(&contents);
+                    let name =
+                        name.unwrap_or_else(|| entry.file_name().to_string_lossy().to_string());
+                    if !root.admits_name(&name) {
+                        continue;
+                    }
                     root_skills.push(SkillSummary {
-                        name: name
-                            .unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
+                        name,
                         description,
                         source: root.source,
                         shadowed_by: None,
@@ -3874,8 +3910,18 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
         format!("  {total_active} available skills"),
         String::new(),
     ];
+    let warnings = enforced_shadow_warnings(skills);
+    if !warnings.is_empty() {
+        lines.extend(
+            warnings
+                .iter()
+                .map(|warning| format!("  warning: {warning}")),
+        );
+        lines.push(String::new());
+    }
 
     for scope in [
+        DefinitionScope::Enforced,
         DefinitionScope::Project,
         DefinitionScope::UserConfigHome,
         DefinitionScope::UserHome,
@@ -3923,8 +3969,36 @@ fn render_skills_report_json(skills: &[SkillSummary]) -> Value {
             "active": active,
             "shadowed": skills.len().saturating_sub(active),
         },
+        "warnings": enforced_shadow_warnings(skills),
         "skills": skills.iter().map(skill_summary_json).collect::<Vec<_>>(),
     })
+}
+
+/// One warning per project or user skill ignored because an enforced skill
+/// has its name.
+fn enforced_shadow_warnings(skills: &[SkillSummary]) -> Vec<String> {
+    skills
+        .iter()
+        .filter(|skill| {
+            skill.shadowed_by == Some(DefinitionSource::Enforced)
+                && skill.source != DefinitionSource::Enforced
+        })
+        .map(|skill| {
+            format!(
+                "{} skill `{}` is ignored: Neuron enforces its own skill of that name",
+                skill.source.label(),
+                skill.name
+            )
+        })
+        .collect()
+}
+
+/// Warnings about project or user skills that an enforced skill overrides:
+/// the same lines `/skills` shows, for a caller that lists them elsewhere.
+#[must_use]
+pub fn enforced_skill_shadow_warnings(cwd: &Path) -> Vec<String> {
+    load_skills_from_roots(&discover_skill_roots(cwd))
+        .map_or_default(|skills| enforced_shadow_warnings(&skills))
 }
 
 fn render_skill_install_report(skill: &InstalledSkill) -> String {
@@ -4333,8 +4407,7 @@ impl McpChange {
                 let query = rest.join(" ");
                 let added = loader
                     .load()
-                    .map(|config| runtime::mcp_catalog_servers(config.mcp()))
-                    .unwrap_or_default();
+                    .map_or_default(|config| runtime::mcp_catalog_servers(config.mcp()));
                 let catalog = runtime::McpCatalog::builtin();
                 Some(Self::Catalog {
                     version: catalog.version.clone(),
@@ -4355,10 +4428,7 @@ impl McpChange {
             }
             "remove" => {
                 let parsed = parse_mcp_remove_args(rest);
-                let name = parsed
-                    .as_ref()
-                    .map(|(name, _)| name.clone())
-                    .unwrap_or_default();
+                let name = parsed.as_ref().map_or_default(|(name, _)| name.clone());
                 Some(Self::Removed {
                     name,
                     outcome: parsed
@@ -4961,6 +5031,7 @@ fn definition_source_id(source: DefinitionSource) -> &'static str {
             "user_claw"
         }
         DefinitionSource::Bundled => "bundled",
+        DefinitionSource::Enforced => "enforced",
     }
 }
 
@@ -6285,6 +6356,101 @@ mod tests {
             resolve_skill_path(&workspace, "/handoff").expect("legacy command should resolve"),
             legacy_commands.join("handoff.md")
         );
+    }
+
+    #[test]
+    fn enforced_skills_win_over_project_skills_of_the_same_name_with_a_warning() {
+        let _guard = env_guard();
+        let workspace = temp_dir("enforced-registry");
+        let original = std::env::var_os("NEURON_CONFIG_HOME");
+        let config_home = workspace.join("config");
+        std::env::set_var("NEURON_CONFIG_HOME", &config_home);
+        fs::create_dir_all(&config_home).expect("config home");
+        // Turning the bundled defaults off leaves enforced skills alone.
+        fs::write(
+            config_home.join("settings.json"),
+            r#"{"defaultSkills":false}"#,
+        )
+        .expect("settings");
+
+        let enforced = resolve_skill_path(&workspace, "reading-documents").expect("resolves");
+        assert!(fs::read_to_string(&enforced)
+            .expect("read")
+            .contains("read_document"));
+
+        let project_skills = workspace.join(".claw").join("skills");
+        write_skill(&project_skills, "reading-documents", "Project override");
+        write_skill(&project_skills, "ponytail", "Project Ponytail override");
+        assert_eq!(
+            resolve_skill_path(&workspace, "reading-documents").expect("resolves"),
+            enforced,
+            "a project skill does not shadow an enforced one"
+        );
+        assert_eq!(
+            resolve_skill_path(&workspace, "ponytail").expect("resolves"),
+            project_skills.join("ponytail").join("SKILL.md"),
+            "bundled defaults still yield to project skills"
+        );
+
+        let skills = load_skills_from_roots(&super::discover_skill_roots(&workspace))
+            .expect("registry loads");
+        let project = skills
+            .iter()
+            .find(|skill| {
+                skill.name == "reading-documents" && skill.source == DefinitionSource::ProjectClaw
+            })
+            .expect("project copy listed");
+        assert_eq!(project.shadowed_by, Some(DefinitionSource::Enforced));
+        let report = render_skills_report(&skills);
+        assert!(report.contains("Enforced (always on):"), "{report}");
+        assert!(
+            report.contains(
+                "warning: Project roots skill `reading-documents` is ignored: Neuron enforces its own skill of that name"
+            ),
+            "{report}"
+        );
+        // A folder someone else put next to the enforced skills is not
+        // loaded as enforced: only the enforced skills' own names are.
+        let enforced_root = enforced
+            .parent()
+            .and_then(Path::parent)
+            .expect("enforced root")
+            .to_path_buf();
+        write_skill(&enforced_root, "planted", "Planted skill");
+        // A folder of another name claiming an enforced skill's name.
+        fs::create_dir_all(enforced_root.join("disguised")).expect("disguised");
+        fs::write(
+            enforced_root.join("disguised").join("SKILL.md"),
+            "---\nname: reading-documents\ndescription: Disguised\n---\n\n# disguised\n",
+        )
+        .expect("write disguised");
+        assert!(resolve_skill_path(&workspace, "planted").is_err());
+        assert_eq!(
+            resolve_skill_path(&workspace, "reading-documents").expect("resolves"),
+            enforced
+        );
+        let planted = load_skills_from_roots(&super::discover_skill_roots(&workspace))
+            .expect("registry loads");
+        let enforced_listed = planted
+            .iter()
+            .filter(|skill| skill.source == DefinitionSource::Enforced)
+            .collect::<Vec<_>>();
+        assert_eq!(enforced_listed.len(), 1, "{planted:?}");
+        assert_eq!(enforced_listed[0].name, "reading-documents");
+        assert_ne!(enforced_listed[0].description.as_deref(), Some("Disguised"));
+        fs::remove_dir_all(enforced_root.join("planted")).expect("cleanup");
+        fs::remove_dir_all(enforced_root.join("disguised")).expect("cleanup");
+
+        let json = super::render_skills_report_json(&skills);
+        assert_eq!(json["warnings"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            super::enforced_skill_shadow_warnings(&workspace).len(),
+            1,
+            "startup warnings name the ignored skill"
+        );
+
+        restore_env_var("NEURON_CONFIG_HOME", original);
+        fs::remove_dir_all(workspace).expect("cleanup");
     }
 
     #[test]

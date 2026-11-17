@@ -257,8 +257,7 @@ pub fn non_interactive_hint(remedy: &PermissionRemedy) -> String {
     let why = remedy
         .no_prefix_rule
         .as_deref()
-        .map(|why| format!(" (no prefix rule covers this command: {why})"))
-        .unwrap_or_default();
+        .map_or_default(|why| format!(" (no prefix rule covers this command: {why})"));
     if remedy.allow_rules.is_empty() {
         format!("{NOT_RUN} and tell the user that no permissions.allow rule covers it{why}.")
     } else {
@@ -342,8 +341,7 @@ impl SessionApprovals {
         self.state()
             .shell_prefixes
             .get(tool_name)
-            .map(|prefixes| prefixes.iter().cloned().collect())
-            .unwrap_or_default()
+            .map_or_default(|prefixes| prefixes.iter().cloned().collect())
     }
 
     /// Approves a web domain for `WebFetch`.
@@ -496,17 +494,13 @@ fn escalation_reason(
     let why = if current_mode == PermissionMode::Prompt {
         "Permission mode prompt asks before every tool call.".to_string()
     } else if command.is_some() {
-        let detail = detail
-            .map(|detail| format!(" ({detail})"))
-            .unwrap_or_default();
+        let detail = detail.map_or_default(|detail| format!(" ({detail})"));
         format!(
             "It is outside the auto-allow list for {}{detail}.",
             current_mode.as_str()
         )
     } else {
-        let detail = detail
-            .map(|detail| format!(" ({detail})"))
-            .unwrap_or_default();
+        let detail = detail.map_or_default(|detail| format!(" ({detail})"));
         format!(
             "It needs {}, beyond what {} allows{detail}.",
             required_mode.as_str(),
@@ -870,7 +864,7 @@ impl PermissionPolicy {
                     }
                 }
             }
-            "read_file" => {
+            "read_file" | "read_document" => {
                 if let Some(reason) = input_field(input, &["path", "file_path", "filePath"])
                     .and_then(|path| sensitive_path_reason_resolved(&path, workspace.as_slice()))
                 {
@@ -1992,9 +1986,13 @@ impl PermissionRule {
     /// (MIT), upstream commit aca6584, which lowercases rule names; Neuron has
     /// mixed-case tool names, so it compares case-insensitively instead.
     /// A server rule (`mcp__github`, `mcp__github__*`) names every tool of that MCP
-    /// server.
+    /// server. A `read_file` rule also names `read_document`: both read a file
+    /// from the same `path` input, so a path denied (or set to ask) for
+    /// `read_file` cannot be read as a document instead.
     fn names_tool(&self, tool_name: &str) -> bool {
         self.tool_name.eq_ignore_ascii_case(tool_name)
+            || (self.tool_name.eq_ignore_ascii_case("read_file")
+                && tool_name.eq_ignore_ascii_case("read_document"))
             || mcp_server_rule_prefix(&self.tool_name).is_some_and(|prefix| {
                 tool_name.len() > prefix.len()
                     && tool_name
@@ -2424,6 +2422,7 @@ mod tests {
             .with_tool_requirement("WebFetch", PermissionMode::ReadOnly)
             .with_tool_requirement("WebSearch", PermissionMode::ReadOnly)
             .with_tool_requirement("read_file", PermissionMode::ReadOnly)
+            .with_tool_requirement("read_document", PermissionMode::ReadOnly)
             .with_workspace_root(std::env::temp_dir().join("neuron-permissions-workspace"))
             .with_session_approvals(SessionApprovals::isolated())
     }
@@ -2442,11 +2441,17 @@ mod tests {
             policy.authorize("read_file", &read(".env.example"), None),
             PermissionOutcome::Allow
         );
+        assert_eq!(
+            policy.authorize("read_document", &read("docs/plan.docx"), None),
+            PermissionOutcome::Allow
+        );
         for (tool, input) in [
             ("read_file", read(".env")),
             ("read_file", read("services/api/.env.local")),
             ("read_file", read(".neuron/settings.local.json")),
             ("read_file", read(".claw.json")),
+            ("read_document", read(".env")),
+            ("read_document", read(".neuron/settings.local.json")),
             ("grep_search", grep(".env")),
             ("grep_search", grep(".neuron/settings.json")),
         ] {
@@ -2463,6 +2468,52 @@ mod tests {
         );
         assert_eq!(prompter.seen.len(), 1);
         assert_eq!(prompter.seen[0].session_prefixes, [] as [String; 0]);
+    }
+
+    #[test]
+    fn read_file_rules_also_cover_read_document() {
+        let read = |path: &str| serde_json::json!({ "path": path }).to_string();
+        let rules = RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            vec!["read_file(confidential/:*)".to_string()],
+            vec!["Read_File(drafts/:*)".to_string()],
+        );
+        let policy = workspace_policy(PermissionMode::WorkspaceWrite).with_permission_rules(&rules);
+
+        for tool in ["read_file", "read_document"] {
+            let PermissionOutcome::Deny { reason } =
+                policy.authorize(tool, &read("confidential/board.pdf"), None)
+            else {
+                panic!("{tool} should be denied by the read_file rule");
+            };
+            assert!(reason.contains("denied by rule"), "{reason}");
+
+            let mut prompter = RecordingPrompter {
+                seen: Vec::new(),
+                allow: true,
+            };
+            assert_eq!(
+                policy.authorize(tool, &read("drafts/plan.docx"), Some(&mut prompter)),
+                PermissionOutcome::Allow
+            );
+            assert_eq!(prompter.seen.len(), 1, "{tool} should ask");
+        }
+        assert_eq!(
+            policy.authorize("read_document", &read("public/report.pdf"), None),
+            PermissionOutcome::Allow
+        );
+
+        // The alias runs one way only: a read_document rule does not name read_file.
+        let rules = RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            vec!["read_document(confidential/:*)".to_string()],
+            Vec::new(),
+        );
+        let policy = workspace_policy(PermissionMode::WorkspaceWrite).with_permission_rules(&rules);
+        assert_eq!(
+            policy.authorize("read_file", &read("confidential/notes.txt"), None),
+            PermissionOutcome::Allow
+        );
     }
 
     #[test]

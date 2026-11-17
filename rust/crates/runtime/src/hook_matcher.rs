@@ -114,6 +114,16 @@ pub fn matcher_matches(matcher: Option<&str>, target: Option<&str>) -> bool {
     let Some(target) = target else {
         return true;
     };
+    // A hook written for `read_file` also runs for `read_document`, which reads
+    // a file from the same `path` input, so a read guard cannot be bypassed by
+    // reading the file as a document.
+    if target.eq_ignore_ascii_case("read_document") && matcher_matches_name(matcher, "read_file") {
+        return true;
+    }
+    matcher_matches_name(matcher, target)
+}
+
+fn matcher_matches_name(matcher: &str, target: &str) -> bool {
     if is_plain_alternation(matcher) {
         return matcher
             .split('|')
@@ -264,6 +274,18 @@ mod tests {
         assert!(!matcher_matches(Some("mcp__.*"), Some("bash")));
         assert!(matcher_matches(Some(".*_file"), Some("read_file")));
         assert!(!matcher_matches(Some("read.*"), Some("xread_file")));
+    }
+
+    #[test]
+    fn read_file_hooks_also_run_for_read_document() {
+        assert!(matcher_matches(Some("read_file"), Some("read_document")));
+        assert!(matcher_matches(
+            Some("write_file|Read_File"),
+            Some("read_document")
+        ));
+        assert!(matcher_matches(Some("read_.*"), Some("read_document")));
+        assert!(!matcher_matches(Some("read_document"), Some("read_file")));
+        assert!(!matcher_matches(Some("write_file"), Some("read_document")));
     }
 
     #[test]

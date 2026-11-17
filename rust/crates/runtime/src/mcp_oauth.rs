@@ -389,8 +389,7 @@ pub fn parse_token_response(body: &str) -> Result<TokenResponse, String> {
         let description = value
             .get("error_description")
             .and_then(Value::as_str)
-            .map(|text| format!(": {text}"))
-            .unwrap_or_default();
+            .map_or_default(|text| format!(": {text}"));
         return Err(format!("the token endpoint refused: {error}{description}"));
     }
     let response: TokenResponse = serde_json::from_value(value)
@@ -532,7 +531,7 @@ pub(crate) async fn bearer_token(
 }
 
 pub(crate) fn auth_required(server_name: &str, detail: Option<&str>) -> io::Error {
-    let detail = detail.map(|text| format!(" ({text})")).unwrap_or_default();
+    let detail = detail.map_or_default(|text| format!(" ({text})"));
     io::Error::new(
         io::ErrorKind::PermissionDenied,
         format!("authorization required{detail}; run `neuron mcp login {server_name}`"),
@@ -823,8 +822,7 @@ async fn wait_for_callback(
         let (outcome, page) = if let Some(error) = params.error {
             let detail = params
                 .error_description
-                .map(|text| format!(": {text}"))
-                .unwrap_or_default();
+                .map_or_default(|text| format!(": {text}"));
             (
                 Err(format!("sign-in failed: {error}{detail}")),
                 "Sign-in failed. You can close this tab.",

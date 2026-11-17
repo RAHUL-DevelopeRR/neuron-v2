@@ -229,6 +229,17 @@ type RuntimePluginStateBuildOutput = (
 );
 
 fn main() {
+    // Hidden: one read_document parse in a child process, so a hostile file
+    // cannot crash or hang the agent (see `tools::run_document_worker`).
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == tools::DOCUMENT_WORKER_ARG)
+    {
+        std::process::exit(tools::run_document_worker());
+    }
+    // Never parse documents in this process: with no binary to start, reads
+    // are refused.
+    tools::use_own_binary_as_document_worker();
     if let Err(error) = run() {
         let message = error.to_string();
         // When --output-format json is active, emit errors as JSON so downstream
@@ -737,6 +748,7 @@ fn run_prompt(
     let effective_model = configure_provider_for_model(model)?;
     // A model the gateway cannot serve now is named before the request fails.
     gateway_repl::warn_about_prompt_model(&effective_model);
+    repl_loop::print_skill_shadow_warnings();
     // `cat log | neuron prompt "explain this log"`: what stdin carries is context
     // for the prompt, in any permission mode. A run whose stdin is not a terminal
     // never asks for approval (approvals and questions are refused), so reading
@@ -6508,7 +6520,7 @@ mod tests {
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: Some(
-                    ["glob_search", "read_file", "write_file"]
+                    ["glob_search", "read_document", "read_file", "write_file"]
                         .into_iter()
                         .map(str::to_string)
                         .collect()
@@ -6518,6 +6530,25 @@ mod tests {
                 reasoning_effort: None,
                 allow_broad_cwd: false,
             }
+        );
+        // Naming read_file itself also allows read_document, which read_file
+        // sends Office and PDF files to.
+        let args = vec![
+            "--allowedTools".to_string(),
+            "read_file,grep_search".to_string(),
+        ];
+        let CliAction::Repl { allowed_tools, .. } = parse_args(&args).expect("args should parse")
+        else {
+            panic!("a repl");
+        };
+        assert_eq!(
+            allowed_tools,
+            Some(
+                ["grep_search", "read_document", "read_file"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            )
         );
     }
 

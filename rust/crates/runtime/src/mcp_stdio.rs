@@ -740,8 +740,7 @@ impl ManagedMcpServer {
         };
         self.exited_on_start = true;
         let log = mcp_server_log()
-            .map(|path| format!("; its output is in {}", path.display()))
-            .unwrap_or_default();
+            .map_or_default(|path| format!("; its output is in {}", path.display()));
         // An unvetted server started with `npx -y` or `uvx` fails like this when its
         // sandbox has no network to fetch the package.
         let hint = match &self.bootstrap.transport {

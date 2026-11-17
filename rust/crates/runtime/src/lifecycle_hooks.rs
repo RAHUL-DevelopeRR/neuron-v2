@@ -123,7 +123,7 @@ mod tests {
                     .iter()
                     .rev()
                     .find(|message| message.role == MessageRole::User)
-                    .map(|message| {
+                    .map_or_default(|message| {
                         message
                             .blocks
                             .iter()
@@ -132,8 +132,7 @@ mod tests {
                                 _ => None,
                             })
                             .collect::<String>()
-                    })
-                    .unwrap_or_default();
+                    });
                 self.prompts.lock().expect("prompts").push(last_user);
                 Ok(vec![
                     AssistantEvent::TextDelta("done".to_string()),

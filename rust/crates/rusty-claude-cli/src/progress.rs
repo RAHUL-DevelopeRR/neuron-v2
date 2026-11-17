@@ -297,7 +297,9 @@ pub(crate) fn describe_tool_progress(name: &str, input: &str) -> String {
                 format!("command {}", truncate_for_summary(command.trim(), 100))
             }
         }
-        "read_file" | "Read" => format!("reading {}", extract_tool_path(&parsed)),
+        "read_file" | "read_document" | "Read" => {
+            format!("reading {}", extract_tool_path(&parsed))
+        }
         "write_file" | "Write" => format!("writing {}", extract_tool_path(&parsed)),
         "edit_file" | "Edit" => format!("editing {}", extract_tool_path(&parsed)),
         "glob_search" | "Glob" => {

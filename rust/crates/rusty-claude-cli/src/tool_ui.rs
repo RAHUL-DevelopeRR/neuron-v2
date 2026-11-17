@@ -12,7 +12,7 @@ pub fn format_tool_call_start(name: &str, input: &str) -> String {
 
     let detail = match name {
         "bash" | "Bash" => format_bash_call(&parsed),
-        "read_file" | "Read" => {
+        "read_file" | "read_document" | "Read" => {
             let path = extract_tool_path(&parsed);
             format!("{ICON_FILE} {DIM}Reading {path}{R}")
         }

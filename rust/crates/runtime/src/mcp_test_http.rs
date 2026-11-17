@@ -40,8 +40,7 @@ impl FakeRequest {
     /// `application/x-www-form-urlencoded` body fields.
     pub fn form(&self) -> Vec<(String, String)> {
         reqwest::Url::parse(&format!("http://x/?{}", self.body))
-            .map(|url| url.query_pairs().into_owned().collect())
-            .unwrap_or_default()
+            .map_or_default(|url| url.query_pairs().into_owned().collect())
     }
 }
 

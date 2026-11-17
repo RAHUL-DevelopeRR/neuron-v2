@@ -76,7 +76,10 @@ pub(crate) fn extract_text_from_bytes(data: &[u8]) -> String {
 
 /// Inflate (zlib / deflate) compressed data via `flate2`.
 fn inflate(data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut decoder = flate2::read::ZlibDecoder::new(data);
+    // A few KB of deflate can claim gigabytes; stop at a size no text
+    // stream needs.
+    const MAX_INFLATED_BYTES: u64 = 64 * 1024 * 1024;
+    let mut decoder = flate2::read::ZlibDecoder::new(data).take(MAX_INFLATED_BYTES);
     let mut buf = Vec::new();
     decoder
         .read_to_end(&mut buf)

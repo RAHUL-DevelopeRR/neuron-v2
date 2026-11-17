@@ -375,6 +375,25 @@ pub(crate) struct ReplLaunch {
     pub resume: Option<String>,
 }
 
+/// `warning: ...` lines for project or user skills that an enforced skill
+/// overrides, shown when a session starts (as `/skills` lists them), so a
+/// project's own skill of that name is not ignored without a word.
+pub(crate) fn skill_shadow_warnings(cwd: &Path) -> Vec<String> {
+    commands::enforced_skill_shadow_warnings(cwd)
+        .into_iter()
+        .map(|warning| format!("warning: {warning}"))
+        .collect()
+}
+
+/// Prints [`skill_shadow_warnings`] for the current folder.
+pub(crate) fn print_skill_shadow_warnings() {
+    if let Ok(cwd) = env::current_dir() {
+        for warning in skill_shadow_warnings(&cwd) {
+            crate::provider::print_warning(&warning);
+        }
+    }
+}
+
 /// Starts the interactive REPL (optionally continuing a saved session) and
 /// runs it until the user exits.
 pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Error>> {
@@ -414,6 +433,7 @@ pub(crate) fn launch(options: ReplLaunch) -> Result<(), Box<dyn std::error::Erro
     println!();
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
+    print_skill_shadow_warnings();
     print_footer(&cli);
     if resumed {
         println!(
@@ -804,6 +824,42 @@ fn group_digits(value: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_project_skill_an_enforced_skill_overrides_is_named_at_startup() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "neuron-skill-shadow-{}-{unique}",
+            std::process::id()
+        ));
+        let skill = workspace
+            .join(".claw")
+            .join("skills")
+            .join("reading-documents");
+        std::fs::create_dir_all(&skill).expect("skill dir");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---
+name: reading-documents
+description: Project copy
+---
+Read documents.
+",
+        )
+        .expect("skill");
+        let warnings = super::skill_shadow_warnings(&workspace);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with("warning: ")
+                    && warning.contains("`reading-documents` is ignored")),
+            "{warnings:?}"
+        );
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
     use super::{
         check_context_argument, context_command_argument, describe_turn_outcome,
         describe_turn_outcome_without_refusal, dispatch_line, group_digits, handle_turn_interrupt,
@@ -1220,10 +1276,11 @@ mod tests {
         assert_eq!(session, PathBuf::from("s.jsonl"));
         assert_eq!(launch.model.as_deref(), Some("groq/openai/gpt-oss-120b"));
         assert_eq!(launch.permission_mode, Some(PermissionMode::ReadOnly));
+        // read_file brings read_document, which it sends documents to.
         assert_eq!(
             launch.allowed_tools,
             Some(
-                ["read_file", "grep_search"]
+                ["read_file", "read_document", "grep_search"]
                     .into_iter()
                     .map(String::from)
                     .collect()

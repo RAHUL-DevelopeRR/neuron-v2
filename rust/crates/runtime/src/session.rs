@@ -137,8 +137,7 @@ impl SessionLoadDiagnostics {
             let reason = self
                 .first_skip_reason
                 .as_deref()
-                .map(|reason| format!(" (first: {reason})"))
-                .unwrap_or_default();
+                .map_or_default(|reason| format!(" (first: {reason})"));
             parts.push(format!(
                 "skipped {} malformed record(s){reason}",
                 self.skipped_records
@@ -492,13 +491,12 @@ impl Session {
         let prompt_history = object
             .get("prompt_history")
             .and_then(JsonValue::as_array)
-            .map(|entries| {
+            .map_or_default(|entries| {
                 entries
                     .iter()
                     .filter_map(SessionPromptEntry::from_json_opt)
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         let model = object
             .get("model")
             .and_then(JsonValue::as_str)
@@ -1199,8 +1197,7 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 fn current_time_millis() -> u64 {
     let wall_clock = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or_default();
+        .map_or_default(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
 
     let mut candidate = wall_clock;
     loop {

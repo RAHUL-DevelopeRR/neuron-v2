@@ -60,7 +60,7 @@ pub(crate) fn preview_tool_input(tool: &str, input: &str) -> ToolInputPreview {
 /// The fields that say what a `tool` call is about, in order of preference.
 fn target_keys(tool: &str) -> &'static [&'static str] {
     match tool {
-        "read_file" | "write_file" | "edit_file" => &["path", "file_path"],
+        "read_file" | "read_document" | "write_file" | "edit_file" => &["path", "file_path"],
         "NotebookEdit" => &["notebook_path", "path"],
         "bash" | "PowerShell" => &["command"],
         "glob_search" | "grep_search" => &["pattern"],

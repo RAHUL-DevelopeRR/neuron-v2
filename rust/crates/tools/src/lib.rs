@@ -251,6 +251,15 @@ impl GlobalToolRegistry {
                     )
                 })?;
                 allowed.insert(canonical.clone());
+                // `read` or `read_file` means reading files, documents
+                // included: read_file sends Office and PDF files to
+                // read_document, and read_file permission rules and hooks
+                // cover read_document too.
+                if canonical == "read_file"
+                    && canonical_names.iter().any(|name| name == "read_document")
+                {
+                    allowed.insert("read_document".to_string());
+                }
             }
         }
 
@@ -701,6 +710,37 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                         "type": "integer",
                         "minimum": 1,
                         "description": "Maximum lines to return (default 2000)"
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "read_document",
+            description: "Read a Word (.docx), PowerPoint (.pptx), spreadsheet (.xlsx, .xls, .ods) or PDF file from the workspace as Markdown: headings, lists, tables, slides with speaker notes, sheets and PDF pages. Use this, not scripts or read_file, for these files.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "pages": {
+                        "type": "string",
+                        "description": "Pages, slides or sheets to read, for example \"3\", \"2-5\" or \"1,4-\"; a sheet name also works. Default: all"
+                    },
+                    "rows": {
+                        "type": "string",
+                        "description": "Spreadsheets only: sheet rows to read, for example \"501-1000\""
+                    },
+                    "columns": {
+                        "type": "string",
+                        "description": "Spreadsheets only: columns to read, for example \"AO-BZ\""
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "minimum": 500,
+                        "maximum": 36_000,
+                        "description": "Most characters to return (default 12000, at most 36000); longer output ends with a hint naming the pages to read next"
                     }
                 },
                 "required": ["path"],
@@ -1620,6 +1660,11 @@ fn execute_tool_with_enforcer_and_cancel(
         "read_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<ReadFileInput>(input).and_then(run_read_file)
+        }
+        "read_document" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<ReadDocumentInput>(input)
+                .and_then(|input| run_read_document(input, cancel))
         }
         "write_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -2574,6 +2619,28 @@ fn run_read_file(input: ReadFileInput) -> Result<String, String> {
 }
 
 #[allow(clippy::needless_pass_by_value)]
+fn run_read_document(
+    input: ReadDocumentInput,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
+    let workspace_root = runtime::workdir::current_dir().map_err(|error| error.to_string())?;
+    let path =
+        runtime::readable_file_in_workspace(&input.path, &workspace_root).map_err(io_to_string)?;
+    // In the CLI this runs in a child process with a time (and on Windows a
+    // memory) limit; the workspace and permission checks above stay here.
+    read_document::worker::read(
+        &path,
+        &read_document::Options {
+            pages: input.pages.as_deref(),
+            rows: input.rows.as_deref(),
+            columns: input.columns.as_deref(),
+            max_chars: input.max_chars,
+        },
+        cancel,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
     let workspace_root = runtime::workdir::current_dir().map_err(|error| error.to_string())?;
     to_pretty_json(
@@ -2685,11 +2752,46 @@ fn io_to_string(error: std::io::Error) -> String {
     error.to_string()
 }
 
+/// Unknown keys are refused, here and in [`ReadDocumentInput`]: permission
+/// rules match the first of several keys (`command` before `path`), so an
+/// extra `command` key would otherwise let a rule on `path` be matched
+/// against other text while the file named by `path` is read.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadFileInput {
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadDocumentInput {
+    path: String,
+    #[serde(default, deserialize_with = "deserialize_pages")]
+    pages: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_pages")]
+    rows: Option<String>,
+    #[serde(default)]
+    columns: Option<String>,
+    max_chars: Option<usize>,
+}
+
+/// `pages` as models send it: a string, or a bare number.
+fn deserialize_pages<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text),
+        Some(Value::Number(number)) => Some(number.to_string()),
+        Some(other) => {
+            return Err(serde::de::Error::custom(format!(
+                "pages must be a string such as \"2-4\", not {other}"
+            )))
+        }
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -4886,7 +4988,7 @@ pub const REVIEW_ENV_VAR: &str = "NEURON_REVIEW";
 /// The model the reviewer runs on; the session's model when unset.
 pub const REVIEW_MODEL_ENV_VAR: &str = "NEURON_REVIEW_MODEL";
 const REVIEW_MAX_ITERATIONS: usize = 12;
-const REVIEWER_TOOLS: &[&str] = &["read_file", "glob_search", "grep_search"];
+const REVIEWER_TOOLS: &[&str] = &["read_file", "read_document", "glob_search", "grep_search"];
 const REVIEWER_INSTRUCTIONS: &str = "You review a code change that another agent just made, before it reports back to the user. Report only real problems: parts of the user's request that are missing or done wrong, bugs the change introduces, changes the request did not ask for, and failing checks the change caused. Do not report style preferences or optional improvements. Read files when the diff alone does not show enough. If there is nothing to fix, reply with exactly LGTM. Otherwise reply with a numbered list, one problem per item, naming the file (and the line when you can) and what is wrong in one or two sentences.";
 
 /// The completion check's second opinion (see `runtime::ChangeReviewer`): a
@@ -5266,6 +5368,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
     let tools = match subagent_type {
         "Explore" => vec![
             "read_file",
+            "read_document",
             "glob_search",
             "grep_search",
             "WebFetch",
@@ -5276,6 +5379,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
         ],
         "Plan" => vec![
             "read_file",
+            "read_document",
             "glob_search",
             "grep_search",
             "WebFetch",
@@ -5289,6 +5393,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
         "Verification" => vec![
             "bash",
             "read_file",
+            "read_document",
             "glob_search",
             "grep_search",
             "WebFetch",
@@ -5302,6 +5407,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
         ],
         "claw-guide" => vec![
             "read_file",
+            "read_document",
             "glob_search",
             "grep_search",
             "WebFetch",
@@ -5314,6 +5420,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
         "statusline-setup" => vec![
             "bash",
             "read_file",
+            "read_document",
             "write_file",
             "edit_file",
             "glob_search",
@@ -5324,6 +5431,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
         _ => vec![
             "bash",
             "read_file",
+            "read_document",
             "write_file",
             "edit_file",
             "glob_search",
@@ -8361,6 +8469,13 @@ mod gateway_search;
 pub mod lane_completion;
 pub mod pdf_extract;
 mod powershell;
+mod read_document;
+pub use read_document::worker::{
+    read_document_with_worker, run_worker as run_document_worker,
+    use_own_binary_as_worker as use_own_binary_as_document_worker,
+    use_worker as use_document_worker, worker_request as document_worker_request,
+    TEST_DELAY_VAR as DOCUMENT_WORKER_TEST_DELAY_VAR, WORKER_ARG as DOCUMENT_WORKER_ARG,
+};
 #[cfg(test)]
 mod safety_tests;
 mod web_fetch;
@@ -8460,6 +8575,109 @@ mod tests {
             .fold(PermissionPolicy::new(mode), |policy, spec| {
                 policy.with_tool_requirement(spec.name, spec.required_permission)
             })
+    }
+
+    #[test]
+    fn read_document_reads_inside_the_workspace_only_and_is_read_only() {
+        let _guard = env_guard();
+        let root = temp_path("read-document-root");
+        let outside_dir = temp_path("read-document-outside");
+        fs::create_dir_all(root.join("docs")).expect("workspace root");
+        fs::create_dir_all(&outside_dir).expect("outside dir");
+        let docx = crate::read_document::tests::sample_docx();
+        fs::write(root.join("docs").join("plan.docx"), &docx).expect("inside docx");
+        let outside = outside_dir.join("secret.docx");
+        fs::write(&outside, &docx).expect("outside docx");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let inside = execute_tool(
+            "read_document",
+            &json!({ "path": "docs/plan.docx", "pages": 1, "max_chars": 2000 }),
+        );
+        let escaped = execute_tool(
+            "read_document",
+            &json!({ "path": outside.to_string_lossy() }),
+        );
+        let traversal = execute_tool(
+            "read_document",
+            &json!({ "path": "../read-document-outside/secret.docx" }),
+        );
+        let read_file_hint = execute_tool("read_file", &json!({ "path": "docs/plan.docx" }));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside_dir);
+
+        let inside = inside.expect("reads inside the workspace");
+        assert!(inside.contains("# Project Plan"), "{inside}");
+        assert!(inside.contains("showing page 1]"), "{inside}");
+        assert!(escaped
+            .expect_err("outside is refused")
+            .contains("escapes workspace boundary"));
+        assert!(traversal.is_err(), "parent traversal is refused");
+        let hint = read_file_hint.expect_err("read_file refuses documents");
+        assert!(hint.contains("read_document"), "{hint}");
+
+        let spec = mvp_tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "read_document")
+            .expect("registered");
+        assert_eq!(spec.required_permission, PermissionMode::ReadOnly);
+        assert_eq!(
+            super::tool_advertisement("read_document"),
+            super::ToolAdvertisement::Default
+        );
+        assert!(runtime::parallel_tools::is_concurrency_safe_tool(
+            "read_document"
+        ));
+    }
+
+    #[test]
+    fn an_extra_key_cannot_steer_a_read_rule_away_from_the_path_read() {
+        let _guard = env_guard();
+        let root = temp_path("read-rule-extra-key");
+        fs::create_dir_all(root.join("confidential")).expect("workspace root");
+        fs::write(
+            root.join("confidential").join("board.docx"),
+            crate::read_document::tests::sample_docx(),
+        )
+        .expect("docx");
+        fs::write(root.join("confidential").join("notes.txt"), "secret").expect("text");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let rules = runtime::RuntimePermissionRuleConfig::new(
+            Vec::new(),
+            vec!["read_file(confidential/:*)".to_string()],
+            Vec::new(),
+        );
+        let policy = permission_policy_for_mode(PermissionMode::WorkspaceWrite)
+            .with_permission_rules(&rules);
+        let registry = GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy));
+        let results = [
+            ("read_document", "confidential/board.docx"),
+            ("read_file", "confidential/notes.txt"),
+        ]
+        .map(|(tool, path)| {
+            (
+                tool,
+                registry.execute(tool, &json!({ "path": path })),
+                registry.execute(tool, &json!({ "path": path, "command": "public/x" })),
+            )
+        });
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(&root);
+
+        for (tool, plain, steered) in results {
+            let plain = plain.expect_err("the rule denies the path");
+            assert!(plain.contains("denied"), "{tool}: {plain}");
+            let steered = steered.expect_err("an extra key is refused");
+            assert!(steered.contains("unknown field"), "{tool}: {steered}");
+            assert!(!steered.contains("Project Plan"), "{tool}: {steered}");
+            assert!(!steered.contains("secret"), "{tool}: {steered}");
+        }
     }
 
     #[test]
@@ -11299,10 +11517,12 @@ mod tests {
 
         let explore = allowed_tools_for_subagent("Explore");
         assert!(explore.contains("read_file"));
+        assert!(explore.contains("read_document"));
         assert!(explore.contains("grep_search"));
         assert!(!explore.contains("bash"));
 
         let plan = allowed_tools_for_subagent("Plan");
+        assert!(plan.contains("read_document"));
         assert!(plan.contains("TodoWrite"));
         assert!(plan.contains("StructuredOutput"));
         assert!(!plan.contains("Agent"));
