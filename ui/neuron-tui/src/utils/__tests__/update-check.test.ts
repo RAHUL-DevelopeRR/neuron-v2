@@ -257,6 +257,18 @@ describe('the command', () => {
     expect({ ...DEFAULT_INSTALL_COMMANDS, pip: undefined }).toEqual({ ...others, pip: undefined })
   })
 
+  test("the manifest's pip line gains --upgrade, so it updates an existing install", () => {
+    const live = parseManifest({ ...MANIFEST, install: { pip: 'python -m pip install --pre neuroncli' } })!
+    expect(installCommand(live, 'pip', 'win32')).toBe('python -m pip install --upgrade --pre neuroncli')
+    for (const ready of ['python -m pip install -U neuroncli', 'pip install --upgrade --pre neuroncli']) {
+      const manifest = parseManifest({ ...MANIFEST, install: { pip: ready } })!
+      expect(installCommand(manifest, 'pip', 'linux')).toBe(ready)
+    }
+    // Only pip lines change; other methods keep the manifest's text.
+    const npm = parseManifest({ ...MANIFEST, install: { npm: 'npm install -g @zero-x.live/neuron' } })!
+    expect(installCommand(npm, 'npm')).toBe('npm install -g @zero-x.live/neuron')
+  })
+
   test('the built-in pip command upgrades, with the interpreter each platform has', () => {
     expect(defaultInstallCommand('pip', 'win32')).toBe('python -m pip install --upgrade --pre neuroncli')
     for (const platform of ['linux', 'darwin'] as const) {
@@ -544,7 +556,7 @@ describe('the request', () => {
         status: 'available',
         latest: '7.0.0-beta.1',
         required: true,
-        command: 'python -m pip install --pre neuroncli',
+        command: 'python -m pip install --upgrade --pre neuroncli',
         manifestUrl: url,
       })
       const missing = await runUpdateCheck(

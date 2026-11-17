@@ -218,7 +218,20 @@ export function installCommand(
   method: InstallMethod,
   platform: NodeJS.Platform = process.platform,
 ): string {
-  return cleanCommand(manifest?.install?.[method]) ?? defaultInstallCommand(method, platform)
+  const fromManifest = cleanCommand(manifest?.install?.[method])
+  if (fromManifest === null) return defaultInstallCommand(method, platform)
+  return method === 'pip' ? withPipUpgrade(fromManifest) : fromManifest
+}
+
+/**
+ * The manifest's pip line is the site's first-install command
+ * (`python -m pip install --pre neuroncli`); run over an existing install, pip
+ * only says "Requirement already satisfied". An update needs `--upgrade`, so it
+ * is added after `install` when the line has neither `--upgrade` nor `-U`.
+ */
+export function withPipUpgrade(command: string): string {
+  if (/(^|\s)(--upgrade|-U)(\s|$)/.test(command)) return command
+  return command.replace(/(\bpip\s+install)(\s|$)/, '$1 --upgrade$2')
 }
 
 // --------------------------------------------------------------- manifest
