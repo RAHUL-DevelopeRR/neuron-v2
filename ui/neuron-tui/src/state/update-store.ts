@@ -105,7 +105,11 @@ function check(overrides: Partial<UpdateCheckOptions>): Promise<UpdateCheckResul
         manifestUrl: DEFAULT_MANIFEST_URL,
       }
     }
-    useUpdateStore.getState().setResult(result)
+    // A failed read again (offline, say) does not hide an update already found.
+    const previous = useUpdateStore.getState().result
+    if (!(result.status === 'failed' && previous?.status === 'available')) {
+      useUpdateStore.getState().setResult(result)
+    }
     return result
   })()
   inFlight = run

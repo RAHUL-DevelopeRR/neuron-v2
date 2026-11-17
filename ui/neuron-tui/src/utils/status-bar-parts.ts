@@ -19,11 +19,11 @@
  *
  * When the line is too wide it gives way one step at a time
  * ({@link COLLAPSE_STEPS}): the account group shortens to the window, labels
- * go, the update notice shortens to "Update available · /update", then the
- * window's reset time, the git counts, the folder name, half the meter's
- * circles and the connectors chip go; then the branch is cut, the account
- * group, the update notice, the thinking level and the circles go, and last
- * the model name is cut. The provider monogram, the permission mode and the
+ * go, then the window's reset time, the git counts, the folder name, half the
+ * meter's circles and the connectors chip; the update notice shortens to
+ * "Update available · /update"; then the branch is cut, the account group,
+ * the update notice, the thinking level and the circles go, and last the
+ * model name is cut. The provider monogram, the permission mode and the
  * context percentage are never dropped.
  */
 
@@ -536,13 +536,14 @@ type Step = Partial<Compaction> | 'cut-branch' | 'cut-model'
 export const COLLAPSE_STEPS: readonly Step[] = [
   { accountShort: true },
   { labels: false },
-  // The command is long: the notice keeps its words and points at /update.
-  { updateShort: true },
   { accountResets: false },
   { gitCounts: false },
   { folder: false },
   { cells: 5 },
   { connectors: false },
+  // The command is long: once the cosmetic parts are gone, the notice keeps
+  // its words and points at /update.
+  { updateShort: true },
   // The token window stays before a whole branch name (it is what refuses requests).
   'cut-branch',
   { accountShown: false },

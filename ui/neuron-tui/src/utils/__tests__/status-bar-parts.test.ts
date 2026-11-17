@@ -424,7 +424,7 @@ describe('the update notice', () => {
 
   test('below the minimum version it is required, in the error tone', () => {
     expect(notice(line(withUpdate(true), 240))!.spans).toEqual([{ text: `Update required: ${NPM}`, tone: 'error' }])
-    expect(noticeText(line(withUpdate(true), 150))).toBe('Update required · /update')
+    expect(noticeText(line(withUpdate(true), 100))).toBe('Update required · /update')
   })
 
   test('it is not the first thing to give way: the account shortens before it', () => {
@@ -437,9 +437,19 @@ describe('the update notice', () => {
     expect(render(withUpdate(), afterFirstStep)).toContain('think high')
   })
 
+  test('the command stays in full at common widths, while cosmetic parts give way', () => {
+    for (const width of [170, 160, 150]) {
+      expect(noticeText(line(withUpdate(), width))).toBe(`Update available! Run: ${NPM}`)
+    }
+    // The labels, the git counts and the folder went first.
+    expect(render(withUpdate(), 150)).toBe(
+      `G Gemini 2.5 Flash │ ● high │ ⎇ feat/tui-status-bar │ ✎ Edit │ ●●●◑○○○○○○ 35%      Update available! Run: ${NPM} │ 120K/1M`,
+    )
+  })
+
   test('narrower, it shortens to point at /update, and goes only after the account', () => {
-    expect(noticeText(line(withUpdate(), 150))).toBe('Update available · /update')
-    expect(render(withUpdate(), 150)).toContain('Update available · /update │ 120K/1M')
+    expect(noticeText(line(withUpdate(), 100))).toBe('Update available · /update')
+    expect(render(withUpdate(), 100)).toContain('Update available · /update │ 120K/1M')
 
     let sawShortWithoutAccount = false
     let lastWithNotice = 0

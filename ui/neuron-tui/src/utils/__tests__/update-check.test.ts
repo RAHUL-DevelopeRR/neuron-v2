@@ -494,6 +494,11 @@ describe('/update', () => {
     })
     expect(updateNotice(state)).toEqual({ command: 'curl -fsSL https://zero-x.live/install.sh | sh', required: false })
 
+    // Offline on a later /update: the report says so, the notice stays.
+    const offline = await refreshUpdateCheck(options({ fetchImpl: jsonFetch('down', 503) }))
+    expect(offline.status).toBe('failed')
+    expect(updateNotice(useUpdateStore.getState())).not.toBeNull()
+
     await refreshUpdateCheck(options({ version: '7.0.0-alpha.6' }))
     expect(useUpdateStore.getState().status).toBe('up-to-date')
     expect(updateNotice(useUpdateStore.getState())).toBeNull()
