@@ -10,15 +10,20 @@
  * thinking level, the workspace folder and git branch, the permission mode,
  * the MCP connectors (`⧉ 5/6`: up of turned on, amber when one needs the
  * user, a lock when the connector policy requires one) and the context meter;
- * on the right, the Zero-X plan and its usage: the plan's rolling token window
- * (Free: 1M tokens per 5 hours) as used/limit with the time it resets, and
- * today's requests. Each segment opens its picker when clicked (`target`).
+ * on the right, the update notice while a newer Neuron release exists
+ * ("Update available! Run: <command>", utils/update-check.ts), then the Zero-X
+ * plan and its usage: the plan's rolling token window (Free: 1M tokens per 5
+ * hours) as used/limit with the time it resets, and today's requests. Each
+ * segment opens its picker when clicked (`target`); the update notice copies
+ * its command.
  *
  * When the line is too wide it gives way one step at a time
  * ({@link COLLAPSE_STEPS}): the account group shortens to the window, labels
- * go, then the window's reset time, the git counts, the folder name, half
- * the meter's circles and the connectors chip; then the branch is cut, the account group goes, the
- * thinking level and the circles go, and last the model name is cut. The provider monogram, the permission mode and the
+ * go, the update notice shortens to "Update available · /update", then the
+ * window's reset time, the git counts, the folder name, half the meter's
+ * circles and the connectors chip go; then the branch is cut, the account
+ * group, the update notice, the thinking level and the circles go, and last
+ * the model name is cut. The provider monogram, the permission mode and the
  * context percentage are never dropped.
  */
 
@@ -64,6 +69,8 @@ export type StatusTarget =
   | 'context'
   | 'connectors'
   | 'account'
+  /** The update notice: clicking it copies the command. */
+  | 'update'
 
 export interface StatusSpan {
   text: string
@@ -174,6 +181,14 @@ export interface StatusBarInput {
   timeZone?: string
   /** The MCP servers' chip (state/mcp-panel-store.ts `connectorsChip`); none before they are known. */
   connectors?: ConnectorsChip | null
+  /** A newer release and its install command (state/update-store.ts `updateNotice`); none when up to date. */
+  update?: UpdateNotice | null
+}
+
+export interface UpdateNotice {
+  command: string
+  /** The installed version is older than the release manifest's minimum. */
+  required: boolean
 }
 
 /** One segment's possible texts, before they are fitted. */
@@ -213,6 +228,7 @@ export interface StatusView {
       }
     | { kind: 'signed-out' }
     | null
+  update: UpdateNotice | null
   glyphs: Glyphs
   mode: GlyphMode
 }
@@ -375,6 +391,7 @@ export function statusView({
   now = Date.now(),
   timeZone,
   connectors = null,
+  update = null,
 }: StatusBarInput): StatusView | null {
   if (!status) return null
   const glyphs = statusGlyphs(mode)
@@ -459,6 +476,7 @@ export function statusView({
       : null,
     connectors,
     account: accountView,
+    update,
     glyphs,
     mode,
   }
@@ -488,6 +506,9 @@ export interface Compaction {
   /** Last resorts in a very narrow terminal: the branch, then the model's name, go. */
   branch: boolean
   modelName: boolean
+  /** The update notice as "Update available · /update", then gone. */
+  updateShort: boolean
+  updateShown: boolean
 }
 
 export const FULL: Compaction = {
@@ -505,6 +526,8 @@ export const FULL: Compaction = {
   modelMax: null,
   branch: true,
   modelName: true,
+  updateShort: false,
+  updateShown: true,
 }
 
 type Step = Partial<Compaction> | 'cut-branch' | 'cut-model'
@@ -513,6 +536,8 @@ type Step = Partial<Compaction> | 'cut-branch' | 'cut-model'
 export const COLLAPSE_STEPS: readonly Step[] = [
   { accountShort: true },
   { labels: false },
+  // The command is long: the notice keeps its words and points at /update.
+  { updateShort: true },
   { accountResets: false },
   { gitCounts: false },
   { folder: false },
@@ -521,6 +546,7 @@ export const COLLAPSE_STEPS: readonly Step[] = [
   // The token window stays before a whole branch name (it is what refuses requests).
   'cut-branch',
   { accountShown: false },
+  { updateShown: false },
   { think: false },
   { cells: 0, warningShown: false },
   'cut-model',
@@ -619,6 +645,16 @@ export function buildLine(view: StatusView, c: Compaction): StatusLine {
   }
 
   const right: StatusSegment[] = []
+  const update = view.update
+  if (update && c.updateShown) {
+    const tone: StatusTone = update.required ? 'error' : 'warning'
+    const text = c.updateShort
+      ? `${update.required ? 'Update required' : 'Update available'} · /update`
+      : update.required
+        ? `Update required: ${update.command}`
+        : `Update available! Run: ${update.command}`
+    right.push({ target: 'update', spans: [{ text, tone }] })
+  }
   const account = view.account
   if (account?.kind === 'signed-out' && c.warningShown) {
     right.push({ target: 'account', spans: [{ text: 'Signed out: /login', tone: 'warning' }] })

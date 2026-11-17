@@ -2,8 +2,9 @@
 // clickable footer pattern of Freebuff's cli/src/components/freebuff-chat-footer.tsx
 // (a Button around "model • effort · cwd") grew into Neuron's prompt status bar:
 // five clickable segments (model, thinking level, workspace and branch,
-// permission mode, context meter) and the Zero-X account on the right, fitted
-// to the width by utils/status-bar-parts.ts. See ui/neuron-tui/PORTING.md.
+// permission mode, context meter), the MCP connectors chip, and on the right
+// the update notice and the Zero-X account, fitted to the width by
+// utils/status-bar-parts.ts. See ui/neuron-tui/PORTING.md.
 /**
  * The line under the input:
  *
@@ -11,8 +12,9 @@
  *
  * Each segment opens its picker when clicked (`onActivate`); the same pickers
  * have keys (Alt+M/T/W/P/C, Shift+Tab for the permission mode) and slash
- * commands. It replaces the one-line engine footer; a running turn's live
- * activity stays in the status bar above the input.
+ * commands. The update notice ("Update available! Run: <command>") copies its
+ * command when clicked. It replaces the one-line engine footer; a running
+ * turn's live activity stays in the status bar above the input.
  */
 
 import { TextAttributes } from '@opentui/core'
@@ -22,6 +24,7 @@ import { Button } from './button'
 import { useTheme } from '../hooks/use-theme'
 import { useEngineStore } from '../state/engine-store'
 import { connectorsChip, useMcpPanelStore } from '../state/mcp-panel-store'
+import { useUpdateStore } from '../state/update-store'
 import { getGlyphMode, type GlyphMode } from '../utils/glyphs'
 import { renderProbe } from '../utils/render-probe'
 import {
@@ -104,6 +107,9 @@ export const PromptStatusBar = memo(function PromptStatusBar({
   const models = useEngineStore((state) => state.models)
   const pendingPermission = useEngineStore((state) => state.pendingPermission)
   const mcpServers = useMcpPanelStore((state) => state.known)
+  const updateStatus = useUpdateStore((state) => state.status)
+  const updateCommand = useUpdateStore((state) => state.command)
+  const updateRequired = useUpdateStore((state) => state.required)
   const effectiveNow = fixedNow ?? clock
   const line = useMemo(
     () =>
@@ -117,10 +123,27 @@ export const PromptStatusBar = memo(function PromptStatusBar({
           now: effectiveNow,
           timeZone,
           connectors: connectorsChip(mcpServers),
+          update:
+            updateStatus === 'available' && updateCommand
+              ? { command: updateCommand, required: updateRequired }
+              : null,
         },
         Math.max(0, width - 2),
       ),
-    [status, account, models, glyphMode, pendingPermission, effectiveNow, timeZone, mcpServers, width],
+    [
+      status,
+      account,
+      models,
+      glyphMode,
+      pendingPermission,
+      effectiveNow,
+      timeZone,
+      mcpServers,
+      updateStatus,
+      updateCommand,
+      updateRequired,
+      width,
+    ],
   )
   if (!line || line.left.length === 0) return null
 
@@ -149,7 +172,14 @@ export const PromptStatusBar = memo(function PromptStatusBar({
         <>
           <box style={{ flexGrow: 1, minWidth: RIGHT_GAP }} />
           {line.right.map((segment, index) => (
-            <Segment key={`right-${index}`} segment={segment} onActivate={onActivate} />
+            <React.Fragment key={`right-${segment.target}-${index}`}>
+              {index > 0 ? (
+                <text style={{ wrapMode: 'none', flexShrink: 0 }}>
+                  <span fg={theme.border}>{SEGMENT_SEPARATOR}</span>
+                </text>
+              ) : null}
+              <Segment segment={segment} onActivate={onActivate} />
+            </React.Fragment>
           ))}
         </>
       ) : null}

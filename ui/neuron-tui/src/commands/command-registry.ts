@@ -5,7 +5,7 @@
 // (git-view-commands.ts) are found only when the engine has their feature;
 // /new also starts the engine on a fresh conversation (`clear --confirm`), and
 // the /mode:* commands are not registered (AGENT_MODES_AVAILABLE); /upgrade
-// opens the plans page.
+// opens the plans page; /update (Neuron's) reports the release check.
 // See ui/neuron-tui/PORTING.md.
 import { handleCopyConversationCommand } from './copy-conversation'
 import { handleExportConversationCommand } from './export-conversation'
@@ -24,13 +24,16 @@ import { clearEngineConversation } from '../engine/engine-session'
 import { useThemeStore } from '../hooks/use-theme'
 import { startNewChat } from '../project-files'
 import { useChatStore } from '../state/chat-store'
+import { refreshUpdateCheck } from '../state/update-store'
 import { stopActiveRun } from '../utils/active-run'
 import { AGENT_MODES, AGENT_MODES_AVAILABLE } from '../utils/constants'
+import { copyTextToClipboard } from '../utils/clipboard'
 import { exitCliCleanly } from '../utils/exit-cleanly'
 import { safeOpen } from '../utils/open-url'
 import { getSystemMessage, getUserMessage } from '../utils/message-history'
 import { capturePendingAttachments } from '../utils/pending-attachments'
 import { getSkillByName } from '../utils/skill-registry'
+import { formatUpdateReport } from '../utils/update-check'
 import { USER_SHELL_AVAILABLE } from '../utils/user-shell'
 
 import type { MultilineInputHandle } from '../components/multiline-input'
@@ -438,6 +441,30 @@ const ALL_COMMANDS: CommandDefinition[] = [
           ),
         ])
       })
+    },
+  }),
+  defineCommand({
+    // Whether a newer Neuron release exists, and the command that installs it.
+    name: 'update',
+    handler: async (params) => {
+      const shown = params.inputValue.trim()
+      params.saveToHistory(shown)
+      clearInput(params)
+      const result = await refreshUpdateCheck()
+      let copied = false
+      if (result.status === 'available') {
+        try {
+          copied =
+            (await copyTextToClipboard(result.command, { suppressGlobalMessage: true })) !== 'unverified'
+        } catch {
+          copied = false
+        }
+      }
+      params.setMessages((prev) => [
+        ...prev,
+        getUserMessage(shown),
+        getSystemMessage(formatUpdateReport(result, copied)),
+      ])
     },
   }),
   defineCommand({

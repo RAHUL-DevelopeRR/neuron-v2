@@ -3,7 +3,7 @@
 // while shell commands are not implemented (USER_SHELL_AVAILABLE), and nor are
 // the /mode:* commands (AGENT_MODES_AVAILABLE) or /image while images don't
 // reach the model (IMAGES_REACH_THE_MODEL); the git commands are listed only
-// when the engine has their feature.
+// when the engine has their feature; /update is Neuron's.
 // See ui/neuron-tui/PORTING.md.
 import { IMAGES_REACH_THE_MODEL } from '../engine/attachments'
 import { FEATURE_CHECKPOINTS, FEATURE_GIT_VIEWS } from '../engine/protocol'
@@ -230,6 +230,11 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     id: 'upgrade',
     label: 'upgrade',
     description: 'Plans and pricing (opens zero-x.live/pricing)',
+  },
+  {
+    id: 'update',
+    label: 'update',
+    description: 'Check for a newer Neuron release and copy the command that installs it',
   },
   {
     id: 'theme:toggle',

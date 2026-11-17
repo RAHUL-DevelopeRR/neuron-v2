@@ -407,3 +407,74 @@ describe('the gateway lists model families; sessions may hold route ids', () => 
     }
   })
 })
+
+describe('the update notice', () => {
+  const NPM = 'npm install -g @zero-x.live/neuron'
+  const withUpdate = (required = false, rest: Partial<StatusBarInput> = {}) =>
+    input({}, 'unicode', { update: { command: NPM, required }, ...rest })
+  const notice = (value: StatusLine) => value.right.find((segment) => segment.target === 'update')
+  const noticeText = (value: StatusLine) => notice(value)?.spans.map((span) => span.text).join('') ?? null
+
+  test('on the right, before the account, in the warning tone, the command in full', () => {
+    const fitted = line(withUpdate(), 240)
+    expect(fitted.right.map((segment) => segment.target)).toEqual(['update', 'account'])
+    expect(notice(fitted)!.spans).toEqual([{ text: `Update available! Run: ${NPM}`, tone: 'warning' }])
+    expect(render(withUpdate(), 240)).toContain(`Update available! Run: ${NPM} │ Free · 5h 120K/1M`)
+  })
+
+  test('below the minimum version it is required, in the error tone', () => {
+    expect(notice(line(withUpdate(true), 240))!.spans).toEqual([{ text: `Update required: ${NPM}`, tone: 'error' }])
+    expect(noticeText(line(withUpdate(true), 150))).toBe('Update required · /update')
+  })
+
+  test('it is not the first thing to give way: the account shortens before it', () => {
+    // Wide enough for everything once the account group is short, and no more.
+    const full = line(withUpdate(), 240)
+    const afterFirstStep = lineWidth(full) - stringWidth('Free · 5h 120K/1M · resets 14:32 · 37/100 req') + stringWidth('120K/1M · resets 14:32')
+    const fitted = line(withUpdate(), afterFirstStep)
+    expect(noticeText(fitted)).toBe(`Update available! Run: ${NPM}`)
+    expect(fitted.right.find((segment) => segment.target === 'account')!.spans[0]!.text).toBe('120K/1M')
+    expect(render(withUpdate(), afterFirstStep)).toContain('think high')
+  })
+
+  test('narrower, it shortens to point at /update, and goes only after the account', () => {
+    expect(noticeText(line(withUpdate(), 150))).toBe('Update available · /update')
+    expect(render(withUpdate(), 150)).toContain('Update available · /update │ 120K/1M')
+
+    let sawShortWithoutAccount = false
+    let lastWithNotice = 0
+    for (let width = 240; width >= 24; width--) {
+      const fitted = line(withUpdate(), width)
+      expect(lineWidth(fitted)).toBeLessThanOrEqual(width)
+      const text = noticeText(fitted)
+      const hasAccount = fitted.right.some((segment) => segment.target === 'account')
+      // Never dropped while the account group is still there.
+      if (hasAccount) expect(text).not.toBeNull()
+      if (text === 'Update available · /update' && !hasAccount) sawShortWithoutAccount = true
+      if (text !== null) lastWithNotice = width
+      // Once it is gone, the thinking level is the next to go.
+      if (text === null && width < lastWithNotice - 30) expect(targets(fitted)).not.toContain('think')
+    }
+    expect(sawShortWithoutAccount).toBe(true)
+    // And it is gone before the narrowest lines.
+    expect(lastWithNotice).toBeGreaterThan(40)
+    expect(render(withUpdate(), 40)).toBe('G Gemini 2.5 Flash │ ✎ Edit │ 35%')
+  })
+
+  test('none without an update, and the line is the same as before', () => {
+    for (const width of [200, 120, 80, 44]) {
+      expect(render(input({}, 'unicode', { update: null }), width)).toBe(render(input(), width))
+    }
+    expect(line(input(), 240).right.map((segment) => segment.target)).toEqual(['account'])
+  })
+
+  test('another provider: the notice alone on the right', () => {
+    const fitted = line(
+      input({ signed_in: false, sign_in_required: false, account: null }, 'unicode', {
+        update: { command: NPM, required: false },
+      }),
+      200,
+    )
+    expect(fitted.right.map((segment) => segment.target)).toEqual(['update'])
+  })
+})
