@@ -77,6 +77,38 @@ class PackagedLauncherTests(unittest.TestCase):
             version = launcher._package_version()
             download.assert_called_once_with(version, launcher._release_asset(), self.cache / version)
 
+    def _run_main_capturing_environment(self, environment: dict) -> dict:
+        """Run main() with a stub binary and return the environment neuron gets."""
+        launcher = self.launcher
+        binary = self.root / "neuron"
+        seen: dict = {}
+
+        def capture(*_args: object) -> int:
+            seen.update(os.environ)
+            if os.name == "posix":
+                raise SystemExit(0)
+            return 0
+
+        with patch.dict(os.environ, environment), patch.object(
+            launcher, "_find_binary", return_value=binary
+        ), patch.object(launcher, "_find_ui_binary", return_value=None), patch.object(
+            launcher.os, "execv", side_effect=capture
+        ), patch.object(launcher, "_run_child", side_effect=capture), patch.object(
+            sys, "argv", ["neuron"]
+        ), self.assertRaises(SystemExit):
+            launcher.main()
+        return seen
+
+    def test_neuron_is_told_this_is_a_pip_install_unless_the_user_says_otherwise(self) -> None:
+        with patch.dict(os.environ, {}):
+            os.environ.pop("NEURON_INSTALL_METHOD", None)
+            self.assertEqual(self._run_main_capturing_environment({})["NEURON_INSTALL_METHOD"], "pip")
+            self.assertNotIn("NEURON_INSTALL_METHOD", os.environ)
+        for stated, expected in (("shell", "shell"), ("  ", "pip")):
+            with self.subTest(stated=stated):
+                seen = self._run_main_capturing_environment({"NEURON_INSTALL_METHOD": stated})
+                self.assertEqual(seen["NEURON_INSTALL_METHOD"], expected)
+
     def test_binary_path_override_must_be_an_existing_native_binary(self) -> None:
         native = self.root / "native-neuron"
         native.touch()

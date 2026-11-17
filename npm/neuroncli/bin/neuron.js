@@ -13,7 +13,7 @@ import {spawn} from 'node:child_process';
 import {existsSync, statSync} from 'node:fs';
 import path from 'node:path';
 import {LauncherError, ensureBinary} from '../lib/binary.js';
-import {wantsFullScreenUi} from '../lib/full-screen.js';
+import {wantsFullScreenUi, withInstallMethod} from '../lib/full-screen.js';
 import {exitCodeForSignal, isInteractive, listenedSignals, shouldForwardSignal} from '../lib/signals.js';
 
 function report(error) {
@@ -52,7 +52,7 @@ function childEnvironment() {
   // The default MCP servers are not npm dependencies of this package: Neuron installs
   // each from the downloads its catalog pins and checks every hash (npm would honour no
   // lockfile of a published package). Playwright runs with this Node.js.
-  return {...process.env, NEURON_MCP_NODE: process.execPath};
+  return withInstallMethod({...process.env, NEURON_MCP_NODE: process.execPath});
 }
 
 async function main() {

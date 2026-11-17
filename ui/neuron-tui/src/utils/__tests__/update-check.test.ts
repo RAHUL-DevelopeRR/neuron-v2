@@ -10,6 +10,7 @@ import {
   DEFAULT_MANIFEST_URL,
   UPDATE_CHECK_USER_AGENT,
   compareSemver,
+  defaultInstallCommand,
   detectInstallMethod,
   evaluateManifest,
   fetchManifest,
@@ -203,16 +204,85 @@ describe('install method', () => {
     expect(detectInstallMethod({ ...linux, env: { NEURON_INSTALL_METHOD: ' PIP ' }, execPath: npmPath })).toBe('pip')
     expect(detectInstallMethod({ ...linux, env: { NEURON_INSTALL_METHOD: 'brew' }, execPath: npmPath })).toBe('npm')
   })
+
+  test("npm's cache fallback is npm when the npm launcher says so", () => {
+    // A read-only npm package folder puts the UI in the cache the pip launcher uses too.
+    const linuxCache = '/home/dev/.cache/neuroncli/7.0.0-alpha.6/neuron-tui-linux-x64'
+    expect(detectInstallMethod({ ...linux, env: { NEURON_INSTALL_METHOD: 'npm' }, execPath: linuxCache })).toBe('npm')
+    const winCache = 'C:\\Users\\dev\\AppData\\Local\\neuroncli\\7.0.0-alpha.6\\neuron-tui-win32-x64.exe'
+    expect(
+      detectInstallMethod({ ...win, env: { ...win.env, NEURON_INSTALL_METHOD: 'npm' }, execPath: winCache }),
+    ).toBe('npm')
+    // An older launcher that says nothing: the shared cache reads as pip.
+    expect(detectInstallMethod({ ...linux, execPath: linuxCache })).toBe('pip')
+  })
+
+  test('pip with NEURON_CACHE_DIR, and the UI bundled in the pip package', () => {
+    const custom = '/data/neuron-cache/7.0.0-alpha.6/neuron-tui-linux-x64'
+    expect(
+      detectInstallMethod({
+        ...linux,
+        env: { NEURON_CACHE_DIR: '/data/neuron-cache', NEURON_INSTALL_METHOD: 'pip' },
+        execPath: custom,
+      }),
+    ).toBe('pip')
+    // Bundled in site-packages/neuron_cli: pip, said or not.
+    expect(
+      detectInstallMethod({ ...linux, execPath: '/home/dev/.venv/lib/python3.12/site-packages/neuron_cli/neuron-tui' }),
+    ).toBe('pip')
+    expect(
+      detectInstallMethod({ ...win, execPath: 'C:\\Python312\\Lib\\site-packages\\Neuron_CLI\\neuron-tui.exe' }),
+    ).toBe('pip')
+    expect(
+      detectInstallMethod({
+        ...mac,
+        env: { NEURON_INSTALL_METHOD: 'pip' },
+        execPath: '/Users/dev/Library/Python/3.12/lib/python/site-packages/neuron_cli/neuron-tui',
+      }),
+    ).toBe('pip')
+    // A file that only ends the same is not the bundled UI.
+    expect(detectInstallMethod({ ...linux, execPath: '/opt/neuron_cli/neuron-tui-old' })).toBe('shell')
+  })
 })
 
 describe('the command', () => {
   test("the manifest's command for the method, else the built-in one", () => {
     const manifest = parseManifest({ ...MANIFEST, install: { npm: 'npm i -g @zero-x.live/neuron@next', pip: '' } })!
     expect(installCommand(manifest, 'npm')).toBe('npm i -g @zero-x.live/neuron@next')
-    expect(installCommand(manifest, 'pip')).toBe(DEFAULT_INSTALL_COMMANDS.pip)
+    expect(installCommand(manifest, 'pip', 'win32')).toBe(DEFAULT_INSTALL_COMMANDS.pip)
+    expect(installCommand(manifest, 'pip', 'linux')).toBe('python3 -m pip install --upgrade --pre neuroncli')
     expect(installCommand(manifest, 'shell')).toBe(DEFAULT_INSTALL_COMMANDS.shell)
     expect(installCommand(null, 'powershell')).toBe('irm https://zero-x.live/install.ps1 | iex')
-    expect(DEFAULT_INSTALL_COMMANDS).toEqual(MANIFEST.install)
+    const { pip: _pip, ...others } = MANIFEST.install
+    expect({ ...DEFAULT_INSTALL_COMMANDS, pip: undefined }).toEqual({ ...others, pip: undefined })
+  })
+
+  test('the built-in pip command upgrades, with the interpreter each platform has', () => {
+    expect(defaultInstallCommand('pip', 'win32')).toBe('python -m pip install --upgrade --pre neuroncli')
+    for (const platform of ['linux', 'darwin'] as const) {
+      expect(defaultInstallCommand('pip', platform)).toBe('python3 -m pip install --upgrade --pre neuroncli')
+    }
+    for (const method of ['npm', 'powershell', 'shell'] as const) {
+      expect(defaultInstallCommand(method, 'linux')).toBe(DEFAULT_INSTALL_COMMANDS[method])
+    }
+  })
+
+  test('a check names the pip command for its own platform', async () => {
+    const { pip: _pip, ...install } = MANIFEST.install
+    const result = await runUpdateCheck(
+      options({ env: { NEURON_INSTALL_METHOD: 'pip' }, fetchImpl: jsonFetch({ ...MANIFEST, install }) }),
+    )
+    expect(result).toMatchObject({ status: 'available', method: 'pip', command: 'python3 -m pip install --upgrade --pre neuroncli' })
+    const onWindows = await runUpdateCheck(
+      options({
+        env: { NEURON_INSTALL_METHOD: 'pip' },
+        platform: 'win32',
+        execPath: 'C:\\tools\\neuron-tui.exe',
+        home: 'C:\\Users\\dev',
+        fetchImpl: jsonFetch({ ...MANIFEST, install }),
+      }),
+    )
+    expect(onWindows).toMatchObject({ status: 'available', command: 'python -m pip install --upgrade --pre neuroncli' })
   })
 
   test('control characters never reach the terminal', () => {
@@ -282,6 +352,41 @@ describe('skip rules', () => {
     expect(skip('7.0.0-alpha.5', {}, false)).toBe('output is not a terminal')
     // An empty CI or NEURON_NO_UPDATE_CHECK=0 does not turn it off.
     expect(skip('7.0.0-alpha.5', { CI: '', NEURON_NO_UPDATE_CHECK: '0' })).toBeNull()
+  })
+
+  test('CI=false and CI=0 are not CI', () => {
+    for (const value of ['false', '0', ' FALSE ', 'False', '  ']) {
+      expect(skip('7.0.0-alpha.5', { CI: value })).toBeNull()
+    }
+    for (const value of ['true', 'TRUE', '1', 'yes', 'github']) {
+      expect(skip('7.0.0-alpha.5', { CI: value })).toBe('CI is set')
+    }
+  })
+
+  test('a rejected manifest URL is never shown with its credentials', async () => {
+    for (const bad of ['https://user:s3cret@example.test/m.json', 'https://:s3cret@example.test/m.json', 'http://user:s3cret@example.test/m']) {
+      const target = manifestUrl({ NEURON_UPDATE_MANIFEST_URL: bad })
+      expect('error' in target).toBe(true)
+      expect(target.url).not.toContain('s3cret')
+      expect(target.url).not.toContain('user')
+      for (const env of [{ NEURON_UPDATE_MANIFEST_URL: bad }, { NEURON_UPDATE_MANIFEST_URL: bad, CI: 'true' }]) {
+        const result = await runUpdateCheck(options({ env }))
+        expect(result.status).toBe('disabled')
+        expect(result.manifestUrl).not.toContain('s3cret')
+        expect(formatUpdateReport(result)).not.toContain('s3cret')
+      }
+    }
+    expect(manifestUrl({ NEURON_UPDATE_MANIFEST_URL: 'https://user:s3cret@example.test/m.json' }).url).toBe(
+      'https://example.test/m.json',
+    )
+    // Text that is not a URL, or a URL of another scheme, is not echoed either.
+    for (const odd of ['user:s3cret@ not a url', 'https://exa mple.test/s3cret', 'ftp://s3cret.test/m']) {
+      const target = manifestUrl({ NEURON_UPDATE_MANIFEST_URL: odd })
+      expect('error' in target).toBe(true)
+      expect(target.url).not.toContain('s3cret')
+    }
+    // A plain http URL off loopback carries nothing secret and is shown.
+    expect(manifestUrl({ NEURON_UPDATE_MANIFEST_URL: 'http://example.test/m.json' }).url).toBe('http://example.test/m.json')
   })
 
   test('the manifest URL override is https, or http on loopback only', () => {

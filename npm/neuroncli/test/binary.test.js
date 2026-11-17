@@ -6,7 +6,7 @@ import path from 'node:path';
 import {test} from 'node:test';
 import {setTimeout as delay} from 'node:timers/promises';
 import {LauncherError, assetFor, binaryLocations, cacheRoot, checksumsBase, downloadBase, downloadBinary, parseChecksum, parseSums} from '../lib/binary.js';
-import {wantsFullScreenUi} from '../lib/full-screen.js';
+import {wantsFullScreenUi, withInstallMethod} from '../lib/full-screen.js';
 import {exitCodeForSignal, listenedSignals, shouldForwardSignal} from '../lib/signals.js';
 import {PACKAGE_ROOT, REPO_ROOT, sha256, startServer, tempDir, unusedUrl} from './helpers.js';
 
@@ -88,6 +88,20 @@ test('the UI is wanted only for a bare launch on a terminal', () => {
   for (const args of [['--no-tui'], ['fix the bug'], ['-p', 'hi'], ['status'], ['--help'], ['--version'], ['--model', 'opus', 'prompt']]) {
     assert.equal(wantsFullScreenUi(args, tty), false, args.join(' '));
   }
+});
+
+test('neuron is told this is an npm install, unless the user says otherwise', () => {
+  const env = withInstallMethod({PATH: '/usr/bin', NEURON_MCP_NODE: '/usr/bin/node'});
+  assert.deepEqual(env, {PATH: '/usr/bin', NEURON_MCP_NODE: '/usr/bin/node', NEURON_INSTALL_METHOD: 'npm'});
+  assert.equal(withInstallMethod({NEURON_INSTALL_METHOD: 'shell'}).NEURON_INSTALL_METHOD, 'shell');
+  // A blank value is no choice.
+  assert.equal(withInstallMethod({NEURON_INSTALL_METHOD: '  '}).NEURON_INSTALL_METHOD, 'npm');
+  // The launcher's own environment is not changed.
+  const own = {};
+  withInstallMethod(own);
+  assert.deepEqual(own, {});
+  // bin/neuron.js passes its child environment through it.
+  assert.match(readFileSync(path.join(PACKAGE_ROOT, 'bin', 'neuron.js'), 'utf8'), /withInstallMethod\(\{\.\.\.process\.env, NEURON_MCP_NODE/);
 });
 
 test('download base must be HTTPS or loopback HTTP', () => {

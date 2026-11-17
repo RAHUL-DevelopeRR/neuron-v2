@@ -19,21 +19,19 @@ import {
   buildSkillPrompt,
 } from './prompt-builders'
 import { runBashCommand } from './router'
+import { runUpdateCommand } from './update-command'
 import { getNeuronEngineClient } from '../engine/neuron-engine-client'
 import { clearEngineConversation } from '../engine/engine-session'
 import { useThemeStore } from '../hooks/use-theme'
 import { startNewChat } from '../project-files'
 import { useChatStore } from '../state/chat-store'
-import { refreshUpdateCheck } from '../state/update-store'
 import { stopActiveRun } from '../utils/active-run'
 import { AGENT_MODES, AGENT_MODES_AVAILABLE } from '../utils/constants'
-import { copyTextToClipboard } from '../utils/clipboard'
 import { exitCliCleanly } from '../utils/exit-cleanly'
 import { safeOpen } from '../utils/open-url'
 import { getSystemMessage, getUserMessage } from '../utils/message-history'
 import { capturePendingAttachments } from '../utils/pending-attachments'
 import { getSkillByName } from '../utils/skill-registry'
-import { formatUpdateReport } from '../utils/update-check'
 import { USER_SHELL_AVAILABLE } from '../utils/user-shell'
 
 import type { MultilineInputHandle } from '../components/multiline-input'
@@ -450,21 +448,7 @@ const ALL_COMMANDS: CommandDefinition[] = [
       const shown = params.inputValue.trim()
       params.saveToHistory(shown)
       clearInput(params)
-      const result = await refreshUpdateCheck()
-      let copied = false
-      if (result.status === 'available') {
-        try {
-          copied =
-            (await copyTextToClipboard(result.command, { suppressGlobalMessage: true })) !== 'unverified'
-        } catch {
-          copied = false
-        }
-      }
-      params.setMessages((prev) => [
-        ...prev,
-        getUserMessage(shown),
-        getSystemMessage(formatUpdateReport(result, copied)),
-      ])
+      await runUpdateCommand(shown, { setMessages: params.setMessages })
     },
   }),
   defineCommand({

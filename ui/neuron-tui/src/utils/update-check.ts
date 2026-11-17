@@ -12,7 +12,7 @@
  * no line in the chat.
  *
  * No check runs for a development build (a version that is not semver, or the
- * package's `0.0.0`), with `CI` set, with `NEURON_NO_UPDATE_CHECK=1`, or when
+ * package's `0.0.0`), with `CI` set (to anything but `false` or `0`), with `NEURON_NO_UPDATE_CHECK=1`, or when
  * stdout is not a terminal. `NEURON_UPDATE_MANIFEST_URL` points it at another
  * manifest (https, or http on loopback only) for tests.
  *
@@ -117,12 +117,23 @@ export function compareSemver(a: string, b: string): -1 | 0 | 1 | null {
 export type InstallMethod = 'npm' | 'pip' | 'powershell' | 'shell'
 export const INSTALL_METHODS: readonly InstallMethod[] = ['npm', 'pip', 'powershell', 'shell']
 
-/** The command for each install method when the manifest names none. */
+/**
+ * The command for each install method when the manifest names none. The pip
+ * one is for Windows; {@link defaultInstallCommand} names `python3` elsewhere,
+ * where a bare `python` is often missing (stock macOS, Ubuntu). `--upgrade`
+ * matters: without it pip leaves an installed `neuroncli` as it is.
+ */
 export const DEFAULT_INSTALL_COMMANDS: Readonly<Record<InstallMethod, string>> = {
   npm: 'npm install -g @zero-x.live/neuron',
-  pip: 'python -m pip install --pre neuroncli',
+  pip: 'python -m pip install --upgrade --pre neuroncli',
   powershell: 'irm https://zero-x.live/install.ps1 | iex',
   shell: 'curl -fsSL https://zero-x.live/install.sh | sh',
+}
+
+/** The built-in command for `method` on `platform`. */
+export function defaultInstallCommand(method: InstallMethod, platform: NodeJS.Platform): string {
+  if (method === 'pip' && platform !== 'win32') return 'python3 -m pip install --upgrade --pre neuroncli'
+  return DEFAULT_INSTALL_COMMANDS[method]
 }
 
 export interface DetectInput {
@@ -152,9 +163,13 @@ function join(...parts: string[]): string {
 }
 
 /**
- * How this copy of Neuron was installed, from where its UI binary lives:
+ * How this copy of Neuron was installed. The npm and pip launchers say so in
+ * `NEURON_INSTALL_METHOD` (both share one cache layout, so the path cannot
+ * tell them apart); without it, from where the UI binary lives:
  *   - in `node_modules` under `@zero-x.live/neuron` (or its platform packages): npm;
- *   - in the pip launcher's cache, a `neuroncli` folder: pip;
+ *   - beside the pip launcher, in a `neuron_cli` package folder: pip;
+ *   - in the launchers' default cache, a `neuroncli` folder: pip (npm uses it
+ *     only when its package folder is read-only, and then says so);
  *   - in `%LOCALAPPDATA%\Programs\Neuron\bin`: the PowerShell installer;
  *   - in `~/.local/bin`: the shell installer;
  *   - otherwise the platform's installer.
@@ -168,6 +183,8 @@ export function detectInstallMethod({ execPath, platform, env, home }: DetectInp
   const file = normalizePath(execPath, platform)
   const lower = file.toLowerCase()
   if (lower.includes('/node_modules/') && lower.includes('/@zero-x.live/neuron')) return 'npm'
+  // The UI bundled in the pip package: site-packages/neuron_cli/neuron-tui[.exe].
+  if (/\/neuron_cli\/neuron-tui(\.exe)?$/.test(file)) return 'pip'
 
   const localAppData =
     env.LOCALAPPDATA?.trim() || (platform === 'win32' && home ? join(home, 'AppData', 'Local') : '')
@@ -195,9 +212,13 @@ function cleanCommand(value: unknown): string | null {
   return text.length > 0 && text.length <= 500 ? text : null
 }
 
-/** The manifest's command for `method` when it has one, else the built-in one. */
-export function installCommand(manifest: Pick<ReleaseManifest, 'install'> | null, method: InstallMethod): string {
-  return cleanCommand(manifest?.install?.[method]) ?? DEFAULT_INSTALL_COMMANDS[method]
+/** The manifest's command for `method` when it has one, else the built-in one for `platform`. */
+export function installCommand(
+  manifest: Pick<ReleaseManifest, 'install'> | null,
+  method: InstallMethod,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return cleanCommand(manifest?.install?.[method]) ?? defaultInstallCommand(method, platform)
 }
 
 // --------------------------------------------------------------- manifest
@@ -247,7 +268,9 @@ export interface SkipInput {
 export function updateCheckSkipReason({ version, env, isTTY }: SkipInput): string | null {
   const optOut = env.NEURON_NO_UPDATE_CHECK?.trim().toLowerCase()
   if (optOut === '1' || optOut === 'true') return 'NEURON_NO_UPDATE_CHECK is set'
-  if (env.CI && env.CI.trim()) return 'CI is set'
+  // CI=false and CI=0 are how a shell says "not CI".
+  const ci = env.CI?.trim().toLowerCase()
+  if (ci && ci !== 'false' && ci !== '0') return 'CI is set'
   const parsed = parseSemver(version)
   if (!parsed || (parsed.major === 0 && parsed.minor === 0 && parsed.patch === 0)) {
     return 'this is a development build with no release version'
@@ -261,7 +284,11 @@ function isLoopback(hostname: string): boolean {
   return host === 'localhost' || host === '::1' || /^127(\.\d{1,3}){3}$/.test(host)
 }
 
-/** The manifest to read: `NEURON_UPDATE_MANIFEST_URL` when it is https (or http on loopback). */
+/**
+ * The manifest to read: `NEURON_UPDATE_MANIFEST_URL` when it is https (or http
+ * on loopback). The `url` of a rejected override is what `/update` shows, so it
+ * never carries the override's credentials, nor text that is not a URL.
+ */
 export function manifestUrl(env: Env): { url: string } | { url: string; error: string } {
   const override = env.NEURON_UPDATE_MANIFEST_URL?.trim()
   if (!override) return { url: DEFAULT_MANIFEST_URL }
@@ -269,14 +296,18 @@ export function manifestUrl(env: Env): { url: string } | { url: string; error: s
   try {
     parsed = new URL(override)
   } catch {
-    return { url: override, error: 'NEURON_UPDATE_MANIFEST_URL is not a URL' }
+    return { url: '(not shown: not a URL)', error: 'NEURON_UPDATE_MANIFEST_URL is not a URL' }
   }
   if (parsed.username || parsed.password) {
-    return { url: override, error: 'NEURON_UPDATE_MANIFEST_URL must not carry credentials' }
+    parsed.username = ''
+    parsed.password = ''
+    return { url: parsed.toString(), error: 'NEURON_UPDATE_MANIFEST_URL must not carry credentials' }
   }
   if (parsed.protocol === 'https:') return { url: parsed.toString() }
   if (parsed.protocol === 'http:' && isLoopback(parsed.hostname)) return { url: parsed.toString() }
-  return { url: override, error: 'NEURON_UPDATE_MANIFEST_URL must be https (http only on loopback)' }
+  // Another scheme's URL may keep a secret where http keeps none (`user:s3cret@...`).
+  const shown = parsed.protocol === 'http:' ? parsed.toString() : `(not shown: a ${parsed.protocol} URL)`
+  return { url: shown, error: 'NEURON_UPDATE_MANIFEST_URL must be https (http only on loopback)' }
 }
 
 // ------------------------------------------------------------------ cache
@@ -415,6 +446,7 @@ export function evaluateManifest(
   manifest: ReleaseManifest,
   method: InstallMethod,
   url: string,
+  platform: NodeJS.Platform = process.platform,
 ): UpdateCheckResult {
   const required =
     manifest.minimumVersion !== null && compareSemver(current, manifest.minimumVersion) === -1
@@ -429,7 +461,7 @@ export function evaluateManifest(
     latest: newer ? manifest.version! : manifest.minimumVersion!,
     minimum: manifest.minimumVersion,
     notesUrl: manifest.notesUrl,
-    command: installCommand(manifest, method),
+    command: installCommand(manifest, method, platform),
     method,
     required,
     manifestUrl: url,
@@ -471,7 +503,7 @@ export async function runUpdateCheck(options: UpdateCheckOptions): Promise<Updat
       manifest = await fetchManifest(url, { fetchImpl: options.fetchImpl, timeoutMs: options.timeoutMs })
       if (cacheFile) writeCachedManifest(cacheFile, url, manifest, now)
     }
-    return evaluateManifest(current, manifest, method, url)
+    return evaluateManifest(current, manifest, method, url, options.platform)
   } catch (error) {
     const reason = error instanceof Error && error.message ? error.message : 'the request failed'
     return { status: 'failed', current, reason, manifestUrl: url }

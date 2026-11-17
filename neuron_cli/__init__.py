@@ -20,6 +20,8 @@ Environment:
                            release, even when a mirror serves the binary)
     NEURON_NO_TUI          1 keeps the line REPL and skips the UI download
     NEURON_TUI_BIN         the full-screen UI to use (passed on unchanged)
+    NEURON_INSTALL_METHOD  set to ``pip`` for ``neuron`` unless already set, so
+                           the full-screen UI names the pip update command
 """
 
 from __future__ import annotations
@@ -408,6 +410,14 @@ def _find_ui_binary(args: List[str]) -> Optional[Path]:
         return None
 
 
+def _mark_install_method() -> None:
+    """Tell the full-screen UI this is a pip install, unless the user said
+    otherwise: its binary sits in the cache the npm launcher shares (or
+    NEURON_CACHE_DIR), where its path alone cannot say which."""
+    if not os.environ.get("NEURON_INSTALL_METHOD", "").strip():
+        os.environ["NEURON_INSTALL_METHOD"] = "pip"
+
+
 def _ignore_signal(_signum: int, _frame: object) -> None:
     """Parent-side handler: the child receives terminal signals itself."""
 
@@ -461,6 +471,7 @@ def main() -> None:
         ui = None
     if ui is not None:
         os.environ["NEURON_TUI_BIN"] = str(ui)
+    _mark_install_method()
 
     args = [str(binary), *sys.argv[1:]]
     if os.name == "posix":
