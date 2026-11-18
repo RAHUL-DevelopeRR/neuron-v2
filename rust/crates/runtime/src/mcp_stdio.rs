@@ -2457,8 +2457,19 @@ mod tests {
                 args: python_script_args(script_path),
                 env,
                 tool_call_timeout_ms: None,
-                sandbox: None,
+                sandbox: Some(log_writable_sandbox(log_path)),
             }),
+        }
+    }
+
+    /// The unvetted default (no network, read-only) plus its log's folder writable:
+    /// under bubblewrap (Linux with `bwrap`) the server could not write its log.
+    fn log_writable_sandbox(log_path: &Path) -> crate::config::McpSandboxProfile {
+        crate::config::McpSandboxProfile {
+            fs_write: log_path
+                .parent()
+                .map_or_default(|dir| vec![dir.to_string_lossy().into_owned()]),
+            ..crate::config::McpSandboxProfile::default()
         }
     }
 

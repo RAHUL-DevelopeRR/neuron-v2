@@ -477,7 +477,14 @@ mod tests {
                     ),
                 ]),
                 tool_call_timeout_ms: Some(1_000),
-                sandbox: None,
+                // Its log's folder writable: under bubblewrap (Linux with `bwrap`) the
+                // default sandbox is read-only and the server could not write its log.
+                sandbox: Some(crate::config::McpSandboxProfile {
+                    fs_write: log_path
+                        .parent()
+                        .map_or_default(|dir| vec![dir.to_string_lossy().into_owned()]),
+                    ..crate::config::McpSandboxProfile::default()
+                }),
             }),
         }
     }
