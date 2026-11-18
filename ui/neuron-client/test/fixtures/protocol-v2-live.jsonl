@@ -1,0 +1,19 @@
+{"type":"status","model":"auto","permission_mode":"default","session_id":"s-1","cwd":"/work/app","workspace_trusted":true,"plan_mode":false,"context_percent":12,"git":{"branch":"main","changed":2,"staged":0,"unstaged":2,"untracked":0,"conflicted":0},"signed_in":true,"sign_in_required":false,"account":null,"supports_images":true,"served_model":"neuron-fast"}
+{"type":"notice","message":"The model declined to continue this request.","kind":"refusal"}
+{"type":"extensions","mcp_servers":[{"name":"github","scope":"user","transport":"http","status":"disabled","tools":[],"error":null,"enabled":false}],"plugins":[],"skills":[],"agents":[]}
+{"type":"tool_input_started","id":"toolu_01","name":"Write"}
+{"type":"tool_input_progress","id":"toolu_01","name":"Write","bytes":2048,"lines":41,"target":"src/main.rs","preview":"fn main() {\n    println!(\"hi\");\n}"}
+{"type":"output_progress","output_tokens":512}
+{"type":"request_usage","usage":{"input":1200,"output":530,"cache_read":800,"cache_write":0}}
+{"type":"tool_output_delta","tool_use_id":"toolu_02","stream":"stdout","chunk":"Compiling app v0.1.0\n"}
+{"type":"tool_output_delta","tool_use_id":"toolu_02","stream":"stderr","chunk":"warning: unused variable\n"}
+{"type":"changes","files":[{"path":"src/main.rs","status":"modified","added":12,"removed":3},{"path":"notes.md","status":"created","added":5,"removed":0}]}
+{"type":"diff","title":"Changes against HEAD on main","files":[{"path":"src/main.rs","status":"modified","added":1,"removed":1,"patch":"@@ -1,3 +1,3 @@\n fn main() {\n-    old();\n+    new();\n }\n","binary":false}],"truncated":false}
+{"type":"commit_proposal","message":"Update main entry point","branch":"main","files":[{"path":"src/main.rs","status":"modified","added":1,"removed":1}],"stage_all":true}
+{"type":"checkpoints","items":[{"id":2,"created_at_ms":1767225600000,"prompt_preview":"rename the helper","files":["src/lib.rs"],"shell_commands":["cargo test"],"before_rewind_to":null},{"id":1,"created_at_ms":1767225000000,"prompt_preview":"add a parser","files":["src/parse.rs"],"shell_commands":[]}]}
+{"type":"rewound","checkpoint":1,"mode":"code_and_chat","dry_run":true,"restored":["src/parse.rs"],"removed":["src/new.rs"],"not_restored":[{"path":"big.bin","reason":"too large"}],"shell_commands":["cargo test"],"removed_turns":2,"prompt":"add a parser"}
+{"kind":"command","type":"set_mcp_server_enabled","name":"github","enabled":false}
+{"kind":"command","type":"commit","message":"Update main entry point"}
+{"kind":"command","type":"rewind","checkpoint":1,"mode":"code_and_chat","dry_run":true}
+{"kind":"command","type":"rewind","checkpoint":3,"mode":"chat_only"}
+{"kind":"command","type":"capabilities","features":["questions","reports","live_progress","live_output","git_views"],"client":"desktop"}

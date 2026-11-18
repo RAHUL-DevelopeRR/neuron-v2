@@ -4,7 +4,7 @@ import os from 'os'
 import path from 'path'
 
 import { SessionController, type EngineTransport, type TransportClose } from '../src/controller'
-import { NeuronHost } from '../src/node/host'
+import { HOST_POLICY, NeuronHost } from '../src/node/host'
 import type { ClientMessage, UiEvent } from '../src/protocol'
 import { WebSocketTransport, type HostFrame } from '../src/remote'
 import type { SessionAction } from '../src/session'
@@ -63,7 +63,9 @@ const controllers: SessionController[] = []
 /** Engines the host's restart made, with the session each was asked to continue. */
 let restarted: Array<{ engine: FakeEngine; resume: string | null }> = []
 
-async function startHost(options: { remoteOnly?: boolean; features?: string[]; trusted?: boolean } = {}) {
+async function startHost(
+  options: { remoteOnly?: boolean; localOnly?: boolean; ownerOnLoopback?: boolean; features?: string[]; trusted?: boolean } = {},
+) {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'neuron-host-test-'))
   fs.mkdirSync(path.join(root, 'src'))
   fs.writeFileSync(path.join(root, 'src', 'main.rs'), 'fn main() {}\n')
@@ -76,6 +78,8 @@ async function startHost(options: { remoteOnly?: boolean; features?: string[]; t
     root,
     name: 'test host',
     ...(options.remoteOnly && { isLocal: () => false }),
+    ...(options.localOnly && { isLocal: () => true }),
+    ...(options.ownerOnLoopback && { ownerOnLoopback: true }),
     restart: (resume) => {
       const next = new FakeEngine(options.features, true)
       restarted.push({ engine: next, resume })
@@ -94,12 +98,32 @@ async function attach(kind: 'desktop' | 'mobile', token = TOKEN) {
   return { transport, controller }
 }
 
-const until = async (label: string, predicate: () => boolean) => {
-  const deadline = Date.now() + 5_000
+const until = async (label: string, predicate: () => boolean, timeoutMs = 5_000) => {
+  const deadline = Date.now() + timeoutMs
   while (!predicate()) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`)
     await Bun.sleep(10)
   }
+}
+
+/**
+ * Opens a raw socket, says hello with the token, sends each message as a `send` frame and waits until the
+ * host has forwarded or refused every one. Returns the messages of the error frames that came back, in order.
+ */
+async function sendAsPeer(messages: unknown[]): Promise<string[]> {
+  const errors: string[] = []
+  const socket = new WebSocket(host!.url)
+  socket.onopen = () => {
+    socket.send(JSON.stringify({ t: 'hello', protocol: 1, token: TOKEN, client: { name: 'raw', kind: 'cli' } }))
+    for (const message of messages) socket.send(JSON.stringify({ t: 'send', message }))
+  }
+  socket.onmessage = (event) => {
+    const frame = JSON.parse(String(event.data)) as HostFrame
+    if (frame.t === 'error') errors.push(frame.message)
+  }
+  await until('every message handled', () => errors.length + engine.sent.length >= messages.length)
+  socket.close()
+  return errors
 }
 
 afterEach(async () => {
@@ -155,9 +179,10 @@ describe('NeuronHost', () => {
       expect(client.controller.getState().items.filter((item) => item.kind === 'user')).toHaveLength(1)
       expect(client.controller.getState().busy).toBe(true)
     }
-    mobile.controller.send('/compact')
+    // A slash command goes out as one. `/status` only reads, so the host passes it to any peer.
+    mobile.controller.send('/status')
     await until('the slash command', () => engine.sent.length === 2)
-    expect(engine.sent[1]).toEqual({ kind: 'command', type: 'slash', command: 'compact', args: '' })
+    expect(engine.sent[1]).toEqual({ kind: 'command', type: 'slash', command: 'status', args: '' })
   })
 
   test('the first answer to a permission request wins', async () => {
@@ -183,7 +208,7 @@ describe('NeuronHost', () => {
     expect(call && call.kind === 'tool' && call.state).toBe('denied')
   })
 
-  test('remote clients cannot shut the engine down', async () => {
+  test('a peer cannot send the shutdown command', async () => {
     await startHost()
     const { transport } = await attach('mobile')
     const errors: string[] = []
@@ -246,11 +271,13 @@ describe('NeuronHost', () => {
     })
     const { id } = await transport.rpc<{ id: number }>('term.open', { cols: 100, rows: 30 })
     transport.terminalResize(id, 120, 40)
-    transport.terminalInput(id, 'echo neuron-term-$(1+1)\r')
-    await until('the echo', () => output.includes('neuron-term-2'))
+    // $((1+1)) is 2 in both PowerShell (Windows) and POSIX shells.
+    transport.terminalInput(id, 'echo neuron-term-$((1+1))\r')
+    // A cold Windows PowerShell can take several seconds to start on CI runners.
+    await until('the echo', () => output.includes('neuron-term-2'), 15_000)
     transport.terminalInput(id, 'exit\r')
     await until('the shell to exit', () => exited !== undefined)
-  }, 20_000)
+  }, 30_000)
 
   test('a client from another machine gets no terminal', async () => {
     await startHost({ remoteOnly: true })
@@ -385,3 +412,484 @@ describe('NeuronHost', () => {
     fs.rmSync(parent, { recursive: true, force: true })
   })
 })
+
+describe('NeuronHost policy for peers', () => {
+  async function sendRaw(messages: unknown[]) {
+    const errors: string[] = []
+    const socket = new WebSocket(host!.url)
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ t: 'hello', protocol: 1, token: TOKEN, client: { name: 'raw', kind: 'cli' } }))
+      for (const message of messages) socket.send(JSON.stringify({ t: 'send', message }))
+    }
+    socket.onmessage = (event) => {
+      const frame = JSON.parse(String(event.data)) as HostFrame
+      if (frame.t === 'error') errors.push(frame.message)
+    }
+    await until('the refusals', () => errors.length >= messages.length)
+    socket.close()
+    return errors
+  }
+
+  test('peers cannot commit, rewind for real or switch MCP servers', async () => {
+    await startHost()
+    const errors = await sendRaw([
+      { kind: 'command', type: 'commit', message: 'x' },
+      { kind: 'command', type: 'rewind', checkpoint: 1, mode: 'code_only' },
+      { kind: 'command', type: 'rewind', checkpoint: 1, mode: 'code_only', dry_run: false },
+      { kind: 'command', type: 'set_mcp_server_enabled', name: 'fs', enabled: false },
+    ])
+    expect(errors).toHaveLength(4)
+    expect(engine.sent).toEqual([])
+  })
+
+  test('peers may preview a rewind', async () => {
+    await startHost()
+    const peer = await attach('mobile')
+    peer.transport.send({ kind: 'command', type: 'rewind', checkpoint: 1, mode: 'code_only', dry_run: true })
+    await until('the preview', () => engine.sent.length === 1)
+    expect(engine.sent[0]).toEqual({ kind: 'command', type: 'rewind', checkpoint: 1, mode: 'code_only', dry_run: true })
+  })
+
+  test('a denial whose note has a lone surrogate is refused, and the request stays open', async () => {
+    await startHost()
+    const input = '{"command":"cargo test"}'
+    engine.emit({ type: 'tool_call_started', id: 't1', name: 'bash', input, cut_off: false })
+    engine.emit({
+      type: 'permission_requested',
+      id: 7,
+      request: { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: null, input, session_prefixes: [] },
+    })
+    // serde_json would refuse that line, and the engine would go on waiting for an answer the host had counted as given.
+    const errors = await sendAsPeer([{ kind: 'permission_reply', id: 7, decision: { kind: 'deny', note: 'x\ud800y' } }])
+    expect(errors).toEqual(['Not a Neuron remote frame.'])
+    expect(engine.sent).toEqual([])
+    expect(host!.state.permissions.map((permission) => permission.id)).toEqual([7])
+  })
+})
+
+describe('NeuronHost slash policy for remote peers', () => {
+  /** Sends messages as a non-local peer, then waits until each was either forwarded or refused. */
+  async function remote(messages: unknown[]) {
+    const errors: string[] = []
+    const socket = new WebSocket(host!.url)
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ t: 'hello', protocol: 1, token: TOKEN, client: { name: 'raw', kind: 'cli' } }))
+      for (const message of messages) socket.send(JSON.stringify({ t: 'send', message }))
+    }
+    socket.onmessage = (event) => {
+      const frame = JSON.parse(String(event.data)) as HostFrame
+      if (frame.t === 'error') errors.push(frame.message)
+    }
+    await until('every message handled', () => errors.length + engine.sent.length >= messages.length)
+    socket.close()
+    return errors
+  }
+  const slash = (command: string, args = '') => ({ kind: 'command', type: 'slash', command, args })
+
+  test('read-only slash commands pass', async () => {
+    await startHost({ remoteOnly: true })
+    const names = ['help', 'status', 'cost', 'context', 'usage', 'doctor', 'changes', 'diff', 'stats', 'memory', 'model']
+    const errors = await remote(names.map((name) => slash(name)))
+    expect(errors).toEqual([])
+    expect(engine.sent).toHaveLength(names.length)
+  })
+
+  test('every other slash command is refused, whatever the case or spacing', async () => {
+    await startHost({ remoteOnly: true })
+    const names = ['commit', 'Commit', ' commit', 'commit ', 'COMMIT\n', '/commit', 'rewind', 'permissions', 'logout', 'login', 'pr', 'issue', 'init', 'clear', 'plan', 'status commit', '']
+    const errors = await remote(names.map((name) => slash(name, 'danger-full-access')))
+    expect(errors).toHaveLength(names.length)
+    expect(errors[0]).toContain('Only the Neuron desktop app')
+    expect(engine.sent).toEqual([])
+  })
+
+  test('so are the alpha.5 slash commands that do what the refused commands do', async () => {
+    await startHost({ remoteOnly: true })
+    // /effort and /reasoning set the thinking level, /branch switches or creates a branch, /permissions
+    // sets the mode, /mcp adds, approves or removes servers, /hooks changes hooks, /plan toggles plan mode.
+    const names = ['effort', 'reasoning', 'branch', 'permissions', 'mcp', 'hooks', 'plan', 'Effort', ' MCP ']
+    const errors = await remote(names.map((name) => slash(name, 'danger-full-access')))
+    expect(errors).toHaveLength(names.length)
+    expect(errors[0]).toContain('Only the Neuron desktop app')
+    expect(engine.sent).toEqual([])
+  })
+
+  test('remote resume names a session id or latest, never a path', async () => {
+    await startHost({ remoteOnly: true })
+    const bad = [
+      { kind: 'command', type: 'resume', session: '../../etc/passwd' },
+      { kind: 'command', type: 'resume', session: 'C:\\Users\\x\\s.json' },
+      { kind: 'command', type: 'resume', session: '/tmp/s' },
+      { kind: 'command', type: 'resume', session: '-x' },
+      { kind: 'command', type: 'resume', session: '.hidden' },
+      { kind: 'command', type: 'resume', session: 'a'.repeat(129) },
+      slash('resume', '../x'),
+      slash('Resume', '/abs/path'),
+      slash('resume', ''),
+    ]
+    expect(await remote(bad)).toHaveLength(bad.length)
+    expect(engine.sent).toEqual([])
+  })
+
+  test('remote resume with a valid id or latest is forwarded', async () => {
+    await startHost({ remoteOnly: true })
+    const errors = await remote([
+      { kind: 'command', type: 'resume', session: 'session-2026.11_07' },
+      { kind: 'command', type: 'resume', session: 'latest' },
+      slash('resume', 'abc123'),
+    ])
+    expect(errors).toEqual([])
+    expect(engine.sent).toHaveLength(3)
+  })
+})
+
+/**
+ * A phone behind `neuron engine --share` reaches the host from 127.0.0.1, so the host counts it as local.
+ * "Local" says where a socket came from, not who is typing: the slash allow-list and the resume-by-id rule
+ * hold for every peer, and `local` only opens terminals, engine restarts and `trust_workspace`.
+ */
+describe('NeuronHost walls for a peer on this machine', () => {
+  const slash = (command: string, args = '') => ({ kind: 'command', type: 'slash', command, args })
+  const resume = (session: string) => ({ kind: 'command', type: 'resume', session })
+  const OWNER_ONLY = 'Only the Neuron desktop app can change your files, history or settings.'
+  const BY_ID = 'A remote client can only resume a session by its id.'
+
+  test('the slash twins of the refused commands, and resume by path, never reach the engine', async () => {
+    await startHost({ localOnly: true })
+    // The frames sent over a loopback socket that used to reach the engine.
+    const twins = [
+      slash('permissions', 'danger-full-access'),
+      slash('effort', 'max'),
+      slash('branch', 'x'),
+      slash('commit', 'x'),
+      slash('rewind', '1 code'),
+      slash('exit'),
+      slash('logout'),
+      slash('clear', '--confirm'),
+      slash('pr', 'create'),
+      slash('issue', 'create'),
+      // It rewrites the history, and a local peer could send it before.
+      slash('compact'),
+    ]
+    const errors = await sendAsPeer([...twins, resume('/etc/passwd')])
+    expect(engine.sent).toEqual([])
+    expect(errors).toEqual([...twins.map(() => OWNER_ONLY), BY_ID])
+  })
+
+  test('the read-only slash commands and resume by id still pass', async () => {
+    await startHost({ localOnly: true })
+    const names = ['help', 'status', 'cost', 'context', 'usage', 'doctor', 'changes', 'diff', 'stats', 'memory', 'model']
+    const messages = [...names.map((name) => slash(name)), resume('session-2026.11_07'), resume('latest'), slash('resume', 'abc123')]
+    expect(await sendAsPeer(messages)).toEqual([])
+    expect(engine.sent).toHaveLength(messages.length)
+  })
+
+  test('resume names a session id or latest, never a path, whoever sends it', async () => {
+    await startHost({ localOnly: true })
+    const paths = [
+      resume('/tmp/s'),
+      resume('C:\\Users\\x\\s.json'),
+      resume('../../etc/passwd'),
+      resume('..\\x'),
+      resume('-x'),
+      resume('.hidden'),
+      resume('a'.repeat(129)),
+      slash('resume', '../x'),
+      slash('Resume', '/abs/path'),
+      slash('resume', ''),
+    ]
+    const errors = await sendAsPeer(paths)
+    expect(engine.sent).toEqual([])
+    expect(errors).toHaveLength(paths.length)
+  })
+
+  // The desktop app in a browser runs through a host and is the owner: a new session is `/clear --confirm`, the
+  // permission mode is `/permissions`, and so on. A host started for that says so; none does by default.
+  test('a host started with ownerOnLoopback lets a peer on this machine use the owner slash commands and resume by path', async () => {
+    await startHost({ localOnly: true, ownerOnLoopback: true })
+    const owner = [
+      slash('permissions', 'workspace-write'),
+      slash('clear', '--confirm'),
+      slash('plan', 'off'),
+      slash('login'),
+      slash('logout'),
+      resume('sessions/2026-11-07.json'),
+    ]
+    expect(await sendAsPeer(owner)).toEqual([])
+    expect(engine.sent).toHaveLength(owner.length)
+  })
+
+  test('ownerOnLoopback gives nothing to a peer that is not on this machine', async () => {
+    await startHost({ remoteOnly: true, ownerOnLoopback: true })
+    const twins = [slash('permissions', 'danger-full-access'), slash('clear', '--confirm'), slash('logout')]
+    const errors = await sendAsPeer([...twins, resume('/etc/passwd')])
+    expect(engine.sent).toEqual([])
+    expect(errors).toEqual([...twins.map(() => OWNER_ONLY), BY_ID])
+  })
+
+  test('without ownerOnLoopback a peer on this machine gets the same walls as any other', async () => {
+    await startHost({ localOnly: true })
+    const errors = await sendAsPeer([slash('permissions', 'workspace-write'), slash('clear', '--confirm'), resume('sessions/2026-11-07.json')])
+    expect(engine.sent).toEqual([])
+    expect(errors).toEqual([OWNER_ONLY, OWNER_ONLY, BY_ID])
+  })
+})
+
+describe('NeuronHost policy for the alpha.5 commands', () => {
+  /** Sends messages as a peer on another machine, then waits until each was either forwarded or refused. */
+  async function fromAnotherMachine(messages: unknown[]) {
+    const errors: string[] = []
+    const socket = new WebSocket(host!.url)
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ t: 'hello', protocol: 1, token: TOKEN, client: { name: 'raw', kind: 'cli' } }))
+      for (const message of messages) socket.send(JSON.stringify({ t: 'send', message }))
+    }
+    socket.onmessage = (event) => {
+      const frame = JSON.parse(String(event.data)) as HostFrame
+      if (frame.t === 'error') errors.push(frame.message)
+    }
+    await until('every message handled', () => errors.length + engine.sent.length >= messages.length)
+    socket.close()
+    return errors
+  }
+
+  // They only read, but every call costs the engine real work and no phone screen uses the answer.
+  // The gate drops them, so the host answers "not a frame" and the engine hears nothing.
+  const reads = [
+    { kind: 'command', type: 'list_branches' },
+    { kind: 'command', type: 'list_connector_catalog', query: 'git' },
+  ] as const satisfies readonly ClientMessage[]
+  for (const [where, options] of [
+    ['another machine', { remoteOnly: true }],
+    ['this machine', { localOnly: true }],
+  ] as const) {
+    test(`a peer on ${where} cannot list the branches or the connector catalog`, async () => {
+      await startHost(options)
+      const errors = await sendAsPeer([...reads])
+      expect(engine.sent).toEqual([])
+      expect(errors).toEqual(reads.map(() => 'Not a Neuron remote frame.'))
+    })
+  }
+
+  /** Commands that change something: a connector to run or remove, the permission mode, the branch, how turns run. */
+  const changes = [
+    { kind: 'command', type: 'add_mcp_server', id: 'github', name: null, scope: 'user', secrets: { EXAMPLE_TOKEN: 'not-a-real-token' } },
+    { kind: 'command', type: 'approve_mcp_server', name: 'postgres-tools', fingerprint: '4f1c0de5' },
+    { kind: 'command', type: 'remove_mcp_server', name: 'docs', scope: null },
+    { kind: 'command', type: 'set_permission_mode', mode: 'danger-full-access' },
+    { kind: 'command', type: 'switch_branch', name: 'main', create: false },
+    { kind: 'command', type: 'set_reasoning_effort', effort: 'high' },
+  ] as const satisfies readonly ClientMessage[]
+
+  test('a peer on another machine cannot add, approve or remove a server, change the mode, switch branch or set the effort', async () => {
+    await startHost({ remoteOnly: true })
+    const errors = await fromAnotherMachine([...changes, { kind: 'permission_reply', id: 7, decision: { kind: 'allow_for_project' } }])
+    expect(errors).toHaveLength(changes.length + 1)
+    expect(engine.sent).toEqual([])
+  })
+
+  /** Hands `message` to the host's forwarding step as if the gate before it had let it through, as a bug in the gate would. */
+  function forwardPastTheGate(message: ClientMessage, local: boolean): HostFrame[] {
+    const frames: HostFrame[] = []
+    const peer = {
+      data: { authed: true, name: 'raw', kind: 'cli', timer: null, local, terminals: new Map() },
+      send: (text: string) => frames.push(JSON.parse(text) as HostFrame),
+    }
+    ;(host as unknown as { forward(socket: unknown, message: ClientMessage): void }).forward(peer, message)
+    return frames
+  }
+
+  test('the host refuses those commands itself, to a peer on this machine as well', async () => {
+    await startHost()
+    for (const local of [false, true]) {
+      for (const message of changes) {
+        const frames = forwardPastTheGate(message, local)
+        expect({ type: message.type, local, frames }).toEqual({
+          type: message.type,
+          local,
+          frames: [{ t: 'error', message: 'Only the Neuron desktop app can change your files, history or settings.', fatal: false }],
+        })
+      }
+    }
+    expect(engine.sent).toEqual([])
+  })
+
+  test('the host refuses the two commands that only read as well, past the gate', async () => {
+    await startHost()
+    for (const local of [false, true]) {
+      for (const message of reads) {
+        const frames = forwardPastTheGate(message, local)
+        expect({ type: message.type, local, frames }).toEqual({
+          type: message.type,
+          local,
+          frames: [{ t: 'error', message: 'Only the Neuron desktop app can change your files, history or settings.', fatal: false }],
+        })
+      }
+    }
+    expect(engine.sent).toEqual([])
+  })
+
+  test('the host refuses every command its policy calls owner_only, past the gate, to every peer', async () => {
+    await startHost()
+    const samples: ClientMessage[] = [
+      ...changes,
+      ...reads,
+      { kind: 'command', type: 'commit', message: 'x' },
+      { kind: 'command', type: 'set_mcp_server_enabled', name: 'fs', enabled: false },
+      { kind: 'command', type: 'shutdown' },
+    ]
+    const tag = (message: ClientMessage): string => (message.kind === 'command' ? message.type : message.kind)
+    // A tag the policy calls owner_only fails here until it has a sample.
+    const ownerOnly = Object.entries(HOST_POLICY).flatMap(([type, policy]) => (policy === 'owner_only' ? [type] : []))
+    expect(samples.map(tag).sort()).toEqual(ownerOnly.sort())
+    for (const local of [false, true]) {
+      for (const message of samples) {
+        const refused = forwardPastTheGate(message, local).map((frame) => frame.t)
+        expect({ tag: tag(message), local, refused }).toEqual({ tag: tag(message), local, refused: ['error'] })
+      }
+    }
+    expect(engine.sent).toEqual([])
+  })
+
+  test('ownerOnLoopback does not open what the host policy keeps for the desktop app', async () => {
+    await startHost({ localOnly: true, ownerOnLoopback: true })
+    for (const message of [...changes, ...reads, { kind: 'command', type: 'commit', message: 'x' } as const]) {
+      const frames = forwardPastTheGate(message, true)
+      expect({ type: message.type, frames }).toEqual({
+        type: message.type,
+        frames: [{ t: 'error', message: 'Only the Neuron desktop app can change your files, history or settings.', fatal: false }],
+      })
+    }
+    expect(engine.sent).toEqual([])
+  })
+
+  test('a command the host policy does not know is refused, not forwarded', async () => {
+    await startHost()
+    for (const local of [false, true]) {
+      const frames = forwardPastTheGate({ kind: 'command', type: 'frobnicate' } as unknown as ClientMessage, local)
+      expect(frames).toEqual([{ t: 'error', message: 'Only the Neuron desktop app can change your files, history or settings.', fatal: false }])
+    }
+    expect(engine.sent).toEqual([])
+  })
+
+  test('the host will not save project rules for a peer, and the request stays open for a decision it may take', async () => {
+    await startHost()
+    const input = '{"command":"cargo test"}'
+    engine.emit({ type: 'tool_call_started', id: 't1', name: 'bash', input, cut_off: false })
+    engine.emit({
+      type: 'permission_requested',
+      id: 7,
+      request: { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: null, input, session_prefixes: [], project_rules: ['Bash(cargo test:*)'] },
+    })
+    for (const local of [false, true]) {
+      const frames = forwardPastTheGate({ kind: 'permission_reply', id: 7, decision: { kind: 'allow_for_project' } }, local)
+      expect(frames).toEqual([{ t: 'error', message: 'Only the Neuron desktop app can change your files, history or settings.', fatal: false }])
+    }
+    expect(engine.sent).toEqual([])
+    expect(host!.state.permissions.map((permission) => permission.id)).toEqual([7])
+    // A decision a peer may take still goes through.
+    expect(forwardPastTheGate({ kind: 'permission_reply', id: 7, decision: { kind: 'allow_once' } }, false)).toEqual([])
+    expect(engine.sent).toEqual([{ kind: 'permission_reply', id: 7, decision: { kind: 'allow_once' } }])
+  })
+})
+
+/**
+ * Bun exits the process on an unhandled rejection, and a peer's frame can make the host throw: the engine
+ * has just died (`StdioTransport.send` throws then), or something else went wrong. The peer is told, and
+ * the host keeps serving.
+ */
+describe('NeuronHost when a frame makes it throw', () => {
+  /** A raw peer that has said hello. `frames` collects what the host sends it. */
+  async function connectRaw() {
+    const frames: HostFrame[] = []
+    const socket = new WebSocket(host!.url)
+    socket.onmessage = (event) => frames.push(JSON.parse(String(event.data)) as HostFrame)
+    await new Promise<void>((resolve) => (socket.onopen = () => resolve()))
+    socket.send(JSON.stringify({ t: 'hello', protocol: 1, token: TOKEN, client: { name: 'raw', kind: 'cli' } }))
+    await until('the snapshot', () => frames.some((frame) => frame.t === 'snapshot'))
+    return {
+      frames,
+      errors: () => frames.flatMap((frame) => (frame.t === 'error' ? [frame.message] : [])),
+      send: (frame: unknown) => socket.send(JSON.stringify(frame)),
+    }
+  }
+
+  /** What `StdioTransport.send` does once the engine is gone. */
+  const dies = () => {
+    throw new Error('The Neuron engine is not running.')
+  }
+
+  test('a frame that meets an engine that has just died is answered, and the host keeps serving', async () => {
+    await startHost()
+    engine.send = dies
+    const peer = await connectRaw()
+    peer.send({ t: 'send', message: { kind: 'command', type: 'submit', text: 'hi', attachments: [] } })
+    await until('the error', () => peer.errors().length === 1)
+    expect(peer.errors()).toEqual(['The engine is not running.'])
+    // The prompt never reached the engine, so it is not in the transcript either.
+    expect(host!.state.items).toEqual([])
+    // The same peer is still served, and so is a new one.
+    peer.send({ t: 'ping' })
+    await until('the pong', () => peer.frames.some((frame) => frame.t === 'pong'))
+    const late = await attach('mobile')
+    expect(late.controller.getState().connection).toBe('ready')
+  })
+
+  test('a permission reply the engine never got leaves the request open for the next try', async () => {
+    await startHost()
+    const input = '{"command":"cargo test"}'
+    engine.emit({ type: 'tool_call_started', id: 't1', name: 'bash', input, cut_off: false })
+    engine.emit({
+      type: 'permission_requested',
+      id: 7,
+      request: { tool: 'bash', current_mode: 'workspace-write', required_mode: 'danger-full-access', reason: null, input, session_prefixes: [] },
+    })
+    const working = engine.send.bind(engine)
+    engine.send = dies
+    const peer = await connectRaw()
+    const reply = { kind: 'permission_reply', id: 7, decision: { kind: 'allow_once' } }
+    peer.send({ t: 'send', message: reply })
+    await until('the error', () => peer.errors().length === 1)
+    expect(peer.errors()).toEqual(['The engine is not running.'])
+    expect(host!.state.permissions.map((permission) => permission.id)).toEqual([7])
+    // The engine is back: the same answer goes through, and only now is the request answered.
+    engine.send = working
+    peer.send({ t: 'send', message: reply })
+    await until('the answer to reach the engine', () => engine.sent.length === 1)
+    await until('the request to be answered', () => host!.state.permissions.length === 0)
+    expect(engine.sent).toEqual([{ kind: 'permission_reply', id: 7, decision: { kind: 'allow_once' } }])
+  })
+
+  test('whatever else a frame makes the host throw is answered too, without the details', async () => {
+    await startHost()
+    ;(host as unknown as { forward(): void }).forward = () => {
+      throw new Error('an internal detail the peer has no business seeing')
+    }
+    const peer = await connectRaw()
+    peer.send({ t: 'send', message: { kind: 'command', type: 'interrupt' } })
+    await until('the error', () => peer.errors().length === 1)
+    expect(peer.errors()).toEqual(['The host could not handle that frame.'])
+    peer.send({ t: 'ping' })
+    await until('the pong', () => peer.frames.some((frame) => frame.t === 'pong'))
+  })
+})
+
+describe('NeuronHost origin check', () => {
+  const allowed = (origin: string | null, hostHeader: string | null) =>
+    (host as unknown as { originAllowed(o: string | null, h: string | null): boolean }).originAllowed(origin, hostHeader)
+
+  test('a same-host origin needs a loopback Host header', async () => {
+    await startHost()
+    expect(allowed('http://192.168.1.5:3000', '192.168.1.5:3000')).toBe(false)
+    expect(allowed('https://evil.example', 'evil.example')).toBe(false)
+    expect(allowed('http://evil.example:80', 'localhost:7777')).toBe(false)
+  })
+
+  test('local pages and native clients still connect', async () => {
+    await startHost()
+    expect(allowed(null, 'anything')).toBe(true)
+    expect(allowed('http://localhost:5173', 'localhost:7777')).toBe(true)
+    expect(allowed('http://127.0.0.1:5173', '127.0.0.1')).toBe(true)
+  })
+})
+

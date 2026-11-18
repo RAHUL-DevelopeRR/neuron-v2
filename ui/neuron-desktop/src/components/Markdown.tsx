@@ -1,4 +1,5 @@
 import { Fragment, useState, type ReactNode } from 'react'
+import { linkTitle } from '../links'
 
 /** Copies `text`, and says so for a moment. */
 export function CopyButton({ text, label = 'Copy' }: { text: string; label?: string }) {
@@ -130,6 +131,7 @@ function inline(text: string, onLink?: (url: string) => void): ReactNode[] {
         <a
           key={key++}
           href={url}
+          title={linkTitle(url)}
           onClick={(event) => {
             event.preventDefault()
             onLink?.(url)

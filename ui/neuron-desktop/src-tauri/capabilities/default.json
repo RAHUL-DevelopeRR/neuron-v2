@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The main window: core events only. The app's own commands do the rest.",
+  "description": "The main window: core events, the folder picker, the settings store and the update check. The app's own commands do the rest. Note: notification:allow-notify lets page script show system notifications, so the page can raise them without going through the host.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "dialog:allow-open", "store:default", "updater:allow-check", "notification:allow-is-permission-granted", "notification:allow-request-permission", "notification:allow-notify"]
 }
