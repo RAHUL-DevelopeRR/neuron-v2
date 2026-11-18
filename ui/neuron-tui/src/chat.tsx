@@ -79,9 +79,10 @@ import { useEngineStore } from './state/engine-store'
 import { isGitPanelOpen, useGitViewsStore } from './state/git-views-store'
 import { useQueuePanelStore } from './state/queue-panel-store'
 import { useReviewStore } from './state/review-store'
+import { updateNotice, useUpdateStore } from './state/update-store'
 import { useMessageBlockStore } from './state/message-block-store'
 import { stopActiveRun } from './utils/active-run'
-import { showClipboardMessage } from './utils/clipboard'
+import { copyTextToClipboard, showClipboardMessage } from './utils/clipboard'
 import { readClipboardImage } from './utils/clipboard-image'
 import { GLYPHS } from './utils/glyphs'
 import { getSystemMessage } from './utils/message-history'
@@ -142,9 +143,19 @@ export const Chat = ({
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   // The status bar's other pickers and its context popover, in the same slot.
   const [statusPanel, setStatusPanel] = useState<
-    Exclude<StatusTarget, 'model' | 'account' | 'connectors'> | null
+    Exclude<StatusTarget, 'model' | 'account' | 'connectors' | 'update'> | null
   >(null)
   const openStatusTarget = useCallback((target: StatusTarget) => {
+    if (target === 'update') {
+      // The update notice copies its command; the copy shows its own confirmation.
+      const notice = updateNotice(useUpdateStore.getState())
+      if (notice) {
+        void copyTextToClipboard(notice.command, {
+          successMessage: 'Copied the update command: exit Neuron and run it in a terminal',
+        }).catch(() => {})
+      }
+      return
+    }
     if (target === 'model') {
       setStatusPanel(null)
       setModelPickerOpen(true)

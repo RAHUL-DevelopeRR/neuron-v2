@@ -2,6 +2,7 @@
 // knows to have the `neuron-tui` binary ready. The native `neuron` makes the
 // final call (it starts the UI only in place of its line REPL); this mirrors
 // it closely enough to avoid fetching the UI for a prompt or a subcommand.
+// It also tells the UI how this copy was installed (withInstallMethod).
 
 // The flags whose value is the next argument (args.rs VALUE_FLAGS, plus --provider).
 const VALUE_FLAGS = new Set([
@@ -34,4 +35,15 @@ export function wantsFullScreenUi(argv, {env = process.env, interactive}) {
     return false;
   }
   return true;
+}
+
+/**
+ * `env` with NEURON_INSTALL_METHOD=npm, so the full-screen UI names the npm
+ * update command: its binary may sit in the cache the pip launcher shares
+ * (when the package folder is read-only), where its path alone reads as pip.
+ * A value the user set is kept; `env` itself is not changed.
+ */
+export function withInstallMethod(env) {
+  if (String(env.NEURON_INSTALL_METHOD ?? '').trim()) return {...env};
+  return {...env, NEURON_INSTALL_METHOD: 'npm'};
 }

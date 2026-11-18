@@ -87,6 +87,9 @@ const passThrough = [
   'PATH', 'PATHEXT', 'SystemRoot', 'SystemDrive', 'ComSpec', 'windir', 'TEMP', 'TMP',
   'APPDATA', 'LOCALAPPDATA', 'TERM', 'COLORTERM', 'TERM_PROGRAM', 'TERM_PROGRAM_VERSION',
   'WT_SESSION', 'WT_PROFILE_ID', 'LANG', 'LC_ALL',
+  // To try the update notice: NEURON_TUI_VERSION=7.0.0-alpha.1 bun run dev:mock
+  // (a source run is otherwise 0.0.0, which never checks).
+  'NEURON_TUI_VERSION', 'NEURON_UPDATE_MANIFEST_URL', 'NEURON_NO_UPDATE_CHECK',
 ]
 const env: Record<string, string> = {}
 for (const name of passThrough) {

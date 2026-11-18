@@ -5,7 +5,7 @@
 // (git-view-commands.ts) are found only when the engine has their feature;
 // /new also starts the engine on a fresh conversation (`clear --confirm`), and
 // the /mode:* commands are not registered (AGENT_MODES_AVAILABLE); /upgrade
-// opens the plans page.
+// opens the plans page; /update (Neuron's) reports the release check.
 // See ui/neuron-tui/PORTING.md.
 import { handleCopyConversationCommand } from './copy-conversation'
 import { handleExportConversationCommand } from './export-conversation'
@@ -19,6 +19,7 @@ import {
   buildSkillPrompt,
 } from './prompt-builders'
 import { runBashCommand } from './router'
+import { runUpdateCommand } from './update-command'
 import { getNeuronEngineClient } from '../engine/neuron-engine-client'
 import { clearEngineConversation } from '../engine/engine-session'
 import { useThemeStore } from '../hooks/use-theme'
@@ -438,6 +439,16 @@ const ALL_COMMANDS: CommandDefinition[] = [
           ),
         ])
       })
+    },
+  }),
+  defineCommand({
+    // Whether a newer Neuron release exists, and the command that installs it.
+    name: 'update',
+    handler: async (params) => {
+      const shown = params.inputValue.trim()
+      params.saveToHistory(shown)
+      clearInput(params)
+      await runUpdateCommand(shown, { setMessages: params.setMessages })
     },
   }),
   defineCommand({

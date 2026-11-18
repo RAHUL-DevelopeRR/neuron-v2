@@ -563,6 +563,30 @@ SDK run-state context source of Freebuff's status bar.
   modified) titles an `mcp__` call with its connector and tool and shows the
   catalog tier as the title suffix (`utils/mcp-tool-label.ts`).
 
+## Update notice
+
+Neuron's own; Freebuff has no counterpart in the ported files.
+
+- **Check.** `utils/update-check.ts` reads the public release manifest
+  (`https://zero-x.live/releases/cli/latest.json`, schema 1) once per launch,
+  after the first draw (`index.tsx`), with a 3 s timeout and a 24-hour cache in
+  `update-check.json` in the config dir. It compares versions by semver
+  precedence, prereleases included, and picks the install command (npm, pip,
+  PowerShell or shell installer) from `NEURON_INSTALL_METHOD`, which the npm
+  and pip launchers set (both share one cache, so a path cannot tell them
+  apart), or else from where the UI binary lives. The built-in pip command
+  upgrades (`--upgrade`) and names `python3` off Windows. Off for development
+  builds (`0.0.0`), `CI` (but not `CI=false` or `CI=0`),
+  `NEURON_NO_UPDATE_CHECK=1` and a stdout that is not a terminal. A rejected
+  `NEURON_UPDATE_MANIFEST_URL` is shown without its credentials.
+- **Showing it.** `state/update-store.ts` holds the result. The prompt status
+  bar shows `Update available! Run: <command>` on the right (`Update
+  required: <command>` below the minimum version), which copies the command when
+  clicked and shortens to `Update available · /update` before it goes
+  (`COLLAPSE_STEPS`). `/update` (`commands/update-command.ts`) shows
+  "Checking for updates..." at once, then reports the versions, the release
+  notes link and the command in that line's place, and copies the command.
+
 ## Left for later
 
 - **Still open from P3:**

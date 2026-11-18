@@ -45,6 +45,7 @@ import { trimOversizedChatLogs } from './utils/chat-history'
 import { resumeSessionFor } from './utils/run-state-storage'
 import { clearLogFile, logger } from './utils/logger'
 import { shouldShowProjectPicker } from './utils/project-picker'
+import { startUpdateCheck } from './state/update-store'
 import { saveRecentProject } from './utils/recent-projects'
 import {
   CLI_RENDERER_EXIT_SIGNALS,
@@ -295,6 +296,14 @@ async function main(): Promise<void> {
       </MinimumSizeGate>
     </QueryClientProvider>,
   )
+
+  // Whether a newer release exists: only once the UI is drawn, and in the
+  // background (utils/update-check.ts; it never throws or logs to the chat).
+  const updateTimer = setTimeout(() => startUpdateCheck(), UPDATE_CHECK_DELAY_MS)
+  updateTimer.unref?.()
 }
+
+/** How long after the first draw the update check starts. */
+const UPDATE_CHECK_DELAY_MS = 1500
 
 void main()
