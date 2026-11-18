@@ -198,7 +198,14 @@ pub const ENGINE_FEATURES: &[&str] = &[
     FEATURE_MCP_POLICY,
     FEATURE_MCP_HOSTED,
     FEATURE_STATUS_BAR,
+    FEATURE_TURN_PAUSE,
 ];
+
+/// A turn that reached its model-request cap, or kept repeating itself, ends with a
+/// notice of kind [`NoticeKind::Paused`] instead of an error, when the UI declared
+/// [`CAPABILITY_TURN_PAUSE`]; the user continues it with a new prompt ("continue").
+/// Without the capability the same notice comes as a plain one.
+pub const FEATURE_TURN_PAUSE: &str = "turn_pause";
 
 /// `report` events for the commands that show a report (`/usage`, `/init`, `/memory`,
 /// `/doctor`), when the UI takes them ([`CAPABILITY_REPORTS`]).
@@ -381,6 +388,10 @@ pub enum OutputStream {
 
 /// A UI capability: send the hook events of [`FEATURE_HOOK_PROGRESS`].
 pub const CAPABILITY_HOOK_PROGRESS: &str = "hook_progress";
+
+/// A UI capability: a paused turn's notice comes with [`NoticeKind::Paused`], and says
+/// that Enter on an empty prompt continues it ([`FEATURE_TURN_PAUSE`]).
+pub const CAPABILITY_TURN_PAUSE: &str = "turn_pause";
 
 /// Which saved chats [`EngineCommand::ListSessions`] lists.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1015,6 +1026,11 @@ pub enum UiEvent {
         /// The last lines of the main text so far (a few lines, at most about 1 KB),
         /// unescaped.
         preview: Option<String>,
+        /// Lines an edit replaces (`edit_file`'s `old_string` so far), for a diff-style
+        /// `+lines -removed`. Added after protocol 1: absent from older engines and for
+        /// other tools; older UIs ignore it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        removed: Option<u64>,
     },
     /// Output tokens of the model response now streaming (text, reasoning and tool
     /// input), estimated from its length. Starts again from 0 with each model request
@@ -1131,6 +1147,10 @@ pub enum NoticeKind {
     /// OpenAI-compatible `content_filter`). The message is the one line to show, with
     /// the provider's explanation when it gave one. It is not assistant text.
     Refusal,
+    /// The turn was paused, not failed: it reached its model-request cap or kept
+    /// repeating itself. The work so far is kept; the message says how to continue.
+    /// Sent only to a UI that declared [`CAPABILITY_TURN_PAUSE`].
+    Paused,
 }
 
 /// A file, folder or image the user attached to a prompt.
@@ -1430,6 +1450,16 @@ mod tests {
         let older: UiEvent =
             serde_json::from_str(r#"{"type":"notice","message":"Interrupting"}"#).unwrap();
         assert_eq!(older, plain);
+
+        let paused = UiEvent::Notice {
+            message: "Paused: the turn reached its limit of 200 model requests.".into(),
+            kind: Some(NoticeKind::Paused),
+        };
+        let json = serde_json::to_value(&paused).unwrap();
+        assert_eq!(json["kind"], "paused");
+        assert_eq!(serde_json::from_value::<UiEvent>(json).unwrap(), paused);
+        assert!(ENGINE_FEATURES.contains(&FEATURE_TURN_PAUSE));
+        assert_eq!(CAPABILITY_TURN_PAUSE, FEATURE_TURN_PAUSE);
     }
 
     /// Fields added after protocol 1 shipped read as their defaults from older engines.
@@ -1679,6 +1709,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn live_progress_and_git_view_events_as_json() {
         let ready: UiEvent =
             serde_json::from_str(r#"{"type":"ready","protocol":1,"version":"7.0.0"}"#).unwrap();
@@ -1698,10 +1729,30 @@ mod tests {
             lines: 40,
             target: Some("shop/style.css".into()),
             preview: Some("body {\n  margin: 0;".into()),
+            removed: None,
         })
         .unwrap();
         assert_eq!(progress["type"], "tool_input_progress");
         assert_eq!(progress["target"], "shop/style.css");
+        // `removed` is left out unless an edit replaces lines, and reads as `None` from
+        // older engines.
+        assert!(progress.get("removed").is_none(), "{progress}");
+        let older: UiEvent = serde_json::from_value(progress).unwrap();
+        assert!(matches!(
+            older,
+            UiEvent::ToolInputProgress { removed: None, .. }
+        ));
+        let edit = serde_json::to_value(UiEvent::ToolInputProgress {
+            id: "call_2".into(),
+            name: "edit_file".into(),
+            bytes: 90,
+            lines: 3,
+            target: Some("src/app.ts".into()),
+            preview: None,
+            removed: Some(2),
+        })
+        .unwrap();
+        assert_eq!(edit["removed"], 2);
         assert_eq!(
             serde_json::to_value(UiEvent::OutputProgress { output_tokens: 12 }).unwrap(),
             serde_json::json!({"type": "output_progress", "output_tokens": 12})

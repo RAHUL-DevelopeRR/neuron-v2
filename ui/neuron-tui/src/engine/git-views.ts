@@ -23,6 +23,7 @@
  */
 
 import { getNeuronEngineClient, runExchange, type NeuronEngineClient } from './neuron-engine-client'
+import { clearPausedTurn } from './paused-turn'
 import { useChatStore } from '../state/chat-store'
 import { dropRewoundTurns, useGitViewsStore } from '../state/git-views-store'
 import { consoleSafeText } from '../utils/glyphs'
@@ -321,6 +322,9 @@ export function confirmRewind(): void {
     return
   }
   useGitViewsStore.getState().markRewindConfirmed()
+  // The conversation goes back to before the pause: Enter on an empty prompt
+  // must not send "continue" into it.
+  clearPausedTurn()
   const { checkpoint, mode } = picked
   void exchange(engine, (client) =>
     client.send({ type: 'rewind', checkpoint, mode, dry_run: false }),

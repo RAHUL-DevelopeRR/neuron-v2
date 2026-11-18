@@ -21,6 +21,7 @@ import {
 } from './prompt-builders'
 import { runEngineLogin, whenEngineStarted } from '../engine/engine-session'
 import { revealDeferredGitPanel } from '../engine/git-views'
+import { clearPausedTurn, takeContinuePrompt } from '../engine/paused-turn'
 import { getNeuronEngineClient, runExchange } from '../engine/neuron-engine-client'
 import { answerEngineQuestion } from '../engine/question-form'
 import { statusAddendum } from '../engine/status-report'
@@ -242,13 +243,27 @@ export async function routeUserPrompt(
   const setInputMode = useChatStore.getState().setInputMode
   const pendingAttachments = useChatStore.getState().pendingAttachments
 
-  const trimmed = inputValue.trim()
+  let trimmed = inputValue.trim()
   // Allow empty messages if there are pending attachments (images or text).
   // Skill mode also accepts an empty submit: it means "run the skill as-is".
   const hasAttachments = pendingAttachments.length > 0
   // Enter on an empty input brings up a commit card or rewind picker that
   // waits behind it (engine/git-views.ts).
   if (!trimmed && !hasAttachments && inputMode === 'default' && revealDeferredGitPanel()) return
+  // After a paused turn, Enter on an empty input continues it
+  // (engine/paused-turn.ts); anything else sent answers the pause too. Not
+  // while a turn runs or waits in the queue: "continue" would go into a turn
+  // that has nothing to do with the pause.
+  const turnBusy =
+    isStreaming ||
+    Boolean(streamMessageIdRef.current) ||
+    isChainInProgressRef.current ||
+    Boolean(hasQueuedMessages?.())
+  if (!trimmed && !hasAttachments && inputMode === 'default') {
+    if (!turnBusy) trimmed = takeContinuePrompt() ?? ''
+  } else if (trimmed || hasAttachments) {
+    clearPausedTurn()
+  }
   if (!trimmed && !hasAttachments && inputMode !== 'skill') return
 
   // A report panel closes once the next prompt or command is sent.
