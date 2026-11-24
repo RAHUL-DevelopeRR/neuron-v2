@@ -34,11 +34,12 @@
     Install directory. Defaults to $env:NEURON_INSTALL_DIR, then %LOCALAPPDATA%\Programs\Neuron\bin.
 
 .PARAMETER NoPathChange
-    Leave the user PATH alone (so does NEURON_NO_MODIFY_PATH=1). By default the install
-    directory is appended to the user PATH.
+    Leave the user PATH alone (so does NEURON_NO_MODIFY_PATH=1, unless -AddToPath is given). By
+    default the install directory is put first in the user PATH.
 
 .PARAMETER AddToPath
-    Accepted for older install commands; adding to PATH is now the default.
+    Change the user PATH even when NEURON_NO_MODIFY_PATH is set. Adding to PATH is the default;
+    -NoPathChange still wins over this.
 
 .NOTES
     Environment: NEURON_VERSION, NEURON_INSTALL_DIR, NEURON_NO_MODIFY_PATH, NEURON_DOWNLOAD_BASE
@@ -580,7 +581,9 @@ function Install-Neuron {
     if ($PSVersionTable.PSVersion.Major -lt 6) {
         [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
     }
-    $changePath = -not ($NoPathChange -or (Test-Truthy $env:NEURON_NO_MODIFY_PATH))
+    # An explicit -AddToPath (the zero-x.live one-liner passes it) beats the environment's
+    # NEURON_NO_MODIFY_PATH; an explicit -NoPathChange beats both.
+    $changePath = (-not $NoPathChange) -and ($AddToPath -or -not (Test-Truthy $env:NEURON_NO_MODIFY_PATH))
     # Read by Get-NeuronDownload, a child scope, so nothing is left behind in an `irm | iex` session.
     $NeuronDownloadState = @{ DotNetOnly = $false }
 
