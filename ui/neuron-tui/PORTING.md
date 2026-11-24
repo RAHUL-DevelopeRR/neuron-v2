@@ -93,6 +93,9 @@ rewritten for what remains:
     brand colour as `neuron`'s own banner draws it (N blue, e red, u and r
     orange, o and n green). The shadows are the letter's colour dimmed, and the
     sheen lights them in it;
+  - Neura, Neuron's mascot, beside the full logo in the welcome header when
+    the terminal has room for both (`utils/mascot.ts`, half blocks drawn from
+    the grid in `assets/mascot/build-mascot.mjs`; not in the console glyph set);
   - both themes in NeuronCLI's palette (`BRAND` in `utils/logo.ts`, the values
     of `rust/crates/rusty-claude-cli/src/brand.rs`): blue accents, borders,
     headings and the assistant's line, the user's line orange, cyan info, links

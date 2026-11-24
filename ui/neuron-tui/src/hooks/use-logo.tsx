@@ -4,13 +4,13 @@
 import React, { useMemo } from 'react'
 
 import {
-  LOGO,
+  ASCII_LOGO_LINES,
   LOGO_LETTER_COLORS,
-  LOGO_SMALL,
   SHADOW_CHARS,
   TEXT_LOGO,
   logoLetterColor,
   logoShadowColor,
+  logoVariant,
   parseLogoLines,
 } from '../utils/logo'
 
@@ -78,15 +78,10 @@ export const useLogo = ({
 }: UseLogoOptions): LogoResult => {
   // The ASCII art (full and small) is 6 lines tall. If the caller can't spare
   // that many rows, collapse straight to the single-line text variant.
-  const ASCII_LOGO_LINES = 6
-  const rawLogoString = useMemo(() => {
-    if (maxHeight != null && maxHeight < ASCII_LOGO_LINES) {
-      return TEXT_LOGO
-    }
-    if (availableWidth >= 70) return LOGO
-    if (availableWidth >= 20) return LOGO_SMALL
-    return TEXT_LOGO
-  }, [availableWidth, maxHeight])
+  const rawLogoString = useMemo(
+    () => logoVariant(availableWidth, maxHeight),
+    [availableWidth, maxHeight],
+  )
 
   // Format text block for plain text contexts (chat messages, etc.)
   const textBlock = useMemo(() => {
