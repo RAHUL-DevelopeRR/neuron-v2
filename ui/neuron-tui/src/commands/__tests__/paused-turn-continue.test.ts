@@ -59,11 +59,29 @@ describe('Enter after a paused turn', () => {
     expect(empty.sendMessage).not.toHaveBeenCalled()
   })
 
-  test('a typed prompt is sent as typed and answers the pause', async () => {
+  test('a typed prompt is sent as typed, not as "continue"', async () => {
+    // The turn it starts answers the pause (createTurnEventSink, see
+    // engine/__tests__/paused-turn.test.ts).
     notePausedTurn()
     const typed = params('use the other parser instead')
     await routeUserPrompt(typed.params)
     expect(sentContents(typed.sendMessage)).toEqual(['use the other parser instead'])
+  })
+
+  test('a local command in between keeps the pause: Enter still continues', async () => {
+    // The paused line stays on screen and says to press Enter; a command that
+    // starts no turn (/help, /usage, /model...) must not disarm it.
+    notePausedTurn()
+    const help = params('/help')
+    await routeUserPrompt(help.params)
+    expect(help.sendMessage).not.toHaveBeenCalled()
+    expect(hasPausedTurn()).toBe(true)
+    // The help panel is closed (Esc) before the next Enter.
+    useChatStore.getState().setInputMode('default')
+
+    const empty = params('')
+    await routeUserPrompt(empty.params)
+    expect(sentContents(empty.sendMessage)).toEqual(['continue'])
     expect(hasPausedTurn()).toBe(false)
   })
 

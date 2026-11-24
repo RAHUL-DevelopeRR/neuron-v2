@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, test } from 'bun:test'
 
 import { useChatStore } from '../../state/chat-store'
 import { useEngineStore } from '../../state/engine-store'
-import { handleEngineEvent, setEngineTurnActive } from '../engine-session'
+import { clearEngineConversation, handleEngineEvent, setEngineTurnActive } from '../engine-session'
 import {
   CONTINUE_PROMPT,
   clearPausedTurn,
@@ -61,6 +61,18 @@ describe('a paused turn', () => {
     // use-message-queue sends a queued message with sendMessage, not through
     // the router; every turn starts its event sink.
     turnHarness()
+    expect(hasPausedTurn()).toBe(false)
+    expect(takeContinuePrompt()).toBeNull()
+  })
+})
+
+describe('a paused turn and a new chat', () => {
+  test('a new chat disarms Enter: the paused line went with the old chat', async () => {
+    handleEngineEvent({ type: 'notice', message: PAUSED, kind: 'paused' })
+    expect(hasPausedTurn()).toBe(true)
+    // The history screen's New chat, /new and /clear all end here, and none of
+    // them starts a turn.
+    await clearEngineConversation()
     expect(hasPausedTurn()).toBe(false)
     expect(takeContinuePrompt()).toBeNull()
   })

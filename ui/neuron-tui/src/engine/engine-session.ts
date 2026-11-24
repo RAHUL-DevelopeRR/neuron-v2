@@ -711,6 +711,9 @@ export function isUnreachableSignIn(message: string): boolean {
  * `/new <prompt>`, runs in the fresh conversation.
  */
 export function clearEngineConversation(): Promise<void> {
+  // The paused line is gone with the old chat: Enter on an empty prompt must
+  // not send "continue" into the new one.
+  clearPausedTurn()
   const clear = (): Promise<void> => {
     const engine = getNeuronEngineClient()
     if (engine.connection !== 'ready') return Promise.resolve()

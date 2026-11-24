@@ -4,8 +4,10 @@
  * `paused`, with the `turn_pause` capability). The work so far is kept in the
  * session; the next prompt carries on from there.
  *
- * Until the user sends something else, Enter on an empty prompt sends
- * {@link CONTINUE_PROMPT}: one key to keep going, as the notice says.
+ * Until another turn starts (or the chat is cleared, resumed or rewound),
+ * Enter on an empty prompt sends {@link CONTINUE_PROMPT}: one key to keep
+ * going, as the notice says. A local command such as /help starts no turn, so
+ * it leaves the pause armed.
  */
 
 /** What Enter on an empty prompt sends after a pause. */
@@ -18,7 +20,7 @@ export function notePausedTurn(): void {
   pending = true
 }
 
-/** Something else was sent (a prompt, a command): the pause is answered. */
+/** A turn started, or the conversation changed: the pause is answered. */
 export function clearPausedTurn(): void {
   pending = false
 }
