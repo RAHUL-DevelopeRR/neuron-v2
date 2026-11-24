@@ -207,10 +207,8 @@ export function buildDialogCommand(tool: DialogTool, executable: string, startDi
 
 /** The picked paths in a dialog's output, one per line. */
 export function parseDialogOutput(stdout: string): string[] {
-  return stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
+  // Only the line ends go: a file name may start or end with a space.
+  return stdout.split(/\r?\n/).filter((line) => line.trim().length > 0)
 }
 
 /**

@@ -8,7 +8,7 @@ import { prepareUserMessage } from '../../hooks/helpers/send-message'
 import { setProjectRoot } from '../../project-files'
 import { useAttachStore } from '../../state/attach-store'
 import { useChatStore } from '../../state/chat-store'
-import { attachFiles, startAttach } from '../attach-files'
+import { attachFiles, resolveAttachPath, startAttach } from '../attach-files'
 
 import type { SpawnedDialog } from '../file-dialog'
 import type { PendingFileAttachment } from '../../types/store'
@@ -112,6 +112,23 @@ describe('attachFiles', () => {
   test('the same file twice is attached once', () => {
     attachFiles(['report.pdf', `.${path.sep}report.pdf`], { root: workspace })
     expect(files()).toHaveLength(1)
+  })
+
+  test('paths are taken literally: brackets, parentheses, quotes and spaces in names', () => {
+    const odd = path.join(workspace, '[old] (v2)')
+    mkdirSync(odd)
+    writeFileSync(path.join(odd, "a 'b' {c}.pdf"), '%PDF\u0000')
+    writeFileSync(path.join(workspace, '(final) deck.pptx'), 'PK\u0000')
+    const picked = [path.join(odd, "a 'b' {c}.pdf"), path.join(workspace, '(final) deck.pptx')]
+    const outcome = attachFiles(picked, { root: workspace })
+    expect(outcome.refused).toEqual([])
+    expect(files().map((file) => file.path)).toEqual(picked)
+  })
+
+  test('a leading ~ is home', () => {
+    expect(resolveAttachPath('~/x.pdf', workspace, '/home/me')).toBe(path.resolve('/home/me', 'x.pdf'))
+    expect(resolveAttachPath('~', workspace, '/home/me')).toBe('/home/me')
+    expect(resolveAttachPath('docs/x.pdf', workspace)).toBe(path.join(workspace, 'docs', 'x.pdf'))
   })
 
   test('a missing file says so', () => {

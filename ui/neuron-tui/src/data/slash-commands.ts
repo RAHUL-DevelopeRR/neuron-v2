@@ -138,7 +138,6 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
     id: 'attach',
     label: 'attach',
     description: 'Attach files: documents, code, text (or /attach <path>)',
-    aliases: ['upload'],
   },
   {
     id: 'model',

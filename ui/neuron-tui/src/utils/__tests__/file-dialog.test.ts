@@ -124,6 +124,8 @@ describe('dialog command builders', () => {
 describe('reading the dialog back', () => {
   test('one path per line, CRLF or LF, blanks dropped', () => {
     expect(parseDialogOutput('C:\\a b.pdf\r\nC:\\c.txt\r\n\r\n')).toEqual(['C:\\a b.pdf', 'C:\\c.txt'])
+    // Names keep their spaces; only the line ends go.
+    expect(parseDialogOutput('/ws/ odd .txt\n')).toEqual(['/ws/ odd .txt'])
   })
 
   test('exit 0 with paths is a pick, with none a cancel', () => {

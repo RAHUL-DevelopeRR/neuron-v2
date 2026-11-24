@@ -1,8 +1,7 @@
 import { existsSync } from 'fs'
 
-import { attachFiles, attachWorkspaceRoot, startAttach } from '../utils/attach-files'
+import { attachFiles, attachWorkspaceRoot, resolveAttachPath, startAttach } from '../utils/attach-files'
 import { parseAttachArgs } from '../utils/attach-routing'
-import { resolveFilePath } from '../utils/image-handler'
 import { logger } from '../utils/logger'
 
 /**
@@ -12,7 +11,7 @@ import { logger } from '../utils/logger'
  */
 export function handleAttachCommand(args: string): void {
   const root = attachWorkspaceRoot()
-  const paths = parseAttachArgs(args, (candidate) => existsSync(resolveFilePath(candidate, root)))
+  const paths = parseAttachArgs(args, (candidate) => existsSync(resolveAttachPath(candidate, root)))
   if (paths.length > 0) {
     attachFiles(paths, { root })
     return

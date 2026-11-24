@@ -6,6 +6,7 @@
  */
 
 import { closeSync, openSync, readSync, realpathSync, statSync } from 'fs'
+import os from 'os'
 import path from 'path'
 
 import { addPendingFileFromPath, addPendingFileReference, validateAndAddImage } from './pending-attachments'
@@ -18,7 +19,6 @@ import {
   runFileDialog,
   type DialogSpawner,
 } from './file-dialog'
-import { resolveFilePath } from './image-handler'
 import { logger } from './logger'
 import { IS_TEST } from './runtime-env'
 import { IMAGES_REACH_THE_MODEL } from '../engine/attachments'
@@ -40,6 +40,19 @@ function realPath(target: string): string {
   } catch {
     return path.resolve(target)
   }
+}
+
+/**
+ * A picked or typed path as an absolute one, taken literally: only a leading
+ * `~` is expanded. No un-escaping, since on Windows `\(` is a separator and
+ * a folder name (`C:\ws\(final)\deck.pptx`).
+ */
+export function resolveAttachPath(picked: string, root: string, homeDir: string = os.homedir()): string {
+  if (picked === '~') return homeDir
+  if (picked.startsWith('~/') || picked.startsWith('~\\')) {
+    return path.resolve(homeDir, picked.slice(2))
+  }
+  return path.resolve(root, picked)
 }
 
 /** A NUL byte in the first 8 KB, as pending-attachments.ts judges binary. */
@@ -84,7 +97,7 @@ export function attachFiles(
   const outcome: AttachOutcome = { attached: [], refused: [] }
 
   for (const picked of paths) {
-    const resolved = path.resolve(resolveFilePath(picked, root))
+    const resolved = resolveAttachPath(picked, root)
     const filename = path.basename(resolved) || resolved
     let stats
     try {

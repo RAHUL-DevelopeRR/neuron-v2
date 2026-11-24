@@ -1507,7 +1507,7 @@ export const Chat = ({
             width={separatorWidth}
             maxVisibleRows={isCompactHeight ? 4 : 8}
           />
-        ) : attachPickerOpen ? (
+        ) : attachPickerOpen && !askUserState ? (
           <>
             <AttachFilePicker
               startDir={attachPickerStartDir ?? getProjectRoot() ?? process.cwd()}

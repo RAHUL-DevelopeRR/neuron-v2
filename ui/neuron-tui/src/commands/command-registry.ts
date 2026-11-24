@@ -301,7 +301,6 @@ const ALL_COMMANDS: CommandDefinition[] = [
   // browser); /attach <path> attaches that file at once.
   defineCommandWithArgs({
     name: 'attach',
-    aliases: ['upload'],
     handler: (params, args) => {
       params.saveToHistory(params.inputValue.trim())
       clearInput(params)
