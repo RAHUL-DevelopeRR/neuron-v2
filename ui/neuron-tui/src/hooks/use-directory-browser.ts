@@ -2,15 +2,27 @@ import { existsSync, statSync } from 'fs'
 import os from 'os'
 import path from 'path'
 
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-import { getDirectories, hasGitDirectory } from '../utils/directory-browser'
+import {
+  getDirectories,
+  hasGitDirectory,
+  isWindowsDriveRoot,
+  sessionDriveRoots,
+} from '../utils/directory-browser'
 
 import type { DirectoryEntry } from '../utils/directory-browser'
 
 export interface UseDirectoryBrowserOptions {
   /** Initial path to browse from (defaults to home directory) */
   initialPath?: string
+  /** The platform (tests); defaults to this one. */
+  platform?: NodeJS.Platform
+  /**
+   * Finds the drive roots, off the render path (tests); defaults to one
+   * probe of `C:\` to `Z:\` per session.
+   */
+  probeDrives?: () => Promise<string[]>
 }
 
 export interface UseDirectoryBrowserReturn {
@@ -37,11 +49,46 @@ export interface UseDirectoryBrowserReturn {
  */
 export function useDirectoryBrowser({
   initialPath,
+  platform = process.platform,
+  probeDrives = sessionDriveRoots,
 }: UseDirectoryBrowserOptions = {}): UseDirectoryBrowserReturn {
   const [currentPath, setCurrentPath] = useState(initialPath ?? os.homedir())
 
+  // A Windows drive root lists the other drives. Probing them can block for
+  // tens of seconds (a disconnected network drive), so it never happens while
+  // drawing: the folders show at once and the drive rows join them when the
+  // probe answers, once per picker.
+  const atDriveRoot = platform === 'win32' && isWindowsDriveRoot(currentPath)
+  const [drives, setDrives] = useState<readonly string[] | null>(null)
+  const probeStarted = useRef(false)
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+    }
+  }, [])
+  useEffect(() => {
+    if (!atDriveRoot || probeStarted.current) return
+    probeStarted.current = true
+    // The answer is for every drive root, so it still holds after a move.
+    Promise.resolve()
+      .then(probeDrives)
+      .then(
+        (found) => {
+          if (mounted.current) setDrives(found)
+        },
+        () => {
+          if (mounted.current) setDrives([])
+        },
+      )
+  }, [atDriveRoot, probeDrives])
+
   // Get directories for current path
-  const directories = useMemo(() => getDirectories(currentPath), [currentPath])
+  const directories = useMemo(
+    () => getDirectories(currentPath, { platform, drives: drives ?? [] }),
+    [currentPath, platform, drives],
+  )
 
   // Check if current directory has .git
   const isGitRepo = useMemo(() => hasGitDirectory(currentPath), [currentPath])

@@ -437,7 +437,10 @@ once this branch has it.
   (Quick Open), so Alt+P and the button are the fallbacks there.
 - **The project picker with the mouse.** Every row is clickable: the folders,
   the parent (`..`), the recent projects and, at a Windows drive's root, the
-  other drives (`D:\`, listed by `utils/directory-browser.ts`). One click
+  other drives (`D:\`, listed by `utils/directory-browser.ts`; probed once
+  per session, in parallel and off the render path, each drive given 1.5 s,
+  so a disconnected network drive never freezes the screen, and the rows
+  join the list when the probe answers, the focus staying on its row). One click
   selects a row (the bar then shows it, and Open or Ctrl+O opens it); a double
   click (`utils/double-click.ts`, 400 ms) goes into a folder, parent or drive
   as Enter does, or opens a recent project. Any key gives the keyboard back

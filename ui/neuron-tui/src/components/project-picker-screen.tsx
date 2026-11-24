@@ -7,7 +7,7 @@ import os from 'os'
 import path from 'path'
 
 import { TextAttributes } from '@opentui/core'
-import React, { useCallback, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from './button'
 import { MultilineInput } from './multiline-input'
@@ -110,12 +110,18 @@ interface ProjectPickerScreenProps {
   initialPath?: string
   /** The home folder "No project" makes its scratch folder under (tests). */
   homeDir?: string
+  /** The platform the rows are for (tests); defaults to this one. */
+  platform?: NodeJS.Platform
+  /** Finds the drive roots for a drive root's drive rows (tests). */
+  probeDrives?: () => Promise<string[]>
 }
 
 export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
   onSelectProject,
   initialPath,
   homeDir = os.homedir(),
+  platform,
+  probeDrives,
 }) => {
   const theme = useTheme()
   const [sheenPosition, setSheenPosition] = useState(0)
@@ -128,7 +134,7 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
     expandPath,
     tryNavigateToPath,
     navigateToDirectory,
-  } = useDirectoryBrowser({ initialPath })
+  } = useDirectoryBrowser({ initialPath, platform, probeDrives })
 
   // Convert directories to SelectableListItem format
   const directoryItems: SelectableListItem[] = useMemo(
@@ -154,6 +160,27 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
   } = useSearchableList({
     items: directoryItems,
     resetKey: currentPath,
+  })
+
+  // Drive rows arrive after the first paint (and go above the folders): the
+  // keyboard's focus stays on the row it was on rather than on its index.
+  const lastFocus = useRef<{ base: string; id: string | undefined }>({
+    base: currentPath,
+    id: undefined,
+  })
+  // Checked while rendering, so the new rows and the moved focus show (and
+  // take keys) together: only a change of rows in the same folder moves it.
+  const [rowsSeen, setRowsSeen] = useState(directoryItems)
+  if (rowsSeen !== directoryItems) {
+    setRowsSeen(directoryItems)
+    const { base, id } = lastFocus.current
+    if (base === currentPath && id !== undefined) {
+      const index = filteredDirectoryItems.findIndex((item) => item.id === id)
+      if (index >= 0 && index !== focusedIndex) setFocusedIndex(index)
+    }
+  }
+  useEffect(() => {
+    lastFocus.current = { base: currentPath, id: filteredDirectoryItems[focusedIndex]?.id }
   })
 
   // "New folder": the filter input takes the new folder's name while naming.

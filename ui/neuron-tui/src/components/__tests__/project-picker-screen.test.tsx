@@ -8,6 +8,7 @@ import { createRoot, flushSync } from '@opentui/react'
 import React from 'react'
 
 import { initializeThemeStore } from '../../hooks/use-theme'
+import { getDirectories } from '../../utils/directory-browser'
 import {
   NAMING_HINT,
   PICKER_SHORTCUTS_HINT,
@@ -49,10 +50,23 @@ type Selection = { path: string; options?: ProjectSelectOptions }
 async function mountPicker(
   width: number,
   height: number,
-  { folders = ['alpha'] }: { folders?: string[] } = {},
+  {
+    folders = ['alpha'],
+    initialPath,
+    platform,
+    probeDrives,
+  }: {
+    folders?: string[]
+    /** Where the picker starts; defaults to a fresh folder holding `folders`. */
+    initialPath?: string
+    platform?: NodeJS.Platform
+    probeDrives?: () => Promise<string[]>
+  } = {},
 ) {
-  const project = tempDir()
-  for (const folder of folders) mkdirSync(path.join(project, folder))
+  const project = initialPath ?? tempDir()
+  if (initialPath === undefined) {
+    for (const folder of folders) mkdirSync(path.join(project, folder))
+  }
   const home = tempDir()
   const selected: Selection[] = []
 
@@ -67,6 +81,8 @@ async function mountPicker(
       <ProjectPickerScreen
         initialPath={project}
         homeDir={home}
+        platform={platform}
+        probeDrives={probeDrives}
         onSelectProject={(p, options) => selected.push({ path: p, options })}
       />,
     ),
@@ -374,5 +390,87 @@ describe('the project picker recents with the mouse', () => {
 
     await ui.doubleClickRow('[1]')
     expect(ui.selected).toEqual([{ path: recent, options: undefined }])
+  })
+})
+
+// A real drive root to read (C:\), with the drive probe faked: Windows only.
+describe('the project picker at a drive root', () => {
+  const onWindows = test.if(process.platform === 'win32')
+  const DRIVE = 'C:\\'
+  // A drive letter no test machine is expected to have, so its row is ours.
+  const FAKE_DRIVE = 'Q:\\'
+  const folders = () => getDirectories(DRIVE, { platform: 'win32' }).filter((entry) => !entry.isParent)
+
+  function deferredDrives() {
+    let resolve: (drives: string[]) => void = () => {}
+    const promise = new Promise<string[]>((r) => {
+      resolve = r
+    })
+    let calls = 0
+    return {
+      probe: () => {
+        calls++
+        return promise
+      },
+      resolve,
+      calls: () => calls,
+    }
+  }
+
+  onWindows('the folders show and the keys work while the drives have not answered', async () => {
+    const real = folders()
+    expect(real.length).toBeGreaterThan(0)
+    const ui = await mountPicker(120, 40, {
+      initialPath: DRIVE,
+      platform: 'win32',
+      // A disconnected network drive: the probe never answers.
+      probeDrives: () => new Promise<string[]>(() => {}),
+    })
+    expect(ui.frame()).toContain(real[0]!.name)
+    expect(ui.frame()).not.toContain(FAKE_DRIVE)
+    await ui.act(() => ui.mockInput.pressKey('n', { ctrl: true }))
+    expect(ui.frame()).toContain(NAMING_HINT)
+  })
+
+  onWindows('drive rows join when the probe answers, the focus stays on its row, and it probes once', async () => {
+    const real = folders()
+    expect(real.length).toBeGreaterThan(1)
+    const drives = deferredDrives()
+    const ui = await mountPicker(120, 40, {
+      initialPath: DRIVE,
+      platform: 'win32',
+      probeDrives: drives.probe,
+    })
+    expect(drives.calls()).toBe(1)
+    expect(ui.frame()).not.toContain(FAKE_DRIVE)
+
+    // The keyboard is on the second folder when the drive row arrives above it.
+    await ui.act(() => ui.mockInput.pressArrow('down'))
+    await ui.act(() => drives.resolve([DRIVE, FAKE_DRIVE]))
+    expect(ui.frame()).toContain(FAKE_DRIVE)
+
+    // Enter goes into that folder, not into the row now at its old index.
+    await ui.act(() => ui.mockInput.pressEnter())
+    const target = real[1]!.name
+    expect(ui.bar()).toContain(target.slice(-8))
+
+    // Back up to the drive root (the parent row is the first): the rows are
+    // there and nothing was probed again.
+    for (let i = 0; i < 5; i++) await ui.act(() => ui.mockInput.pressArrow('up'))
+    await ui.act(() => ui.mockInput.pressEnter())
+    expect(ui.bar()).not.toContain(target.slice(-8))
+    expect(ui.frame()).toContain(FAKE_DRIVE)
+    expect(drives.calls()).toBe(1)
+  })
+
+  onWindows('a probe that fails adds no drive rows and leaves the folders', async () => {
+    const real = folders()
+    const ui = await mountPicker(120, 40, {
+      initialPath: DRIVE,
+      platform: 'win32',
+      probeDrives: () => Promise.reject(new Error('no drives')),
+    })
+    expect(ui.frame()).toContain(real[0]!.name)
+    expect(ui.frame()).not.toContain(FAKE_DRIVE)
   })
 })
