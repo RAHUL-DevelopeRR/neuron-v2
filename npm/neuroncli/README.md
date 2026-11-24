@@ -1,14 +1,24 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/RAHUL-DevelopeRR/neuron-v2/HEAD/assets/mascot/neura.svg" width="144" alt="Neura, the Neuron mascot: a small blue pixel neuron">
+</p>
+
 # @zero-x.live/neuron
 
-Neuron is a terminal coding agent. It reads your project, edits files and runs
-commands with your permission, and talks to models through the Zero-X gateway
-(free plan included) or your own provider key.
+Neuron is a coding agent for your terminal that you can use free, today: no
+subscription and no card. It reads your project, edits files and runs commands
+with your permission, and talks to models through the Zero-X gateway (free plan
+included) or straight to your own provider key or a local model.
+
+Where your code goes: Neuron works on your files locally. Your prompts and the
+files it reads go to the model provider that answers them; the Zero-X gateway
+records only usage metadata (model, token counts, latency, status). See
+[Privacy](https://github.com/RAHUL-DevelopeRR/neuron-v2#privacy).
 
 Requires Node.js 22.14 or later on Linux (x64, arm64, glibc), macOS (Apple
 silicon, Intel) or Windows (x64).
 
 ```sh
-npm install --global @zero-x.live/neuron   # the 7.0.0 alpha
+npm install --global @zero-x.live/neuron@latest   # also how you update
 neuron auth login
 neuron
 ```

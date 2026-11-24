@@ -1,23 +1,65 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/RAHUL-DevelopeRR/neuron-v2/HEAD/assets/mascot/neura.svg" width="216" alt="Neura, the Neuron mascot: a small blue pixel neuron with two eyes, three dendrites and an axon tail">
+</p>
+
 # Neuron
 
-Neuron by [Zero-X](https://zero-x.live/neuron-cli) is an open-source AI coding agent
-that runs in your terminal. It reads your project, edits files and runs commands, and
-asks before it does anything your permission mode does not allow. It is a single
-native binary written in Rust. New to coding agents? Read
-[how an AI coding agent works](https://zero-x.live/ai-coding-agent).
+**A coding agent for your terminal that you can use free, today.** No subscription and
+no card: Neuron's free plan runs on free model tiers, and the day you want more control
+you point the same agent at your own provider key or a local model. It reads your
+project, edits files and runs commands, and asks before anything your permission mode
+does not allow.
 
-By default Neuron talks to models through the [Zero-X gateway](https://zero-x.live).
-You sign in once with `neuron auth login`; the provider API keys stay on the gateway
-and never reach your machine. You can also use your own provider key instead.
+- **One native binary, written in Rust**, installed from checksummed release assets
+  with GitHub build provenance. No Node or Python runtime needed for the binary itself.
+- **Asks before it acts.** Permission modes run from read-only to full access, and
+  anything outside your mode waits for your yes.
+- **Reads more than code**: PDF, Word, PowerPoint and Excel files, and images.
+- **Open source** under the MIT license, by [Zero-X](https://zero-x.live/neuron-cli).
 
-> 7.0.0-alpha.5 is Neuron's fifth alpha, built and published by this repository's
-> release pipeline. Its known limitations are listed in
-> the [changelog](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/CHANGELOG.md).
-> It is a GitHub prerelease, so the install scripts need the versioned commands below.
-> The npm 6.2.0 and PyPI 6.2.4 (and earlier) packages were built outside the pipeline
-> and are not supported.
+## Where your code goes
+
+Read this before you sign in:
+
+- Neuron runs on your machine. It reads and edits your files locally.
+- To answer you, what you send in a session (your prompts, the files Neuron reads,
+  command output) goes to a model provider: through the
+  [Zero-X gateway](https://zero-x.live) by default, or straight to your own provider
+  when you [bring your own key](#bring-your-own-key). With a local model server it
+  never leaves your machine.
+- The gateway forwards each request and records only usage metadata (model, token
+  counts, latency, status) for quotas and billing. Provider API keys stay on the
+  gateway. Neuron itself sends no analytics.
+- Free model tiers have their own data terms. If your code must stay under one
+  provider's terms, use your own key for that provider. The full details are under
+  [Privacy](#privacy).
 
 ## Install
+
+**Windows (PowerShell)**
+
+```powershell
+irm https://zero-x.live/install.ps1 | iex
+```
+
+**macOS and Linux**
+
+```sh
+curl -fsSL https://zero-x.live/install.sh | sh
+```
+
+**npm** (Node.js 22.14 or later): `npm install --global @zero-x.live/neuron@latest`
+
+**pip** (Python 3.9 or later): `pip install --upgrade --pre neuroncli`. Keep `--pre`
+while Neuron 7 is in alpha: without it pip picks 6.2.4, an old build that is not
+supported.
+
+Then run `neuron` in your project. To update later, run the same command again; from
+7.0.0-alpha.6 on, the full-screen UI also tells you when a newer release is out and
+`/update` shows the command for the way you installed. Known limitations of the alpha
+are in the [changelog](https://github.com/RAHUL-DevelopeRR/neuron-v2/blob/HEAD/CHANGELOG.md).
+
+### Pinned installs and the details
 
 Every method installs the same `neuron` binary from
 [GitHub Releases](https://github.com/RAHUL-DevelopeRR/neuron-v2/releases) and checks
@@ -61,7 +103,7 @@ npm install --global @zero-x.live/neuron
 `--pre`:
 
 ```sh
-pip install --pre neuroncli
+pip install --upgrade --pre neuroncli
 ```
 
 The registry packages are published after the GitHub release, so check them first:
@@ -151,10 +193,14 @@ OpenRouter's free models. The limits are real and you will run into them:
 
 | Free plan | Limit |
 | --- | --- |
+| Tokens per 5 hours | 3,000,000 |
+| Tokens per day | 5,000,000 |
 | Requests per day | 100 |
-| Tokens per day | 500,000 |
 | Requests per minute | 10 |
 | Concurrent requests | 2 |
+
+Tokens are counted as the prompt tokens that were not cached, plus a tenth of the
+cached ones, plus the reply, so a long session that reuses its context goes further.
 
 - Everyone on the free plan shares the same upstream capacity. When a shared pool
   runs out, requests fail with `capacity_exhausted` and a time to retry.
@@ -165,7 +211,7 @@ OpenRouter's free models. The limits are real and you will run into them:
   time. `/model` lists what is available to you now; outside a session,
   `curl https://zero-x.live/v1/models` shows the current catalog.
 
-**Pro and Max.** Paid plans raise the daily and per-minute limits and add paid
+**Athlete, Speed, Pro and Max.** Paid plans raise the daily and per-minute limits and add paid
 upstream capacity, billed against monthly credits included with the plan; credit
 top-ups are also sold. Prices and current limits are at
 <https://zero-x.live/pricing>. In Neuron, `/upgrade` opens that page, and

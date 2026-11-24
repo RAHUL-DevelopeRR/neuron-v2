@@ -49,6 +49,21 @@ export const LOGO_SMALL = `
 /** What the logo collapses to when even the small one does not fit. */
 export const TEXT_LOGO = 'NEURON'
 
+/** How many lines the block logos (full and small) are. */
+export const ASCII_LOGO_LINES = 6
+
+/**
+ * The logo for `availableWidth` columns: the full one from 70, the N alone
+ * from 20, else the text. Fewer than {@link ASCII_LOGO_LINES} rows of
+ * `maxHeight` also give the text.
+ */
+export function logoVariant(availableWidth: number, maxHeight?: number): string {
+  if (maxHeight != null && maxHeight < ASCII_LOGO_LINES) return TEXT_LOGO
+  if (availableWidth >= 70) return LOGO
+  if (availableWidth >= 20) return LOGO_SMALL
+  return TEXT_LOGO
+}
+
 // The column each letter of LOGO starts at (LOGO_SMALL is its first letter).
 const LOGO_LETTER_STARTS = [0, 11, 19, 28, 36, 45]
 
