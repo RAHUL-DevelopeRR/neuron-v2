@@ -1506,6 +1506,14 @@ fn settings_max_iterations_caps_the_model_calls_of_a_turn() {
         "{errors}"
     );
     assert!(errors.contains("-p continue"), "{errors}");
+    // The resume command keeps the run's permission mode and tools: `--resume`
+    // alone would give the resumed run every tool.
+    assert!(
+        errors.contains(
+            "neuron --permission-mode read-only --allowedTools read_document,read_file --resume "
+        ),
+        "{errors}"
+    );
     assert!(!errors.contains("conversation loop exceeded"), "{errors}");
     assert!(!errors.contains("unknown key"), "{errors}");
     assert_eq!(gateway.count("POST", "/v1/chat/completions"), 3);
@@ -1525,7 +1533,8 @@ fn settings_max_iterations_caps_the_model_calls_of_a_turn() {
     );
     assert_eq!(gateway.count("POST", "/v1/chat/completions"), 5);
 
-    // `--output-format json`: the usual result, outcome `iteration_limit`, and exit 1.
+    // `--output-format json`: the usual result, outcome `iteration_limit`, with
+    // `error` saying why it stopped and how to resume it, and exit 1.
     let mut command = workspace.command(&gateway);
     command
         .env("NEURON_TOKEN", SESSION_TOKEN)
@@ -1536,10 +1545,66 @@ fn settings_max_iterations_caps_the_model_calls_of_a_turn() {
     let result = json_result(&output);
     assert_eq!(result["outcome"], "iteration_limit", "{result}");
     assert_eq!(result["iterations"], 2, "{result}");
+    let error = result["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("the turn reached its limit of 2 model requests"),
+        "{result}"
+    );
+    assert!(
+        error.contains("--permission-mode read-only --output-format json --resume "),
+        "{result}"
+    );
     let errors = stderr(&output);
     assert!(errors.contains("-p continue"), "{errors}");
     assert!(!errors.contains("conversation loop exceeded"), "{errors}");
     assert_eq!(gateway.count("POST", "/v1/chat/completions"), 7);
+}
+
+#[test]
+fn a_paused_stream_json_run_ends_on_an_error_result() {
+    // `stream-json`: the result line is an error (a GitHub Action posts "Neuron
+    // failed: <error>", not the model's partial text), and the outcome is kept.
+    let gateway = gateway_with_chat(|_, index| {
+        Reply::sse(&[
+            serde_json::json!({"id":"loop","model":"auto","choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("call_{index}"),"function":{"name":"read_file","arguments":"{\"path\":\"fixture.txt\"}"}}]}}]}),
+            serde_json::json!({"id":"loop","choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ])
+    });
+    let workspace = Workspace::new("stream-json-paused");
+    fs::write(workspace.root.join("fixture.txt"), "loop fixture").unwrap();
+    fs::write(
+        workspace.root.join("config/settings.json"),
+        r#"{"defaultMcpServers":false}"#,
+    )
+    .unwrap();
+    let mut command = workspace.command(&gateway);
+    command
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .env("NEURON_MAX_ITERATIONS", "2")
+        .args([
+            "--output-format",
+            "stream-json",
+            "--permission-mode",
+            "read-only",
+            "prompt",
+            "keep reading",
+        ]);
+    let output = run(command, None);
+    assert!(!output.status.success(), "{}", stderr(&output));
+    let result = stdout(&output)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|line| line["type"] == "result")
+        .unwrap_or_else(|| panic!("no result line: {}", stdout(&output)));
+    assert_eq!(result["is_error"], true, "{result}");
+    assert_eq!(result["outcome"], "iteration_limit", "{result}");
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("--output-format stream-json --resume ")),
+        "{result}"
+    );
+    assert_eq!(gateway.count("POST", "/v1/chat/completions"), 2);
 }
 
 #[test]

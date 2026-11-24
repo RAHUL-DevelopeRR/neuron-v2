@@ -333,11 +333,75 @@ pub(crate) fn paused_notice(outcome: &TurnOutcome, hint: ContinueHint) -> Option
     ))
 }
 
+/// What a paused one-shot run was started with that its resume command repeats:
+/// `--resume` brings back the session's model only, so without these the resumed
+/// run would get the configured permission mode, every tool and text output.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ResumeHint<'a> {
+    pub session_id: &'a str,
+    /// `read-only`, `workspace-write` or `danger-full-access`; other modes have no
+    /// flag and are left out.
+    pub permission_mode: Option<&'a str>,
+    pub allowed_tools: Option<&'a AllowedToolSet>,
+    pub reasoning_effort: Option<&'a str>,
+    /// `json` or `stream-json`; `None` for text.
+    pub output_format: Option<&'a str>,
+}
+
+impl ResumeHint<'_> {
+    /// `neuron [the run's flags] --resume <session> -p continue`. The flags come
+    /// before `--resume`: everything after `-p` is the prompt.
+    pub(crate) fn command(&self) -> String {
+        let mut words = vec!["neuron".to_string()];
+        if let Some(mode) = self
+            .permission_mode
+            .filter(|mode| normalize_permission_mode(mode).is_some())
+        {
+            words.extend(["--permission-mode".to_string(), mode.to_string()]);
+        }
+        if let Some(tools) = self.allowed_tools {
+            let list = tools
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(",");
+            words.extend(["--allowedTools".to_string(), shell_word(&list)]);
+        }
+        if let Some(effort) = self.reasoning_effort {
+            words.extend(["--reasoning-effort".to_string(), shell_word(effort)]);
+        }
+        if let Some(format) = self.output_format {
+            words.extend(["--output-format".to_string(), shell_word(format)]);
+        }
+        words.extend([
+            "--resume".to_string(),
+            shell_word(self.session_id),
+            "-p".to_string(),
+            "continue".to_string(),
+        ]);
+        words.join(" ")
+    }
+}
+
+/// `word` as one shell word: as it is when it needs no quoting, else in double quotes.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ',' | ':' | '/')
+        });
+    if plain {
+        word.to_string()
+    } else {
+        format!("\"{}\"", word.replace('"', "\\\""))
+    }
+}
+
 /// Why a one-shot run (`neuron -p`) whose turn was paused failed, and how to go on
 /// from where it stopped: there is no prompt to type `continue` into. `None` for
 /// outcomes that are not pauses.
-pub(crate) fn one_shot_pause_message(outcome: &TurnOutcome, session_id: &str) -> Option<String> {
+pub(crate) fn one_shot_pause_message(outcome: &TurnOutcome, hint: &ResumeHint) -> Option<String> {
     let reason = runtime::paused_turn_reason(outcome)?;
+    let command = hint.command();
     // At the cap (not a loop), a script may simply need more requests per turn.
     let raise = if matches!(outcome, TurnOutcome::IterationLimit { .. }) {
         format!(
@@ -348,7 +412,7 @@ pub(crate) fn one_shot_pause_message(outcome: &TurnOutcome, session_id: &str) ->
         String::new()
     };
     Some(format!(
-        "the run stopped before the task was finished: {reason}. The work so far is saved. To keep going, run: neuron --resume {session_id} -p continue (or give different instructions in place of continue).{raise}"
+        "the run stopped before the task was finished: {reason}. The work so far is saved. To keep going, run: {command} (or give different instructions in place of continue).{raise}"
     ))
 }
 
@@ -927,7 +991,7 @@ Read documents.
         group_digits, handle_turn_interrupt, one_shot_pause_message, paused_notice,
         refusal_note_text, refusal_notice, render_context_report, turn_outcome_label,
         watch_turn_interrupts, ContextReport, ContinueHint, InterruptAction, InterruptPresses,
-        QuitHint, ReplBackend, ReplStep,
+        QuitHint, ReplBackend, ReplStep, ResumeHint,
     };
     use crate::{CliAction, ResumeLaunchOptions, DEFAULT_MODEL};
     use runtime::context_manager::{ContextBudget, ContextManager, ContextPolicy};
@@ -1164,21 +1228,91 @@ Read documents.
         let stuck = TurnOutcome::NoProgress {
             reason: "the model kept repeating the same 2 tool calls".to_string(),
         };
-        let message = one_shot_pause_message(&stuck, "session-123").expect("a pause");
+        let hint = |session_id| ResumeHint {
+            session_id,
+            ..ResumeHint::default()
+        };
+        let message = one_shot_pause_message(&stuck, &hint("session-123")).expect("a pause");
         assert!(message.contains("the model kept repeating the same 2 tool calls"));
         assert!(message.contains("neuron --resume session-123 -p continue"));
         assert!(!message.contains("type continue"));
         // A loop is not fixed by a higher cap: no advice to raise it.
         assert!(!message.contains("NEURON_MAX_ITERATIONS"));
-        assert_eq!(one_shot_pause_message(&TurnOutcome::Completed, "s"), None);
+        assert_eq!(
+            one_shot_pause_message(&TurnOutcome::Completed, &hint("s")),
+            None
+        );
 
-        let capped = one_shot_pause_message(&TurnOutcome::IterationLimit { limit: 3 }, "session-9")
-            .expect("a pause");
+        let capped = one_shot_pause_message(
+            &TurnOutcome::IterationLimit { limit: 3 },
+            &hint("session-9"),
+        )
+        .expect("a pause");
         assert_eq!(
             capped,
             "the run stopped before the task was finished: the turn reached its limit of 3 model requests. The work so far is saved. To keep going, run: neuron --resume session-9 -p continue (or give different instructions in place of continue). To allow more requests per turn, set NEURON_MAX_ITERATIONS or the \"maxIterations\" setting."
         );
         assert!(!capped.contains("conversation loop exceeded"));
+    }
+
+    #[test]
+    fn the_resume_command_of_a_paused_run_keeps_its_options() {
+        // `--resume` brings back the model only: without the flags, the resumed run
+        // would get every tool and the configured permission mode.
+        let tools = ["bash", "read_document", "read_file"]
+            .map(String::from)
+            .into_iter()
+            .collect::<crate::AllowedToolSet>();
+        let hint = ResumeHint {
+            session_id: "session-7",
+            permission_mode: Some("read-only"),
+            allowed_tools: Some(&tools),
+            reasoning_effort: Some("high"),
+            output_format: Some("json"),
+        };
+        let command = hint.command();
+        assert_eq!(
+            command,
+            "neuron --permission-mode read-only --allowedTools bash,read_document,read_file --reasoning-effort high --output-format json --resume session-7 -p continue"
+        );
+        let message = one_shot_pause_message(&TurnOutcome::IterationLimit { limit: 3 }, &hint)
+            .expect("a pause");
+        assert!(message.contains(&command), "{message}");
+
+        // The command parses back to the same options.
+        let words = command
+            .split_whitespace()
+            .skip(1)
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let Ok(CliAction::ResumePrompt {
+            session_path,
+            prompt,
+            output_format,
+            launch,
+            ..
+        }) = crate::parse_args(&words)
+        else {
+            panic!("not a resumed prompt: {command}");
+        };
+        assert_eq!(session_path, std::path::PathBuf::from("session-7"));
+        assert_eq!(prompt, "continue");
+        assert_eq!(output_format, crate::CliOutputFormat::Json);
+        assert_eq!(launch.permission_mode, Some(PermissionMode::ReadOnly));
+        assert_eq!(launch.allowed_tools.as_ref(), Some(&tools));
+        assert_eq!(launch.reasoning_effort.as_deref(), Some("high"));
+
+        // Modes with no flag are left out; stream-json is named as such.
+        let other = ResumeHint {
+            session_id: "s",
+            permission_mode: Some("prompt"),
+            output_format: Some("stream-json"),
+            ..ResumeHint::default()
+        };
+        assert_eq!(
+            other.command(),
+            "neuron --output-format stream-json --resume s -p continue"
+        );
     }
 
     #[test]

@@ -77,8 +77,11 @@ pub(crate) fn init_event(
 
 /// The last line of a run: `answer` is what `--output-format json` prints. A failed
 /// run's answer is `"type": "error"`; here the line stays `result` with `is_error`.
+/// A paused one-shot run's answer has the usual fields and an `error` (why it
+/// stopped, how to resume it): it did not finish, so it is an error too.
 pub(crate) fn result_event(answer: Value) -> Value {
-    let is_error = answer.get("type").and_then(Value::as_str) == Some("error");
+    let is_error = answer.get("type").and_then(Value::as_str) == Some("error")
+        || answer.get("error").is_some_and(Value::is_string);
     let mut result = json!({
         "type": "result",
         "schema": STREAM_SCHEMA_VERSION,
@@ -252,6 +255,16 @@ mod tests {
         assert_eq!(failed["type"], "result");
         assert_eq!(failed["is_error"], true);
         assert_eq!(failed["error"], "boom");
+        // A paused run: the usual answer with `error`, and its outcome kept.
+        let paused = result_event(json!({
+            "message": "",
+            "outcome": "iteration_limit",
+            "error": "the run stopped before the task was finished: ...",
+        }));
+        assert_eq!(paused["is_error"], true);
+        assert_eq!(paused["outcome"], "iteration_limit");
+        // A `null` error (not a failure) does not count.
+        assert_eq!(result_event(json!({ "error": null }))["is_error"], false);
         for (key, value) in answer.as_object().unwrap() {
             assert_eq!(&line[key], value, "{key}");
         }

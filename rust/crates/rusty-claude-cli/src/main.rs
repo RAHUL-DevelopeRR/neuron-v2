@@ -3549,13 +3549,31 @@ impl LiveCli {
         &self,
         outcome: &runtime::TurnOutcome,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if !headless::one_shot() {
-            return Ok(());
-        }
-        match repl_loop::one_shot_pause_message(outcome, &self.session.id) {
+        match self.one_shot_pause_message(outcome, None) {
             Some(message) => Err(message.into()),
             None => Ok(()),
         }
+    }
+
+    /// Why a paused one-shot run failed and the command that resumes it with this
+    /// run's options (`output_format`: `json` or `stream-json`, `None` for text);
+    /// `None` when the turn was not paused or the session is interactive.
+    fn one_shot_pause_message(
+        &self,
+        outcome: &runtime::TurnOutcome,
+        output_format: Option<&str>,
+    ) -> Option<String> {
+        if !headless::one_shot() {
+            return None;
+        }
+        let hint = repl_loop::ResumeHint {
+            session_id: &self.session.id,
+            permission_mode: Some(self.permission_mode.as_str()),
+            allowed_tools: self.allowed_tools.as_ref(),
+            reasoning_effort: self.runtime.api_client().reasoning_effort(),
+            output_format,
+        };
+        repl_loop::one_shot_pause_message(outcome, &hint)
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -3629,8 +3647,13 @@ impl LiveCli {
             runtime::ui_hooks::notice(&warning);
         }
         let usage = engine::usage_since(usage_before, summary.usage);
-        (
-            json!({
+        let format = if stream_json::requested() {
+            stream_json::FORMAT_NAME
+        } else {
+            "json"
+        };
+        let pause = self.one_shot_pause_message(&summary.outcome, Some(format));
+        let mut answer = json!({
                 "message": final_assistant_text(&summary),
                 "model": shown_model(&self.model),
                 // What `--resume` takes to continue this session.
@@ -3674,9 +3697,17 @@ impl LiveCli {
                         .map_or(0.0, runtime::UsageCostEstimate::total_cost_usd)
                 ),
                 "estimated_cost_known": pricing_for_model(&self.model).is_some()
-            }),
-            self.fail_paused_one_shot(&summary.outcome),
-        )
+        });
+        // A paused run did not finish: `error` says why and how to resume it, so
+        // `stream-json` marks the result `is_error` (the process exits 1). `outcome`
+        // still says which pause it was.
+        match pause {
+            Some(message) => {
+                answer["error"] = json!(message);
+                (answer, Err(message.into()))
+            }
+            None => (answer, Ok(())),
+        }
     }
 
     #[allow(clippy::too_many_lines)]
