@@ -4834,6 +4834,8 @@ fn spawn_agent_job_with_completion(
 fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<String, String> {
     let mut runtime = build_agent_runtime(job)?
         .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS)
+        // At the cap the turn ends as `IterationLimit`, reported below in plain words.
+        .with_pause_at_iteration_limit(true)
         .with_cancellation_token(cancel.clone());
     let mut summary = runtime
         .run_turn(job.prompt.clone(), None)
@@ -4864,6 +4866,10 @@ fn run_agent_job(job: &AgentJob, cancel: &runtime::CancellationToken) -> Result<
         runtime::TurnOutcome::LoopDetected { tool_name, repeats } => Err(format!(
             "sub-agent stopped after repeating `{tool_name}` {repeats} times"
         )),
+        runtime::TurnOutcome::IterationLimit { limit } => Err(format!(
+            "sub-agent stopped after {limit} model requests without finishing"
+        )),
+        runtime::TurnOutcome::NoProgress { reason } => Err(format!("sub-agent stopped: {reason}")),
         runtime::TurnOutcome::Refused { note, .. } => Err(format!(
             "sub-agent stopped: {}",
             runtime::refusal_line(note.as_deref())

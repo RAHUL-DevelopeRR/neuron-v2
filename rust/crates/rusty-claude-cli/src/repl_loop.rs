@@ -222,6 +222,8 @@ pub(crate) fn turn_outcome_label(outcome: &TurnOutcome) -> &'static str {
         TurnOutcome::Completed => "completed",
         TurnOutcome::Cancelled { .. } => "cancelled",
         TurnOutcome::LoopDetected { .. } => "loop_detected",
+        TurnOutcome::IterationLimit { .. } => "iteration_limit",
+        TurnOutcome::NoProgress { .. } => "no_progress",
         TurnOutcome::OutputTruncated => "output_truncated",
         TurnOutcome::Refused { .. } => "refused",
         TurnOutcome::BudgetStopped { .. } => "budget_stopped",
@@ -297,6 +299,123 @@ pub(crate) fn describe_turn_outcome_without_refusal(
     (!notes.is_empty()).then(|| notes.join("\n"))
 }
 
+/// [`describe_turn_outcome`] without the refusal line and the pause notice, which the
+/// full-screen UI gets as notices of their own kinds.
+pub(crate) fn describe_turn_outcome_for_ui(summary: &TurnSummary) -> Option<String> {
+    let paused = paused_notice(&summary.outcome, ContinueHint::Typed);
+    let notes = outcome_notes(summary, QuitHint::Hidden)
+        .into_iter()
+        .filter(|note| Some(note) != paused.as_ref())
+        .collect::<Vec<_>>();
+    (!notes.is_empty()).then(|| notes.join("\n"))
+}
+
+/// How the user continues a paused turn, as its notice says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContinueHint {
+    /// Type `continue` (the line terminal, older full-screen UIs).
+    Typed,
+    /// Press Enter on an empty prompt, or type `continue` (a UI with `turn_pause`).
+    EnterOrTyped,
+}
+
+/// The calm one-line notice a paused turn ends with (the model-request cap, the loop
+/// guard, the progress watch): what happened, that nothing was lost, and how to go
+/// on. `None` for other outcomes.
+pub(crate) fn paused_notice(outcome: &TurnOutcome, hint: ContinueHint) -> Option<String> {
+    let reason = runtime::paused_turn_reason(outcome)?;
+    let how = match hint {
+        ContinueHint::Typed => "type continue to keep going",
+        ContinueHint::EnterOrTyped => "press Enter or type continue to keep going",
+    };
+    Some(format!(
+        "Paused: {reason}. Your progress is saved: {how}, or tell it what to do differently."
+    ))
+}
+
+/// What a paused one-shot run was started with that its resume command repeats:
+/// `--resume` brings back the session's model only, so without these the resumed
+/// run would get the configured permission mode, every tool and text output.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ResumeHint<'a> {
+    pub session_id: &'a str,
+    /// `read-only`, `workspace-write` or `danger-full-access`; other modes have no
+    /// flag and are left out.
+    pub permission_mode: Option<&'a str>,
+    pub allowed_tools: Option<&'a AllowedToolSet>,
+    pub reasoning_effort: Option<&'a str>,
+    /// `json` or `stream-json`; `None` for text.
+    pub output_format: Option<&'a str>,
+}
+
+impl ResumeHint<'_> {
+    /// `neuron [the run's flags] --resume <session> -p continue`. The flags come
+    /// before `--resume`: everything after `-p` is the prompt.
+    pub(crate) fn command(&self) -> String {
+        let mut words = vec!["neuron".to_string()];
+        if let Some(mode) = self
+            .permission_mode
+            .filter(|mode| normalize_permission_mode(mode).is_some())
+        {
+            words.extend(["--permission-mode".to_string(), mode.to_string()]);
+        }
+        if let Some(tools) = self.allowed_tools {
+            let list = tools
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(",");
+            words.extend(["--allowedTools".to_string(), shell_word(&list)]);
+        }
+        if let Some(effort) = self.reasoning_effort {
+            words.extend(["--reasoning-effort".to_string(), shell_word(effort)]);
+        }
+        if let Some(format) = self.output_format {
+            words.extend(["--output-format".to_string(), shell_word(format)]);
+        }
+        words.extend([
+            "--resume".to_string(),
+            shell_word(self.session_id),
+            "-p".to_string(),
+            "continue".to_string(),
+        ]);
+        words.join(" ")
+    }
+}
+
+/// `word` as one shell word: as it is when it needs no quoting, else in double quotes.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ',' | ':' | '/')
+        });
+    if plain {
+        word.to_string()
+    } else {
+        format!("\"{}\"", word.replace('"', "\\\""))
+    }
+}
+
+/// Why a one-shot run (`neuron -p`) whose turn was paused failed, and how to go on
+/// from where it stopped: there is no prompt to type `continue` into. `None` for
+/// outcomes that are not pauses.
+pub(crate) fn one_shot_pause_message(outcome: &TurnOutcome, hint: &ResumeHint) -> Option<String> {
+    let reason = runtime::paused_turn_reason(outcome)?;
+    let command = hint.command();
+    // At the cap (not a loop), a script may simply need more requests per turn.
+    let raise = if matches!(outcome, TurnOutcome::IterationLimit { .. }) {
+        format!(
+            " To allow more requests per turn, set {} or the \"maxIterations\" setting.",
+            runtime::MAX_ITERATIONS_ENV_VAR
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "the run stopped before the task was finished: {reason}. The work so far is saved. To keep going, run: {command} (or give different instructions in place of continue).{raise}"
+    ))
+}
+
 /// The notes of [`describe_turn_outcome`] other than the refusal line.
 fn outcome_notes(summary: &TurnSummary, hint: QuitHint) -> Vec<String> {
     let mut notes = Vec::new();
@@ -316,9 +435,15 @@ fn outcome_notes(summary: &TurnSummary, hint: QuitHint) -> Vec<String> {
                 format!("Interrupted. {calls} pending tool call(s) were not run.")
             }
         }),
-        TurnOutcome::LoopDetected { tool_name, repeats } => notes.push(format!(
-            "Stopped: the model called `{tool_name}` {repeats} times in a row with identical arguments. Rephrase the request or give more guidance."
-        )),
+        // A one-shot run has no prompt to type continue into: it fails instead, with
+        // [`one_shot_pause_message`] on stderr.
+        TurnOutcome::LoopDetected { .. }
+        | TurnOutcome::IterationLimit { .. }
+        | TurnOutcome::NoProgress { .. } => {
+            if !crate::headless::one_shot() {
+                notes.extend(paused_notice(&summary.outcome, ContinueHint::Typed));
+            }
+        }
         TurnOutcome::OutputTruncated => notes.push(
             "Note: the response was cut off at the output token limit even after one automatic continuation. Ask the model to continue or to work in smaller steps."
                 .to_string(),
@@ -862,10 +987,11 @@ Read documents.
 
     use super::{
         check_context_argument, context_command_argument, describe_turn_outcome,
-        describe_turn_outcome_without_refusal, dispatch_line, group_digits, handle_turn_interrupt,
+        describe_turn_outcome_for_ui, describe_turn_outcome_without_refusal, dispatch_line,
+        group_digits, handle_turn_interrupt, one_shot_pause_message, paused_notice,
         refusal_note_text, refusal_notice, render_context_report, turn_outcome_label,
-        watch_turn_interrupts, ContextReport, InterruptAction, InterruptPresses, QuitHint,
-        ReplBackend, ReplStep,
+        watch_turn_interrupts, ContextReport, ContinueHint, InterruptAction, InterruptPresses,
+        QuitHint, ReplBackend, ReplStep, ResumeHint,
     };
     use crate::{CliAction, ResumeLaunchOptions, DEFAULT_MODEL};
     use runtime::context_manager::{ContextBudget, ContextManager, ContextPolicy};
@@ -1088,8 +1214,146 @@ Read documents.
             QuitHint::Shown,
         )
         .expect("notice");
-        assert!(looped.contains("`bash` 4 times"));
+        // Plain words, not the tool's internal name.
+        assert!(
+            looped.contains("the model kept running the same command 4 times in a row"),
+            "{looped}"
+        );
+        assert!(!looped.contains('`'), "{looped}");
         assert!(looped.contains("shortened 1 older tool result(s)"));
+    }
+
+    #[test]
+    fn a_paused_one_shot_run_says_how_to_resume_it() {
+        let stuck = TurnOutcome::NoProgress {
+            reason: "the model kept repeating the same 2 tool calls".to_string(),
+        };
+        let hint = |session_id| ResumeHint {
+            session_id,
+            ..ResumeHint::default()
+        };
+        let message = one_shot_pause_message(&stuck, &hint("session-123")).expect("a pause");
+        assert!(message.contains("the model kept repeating the same 2 tool calls"));
+        assert!(message.contains("neuron --resume session-123 -p continue"));
+        assert!(!message.contains("type continue"));
+        // A loop is not fixed by a higher cap: no advice to raise it.
+        assert!(!message.contains("NEURON_MAX_ITERATIONS"));
+        assert_eq!(
+            one_shot_pause_message(&TurnOutcome::Completed, &hint("s")),
+            None
+        );
+
+        let capped = one_shot_pause_message(
+            &TurnOutcome::IterationLimit { limit: 3 },
+            &hint("session-9"),
+        )
+        .expect("a pause");
+        assert_eq!(
+            capped,
+            "the run stopped before the task was finished: the turn reached its limit of 3 model requests. The work so far is saved. To keep going, run: neuron --resume session-9 -p continue (or give different instructions in place of continue). To allow more requests per turn, set NEURON_MAX_ITERATIONS or the \"maxIterations\" setting."
+        );
+        assert!(!capped.contains("conversation loop exceeded"));
+    }
+
+    #[test]
+    fn the_resume_command_of_a_paused_run_keeps_its_options() {
+        // `--resume` brings back the model only: without the flags, the resumed run
+        // would get every tool and the configured permission mode.
+        let tools = ["bash", "read_document", "read_file"]
+            .map(String::from)
+            .into_iter()
+            .collect::<crate::AllowedToolSet>();
+        let hint = ResumeHint {
+            session_id: "session-7",
+            permission_mode: Some("read-only"),
+            allowed_tools: Some(&tools),
+            reasoning_effort: Some("high"),
+            output_format: Some("json"),
+        };
+        let command = hint.command();
+        assert_eq!(
+            command,
+            "neuron --permission-mode read-only --allowedTools bash,read_document,read_file --reasoning-effort high --output-format json --resume session-7 -p continue"
+        );
+        let message = one_shot_pause_message(&TurnOutcome::IterationLimit { limit: 3 }, &hint)
+            .expect("a pause");
+        assert!(message.contains(&command), "{message}");
+
+        // The command parses back to the same options.
+        let words = command
+            .split_whitespace()
+            .skip(1)
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let Ok(CliAction::ResumePrompt {
+            session_path,
+            prompt,
+            output_format,
+            launch,
+            ..
+        }) = crate::parse_args(&words)
+        else {
+            panic!("not a resumed prompt: {command}");
+        };
+        assert_eq!(session_path, std::path::PathBuf::from("session-7"));
+        assert_eq!(prompt, "continue");
+        assert_eq!(output_format, crate::CliOutputFormat::Json);
+        assert_eq!(launch.permission_mode, Some(PermissionMode::ReadOnly));
+        assert_eq!(launch.allowed_tools.as_ref(), Some(&tools));
+        assert_eq!(launch.reasoning_effort.as_deref(), Some("high"));
+
+        // Modes with no flag are left out; stream-json is named as such.
+        let other = ResumeHint {
+            session_id: "s",
+            permission_mode: Some("prompt"),
+            output_format: Some("stream-json"),
+            ..ResumeHint::default()
+        };
+        assert_eq!(
+            other.command(),
+            "neuron --output-format stream-json --resume s -p continue"
+        );
+    }
+
+    #[test]
+    fn a_paused_turn_says_what_happened_and_how_to_continue_without_env_vars() {
+        let capped = summary(TurnOutcome::IterationLimit { limit: 200 }, 0);
+        assert_eq!(turn_outcome_label(&capped.outcome), "iteration_limit");
+        assert_eq!(
+            describe_turn_outcome(&capped, QuitHint::Shown).as_deref(),
+            Some("Paused: the turn reached its limit of 200 model requests. Your progress is saved: type continue to keep going, or tell it what to do differently.")
+        );
+        assert_eq!(
+            paused_notice(&capped.outcome, ContinueHint::EnterOrTyped).as_deref(),
+            Some("Paused: the turn reached its limit of 200 model requests. Your progress is saved: press Enter or type continue to keep going, or tell it what to do differently.")
+        );
+        let stuck = summary(
+            TurnOutcome::NoProgress {
+                reason: "the model read the same part of a.py 6 times without changing the file"
+                    .to_string(),
+            },
+            2,
+        );
+        assert_eq!(turn_outcome_label(&stuck.outcome), "no_progress");
+        let notice = describe_turn_outcome(&stuck, QuitHint::Shown).unwrap();
+        assert!(notice.starts_with("Paused: the model read the same part of a.py 6 times"));
+        assert!(!notice.contains("NEURON_MAX_ITERATIONS"));
+        // The full-screen UI gets the pause as its own notice; the rest stays.
+        assert_eq!(
+            describe_turn_outcome_for_ui(&stuck).as_deref(),
+            Some("Context: shortened 2 older tool result(s) to stay within the model's context window.")
+        );
+        assert_eq!(
+            describe_turn_outcome_for_ui(&summary(TurnOutcome::OutputTruncated, 0))
+                .map(|notice| notice.starts_with("Note: the response was cut off")),
+            Some(true)
+        );
+        assert_eq!(
+            paused_notice(&TurnOutcome::Completed, ContinueHint::Typed),
+            None
+        );
+        // No em dashes in what the user reads.
+        assert!(!notice.contains('\u{2014}'));
     }
 
     #[test]

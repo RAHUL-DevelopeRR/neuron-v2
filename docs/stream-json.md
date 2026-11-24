@@ -86,6 +86,12 @@ A failed run's `result` has `is_error: true` and the failure fields of `json` mo
 (`error`, plus what the turn did before it), and the process exits non-zero. Exit code `2` means tool calls
 were denied because nobody could approve them (see `USAGE.md`).
 
+A run whose turn was paused before the task was finished (the model-request cap, the
+loop guard or the progress watch) is a failed run too: its `result` has
+`is_error: true`, the usual fields with `outcome` `iteration_limit`, `loop_detected` or
+`no_progress`, and `error` with the reason and the command that resumes it with the
+same options; the process exits 1.
+
 ## stderr
 
 Notices (retries, piped-stdin notes, denials) stay on **stderr** as JSON lines

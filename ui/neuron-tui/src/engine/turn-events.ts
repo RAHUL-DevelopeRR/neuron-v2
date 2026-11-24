@@ -36,6 +36,7 @@ import {
   withoutToolBlocks,
 } from './live-tool-blocks'
 import { startLiveTurn } from './live-turn'
+import { clearPausedTurn } from './paused-turn'
 import {
   QUESTION_PREFIX,
   engineQuestionBlock,
@@ -107,6 +108,10 @@ export function createTurnEventSink(
 ): TurnEventSink {
   const chunk = createStreamChunkHandler(state)
   const sdk = createEventHandler(state)
+  // A new turn answers a paused one, however it was sent (typed, queued,
+  // steered text requeued at the end of a run): Enter on an empty prompt no
+  // longer continues the old one.
+  clearPausedTurn()
   const live = startLiveTurn()
   // Results carry their call's id. Older engines named only the tool, so
   // without an id a result goes to the oldest open call of that tool, which is

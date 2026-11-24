@@ -181,6 +181,8 @@ export interface Glyphs {
   todoActive: string
   /** The busy spinner's frames, one character each. */
   spinnerFrames: string
+  /** Before the live line of a file the model is writing. */
+  activity: string
   /** A cancelled agent. */
   cancelled: string
   /** A paused queue. */
@@ -221,6 +223,7 @@ const UNICODE_GLYPHS: Glyphs = {
   todo: '☐',
   todoActive: '▸',
   spinnerFrames: '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏',
+  activity: '●',
   cancelled: '⊘',
   paused: '⏸',
   shift: '⇧',
@@ -260,6 +263,7 @@ const CONSOLE_GLYPHS: Glyphs = {
   todo: '○',
   todoActive: '►',
   spinnerFrames: '|/-\\',
+  activity: '●',
   cancelled: '-',
   paused: '||',
   shift: 'Shift+',

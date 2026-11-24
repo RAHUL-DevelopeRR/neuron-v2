@@ -894,6 +894,107 @@ fn stdio_engine_shows_a_tool_call_while_the_model_writes_it() {
     let _ = fs::remove_dir_all(&home);
 }
 
+/// A model reading `path` with `read_file`, as call `id`.
+fn read_file_reply(id: &str, path: &str) -> String {
+    let arguments = json!({ "path": path }).to_string();
+    [
+        sse(&json!({
+            "id": "chatcmpl-r", "object": "chat.completion.chunk", "model": "auto",
+            "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": id, "type": "function",
+                "function": {"name": "read_file", "arguments": arguments}}]}, "finish_reason": null}]
+        })),
+        sse(&json!({
+            "id": "chatcmpl-r", "object": "chat.completion.chunk", "model": "auto",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
+        })),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat()
+}
+
+/// A turn that reaches its model-request cap is paused, not failed: no `error` event, a
+/// notice of kind `paused` that says how to continue (with the UI's `turn_pause`), and
+/// "continue" picks the work up in the next turn.
+#[test]
+fn stdio_engine_pauses_a_turn_at_its_request_cap_and_continues_it() {
+    let gateway = FakeGateway::with_replies(vec![
+        read_file_reply("call_a", "a.txt"),
+        read_file_reply("call_b", "b.txt"),
+        text_reply("Both files read."),
+    ]);
+    let (workspace, home) = workspace_and_home("turn-pause");
+    fs::write(workspace.join("a.txt"), "alpha\n").expect("a.txt");
+    fs::write(workspace.join("b.txt"), "beta\n").expect("b.txt");
+    let mut engine = StdioEngine::start(
+        &workspace,
+        &home,
+        &[
+            ("NEURON_API_BASE", &gateway.base),
+            ("NEURON_TOKEN", SESSION),
+            ("NEURON_MAX_ITERATIONS", "2"),
+        ],
+        &["--permission-mode", "workspace-write"],
+        Some(SESSION),
+    );
+    let ready = engine.next();
+    assert!(
+        ready["features"]
+            .as_array()
+            .expect("features")
+            .iter()
+            .any(|feature| feature == "turn_pause"),
+        "{ready}"
+    );
+    assert_eq!(engine.next_of("status")["signed_in"], true);
+    engine.send(&json!({
+        "kind": "command", "type": "capabilities",
+        "features": ["turn_pause"], "client": "terminal",
+    }));
+
+    engine.send(&submit("read both files"));
+    let turn = engine.until("turn_finished");
+    assert!(
+        turn.iter().all(|event| event["type"] != "error"),
+        "a paused turn is not a failure: {turn:?}"
+    );
+    let paused = turn
+        .iter()
+        .filter(|event| event["type"] == "notice" && event["kind"] == "paused")
+        .collect::<Vec<_>>();
+    assert_eq!(paused.len(), 1, "{turn:?}");
+    assert_eq!(
+        paused[0]["message"],
+        "Paused: the turn reached its limit of 2 model requests. Your progress is saved: press Enter or type continue to keep going, or tell it what to do differently."
+    );
+    assert!(!notices(&turn)
+        .iter()
+        .any(|notice| notice.contains("NEURON_MAX_ITERATIONS")));
+    let results = turn
+        .iter()
+        .filter(|event| event["type"] == "tool_result")
+        .count();
+    assert_eq!(results, 2, "{turn:?}");
+
+    engine.send(&submit("continue"));
+    let turn = engine.until("turn_finished");
+    let text = turn
+        .iter()
+        .filter(|event| event["type"] == "text_delta")
+        .filter_map(|event| event["text"].as_str())
+        .collect::<String>();
+    assert_eq!(text, "Both files read.");
+    assert!(
+        turn.iter()
+            .all(|event| event["type"] != "error" && event["kind"] != "paused"),
+        "{turn:?}"
+    );
+
+    engine.end_input();
+    let _ = fs::remove_dir_all(&workspace);
+    let _ = fs::remove_dir_all(&home);
+}
+
 /// `git` in `cwd` (the test's own environment); its stdout.
 fn git(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")

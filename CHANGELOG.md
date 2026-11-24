@@ -3,6 +3,29 @@
 Notable changes to Neuron. Versions follow [semantic versioning](https://semver.org/).
 The release workflow copies a version's section into its GitHub release notes.
 
+## 7.0.0-alpha.6 (unreleased)
+
+- A long task no longer dies at 50 model calls with an error naming an environment
+  variable. The per-turn cap is now 200 (`maxIterations`, `NEURON_MAX_ITERATIONS`), a
+  backstop rather than a stopping point, and an interactive turn that reaches it is paused
+  instead of failed: its work stays in the session, a calm notice says so, and `continue`
+  (or Enter on an empty prompt in the full-screen UI) picks it up. `neuron -p` runs still
+  exit non-zero at the cap, as scripts expect, but say in plain words that the work is
+  saved and give the `neuron --resume <session> -p continue` command; a sub-agent at its
+  cap reports that it stopped before finishing. The old "conversation loop exceeded the
+  maximum number of iterations" error is gone.
+- Loops are caught by what the agent does, not by counting: besides the same call repeated
+  with identical arguments, Neuron now notices the same two or three calls repeating with
+  the same results, and the same part of a file read again and again without the file
+  changing. The first time, the model is told to change its approach; if it keeps going,
+  the turn is paused the same way. The repeated-call guard warns again for each new streak.
+- While the model writes a file, the status line reads `● writing src/index.js +91` with a
+  spinner, the path relative to the workspace and the line count growing as the content
+  streams (`● editing src/app.ts +12 -3` for an edit). A pause in the stream adds
+  "no new tokens for 37s" after it instead of replacing the line with "Waiting for the
+  model". `tool_input_progress` gains an optional `removed` count, and the `turn_pause`
+  feature and capability add a `paused` notice kind; older engines and UIs ignore both.
+
 ## 7.0.0-alpha.5 (2026-11-07)
 
 - Trust hardening: the npm and PyPI launchers now check the downloaded binary against the

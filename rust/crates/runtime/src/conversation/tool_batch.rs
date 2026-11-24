@@ -2,8 +2,9 @@
 //! which calls qualify is in [`crate::parallel_tools`].
 
 use super::{
-    merge_hook_feedback, tool_input_object, ApiClient, ConversationMessage, ConversationRuntime,
-    LoopGuard, LoopVerdict, RuntimeError, ToolError, ToolExecutor, TurnProgress,
+    merge_hook_feedback, tool_input_object, watch_tool_result, ApiClient, ConversationMessage,
+    ConversationRuntime, LoopGuard, LoopVerdict, RuntimeError, ToolError, ToolExecutor,
+    TurnProgress,
 };
 use crate::parallel_tools::{is_concurrency_safe_tool, ConcurrentToolCall};
 use crate::permissions::{PermissionMode, PermissionOutcome};
@@ -73,11 +74,18 @@ where
             });
             let (output, is_error) =
                 self.after_tool_ran(&call.tool_use_id, &call.tool_name, &call.input, &[], result);
-            let message = ConversationMessage::tool_result(
+            let mut message = ConversationMessage::tool_result(
                 call.tool_use_id.clone(),
                 call.tool_name.clone(),
                 self.context_manager.cap_tool_result(output),
                 is_error,
+            );
+            // The whole batch already ran: a pause takes effect after it.
+            watch_tool_result(
+                &mut progress.watch,
+                &call.tool_name,
+                &call.input,
+                &mut message,
             );
             self.record_tool_result(iteration, message, progress)?;
         }
