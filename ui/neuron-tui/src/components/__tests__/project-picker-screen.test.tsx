@@ -361,8 +361,18 @@ describe('the project picker recents with the mouse', () => {
     await ui.clickButton('Open ')
     expect(ui.selected).toEqual([{ path: recent, options: undefined }])
 
+    // Open ended the sequence: the click before it does not pair with this one.
+    await ui.clickRow('[1]')
+    expect(ui.selected).toHaveLength(1)
+    expect(ui.frame()).toContain(selectionHint({ kind: 'recent', path: recent }))
+  })
+
+  test('a double click opens a recent project with no click before it', async () => {
+    const recent = tempDir()
+    writeFileSync(recentsFile(), JSON.stringify([{ path: recent, lastOpened: Date.now() }]))
+    const ui = await mountPicker(120, 40)
+
     await ui.doubleClickRow('[1]')
-    expect(ui.selected).toHaveLength(2)
-    expect(ui.selected[1]).toEqual({ path: recent, options: undefined })
+    expect(ui.selected).toEqual([{ path: recent, options: undefined }])
   })
 })

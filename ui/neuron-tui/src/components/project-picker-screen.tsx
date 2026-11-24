@@ -320,7 +320,9 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
   )
 
   // Open (and Ctrl+O): the selected row, or the folder the picker is in.
+  // Open ends a click sequence: the click before it never pairs with the next.
   const selectCurrentDirectory = useCallback(() => {
+    doubleClickRef.current.reset()
     onSelectProject(openTarget)
   }, [openTarget, onSelectProject])
 
