@@ -8,7 +8,12 @@ import { createRoot, flushSync } from '@opentui/react'
 import React from 'react'
 
 import { initializeThemeStore } from '../../hooks/use-theme'
-import { PICKER_SHORTCUTS_HINT, ProjectPickerScreen } from '../project-picker-screen'
+import {
+  NAMING_HINT,
+  PICKER_SHORTCUTS_HINT,
+  ProjectPickerScreen,
+  selectionHint,
+} from '../project-picker-screen'
 
 import type { ProjectSelectOptions } from '../project-picker-screen'
 
@@ -41,9 +46,13 @@ afterAll(() => {
 
 type Selection = { path: string; options?: ProjectSelectOptions }
 
-async function mountPicker(width: number, height: number) {
+async function mountPicker(
+  width: number,
+  height: number,
+  { folders = ['alpha'] }: { folders?: string[] } = {},
+) {
   const project = tempDir()
-  mkdirSync(path.join(project, 'alpha'))
+  for (const folder of folders) mkdirSync(path.join(project, folder))
   const home = tempDir()
   const selected: Selection[] = []
 
@@ -87,6 +96,29 @@ async function mountPicker(width: number, height: number) {
       await setup.mockMouse.click(x, y)
       await settle()
     },
+    /** Where the row showing `text` is (the first line that has it). */
+    rowAt(text: string) {
+      const lines = setup.captureCharFrame().split('\n')
+      const y = lines.findIndex((line) => line.includes(text))
+      if (y < 0) throw new Error(`no row with "${text}" on screen`)
+      return { x: lines[y]!.indexOf(text) + 1, y }
+    },
+    async clickRow(text: string) {
+      const { x, y } = this.rowAt(text)
+      await setup.mockMouse.click(x, y)
+      await settle()
+    },
+    async doubleClickRow(text: string) {
+      const { x, y } = this.rowAt(text)
+      await setup.mockMouse.doubleClick(x, y)
+      await settle()
+    },
+    /** The bottom bar: the path Open opens, and the buttons. */
+    bar: () =>
+      setup
+        .captureCharFrame()
+        .split('\n')
+        .find((line) => line.includes('Open  │')) ?? '',
   })
 }
 
@@ -109,10 +141,10 @@ describe('the project picker', () => {
     })
   }
 
-  test('Ctrl+N names a new folder, Enter creates it and moves into it, Ctrl+O opens it', async () => {
+  test('Ctrl+N names a new folder, Enter creates it in the folder browsed and opens it', async () => {
     const ui = await mountPicker(80, 24)
     await ui.act(() => ui.mockInput.pressKey('n', { ctrl: true }))
-    expect(ui.frame()).toContain('Enter creates the folder here, Esc cancels.')
+    expect(ui.frame()).toContain(NAMING_HINT)
     expect(ui.frame()).toContain('Name of the new folder...')
 
     await ui.act(() => ui.mockInput.typeText('demo'))
@@ -120,15 +152,19 @@ describe('the project picker', () => {
 
     const made = path.join(ui.project, 'demo')
     expect(statSync(made).isDirectory()).toBe(true)
-    expect(ui.frame()).toContain('Created "demo". Press Ctrl+O to open it.')
-    // The picker is now in the new folder: the bar shows it, and the filter is clear.
-    const bar = ui.frame().split('\n').find((line) => line.includes('Open  │'))
-    expect(bar).toContain(`${path.sep}demo`)
-    expect(ui.frame()).toContain('Select project directory...')
-    expect(ui.frame()).not.toContain('alpha')
-
-    await ui.act(() => ui.mockInput.pressKey('o', { ctrl: true }))
+    // Opened as the project at once, not left for Ctrl+O.
     expect(ui.selected).toEqual([{ path: made, options: undefined }])
+    expect(ui.frame()).toContain('Created "demo". Opening it...')
+  })
+
+  test('a name with a separator or a bad character is refused and opens nothing', async () => {
+    const ui = await mountPicker(80, 24)
+    await ui.act(() => ui.mockInput.pressKey('n', { ctrl: true }))
+    await ui.act(() => ui.mockInput.typeText('a/b'))
+    await ui.act(() => ui.mockInput.pressEnter())
+    expect(ui.frame()).toContain('A folder name cannot contain /')
+    expect(existsSync(path.join(ui.project, 'a'))).toBe(false)
+    expect(ui.selected).toEqual([])
   })
 
   test('a bad name says why and keeps the name; Esc cancels', async () => {
@@ -159,7 +195,7 @@ describe('the project picker', () => {
   test('the New folder button starts naming too', async () => {
     const ui = await mountPicker(80, 24)
     await ui.clickButton('New folder')
-    expect(ui.frame()).toContain('Enter creates the folder here, Esc cancels.')
+    expect(ui.frame()).toContain(NAMING_HINT)
   })
 
   test('No project opens a new scratch folder under ~/Neuron, never home itself', async () => {
@@ -205,20 +241,128 @@ describe('the project picker', () => {
     expect(ui.frame()).toContain('"alpha" already exists here.')
   })
 
-  test('clicking a folder in the list while naming cancels the name', async () => {
+  test('clicking a folder in the list while naming cancels the name and selects it', async () => {
     const ui = await mountPicker(80, 24)
     await ui.act(() => ui.mockInput.pressKey('n', { ctrl: true }))
     await ui.act(() => ui.mockInput.typeText('demo'))
-    const lines = ui.frame().split('\n')
-    const y = lines.findIndex((line) => line.includes('alpha'))
-    expect(y).toBeGreaterThanOrEqual(0)
-    await ui.act(() => ui.mockMouse.click(lines[y]!.indexOf('alpha') + 2, y))
+    await ui.clickRow('alpha')
 
-    expect(ui.frame()).toContain(PICKER_SHORTCUTS_HINT)
+    expect(ui.frame()).not.toContain(NAMING_HINT)
     expect(ui.frame()).toContain('Select project directory...')
-    const bar = ui.frame().split('\n').find((line) => line.includes('Open  │'))
-    expect(bar).toContain(`${path.sep}alpha`)
+    // Selected, not gone into: alpha is still a row of the list.
+    expect(ui.frame()).toContain(selectionHint({ kind: 'row', path: path.join(ui.project, 'alpha') }))
+    expect(ui.frame()).toContain('📁   alpha')
+    expect(ui.bar()).toContain(`${path.sep}alpha`)
     expect(existsSync(path.join(ui.project, 'demo'))).toBe(false)
     expect(ui.selected).toEqual([])
+  })
+})
+
+describe('the project picker with the mouse', () => {
+  test('one click selects a folder and Open opens it', async () => {
+    const ui = await mountPicker(80, 24, { folders: ['alpha', 'beta'] })
+    await ui.clickRow('beta')
+    const beta = path.join(ui.project, 'beta')
+    // Still in the project folder (both rows listed); the bar shows what Open opens.
+    expect(ui.frame()).toContain('📁   alpha')
+    expect(ui.frame()).toContain(selectionHint({ kind: 'row', path: beta }))
+    expect(ui.bar()).toContain(`${path.sep}beta`)
+    expect(ui.selected).toEqual([])
+
+    await ui.clickButton('Open ')
+    expect(ui.selected).toEqual([{ path: beta, options: undefined }])
+  })
+
+  test('a double click goes into a folder, as Enter does', async () => {
+    const ui = await mountPicker(80, 24, { folders: ['alpha', 'beta'] })
+    mkdirSync(path.join(ui.project, 'beta', 'inner'))
+    await ui.doubleClickRow('beta')
+    expect(ui.frame()).toContain('inner')
+    expect(ui.frame()).not.toContain('alpha')
+    expect(ui.bar()).toContain(`${path.sep}beta`)
+    // Nothing is selected in the new folder: the shortcuts are back, Open opens beta.
+    expect(ui.frame()).toContain(PICKER_SHORTCUTS_HINT)
+    expect(ui.selected).toEqual([])
+    await ui.clickButton('Open ')
+    expect(ui.selected).toEqual([{ path: path.join(ui.project, 'beta'), options: undefined }])
+  })
+
+  test('two single clicks on different rows only move the selection', async () => {
+    const ui = await mountPicker(80, 24, { folders: ['alpha', 'beta'] })
+    await ui.clickRow('alpha')
+    await ui.clickRow('beta')
+    expect(ui.frame()).toContain('📁   alpha')
+    expect(ui.bar()).toContain(`${path.sep}beta`)
+  })
+
+  test('the parent row can be selected and opened', async () => {
+    const ui = await mountPicker(80, 24)
+    await ui.clickRow(' ..  ')
+    expect(ui.bar()).toContain(path.basename(path.dirname(ui.project)).slice(-8))
+    await ui.clickButton('Open ')
+    expect(ui.selected).toEqual([{ path: path.dirname(ui.project), options: undefined }])
+  })
+
+  test('Ctrl+O opens the clicked row; any other key gives the keyboard back', async () => {
+    const ui = await mountPicker(80, 24, { folders: ['alpha', 'beta'] })
+    await ui.clickRow('beta')
+    await ui.act(() => ui.mockInput.pressArrow('up'))
+    // The selection is dropped: Open is this folder again.
+    expect(ui.frame()).toContain(PICKER_SHORTCUTS_HINT)
+    expect(ui.bar()).not.toContain(`${path.sep}beta`)
+    await ui.act(() => ui.mockInput.pressKey('o', { ctrl: true }))
+    expect(ui.selected).toEqual([{ path: ui.project, options: undefined }])
+
+    await ui.clickRow('beta')
+    await ui.act(() => ui.mockInput.pressKey('o', { ctrl: true }))
+    expect(ui.selected[1]).toEqual({ path: path.join(ui.project, 'beta'), options: undefined })
+  })
+
+  test('the scroll wheel scrolls the folder list', async () => {
+    const folders = Array.from({ length: 30 }, (_, i) => `folder-${String(i).padStart(2, '0')}`)
+    const ui = await mountPicker(80, 24, { folders })
+    expect(ui.frame()).not.toContain('folder-29')
+    const { x, y } = ui.rowAt('folder-00')
+    for (let i = 0; i < 10; i++) await ui.act(() => ui.mockMouse.scroll(x, y, 'down'))
+    expect(ui.frame()).not.toContain('folder-00')
+    expect(ui.frame()).toMatch(/folder-(1\d|2\d)/)
+  })
+
+  test('the row under the pointer is highlighted', async () => {
+    const ui = await mountPicker(80, 24, { folders: ['alpha', 'beta'] })
+    const background = (text: string) => {
+      const { y } = ui.rowAt(text)
+      const line = ui.captureSpans().lines[y]!
+      const span = line.spans.find((s) => s.text.includes(text))!
+      return span.bg.toString()
+    }
+    const before = background('beta')
+    const { x, y } = ui.rowAt('beta')
+    await ui.act(() => ui.mockMouse.moveTo(x, y))
+    expect(background('beta')).not.toBe(before)
+  })
+})
+
+describe('the project picker recents with the mouse', () => {
+  const recentsFile = () => path.join(process.env.NEURON_TUI_CONFIG_DIR!, 'recent-projects.json')
+  afterEach(() => rmSync(recentsFile(), { force: true }))
+
+  test('one click selects a recent project, a double click opens it', async () => {
+    const recent = tempDir()
+    writeFileSync(recentsFile(), JSON.stringify([{ path: recent, lastOpened: Date.now() }]))
+    const ui = await mountPicker(120, 40)
+    const shown = path.basename(recent)
+    expect(ui.frame()).toContain('Recent:')
+
+    await ui.clickRow('[1]')
+    expect(ui.selected).toEqual([])
+    expect(ui.frame()).toContain(selectionHint({ kind: 'recent', path: recent }))
+    expect(ui.bar()).toContain(shown.slice(-10))
+    await ui.clickButton('Open ')
+    expect(ui.selected).toEqual([{ path: recent, options: undefined }])
+
+    await ui.doubleClickRow('[1]')
+    expect(ui.selected).toHaveLength(2)
+    expect(ui.selected[1]).toEqual({ path: recent, options: undefined })
   })
 })

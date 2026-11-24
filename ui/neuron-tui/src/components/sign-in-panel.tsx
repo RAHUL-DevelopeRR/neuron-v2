@@ -13,6 +13,7 @@ import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
 import React, { useCallback, useEffect, useState } from 'react'
 
+import { Button } from './button'
 import { TerminalLink } from './terminal-link'
 import { getNeuronEngineClient } from '../engine/neuron-engine-client'
 import { useTheme } from '../hooks/use-theme'
@@ -96,18 +97,25 @@ export const SignInPanel = ({ width }: { width: number }) => {
     return () => clearInterval(timer)
   }, [signIn])
 
+  // Esc, or a click on "esc cancel", stops a running sign-in.
+  const cancel = useCallback(() => {
+    if (!signIn || signIn.approved) return
+    try {
+      getNeuronEngineClient().interrupt()
+    } catch (error) {
+      logger.warn({ error }, '[sign-in] cancel failed')
+    }
+  }, [signIn])
+  const [cancelHovered, setCancelHovered] = useState(false)
+
   useKeyboard(
     useCallback(
       (key: KeyEvent) => {
         if (!signIn || signIn.approved || key.name !== 'escape') return
         key.preventDefault?.()
-        try {
-          getNeuronEngineClient().interrupt()
-        } catch (error) {
-          logger.warn({ error }, '[sign-in] cancel failed')
-        }
+        cancel()
       },
-      [signIn],
+      [signIn, cancel],
     ),
   )
 
@@ -188,7 +196,23 @@ export const SignInPanel = ({ width }: { width: number }) => {
                 : '   expired: press Esc and run /login again'}
             </span>
           </text>
-          <text style={{ fg: theme.muted }}>Waiting for approval · esc cancel</text>
+          <box style={{ flexDirection: 'row' }}>
+            <text style={{ fg: theme.muted }}>{'Waiting for approval · '}</text>
+            <Button
+              onClick={cancel}
+              onMouseOver={() => setCancelHovered(true)}
+              onMouseOut={() => setCancelHovered(false)}
+            >
+              <text
+                style={{
+                  fg: cancelHovered ? theme.foreground : theme.muted,
+                  attributes: cancelHovered ? TextAttributes.UNDERLINE : undefined,
+                }}
+              >
+                esc cancel
+              </text>
+            </Button>
+          </box>
         </>
       )}
     </box>

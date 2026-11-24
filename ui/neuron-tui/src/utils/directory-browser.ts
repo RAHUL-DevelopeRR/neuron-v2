@@ -1,4 +1,4 @@
-import { readdirSync, statSync } from 'fs'
+import { existsSync, readdirSync, statSync } from 'fs'
 import path from 'path'
 
 export type DirectoryEntry = {
@@ -8,17 +8,62 @@ export type DirectoryEntry = {
   isGitRepo: boolean
   /** A file, listed only when files were asked for (the attach browser). */
   isFile?: boolean
+  /** Another drive's root, listed at a Windows drive root (`D:\`). */
+  isDrive?: boolean
 }
 
 export interface DirectoryListingOptions {
   /** List files too, after the folders (hidden files stay hidden). */
   includeFiles?: boolean
+  /** The platform the rows are for (tests); defaults to this one. */
+  platform?: NodeJS.Platform
+  /** Whether a drive root such as `D:\` exists (tests); defaults to the disk. */
+  driveExists?: (root: string) => boolean
+}
+
+/** The project picker's name for the same options. */
+export type GetDirectoriesOptions = DirectoryListingOptions
+
+const DRIVE_ROOT = /^[A-Za-z]:[\\/]?$/
+
+/** Whether `dir` is a Windows drive's root, such as `C:\`. */
+export function isWindowsDriveRoot(dir: string): boolean {
+  return DRIVE_ROOT.test(dir)
+}
+
+/**
+ * The other drives' roots, `C:\` to `Z:\` (A and B are floppy letters, slow to
+ * probe on some machines), less the drive `dir` is on.
+ */
+export function listOtherDrives(
+  dir: string,
+  driveExists: (root: string) => boolean = defaultDriveExists,
+): string[] {
+  const current = dir.slice(0, 1).toUpperCase()
+  const drives: string[] = []
+  for (let code = 'C'.charCodeAt(0); code <= 'Z'.charCodeAt(0); code++) {
+    const letter = String.fromCharCode(code)
+    if (letter === current) continue
+    const root = `${letter}:\\`
+    if (driveExists(root)) drives.push(root)
+  }
+  return drives
+}
+
+function defaultDriveExists(root: string): boolean {
+  try {
+    return existsSync(root)
+  } catch {
+    return false
+  }
 }
 
 /**
  * Get directory entries for a given path, including parent directory option.
- * Skips hidden directories (those starting with '.'). With `includeFiles`,
- * the files follow the folders.
+ * Skips hidden directories (those starting with '.'). At a Windows drive's
+ * root, where there is no parent, the other drives are listed first, so the
+ * mouse can reach them as the keyboard reaches a typed `D:\`. With
+ * `includeFiles`, the files follow the folders.
  */
 export function getDirectories(
   dirPath: string,
@@ -79,7 +124,19 @@ export function getDirectories(
   childEntries.sort(byName)
   files.sort(byName)
 
-  const listed = [...childEntries, ...files]
+  const platform = options.platform ?? process.platform
+  const drives: DirectoryEntry[] =
+    platform === 'win32' && isWindowsDriveRoot(dirPath)
+      ? listOtherDrives(dirPath, options.driveExists).map((root) => ({
+          name: root,
+          path: root,
+          isParent: false,
+          isGitRepo: false,
+          isDrive: true,
+        }))
+      : []
+
+  const listed = [...drives, ...childEntries, ...files]
   return parentEntry ? [parentEntry, ...listed] : listed
 }
 

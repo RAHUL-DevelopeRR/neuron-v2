@@ -16,6 +16,9 @@
  * at first. Each row shows what would run (the command line, secrets
  * redacted by the engine), and the approval carries the preview's
  * fingerprint, so a config that changed before the restart is not approved.
+ *
+ * The mouse works too: a click on a server row ticks it, a click on a choice
+ * makes it, and the row under the pointer is shaded.
  */
 
 import { TextAttributes, type KeyEvent } from '@opentui/core'
@@ -34,6 +37,7 @@ import {
 } from '@neuron/client/copy/trust'
 import { sanitizeTerminalText } from '@neuron-tui/common/util/terminal-safe-text'
 
+import { Button } from './button'
 import { truncateToWidth } from './model-picker'
 import { TerminalLink } from './terminal-link'
 import { useTerminalDimensions } from '../hooks/use-terminal-dimensions'
@@ -165,34 +169,58 @@ export const TrustScreen = ({
   const [approved, setApproved] = useState<ReadonlySet<string>>(() => new Set())
   const busy = step.kind === 'saving' || step.kind === 'restarting'
 
+  // The keys and the mouse do the same things through here, so a click obeys
+  // the same rules (nothing but Quit while trust is saved).
+  const runAction = useCallback(
+    (action: TrustScreenKeyAction) => {
+      if (action.type === 'none') return
+      // Quitting is always possible; nothing else while trust is saved.
+      if (action.type === 'choose' && action.choice === 'quit') return onQuit()
+      if (busy) return
+      if (action.type === 'select') return setSelected(action.index)
+      if (action.type === 'toggle') {
+        const name = servers[action.index]?.name
+        if (!name) return
+        setApproved((names) => {
+          const next = new Set(names)
+          if (next.has(name)) next.delete(name)
+          else next.add(name)
+          return next
+        })
+        return
+      }
+      if (action.choice === 'allow') {
+        onAllow(trustMcpApprovals(servers, approved))
+      }
+    },
+    [approved, busy, onAllow, onQuit, servers],
+  )
+
   useKeyboard(
     useCallback(
       (key: KeyEvent) => {
         const action = trustScreenKeyAction(key, current, servers.length)
         if (action.type === 'none') return
         key.preventDefault?.()
-        // Quitting is always possible; nothing else while trust is saved.
-        if (action.type === 'choose' && action.choice === 'quit') return onQuit()
-        if (busy) return
-        if (action.type === 'select') return setSelected(action.index)
-        if (action.type === 'toggle') {
-          const name = servers[action.index]?.name
-          if (!name) return
-          setApproved((names) => {
-            const next = new Set(names)
-            if (next.has(name)) next.delete(name)
-            else next.add(name)
-            return next
-          })
-          return
-        }
-        if (action.choice === 'allow') {
-          onAllow(trustMcpApprovals(servers, approved))
-        }
+        runAction(action)
       },
-      [approved, busy, current, onAllow, onQuit, servers],
+      [current, runAction, servers.length],
     ),
   )
+
+  // The row under the mouse, shaded: a click there acts on it. Hovering does
+  // not move the keyboard's choice, so Enter never does what the mouse points at.
+  const [hovered, setHovered] = useState<string | null>(null)
+  const hoverProps = (id: string) => ({
+    onMouseOver: () => setHovered(id),
+    onMouseOut: () => setHovered((now) => (now === id ? null : now)),
+  })
+  // A click on a server row ticks it (and moves the keyboard there too).
+  const clickServer = (index: number) => {
+    if (busy) return
+    setSelected(index)
+    runAction({ type: 'toggle', index })
+  }
 
   const marker = glyphMode === 'console' ? '>' : '›'
   const textWidth = Math.max(20, width - 4)
@@ -271,14 +299,23 @@ export const TrustScreen = ({
               const box = approved.has(server.name) ? '[x]' : '[ ]'
               const name = sanitizeTerminalText(server.name).replace(/\n/g, ' ')
               const runs = trustMcpRunsLine(server)
+              const hoverId = `server:${server.name}`
               return (
                 <box key={server.name} style={{ flexDirection: 'column' }}>
-                  <text style={{ wrapMode: 'none', fg: isSelected ? theme.primary : theme.foreground }}>
-                    <span>{isSelected ? `${marker} ` : '  '}</span>
-                    <span attributes={isSelected ? TextAttributes.BOLD : undefined}>
-                      {truncateToWidth(`${box} ${name}  ${server.transport}`, textWidth - 4)}
-                    </span>
-                  </text>
+                  <Button
+                    onClick={() => clickServer(index)}
+                    {...hoverProps(hoverId)}
+                    style={{
+                      backgroundColor: hovered === hoverId ? theme.surfaceHover : 'transparent',
+                    }}
+                  >
+                    <text style={{ wrapMode: 'none', fg: isSelected ? theme.primary : theme.foreground }}>
+                      <span>{isSelected ? `${marker} ` : '  '}</span>
+                      <span attributes={isSelected ? TextAttributes.BOLD : undefined}>
+                        {truncateToWidth(`${box} ${name}  ${server.transport}`, textWidth - 4)}
+                      </span>
+                    </text>
+                  </Button>
                   {runs ? (
                     // The whole command line, wrapped: what is approved is what was read.
                     <box style={{ paddingLeft: 6 }}>
@@ -301,11 +338,21 @@ export const TrustScreen = ({
       <box style={{ flexDirection: 'column', paddingTop: 1 }}>
         {CHOICES.map((choice, index) => {
           const isSelected = servers.length + index === current
+          const hoverId = `choice:${choice.id}`
           return (
-            <text key={choice.id} style={{ fg: isSelected ? theme.primary : theme.foreground }}>
-              <span>{isSelected ? `${marker} ` : '  '}</span>
-              <span attributes={isSelected ? TextAttributes.BOLD : undefined}>{`${index + 1}  ${choice.label}`}</span>
-            </text>
+            <Button
+              key={choice.id}
+              onClick={() => runAction({ type: 'choose', choice: choice.id })}
+              {...hoverProps(hoverId)}
+              style={{
+                backgroundColor: hovered === hoverId ? theme.surfaceHover : 'transparent',
+              }}
+            >
+              <text style={{ fg: isSelected ? theme.primary : theme.foreground }}>
+                <span>{isSelected ? `${marker} ` : '  '}</span>
+                <span attributes={isSelected ? TextAttributes.BOLD : undefined}>{`${index + 1}  ${choice.label}`}</span>
+              </text>
+            </Button>
           )
         })}
       </box>

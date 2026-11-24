@@ -1,16 +1,17 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the folder
 // icons come from utils/glyphs.ts, the logo is in NeuronCLI's brand colours,
-// and "New folder", "No project" and the Ctrl shortcuts are Neuron's own.
+// "New folder", "No project", the Ctrl shortcuts, drive rows and the mouse's
+// select-then-open clicks are Neuron's own.
 // See ui/neuron-tui/PORTING.md.
 import os from 'os'
 import path from 'path'
 
-import React, { useCallback, useMemo, useState } from 'react'
+import { TextAttributes } from '@opentui/core'
+import React, { useCallback, useMemo, useRef, useState } from 'react'
 
 import { Button } from './button'
 import { MultilineInput } from './multiline-input'
-import { SelectableList } from './selectable-list'
-import { TerminalLink } from './terminal-link'
+import { SELECTED_TEXT, SelectableList } from './selectable-list'
 import { useDirectoryBrowser } from '../hooks/use-directory-browser'
 import { useLogo } from '../hooks/use-logo'
 import { usePathTabCompletion } from '../hooks/use-path-tab-completion'
@@ -18,6 +19,7 @@ import { useSearchableList } from '../hooks/use-searchable-list'
 import { useSheenAnimation } from '../hooks/use-sheen-animation'
 import { useTerminalLayout } from '../hooks/use-terminal-layout'
 import { useTheme } from '../hooks/use-theme'
+import { createDoubleClickDetector } from '../utils/double-click'
 import { exitCliCleanly } from '../utils/exit-cleanly'
 import { GLYPHS } from '../utils/glyphs'
 import { formatCwd } from '../utils/path-helpers'
@@ -74,7 +76,25 @@ export interface ProjectSelectOptions {
 /** The shortcuts, shown under the filter. */
 export const PICKER_SHORTCUTS_HINT = 'Ctrl+N new folder  Ctrl+O open  Ctrl+P/Alt+P no project'
 
+/** Under the filter while a new folder is named. */
+export const NAMING_HINT = 'Enter creates the folder here and opens it, Esc cancels.'
+
 type PickerNotice = { kind: 'error' | 'info'; text: string }
+
+/**
+ * A row the mouse selected: a folder, the parent or a drive in the list
+ * (`row`), or a recent project. Open opens it; it holds only while the picker
+ * is still in `base`, the folder it was clicked in.
+ */
+type PickerSelection = { kind: 'row' | 'recent'; path: string; base: string }
+
+/** What the hint says about a selected row: what a double click and Open do. */
+export function selectionHint(selection: { kind: 'row' | 'recent'; path: string }): string {
+  const name = shortName(path.basename(selection.path) || selection.path, 24)
+  return selection.kind === 'recent'
+    ? `Double-click or Open opens "${name}".`
+    : `Double-click goes into "${name}", Open opens it.`
+}
 
 /** The end of `text` in `max` columns: the folder's own name is the useful part. */
 export function truncateStart(text: string, max: number): string {
@@ -117,6 +137,7 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
         id: entry.path,
         label: entry.name,
         icon: entry.isParent ? GLYPHS.folderOpen : GLYPHS.folder,
+        secondary: entry.isDrive ? 'drive' : undefined,
         accent: entry.isGitRepo,
       })),
     [directories],
@@ -139,6 +160,15 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
   const [naming, setNaming] = useState(false)
   const [newFolderName, setNewFolderName] = useState('')
   const [notice, setNotice] = useState<PickerNotice | null>(null)
+
+  // The mouse: one click selects a row, a second on it within a moment acts.
+  const [selectionState, setSelection] = useState<PickerSelection | null>(null)
+  const selection =
+    selectionState && selectionState.base === currentPath ? selectionState : null
+  const doubleClickRef = useRef(createDoubleClickDetector())
+  const [hoveredRecent, setHoveredRecent] = useState<string | null>(null)
+  /** What Open (and Ctrl+O) opens: the selected row, else this folder. */
+  const openTarget = selection?.path ?? currentPath
 
   // Load recent projects, excluding the home directory
   const recentProjects = useMemo(
@@ -249,37 +279,65 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
     setNotice(null)
   }, [])
 
-  // Handle directory selection from SelectableList. A click while naming
+  const clearSelection = useCallback(() => {
+    setSelection(null)
+    doubleClickRef.current.reset()
+  }, [])
+
+  // A click on a folder, the parent or a drive selects it (Open then opens
+  // it); a double click goes into it, as Enter does. A click while naming
   // moves elsewhere, so the name (not yet created) is dropped, as Esc would.
-  const handleDirectorySelect = useCallback(
-    (item: SelectableListItem) => {
+  const handleDirectoryClick = useCallback(
+    (item: SelectableListItem, index: number) => {
       if (naming) cancelNaming()
+      setNotice(null)
       const entry = directories.find((d) => d.path === item.id)
-      if (entry) {
+      if (!entry) return
+      setFocusedIndex(index)
+      if (doubleClickRef.current.click(`row:${entry.path}`)) {
+        setSelection(null)
         navigateToDirectory(entry)
+        return
       }
+      setSelection({ kind: 'row', path: entry.path, base: currentPath })
     },
-    [naming, cancelNaming, directories, navigateToDirectory],
+    [naming, cancelNaming, directories, setFocusedIndex, navigateToDirectory, currentPath],
   )
 
-  // Select current directory as project
+  // A recent project: one click selects it, a double click opens it.
+  const handleRecentClick = useCallback(
+    (projectPath: string) => {
+      if (naming) cancelNaming()
+      setNotice(null)
+      if (doubleClickRef.current.click(`recent:${projectPath}`)) {
+        setSelection(null)
+        onSelectProject(projectPath)
+        return
+      }
+      setSelection({ kind: 'recent', path: projectPath, base: currentPath })
+    },
+    [naming, cancelNaming, onSelectProject, currentPath],
+  )
+
+  // Open (and Ctrl+O): the selected row, or the folder the picker is in.
   const selectCurrentDirectory = useCallback(() => {
-    onSelectProject(currentPath)
-  }, [currentPath, onSelectProject])
+    onSelectProject(openTarget)
+  }, [openTarget, onSelectProject])
 
   const startNaming = useCallback(() => {
+    clearSelection()
     setNaming(true)
     setNewFolderName('')
     setNotice(null)
-  }, [])
+  }, [clearSelection])
 
-  // Create the named folder here and move into it, so Open opens it. Returns
-  // the new folder, or null when the name was refused (the notice says why).
-  const confirmNewFolder = useCallback((): string | null => {
+  // Create the named folder in the folder being browsed and open it as the
+  // project. A refused name opens nothing; the notice says why.
+  const createAndOpenNewFolder = useCallback(() => {
     const result = createNewFolder(newFolderName, currentPath)
     if (!result.ok) {
       setNotice({ kind: 'error', text: result.error })
-      return null
+      return
     }
     setNaming(false)
     setNewFolderName('')
@@ -287,32 +345,29 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
     setCurrentPath(result.path)
     setNotice({
       kind: 'info',
-      text: `Created "${shortName(path.basename(result.path), 18)}". Press Ctrl+O to open it.`,
+      text: `Created "${shortName(path.basename(result.path), 18)}". Opening it...`,
     })
-    return result.path
-  }, [newFolderName, currentPath, setSearchQuery, setCurrentPath])
+    onSelectProject(result.path)
+  }, [newFolderName, currentPath, setSearchQuery, setCurrentPath, onSelectProject])
 
-  // The Open button. While naming, it creates the named folder and opens it,
-  // rather than opening the folder the new one was to go in.
+  // The Open button. While naming it does what Enter does: create the named
+  // folder and open it, rather than the folder the new one was to go in.
   const handleOpenClick = useCallback(() => {
-    if (!naming) {
-      selectCurrentDirectory()
-      return
-    }
-    const made = confirmNewFolder()
-    if (made) onSelectProject(made)
-  }, [naming, selectCurrentDirectory, confirmNewFolder, onSelectProject])
+    if (naming) createAndOpenNewFolder()
+    else selectCurrentDirectory()
+  }, [naming, selectCurrentDirectory, createAndOpenNewFolder])
 
   // "No project": a scratch folder under ~/Neuron, never the home folder.
   const startWithoutProject = useCallback(() => {
     if (naming) cancelNaming()
+    clearSelection()
     const result = createScratchWorkspace(homeDir)
     if (!result.ok) {
       setNotice({ kind: 'error', text: result.error })
       return
     }
     onSelectProject(result.path, { scratch: true })
-  }, [naming, cancelNaming, homeDir, onSelectProject])
+  }, [naming, cancelNaming, clearSelection, homeDir, onSelectProject])
 
   // Tab completion for path input
   const { handleTabCompletion } = usePathTabCompletion({
@@ -344,7 +399,7 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
           return true
         }
         if (isPlainEnterKey(key)) {
-          confirmNewFolder()
+          createAndOpenNewFolder()
           return true
         }
         // The list and the shortcuts wait until the name is in or cancelled.
@@ -366,6 +421,8 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
         return true
       }
       if (notice) setNotice(null)
+      // The keyboard takes over from a row the mouse selected.
+      if (selection) clearSelection()
       if (key.name === 'escape') {
         if (searchQuery.length > 0) {
           setSearchQuery('')
@@ -408,8 +465,10 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
     [
       naming,
       notice,
+      selection,
+      clearSelection,
       cancelNaming,
-      confirmNewFolder,
+      createAndOpenNewFolder,
       startNaming,
       selectCurrentDirectory,
       startWithoutProject,
@@ -489,7 +548,7 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
             }}
           >
             <text style={{ fg: theme.muted, wrapMode: 'word' }}>
-              Navigate to your project folder and press Open.
+              Go into your project folder (double-click or Enter) and press Open.
             </text>
             <text style={{ fg: theme.muted, wrapMode: 'word' }}>
               {`No project starts in a scratch folder in ${scratchParentLabel}.`}
@@ -544,8 +603,10 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
             {notice
               ? notice.text
               : naming
-                ? 'Enter creates the folder here, Esc cancels.'
-                : PICKER_SHORTCUTS_HINT}
+                ? NAMING_HINT
+                : selection
+                  ? selectionHint(selection)
+                  : PICKER_SHORTCUTS_HINT}
           </text>
         </box>
 
@@ -565,7 +626,9 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
               items={filteredDirectoryItems}
               focusedIndex={focusedIndex}
               maxHeight={maxListHeight}
-              onSelect={handleDirectorySelect}
+              onSelect={handleDirectoryClick}
+              onItemClick={handleDirectoryClick}
+              selectedId={selection?.kind === 'row' ? selection.path : null}
               onFocusChange={handleFocusChange}
               emptyMessage={
                 searchQuery ? 'No matching directories' : 'No subdirectories'
@@ -586,25 +649,53 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
             }}
           >
             <text style={{ fg: theme.muted, height: 1 }}>Recent:</text>
-            {recentProjects.slice(0, maxRecentsToShow).map((project, idx) => (
-              <box
-                key={project.path}
-                style={{
-                  flexDirection: 'row',
-                  gap: 1,
-                  paddingLeft: isCompactMode ? 0 : LAYOUT.RECENTS_PADDING_LEFT,
-                  height: 1,
-                }}
-              >
-                <text style={{ fg: theme.secondary }}>[{idx + 1}]</text>
-                <TerminalLink
-                  text={formatCwd(project.path)}
-                  onActivate={() => onSelectProject(project.path)}
-                  underlineOnHover={true}
-                  containerStyle={{ width: 'auto' }}
-                />
-              </box>
-            ))}
+            {recentProjects.slice(0, maxRecentsToShow).map((project, idx) => {
+              const isSelected =
+                selection?.kind === 'recent' && selection.path === project.path
+              const isHovered = hoveredRecent === project.path
+              return (
+                <Button
+                  key={project.path}
+                  onClick={() => handleRecentClick(project.path)}
+                  onMouseOver={() => setHoveredRecent(project.path)}
+                  onMouseOut={() =>
+                    setHoveredRecent((current) =>
+                      current === project.path ? null : current,
+                    )
+                  }
+                  style={{
+                    flexDirection: 'row',
+                    gap: 1,
+                    paddingLeft: isCompactMode ? 0 : LAYOUT.RECENTS_PADDING_LEFT,
+                    height: 1,
+                    overflow: 'hidden',
+                    backgroundColor: isSelected
+                      ? theme.primary
+                      : isHovered
+                        ? theme.surfaceHover
+                        : 'transparent',
+                  }}
+                >
+                  <text style={{ fg: isSelected ? SELECTED_TEXT : theme.secondary }}>
+                    [{idx + 1}]
+                  </text>
+                  <text
+                    style={{
+                      fg: isSelected
+                        ? SELECTED_TEXT
+                        : isHovered
+                          ? theme.foreground
+                          : theme.muted,
+                      attributes:
+                        isSelected || isHovered ? TextAttributes.BOLD : undefined,
+                      wrapMode: 'none',
+                    }}
+                  >
+                    {formatCwd(project.path)}
+                  </text>
+                </Button>
+              )
+            })}
           </box>
         )}
       </box>
@@ -638,7 +729,7 @@ export const ProjectPickerScreen: React.FC<ProjectPickerScreenProps> = ({
           <box style={{ flexGrow: 1, flexShrink: 1, overflow: 'hidden' }}>
             <text style={{ fg: theme.muted, wrapMode: 'none' }}>
               {truncateStart(
-                formatCwd(currentPath),
+                formatCwd(openTarget),
                 contentWidth - LAYOUT.BOTTOM_BUTTONS_WIDTH,
               )}
             </text>

@@ -4,17 +4,31 @@
  * signs in before the folder's trust (T1) and the chat. Enter starts the
  * engine's device sign-in, whose link and code the sign-in panel shows; Esc
  * leaves it for later (the chat's panel then says how to sign in); Ctrl-C
- * quits.
+ * quits. With the mouse, a click on "Sign in with Zero-X" or on a key in the
+ * hint does the same.
  */
 
 import { TextAttributes, type KeyEvent } from '@opentui/core'
 import { useKeyboard } from '@opentui/react'
-import React, { useCallback } from 'react'
+import React, { useCallback, useState } from 'react'
 
+import { Button } from './button'
 import { SignInPanel, signInView } from './sign-in-panel'
 import { useTheme } from '../hooks/use-theme'
 import { useEngineStore } from '../state/engine-store'
 import { getGlyphMode, type GlyphMode } from '../utils/glyphs'
+
+interface OnboardingHint {
+  action: 'sign_in' | 'later' | 'quit'
+  label: string
+}
+
+/** The hint under the choice: each part is also what a click on it does. */
+export const ONBOARDING_HINTS: readonly OnboardingHint[] = [
+  { action: 'sign_in', label: 'Enter to sign in' },
+  { action: 'later', label: 'Esc for later (/login signs in from the chat)' },
+  { action: 'quit', label: 'Ctrl+C to quit' },
+]
 
 /** What a key does on the onboarding sign-in; `signingIn` while a sign-in runs. */
 export function onboardingKeyAction(
@@ -66,6 +80,19 @@ export const OnboardingSignIn = ({
     ),
   )
 
+  // The mouse: the sign-in line and each key in the hint are clickable, and
+  // the one under the pointer lights up.
+  const [hovered, setHovered] = useState<string | null>(null)
+  const hoverProps = (id: string) => ({
+    onMouseOver: () => setHovered(id),
+    onMouseOut: () => setHovered((now) => (now === id ? null : now)),
+  })
+  const actions: Record<OnboardingHint['action'], () => void> = {
+    sign_in: onSignIn,
+    later: onLater,
+    quit: onQuit,
+  }
+
   const marker = glyphMode === 'console' ? '>' : '›'
   const textWidth = Math.max(20, width - 4)
 
@@ -93,13 +120,46 @@ export const OnboardingSignIn = ({
               </text>
             </box>
           ) : null}
-          <text style={{ paddingTop: 1, fg: theme.primary }}>
-            <span>{`${marker} `}</span>
-            <span attributes={TextAttributes.BOLD}>Sign in with Zero-X</span>
-          </text>
-          <text style={{ paddingTop: 1, fg: theme.muted, wrapMode: 'word', width: textWidth }}>
-            Enter to sign in · Esc for later (/login signs in from the chat) · Ctrl+C to quit
-          </text>
+          <Button
+            onClick={onSignIn}
+            {...hoverProps('sign_in')}
+            style={{
+              paddingTop: 1,
+              flexDirection: 'row',
+              alignSelf: 'flex-start',
+            }}
+          >
+            <text
+              style={{
+                fg: theme.primary,
+                bg: hovered === 'sign_in' ? theme.surfaceHover : undefined,
+              }}
+            >
+              <span>{`${marker} `}</span>
+              <span attributes={TextAttributes.BOLD}>Sign in with Zero-X</span>
+            </text>
+          </Button>
+          {/* The keys, each one a click target too. */}
+          <box style={{ paddingTop: 1, flexDirection: 'row', flexWrap: 'wrap', width: textWidth }}>
+            {ONBOARDING_HINTS.map((hint, index) => (
+              <box key={hint.action} style={{ flexDirection: 'row', flexShrink: 0 }}>
+                <Button onClick={actions[hint.action]} {...hoverProps(hint.action)}>
+                  <text
+                    style={{
+                      fg: hovered === hint.action ? theme.foreground : theme.muted,
+                      attributes: hovered === hint.action ? TextAttributes.UNDERLINE : undefined,
+                    }}
+                  >
+                    {hint.label}
+                  </text>
+                </Button>
+                {/* The dot ends its line, so a wrapped line starts with a key. */}
+                {index < ONBOARDING_HINTS.length - 1 ? (
+                  <text style={{ fg: theme.muted }}>{' · '}</text>
+                ) : null}
+              </box>
+            ))}
+          </box>
         </>
       )}
     </box>
