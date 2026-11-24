@@ -3323,10 +3323,10 @@ impl LiveCli {
             self.replace_runtime(runtime)?;
         }
 
-        // An interactive turn that reaches its model-request cap pauses (the user can
-        // say "continue"); a one-shot run fails there, as scripts expect.
-        self.runtime
-            .set_pause_at_iteration_limit(!crate::headless::one_shot());
+        // A turn that reaches its model-request cap pauses with its work kept: the user
+        // says "continue", and a one-shot run still exits non-zero, with how to resume
+        // (`fail_paused_one_shot`), so a script does not take it for success.
+        self.runtime.set_pause_at_iteration_limit(true);
         let cancel = runtime::CancellationToken::new();
         let hook_abort_signal = runtime::HookAbortSignal::new();
         self.runtime.set_cancellation_token(cancel.clone());
@@ -3541,10 +3541,10 @@ impl LiveCli {
         self.fail_paused_one_shot(&summary.outcome)
     }
 
-    /// A one-shot run (`neuron -p`) whose turn the loop guard or the progress watch
-    /// paused did not finish: it fails (exit code 1, the reason and how to resume on
-    /// stderr), as it does at the model-request cap, so a script does not take it for
-    /// success. Interactive turns only pause.
+    /// A one-shot run (`neuron -p`) whose turn was paused (the model-request cap, the
+    /// loop guard or the progress watch) did not finish: it fails (exit code 1, the
+    /// reason and how to resume on stderr), so a script does not take it for success.
+    /// Interactive turns only pause.
     fn fail_paused_one_shot(
         &self,
         outcome: &runtime::TurnOutcome,

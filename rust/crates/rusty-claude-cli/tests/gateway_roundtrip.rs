@@ -1499,11 +1499,14 @@ fn settings_max_iterations_caps_the_model_calls_of_a_turn() {
     let output = run(command, None);
 
     let errors = stderr(&output);
+    // A capped `-p` run still fails, in plain words and with how to resume it.
     assert!(!output.status.success(), "{errors}");
     assert!(
-        errors.contains("maximum number of iterations (3)"),
+        errors.contains("the turn reached its limit of 3 model requests"),
         "{errors}"
     );
+    assert!(errors.contains("-p continue"), "{errors}");
+    assert!(!errors.contains("conversation loop exceeded"), "{errors}");
     assert!(!errors.contains("unknown key"), "{errors}");
     assert_eq!(gateway.count("POST", "/v1/chat/completions"), 3);
 
@@ -1516,7 +1519,7 @@ fn settings_max_iterations_caps_the_model_calls_of_a_turn() {
     let output = run(command, None);
     assert!(!output.status.success());
     assert!(
-        stderr(&output).contains("maximum number of iterations (2)"),
+        stderr(&output).contains("the turn reached its limit of 2 model requests"),
         "{}",
         stderr(&output)
     );

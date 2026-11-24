@@ -3,14 +3,17 @@
 Notable changes to Neuron. Versions follow [semantic versioning](https://semver.org/).
 The release workflow copies a version's section into its GitHub release notes.
 
-## Unreleased
+## 7.0.0-alpha.6 (unreleased)
 
 - A long task no longer dies at 50 model calls with an error naming an environment
   variable. The per-turn cap is now 200 (`maxIterations`, `NEURON_MAX_ITERATIONS`), a
   backstop rather than a stopping point, and an interactive turn that reaches it is paused
   instead of failed: its work stays in the session, a calm notice says so, and `continue`
   (or Enter on an empty prompt in the full-screen UI) picks it up. `neuron -p` runs still
-  stop with an error at the cap, as scripts expect.
+  exit non-zero at the cap, as scripts expect, but say in plain words that the work is
+  saved and give the `neuron --resume <session> -p continue` command; a sub-agent at its
+  cap reports that it stopped before finishing. The old "conversation loop exceeded the
+  maximum number of iterations" error is gone.
 - Loops are caught by what the agent does, not by counting: besides the same call repeated
   with identical arguments, Neuron now notices the same two or three calls repeating with
   the same results, and the same part of a file read again and again without the file

@@ -338,8 +338,17 @@ pub(crate) fn paused_notice(outcome: &TurnOutcome, hint: ContinueHint) -> Option
 /// outcomes that are not pauses.
 pub(crate) fn one_shot_pause_message(outcome: &TurnOutcome, session_id: &str) -> Option<String> {
     let reason = runtime::paused_turn_reason(outcome)?;
+    // At the cap (not a loop), a script may simply need more requests per turn.
+    let raise = if matches!(outcome, TurnOutcome::IterationLimit { .. }) {
+        format!(
+            " To allow more requests per turn, set {} or the \"maxIterations\" setting.",
+            runtime::MAX_ITERATIONS_ENV_VAR
+        )
+    } else {
+        String::new()
+    };
     Some(format!(
-        "the run stopped before the task was finished: {reason}. The work so far is saved. To keep going, run: neuron --resume {session_id} -p continue (or give different instructions in place of continue)."
+        "the run stopped before the task was finished: {reason}. The work so far is saved. To keep going, run: neuron --resume {session_id} -p continue (or give different instructions in place of continue).{raise}"
     ))
 }
 
@@ -1159,7 +1168,17 @@ Read documents.
         assert!(message.contains("the model kept repeating the same 2 tool calls"));
         assert!(message.contains("neuron --resume session-123 -p continue"));
         assert!(!message.contains("type continue"));
+        // A loop is not fixed by a higher cap: no advice to raise it.
+        assert!(!message.contains("NEURON_MAX_ITERATIONS"));
         assert_eq!(one_shot_pause_message(&TurnOutcome::Completed, "s"), None);
+
+        let capped = one_shot_pause_message(&TurnOutcome::IterationLimit { limit: 3 }, "session-9")
+            .expect("a pause");
+        assert_eq!(
+            capped,
+            "the run stopped before the task was finished: the turn reached its limit of 3 model requests. The work so far is saved. To keep going, run: neuron --resume session-9 -p continue (or give different instructions in place of continue). To allow more requests per turn, set NEURON_MAX_ITERATIONS or the \"maxIterations\" setting."
+        );
+        assert!(!capped.contains("conversation loop exceeded"));
     }
 
     #[test]

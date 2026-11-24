@@ -485,7 +485,7 @@ pub enum TurnOutcome {
     /// paused: the work so far is kept, and the user can say "continue".
     LoopDetected { tool_name: String, repeats: usize },
     /// The turn made `limit` model requests, its cap, and was paused there instead of
-    /// failing (interactive sessions; see
+    /// failing (see
     /// [`ConversationRuntime::set_pause_at_iteration_limit`]). The work so far is
     /// kept, and the user can say "continue".
     IterationLimit { limit: usize },
@@ -808,8 +808,9 @@ where
 
     /// Whether a turn that reaches the model-request cap pauses
     /// ([`TurnOutcome::IterationLimit`], `Ok`) instead of failing
-    /// ([`RuntimeErrorKind::MaxIterations`]). Interactive sessions pause, so the user
-    /// can say "continue"; one-shot runs and sub-agents fail, as scripts expect.
+    /// ([`RuntimeErrorKind::MaxIterations`]). The CLI turns this on for every turn:
+    /// an interactive user can say "continue", a one-shot run exits non-zero saying
+    /// how to resume, and a sub-agent reports that it stopped before finishing.
     pub fn set_pause_at_iteration_limit(&mut self, pause: bool) {
         self.pause_at_iteration_limit = pause;
     }
@@ -1147,7 +1148,7 @@ where
                 let error = RuntimeError::with_kind(
                     RuntimeErrorKind::MaxIterations,
                     format!(
-                        "conversation loop exceeded the maximum number of iterations ({}); stopping this turn. Raise the limit with the {MAX_ITERATIONS_ENV_VAR} environment variable (for example {MAX_ITERATIONS_ENV_VAR}=100) or the \"maxIterations\" setting.",
+                        "the turn reached its limit of {} model requests before finishing. The work so far is kept in the session. To allow more requests per turn, set the {MAX_ITERATIONS_ENV_VAR} environment variable (for example {MAX_ITERATIONS_ENV_VAR}=400) or the \"maxIterations\" setting.",
                         self.max_iterations
                     ),
                 );
@@ -4405,7 +4406,8 @@ mod tests {
         // then
         assert!(error
             .to_string()
-            .contains("conversation loop exceeded the maximum number of iterations"));
+            .contains("the turn reached its limit of 1 model requests"));
+        assert!(!error.to_string().contains("conversation loop exceeded"));
     }
 
     #[test]
@@ -5764,7 +5766,9 @@ mod resilience_tests {
             .expect_err("iteration cap must stop the turn");
 
         assert_eq!(error.kind(), RuntimeErrorKind::MaxIterations);
-        assert!(error.to_string().contains("(5)"));
+        assert!(error
+            .to_string()
+            .contains("the turn reached its limit of 5 model requests"));
         // Both knobs that change the cap are named.
         assert!(error.to_string().contains(MAX_ITERATIONS_ENV_VAR));
         assert!(error.to_string().contains("\"maxIterations\" setting"));

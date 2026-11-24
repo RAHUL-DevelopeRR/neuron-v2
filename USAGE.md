@@ -480,7 +480,7 @@ names the file, the line and the closest known key. Commonly used keys:
 | `permissions.defaultMode` | Default permission mode (`permissionMode` still works but prints a deprecation warning) |
 | `permissions` | `allow`, `ask` and `deny` rules for individual tools |
 | `provider` | Provider to use (see [Bring your own key](#bring-your-own-key)) |
-| `maxIterations` | Model calls allowed in one turn (default 200); `NEURON_MAX_ITERATIONS` overrides it. An interactive turn that reaches it is paused, with its work kept: type `continue` (or press Enter in the full-screen UI) to go on. A `neuron -p` run stops with an error there |
+| `maxIterations` | Model calls allowed in one turn (default 200); `NEURON_MAX_ITERATIONS` overrides it. An interactive turn that reaches it is paused, with its work kept: type `continue` (or press Enter in the full-screen UI) to go on. A `neuron -p` run exits with an error there that gives the command to resume it |
 | `workingSetTokens` | Conversation tokens to keep before older tool results become stubs and history is compacted (default 40000 on a plan with a token window, such as Free; none on other plans); `0` turns it off, and `NEURON_WORKING_SET_TOKENS` overrides it. See [The Free token window](#the-free-token-window) |
 | `hooks` | Commands run before and after tool calls |
 | `mcpServers`, `defaultMcpServers`, `disabledMcpServers` | MCP servers (`"type": "zerox"` is a [hosted connector](#hosted-connectors)) |
