@@ -1427,7 +1427,13 @@ while True:
             config_home.join("settings.json"),
             json!({
                 "defaultMcpServers": false,
-                "mcpServers": { "alpha": { "command": python, "args": args } }
+                // The server writes wait.pid in `root`: under bubblewrap (Linux with
+                // `bwrap`) it needs that folder writable.
+                "mcpServers": { "alpha": {
+                    "command": python,
+                    "args": args,
+                    "sandbox": { "fsWrite": [root.display().to_string()] }
+                } }
             })
             .to_string(),
         )

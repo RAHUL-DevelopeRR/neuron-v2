@@ -110,6 +110,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # ubuntu-latest (26.04) has bubblewrap, so the MCP tests run their servers
+        # inside the Linux sandbox there, as they do for users with `bwrap`.
         os: [ubuntu-latest, windows-latest, macos-15]
     runs-on: ${{ matrix.os }}
     steps:

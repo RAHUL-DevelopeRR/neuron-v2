@@ -181,12 +181,17 @@ const LAUNCHER_CACHES: &[LauncherCache] = &[
 /// Commands that run a script named in their arguments: that script's folder is
 /// readable (it is the server's program), and `${package}` in a profile path is its
 /// npm package.
+/// The shells are here too: `sh /path/server.sh` under bubblewrap otherwise cannot see
+/// its script when it sits in a hidden folder (`/tmp` or the home folder).
 const INTERPRETERS: &[&str] = &[
     "node", "nodejs", "bun", "deno", "tsx", "ts-node", "python", "python3", "pythonw", "py", "uv",
+    "sh", "bash", "dash", "zsh",
 ];
 
 /// The file extensions of a script an interpreter runs.
-const SCRIPT_EXTENSIONS: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts", "py", "pyz"];
+const SCRIPT_EXTENSIONS: &[&str] = &[
+    "js", "mjs", "cjs", "ts", "mts", "cts", "py", "pyz", "sh", "bash",
+];
 
 /// Where a server's profile came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1745,6 +1750,31 @@ mod tests {
         // Where file limits are not enforced nothing changes.
         let roots = super::sandbox_roots(&transport(McpSandboxProfile::default()), &host(), false);
         assert_eq!(roots.private_caches, [] as [(&str, std::path::PathBuf); 0]);
+    }
+
+    #[test]
+    fn a_shell_script_server_can_see_its_script() {
+        // `sh /tmp/x/server.sh` under bubblewrap: `/tmp` is replaced by an empty one, so
+        // the script's folder must be bound back as it is for node and python scripts.
+        let dir = unique_dir("shell-script");
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("server.sh");
+        std::fs::write(&script, "").unwrap();
+        let args = vec![script.to_string_lossy().into_owned()];
+        // Bare names: an absolute `/bin/sh` also adds its own folder where it exists.
+        for shell in ["sh", "bash", "dash", "zsh"] {
+            assert_eq!(
+                super::mcp_program_roots(shell, &args),
+                vec![super::normalize(&dir)],
+                "{shell}"
+            );
+        }
+        // `bash -c '...'` names no script: nothing beyond the profile.
+        let inline = vec!["-c".to_string(), "echo hi".to_string()];
+        assert_eq!(
+            super::mcp_program_roots("bash", &inline),
+            [] as [std::path::PathBuf; 0]
+        );
     }
 
     #[test]

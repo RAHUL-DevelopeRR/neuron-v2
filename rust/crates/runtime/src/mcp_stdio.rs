@@ -1585,6 +1585,42 @@ fn assigned_job(
     job.assign_raw(handle?).ok().map(|()| job)
 }
 
+/// The direct children of `parent`, read from `/proc/<pid>/stat` (field 4 is the parent
+/// pid; the command name before it is in parentheses and may hold spaces or `)`).
+#[cfg(any(target_os = "linux", test))]
+fn children_in_proc(proc_root: &Path, parent: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| {
+            std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat"))
+                .ok()
+                .and_then(|stat| parent_pid_from_stat(&stat))
+                == Some(parent)
+        })
+        .collect()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parent_pid_from_stat(stat: &str) -> Option<u32> {
+    let after_name = &stat[stat.rfind(')')? + 1..];
+    after_name.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// A server under bubblewrap runs as bubblewrap's child in a session of its own
+/// (`--new-session`, so it cannot push keystrokes into the user's terminal). Killing
+/// bubblewrap, or its process group, leaves that session running, so each child's own
+/// group (it leads it) is killed first: the server and everything it started.
+#[cfg(target_os = "linux")]
+fn kill_sandboxed_sessions(bubblewrap: u32) {
+    for child in children_in_proc(Path::new("/proc"), bubblewrap) {
+        let _ = plugins::subprocess::kill_tree_of(child);
+    }
+}
+
 /// The job object type a server's tree is held in; nothing outside Windows.
 #[cfg(windows)]
 type ServerJob = winjob::Job;
@@ -1610,6 +1646,10 @@ async fn kill_server_tree(child: &mut Child, job: Option<&ServerJob>) -> io::Res
     }
     #[cfg(not(windows))]
     let _ = job;
+    #[cfg(target_os = "linux")]
+    if let (Some(pid), Ok(None)) = (child.id(), child.try_wait()) {
+        let _ = tokio::task::spawn_blocking(move || kill_sandboxed_sessions(pid)).await;
+    }
     child.start_kill()?;
     let _ = timeout(plugins::subprocess::TREE_KILL_WAIT, child.wait()).await;
     Ok(())
@@ -1888,6 +1928,10 @@ impl McpStdioProcess {
         #[cfg(windows)]
         if let Some(job) = &self.job {
             let _ = job.terminate(1);
+        }
+        #[cfg(target_os = "linux")]
+        if let (Some(pid), Ok(None)) = (self.child.id(), self.child.try_wait()) {
+            kill_sandboxed_sessions(pid);
         }
         let _ = self.child.start_kill();
     }
@@ -2457,8 +2501,19 @@ mod tests {
                 args: python_script_args(script_path),
                 env,
                 tool_call_timeout_ms: None,
-                sandbox: None,
+                sandbox: Some(log_writable_sandbox(log_path)),
             }),
+        }
+    }
+
+    /// The unvetted default (no network, read-only) plus its log's folder writable:
+    /// under bubblewrap (Linux with `bwrap`) the server could not write its log.
+    fn log_writable_sandbox(log_path: &Path) -> crate::config::McpSandboxProfile {
+        crate::config::McpSandboxProfile {
+            fs_write: log_path
+                .parent()
+                .map_or_default(|dir| vec![dir.to_string_lossy().into_owned()]),
+            ..crate::config::McpSandboxProfile::default()
         }
     }
 
@@ -3821,8 +3876,46 @@ mod tests {
             args,
             env: BTreeMap::new(),
             tool_call_timeout_ms: None,
-            sandbox: None,
+            // The counter's folder writable (under bubblewrap /tmp is private); still no
+            // network, so the "list the hosts" hint applies.
+            sandbox: Some(log_writable_sandbox(Path::new(&count))),
         }
+    }
+
+    #[test]
+    fn the_children_of_a_process_are_read_from_proc() {
+        // A command name may hold spaces and `)`: the parent pid is the second field
+        // after the last `)`.
+        assert_eq!(
+            super::parent_pid_from_stat("42 (python3) S 7 42 42 0 -1"),
+            Some(7)
+        );
+        assert_eq!(
+            super::parent_pid_from_stat("43 (a b) c)) R 9 43 43 0 -1"),
+            Some(9)
+        );
+        assert_eq!(super::parent_pid_from_stat("garbage"), None);
+
+        let proc_root = temp_dir();
+        for (pid, stat) in [
+            ("100", "100 (bwrap) S 1 100 100 0 -1"),
+            ("101", "101 (python3) S 100 101 101 0 -1"),
+            ("102", "102 (node x) S 100 102 102 0 -1"),
+            ("103", "103 (other) S 55 103 103 0 -1"),
+        ] {
+            fs::create_dir_all(proc_root.join(pid)).expect("pid dir");
+            fs::write(proc_root.join(pid).join("stat"), stat).expect("stat");
+        }
+        fs::create_dir_all(proc_root.join("self")).expect("non-numeric entry");
+        let mut children = super::children_in_proc(&proc_root, 100);
+        children.sort_unstable();
+        assert_eq!(children, vec![101, 102]);
+        assert_eq!(super::children_in_proc(&proc_root, 999), Vec::<u32>::new());
+        assert_eq!(
+            super::children_in_proc(&proc_root.join("missing"), 100),
+            Vec::<u32>::new()
+        );
+        let _ = fs::remove_dir_all(proc_root);
     }
 
     #[test]
