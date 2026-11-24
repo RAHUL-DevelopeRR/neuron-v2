@@ -120,25 +120,21 @@ export const OnboardingSignIn = ({
               </text>
             </box>
           ) : null}
-          <Button
-            onClick={onSignIn}
-            {...hoverProps('sign_in')}
-            style={{
-              paddingTop: 1,
-              flexDirection: 'row',
-              alignSelf: 'flex-start',
-            }}
-          >
-            <text
+          {/* No top padding: it would add a blank line the screen did not have before. */}
+          <box style={{ flexDirection: 'row' }}>
+            <Button
+              onClick={onSignIn}
+              {...hoverProps('sign_in')}
               style={{
-                fg: theme.primary,
-                bg: hovered === 'sign_in' ? theme.surfaceHover : undefined,
+                backgroundColor: hovered === 'sign_in' ? theme.surfaceHover : 'transparent',
               }}
             >
-              <span>{`${marker} `}</span>
-              <span attributes={TextAttributes.BOLD}>Sign in with Zero-X</span>
-            </text>
-          </Button>
+              <text style={{ fg: theme.primary }}>
+                <span>{`${marker} `}</span>
+                <span attributes={TextAttributes.BOLD}>Sign in with Zero-X</span>
+              </text>
+            </Button>
+          </box>
           {/* The keys, each one a click target too. */}
           <box style={{ paddingTop: 1, flexDirection: 'row', flexWrap: 'wrap', width: textWidth }}>
             {ONBOARDING_HINTS.map((hint, index) => (
