@@ -12,7 +12,10 @@ import {
 import { initializeThemeStore } from '../../hooks/use-theme'
 import { useEngineStore } from '../../state/engine-store'
 import { OnboardingSignIn } from '../onboarding-sign-in'
+import { resetOnboardingSignInForTesting, startOnboardingSignIn } from '../start-gate'
 import { TrustScreen } from '../trust-screen'
+
+import type { UiEvent } from '../../engine/protocol'
 
 import type { TrustedMcpApproval } from '../../engine/engine-session'
 import type { TrustPreviewEvent } from '../../engine/protocol'
@@ -209,6 +212,100 @@ describe("onboarding's sign-in with the mouse", () => {
     } finally {
       setNeuronEngineClientForTesting(null)
     }
+  })
+
+  describe('one sign-in at a time', () => {
+    // An engine that counts `/login` and ends an exchange when told to.
+    function fakeEngine() {
+      const listeners = new Set<(event: UiEvent) => void>()
+      const engine = {
+        connection: 'ready',
+        logins: 0,
+        slash(command: string) {
+          if (command === 'login') engine.logins++
+        },
+        subscribe(listener: (event: UiEvent) => void) {
+          listeners.add(listener)
+          return () => listeners.delete(listener)
+        },
+        onExit: () => () => {},
+        interrupt: () => {},
+        /** The exchange under way ends (signed in, failed or cancelled). */
+        finish() {
+          for (const listener of [...listeners]) listener({ type: 'turn_finished' })
+        },
+      }
+      setNeuronEngineClientForTesting(engine as unknown as NeuronEngineClient)
+      return engine
+    }
+
+    function signInScreen() {
+      return (
+        <OnboardingSignIn width={100} onSignIn={startOnboardingSignIn} onLater={() => {}} onQuit={() => {}} />
+      )
+    }
+
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 10))
+
+    afterEach(() => {
+      setNeuronEngineClientForTesting(null)
+      resetOnboardingSignInForTesting()
+    })
+
+    test('a double click on Sign in with Zero-X sends one /login', async () => {
+      const engine = fakeEngine()
+      const ui = await mount(signInScreen())
+      const lines = ui.frame().split('\n')
+      const y = lines.findIndex((line) => line.includes('Sign in with Zero-X'))
+      const x = lines[y]!.indexOf('Sign in with Zero-X') + 1
+      await ui.mockMouse.doubleClick(x, y)
+      await tick()
+      expect(engine.logins).toBe(1)
+      // The hint's key while it runs adds none either.
+      await ui.click('Enter to sign in')
+      await tick()
+      expect(engine.logins).toBe(1)
+      // A queued second /login would start here, as the first ends (signed
+      // in, or cancelled with Esc): none does.
+      engine.finish()
+      await tick()
+      await tick()
+      expect(engine.logins).toBe(1)
+    })
+
+    test('once a sign-in has ended (failed or cancelled), the next click starts another', async () => {
+      const engine = fakeEngine()
+      const ui = await mount(signInScreen())
+      await ui.click('Sign in with Zero-X')
+      await tick()
+      expect(engine.logins).toBe(1)
+      engine.finish()
+      await tick()
+      await ui.click('Sign in with Zero-X')
+      await tick()
+      expect(engine.logins).toBe(2)
+      engine.finish()
+      await tick()
+    })
+
+    test('with no engine to ask, nothing is left under way', async () => {
+      setNeuronEngineClientForTesting({
+        connection: 'ready',
+        slash: () => {
+          throw new Error('not connected')
+        },
+        subscribe: () => () => {},
+        onExit: () => () => {},
+      } as unknown as NeuronEngineClient)
+      startOnboardingSignIn()
+      await tick()
+      const engine = fakeEngine()
+      startOnboardingSignIn()
+      await tick()
+      expect(engine.logins).toBe(1)
+      engine.finish()
+      await tick()
+    })
   })
 
   test('the part under the pointer lights up', async () => {
