@@ -1720,6 +1720,8 @@ where
         progress.pruned_tool_results +=
             preparation.pruned_tool_results + preparation.truncated_recent_tool_results;
         progress.compacted_messages += preparation.compacted_messages;
+        // Stubbed reads say "run it again if you need it": doing so is not a re-read.
+        progress.watch.forget_pruned_reads(&self.session.messages);
         self.record_context_prepared(progress.iterations, &preparation);
         self.session.persist_snapshot().map_err(session_error)
     }
@@ -1753,6 +1755,7 @@ where
         progress.pruned_tool_results +=
             preparation.pruned_tool_results + preparation.truncated_recent_tool_results;
         progress.compacted_messages += preparation.compacted_messages;
+        progress.watch.forget_pruned_reads(&self.session.messages);
         self.record_context_prepared(progress.iterations, &preparation);
         self.session.persist_snapshot().map_err(session_error)?;
         Ok(true)
@@ -5951,6 +5954,96 @@ mod resilience_tests {
             Vec::<String>::new()
         );
         assert!(is_turn_end_note(&last_text(runtime.session())));
+    }
+
+    #[test]
+    fn reading_a_file_again_after_its_result_was_stubbed_does_not_pause_the_turn() {
+        // A small working set (the Free plan's): every read but the latest becomes a
+        // stub that says "run it again if you need it". The model does, between reads
+        // of other files, more often than the re-read pause allows.
+        const ROUNDS: usize = 8;
+        struct ReadAgainApi {
+            calls: usize,
+            /// Progress notes the model was sent (a stub cuts them off the session's copy).
+            notes: Vec<String>,
+        }
+        impl ApiClient for ReadAgainApi {
+            fn stream(&mut self, request: ApiRequest) -> Response {
+                self.calls += 1;
+                if let Some(ContentBlock::ToolResult { output, .. }) = request
+                    .messages
+                    .last()
+                    .and_then(|message| message.blocks.first())
+                {
+                    if output.contains("[progress check]") {
+                        self.notes.push(output.clone());
+                    }
+                }
+                if self.calls > ROUNDS * 2 {
+                    return Ok(vec![text("done"), AssistantEvent::MessageStop]);
+                }
+                let round = self.calls / 2;
+                let input = if self.calls % 2 == 1 {
+                    // Nearly the same window each time, so the loop guard stays out.
+                    format!(r#"{{"path":"src/service.py","offset":{round},"limit":200}}"#)
+                } else {
+                    format!(r#"{{"path":"src/other_{round}.py","offset":0,"limit":200}}"#)
+                };
+                Ok(vec![
+                    tool_call(&format!("read-{}", self.calls), "read_file", &input),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+        let tools = StaticToolExecutor::new().register("read_file", |input| {
+            let input = serde_json::from_str::<serde_json::Value>(input).expect("json input");
+            let path = input["path"].as_str().unwrap_or_default().to_string();
+            let start = usize::try_from(input["offset"].as_u64().unwrap_or(0)).unwrap_or(0);
+            let end = (start + 200).min(1_000);
+            let content = (start + 1..=end)
+                .map(|number| format!("{path} line {number}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(serde_json::json!({
+                "type": "text",
+                "file": {
+                    "filePath": path,
+                    "content": content,
+                    "numLines": end - start,
+                    "startLine": start + 1,
+                    "totalLines": 1_000,
+                }
+            })
+            .to_string())
+        });
+        let manager = ContextManager::new(
+            ContextBudget::default(),
+            ContextPolicy {
+                keep_recent_tool_results: 1,
+                working_set_tokens: Some(4_000),
+                // Stubs only: no pruning or compaction, which would also drop the reads.
+                threshold_override_tokens: Some(1_000_000),
+                ..ContextPolicy::default()
+            },
+        );
+        let api = ReadAgainApi {
+            calls: 0,
+            notes: Vec::new(),
+        };
+        let mut runtime = runtime_with(Session::new(), api, tools)
+            .with_context_manager(manager)
+            .with_pause_at_iteration_limit(true);
+
+        let summary = runtime
+            .run_turn("investigate", None)
+            .expect("turn completes");
+
+        assert_eq!(summary.outcome, TurnOutcome::Completed);
+        assert!(summary.pruned_tool_results > 0, "nothing was stubbed");
+        assert_eq!(summary.auto_compaction, None::<AutoCompactionEvent>);
+        assert_eq!(runtime.api_client().calls, ROUNDS * 2 + 1);
+        assert_eq!(tool_results(runtime.session()).len(), ROUNDS * 2);
+        assert_eq!(runtime.api_client().notes, Vec::<String>::new());
     }
 
     #[test]

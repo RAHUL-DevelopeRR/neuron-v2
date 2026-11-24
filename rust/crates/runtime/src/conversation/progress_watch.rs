@@ -9,12 +9,20 @@
 //! the file's count again, and so does any call that may change files (a shell, a
 //! sub-agent, an MCP tool, ...): what was read before it may be out of date.
 //!
+//! When the context is pruned or compacted, a file whose read results were all
+//! shortened or removed is forgotten: the model was told to read it again if it needs
+//! it, so doing so is not going round in circles.
+//!
+//! A cycle that waits (a `Sleep` call, or a shell command with `sleep`,
+//! `Start-Sleep` or `timeout /t` in it) is polling, not a loop: waiting for a server
+//! or a build returns the same "not yet" until it does not.
+//!
 //! The answer is graduated: the first time, a note on the tool result asks the model
 //! to change its approach; when it keeps going, the turn is paused (it ends normally,
 //! the work so far is kept, and the user can say "continue" or give guidance).
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use serde_json::Value;
@@ -55,8 +63,9 @@ pub(super) enum WatchVerdict {
 /// One turn's record of the calls that ran (see the module docs).
 #[derive(Debug, Default)]
 pub(super) struct ProgressWatch {
-    /// A hash of each recent call with its result, oldest first.
-    history: VecDeque<u64>,
+    /// A hash of each recent call with its result, oldest first, and whether the
+    /// call waits ([`waits`]).
+    history: VecDeque<(u64, bool)>,
     cycle_warned: bool,
     /// What was read of each file since it last changed (keyed by [`FilePath::key`]),
     /// and how many reads showed nothing new.
@@ -155,7 +164,8 @@ impl ProgressWatch {
             // It may have changed any file, even when it failed part way.
             self.reads.clear();
         }
-        let verdict = self.observe_cycle(tool_name, input, output, is_error);
+        let waits = waits(tool_name, input_value.as_ref());
+        let verdict = self.observe_cycle(tool_name, input, output, is_error, waits);
         let verdict = match verdict {
             WatchVerdict::Proceed if !is_error && tool_name == "read_file" => {
                 input_value.as_ref().map_or(WatchVerdict::Proceed, |value| {
@@ -175,25 +185,76 @@ impl ProgressWatch {
         self.pending_pause.take()
     }
 
+    /// After the context was pruned or compacted: forgets what was read of each file
+    /// that has no whole `read_file` result left in `messages`. Its results were
+    /// shortened to stubs ("run it again if you need it") or compacted away, so the
+    /// model no longer has what it read, and reading it again is not a re-read.
+    pub(super) fn forget_pruned_reads(&mut self, messages: &[ConversationMessage]) {
+        if self.reads.is_empty() {
+            return;
+        }
+        let mut read_inputs = HashMap::new();
+        let mut whole = HashSet::new();
+        for block in messages.iter().flat_map(|message| message.blocks.iter()) {
+            match block {
+                ContentBlock::ToolUse { id, name, input } if name == "read_file" => {
+                    read_inputs.insert(id.as_str(), input.as_str());
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    output,
+                    is_error: false,
+                    ..
+                } if shown_lines(output).is_some() => {
+                    let path = read_inputs
+                        .get(tool_use_id.as_str())
+                        .and_then(|input| serde_json::from_str::<Value>(input).ok())
+                        .as_ref()
+                        .and_then(path_of);
+                    if let Some(path) = path {
+                        whole.insert(path.key);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.reads.retain(|key, _| whole.contains(key));
+    }
+
     fn observe_cycle(
         &mut self,
         tool_name: &str,
         input: &str,
         output: &str,
         is_error: bool,
+        waits: bool,
     ) -> WatchVerdict {
         let mut hasher = DefaultHasher::new();
         tool_call_signature(tool_name, input).hash(&mut hasher);
         output.hash(&mut hasher);
         is_error.hash(&mut hasher);
-        self.history.push_back(hasher.finish());
+        self.history.push_back((hasher.finish(), waits));
         while self.history.len() > HISTORY_LEN {
             self.history.pop_front();
         }
-        let Some(length) = CYCLE_LENGTHS
+        let recent = self
+            .history
+            .iter()
+            .map(|(hash, _)| *hash)
+            .collect::<VecDeque<_>>();
+        let found = CYCLE_LENGTHS
             .into_iter()
-            .find(|length| repeats_cycle(&self.history, *length))
-        else {
+            .find(|length| repeats_cycle(&recent, *length));
+        // A cycle that waits is polling (`sleep 5`, then `curl` still refused): the
+        // same results until the thing waited for is ready. The request cap bounds it.
+        let polls = found.is_some_and(|length| {
+            self.history
+                .iter()
+                .rev()
+                .take(length)
+                .any(|(_, waits)| *waits)
+        });
+        let Some(length) = found.filter(|_| !polls) else {
             self.cycle_warned = false;
             return WatchVerdict::Proceed;
         };
@@ -248,6 +309,34 @@ impl ProgressWatch {
         }
         WatchVerdict::Proceed
     }
+}
+
+/// Whether a call waits: the `Sleep` tool, or a shell command with a wait in it
+/// (`sleep 5`, `sleep 5 && curl ...`, `Start-Sleep -Seconds 5`, `timeout /t 5`).
+/// GNU `timeout 5 cmd` runs `cmd` with a time limit: not a wait.
+fn waits(tool_name: &str, input: Option<&Value>) -> bool {
+    match tool_name {
+        "Sleep" => true,
+        "bash" | "PowerShell" => input
+            .and_then(|input| input.get("command"))
+            .and_then(Value::as_str)
+            .is_some_and(command_waits),
+        _ => false,
+    }
+}
+
+fn command_waits(command: &str) -> bool {
+    command.split(['\n', ';', '&', '|']).any(|segment| {
+        let mut words = segment.split_whitespace();
+        let Some(program) = words.next() else {
+            return false;
+        };
+        match program.to_ascii_lowercase().as_str() {
+            "sleep" | "start-sleep" => true,
+            "timeout" | "timeout.exe" => words.any(|word| word.eq_ignore_ascii_case("/t")),
+            _ => false,
+        }
+    })
 }
 
 /// The lines a `read_file` result showed, hashed one by one.
@@ -384,7 +473,7 @@ fn number(input: &Value, key: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{ProgressWatch, WatchVerdict, REREAD_PAUSE, REREAD_WARN};
-    use crate::session::ConversationMessage;
+    use crate::session::{ContentBlock, ConversationMessage};
 
     fn result(output: &str) -> ConversationMessage {
         ConversationMessage::tool_result("id", "tool", output, false)
@@ -662,6 +751,119 @@ mod tests {
                 WatchVerdict::Proceed
             );
         }
+    }
+
+    #[test]
+    fn waiting_for_a_server_is_polling_not_a_cycle() {
+        // `sleep 5`, then `curl` still refused: the same results every round until
+        // the server is up. Before, the seventh call paused the turn.
+        for (wait_tool, wait_input) in [
+            ("bash", r#"{"command":"sleep 5"}"#),
+            ("PowerShell", r#"{"command":"Start-Sleep -Seconds 5"}"#),
+            ("PowerShell", r#"{"command":"timeout /t 5 /nobreak > nul"}"#),
+            ("Sleep", r#"{"duration_ms":5000}"#),
+        ] {
+            let mut watch = ProgressWatch::default();
+            for _ in 0..12 {
+                assert_eq!(
+                    watch.observe(wait_tool, wait_input, &result("")),
+                    WatchVerdict::Proceed,
+                    "{wait_tool} {wait_input}"
+                );
+                assert_eq!(
+                    watch.observe(
+                        "bash",
+                        r#"{"command":"curl -s localhost:3000"}"#,
+                        &result("exit code 7")
+                    ),
+                    WatchVerdict::Proceed,
+                    "{wait_tool} {wait_input}"
+                );
+            }
+        }
+        // A wait inside the polling command counts too.
+        let mut watch = ProgressWatch::default();
+        assert_never_paused((0..12).flat_map(|_| {
+            [
+                watch.observe(
+                    "bash",
+                    r#"{"command":"sleep 5 && curl -s localhost:3000"}"#,
+                    &result("exit code 7"),
+                ),
+                watch.observe(
+                    "bash",
+                    r#"{"command":"tail -n 5 dev.log"}"#,
+                    &result("starting"),
+                ),
+            ]
+        }));
+    }
+
+    #[test]
+    fn a_command_time_limit_is_not_a_wait() {
+        // GNU `timeout 30 cargo build` runs the build: the cycle is still a loop.
+        let mut watch = ProgressWatch::default();
+        let verdicts = (0..4)
+            .flat_map(|_| {
+                [
+                    watch.observe(
+                        "bash",
+                        r#"{"command":"timeout 30 cargo build"}"#,
+                        &result("error"),
+                    ),
+                    watch.observe("grep_search", r#"{"pattern":"fn main"}"#, &result("x")),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            verdicts
+                .iter()
+                .any(|verdict| matches!(verdict, WatchVerdict::Pause { .. })),
+            "{verdicts:?}"
+        );
+    }
+
+    /// A `read_file` call and its result, as the session holds them.
+    fn read_messages(id: &str, input: &str, output: &str) -> [ConversationMessage; 2] {
+        [
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: "read_file".to_string(),
+                input: input.to_string(),
+            }]),
+            ConversationMessage::tool_result(id, "read_file", output, false),
+        ]
+    }
+
+    #[test]
+    fn a_file_whose_reads_were_all_stubbed_is_forgotten() {
+        let mut watch = ProgressWatch::default();
+        let input = r#"{"path":"src/app.py"}"#;
+        for _ in 0..REREAD_WARN {
+            assert_eq!(read(&mut watch, input), WatchVerdict::Proceed);
+        }
+        // The context manager stubbed the results: the model was told to run it again.
+        let stub = "[tool result: read_file removed to save tokens (9000 chars); run it again if you need it. It began:]\n{...";
+        let messages = read_messages("read-1", input, stub);
+        watch.forget_pruned_reads(&messages);
+        for _ in 0..REREAD_PAUSE + 2 {
+            assert_eq!(read(&mut watch, input), WatchVerdict::Proceed);
+            watch.forget_pruned_reads(&messages);
+        }
+    }
+
+    #[test]
+    fn a_file_with_a_whole_read_left_keeps_its_count() {
+        let mut watch = ProgressWatch::default();
+        let input = r#"{"path":"src/app.py"}"#;
+        for _ in 0..REREAD_WARN {
+            assert_eq!(read(&mut watch, input), WatchVerdict::Proceed);
+        }
+        // Older results were stubbed, but the latest one is still whole.
+        let whole = file_output(0, 2_000, 5_000, "line");
+        let messages = read_messages("read-3", r#"{"path":"./src/app.py"}"#, &whole);
+        watch.forget_pruned_reads(&messages);
+        assert!(matches!(read(&mut watch, input), WatchVerdict::Warn(_)));
     }
 
     #[test]
