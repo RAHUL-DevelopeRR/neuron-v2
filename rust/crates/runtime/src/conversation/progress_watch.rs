@@ -22,7 +22,7 @@
 //! the work so far is kept, and the user can say "continue" or give guidance).
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 
 use serde_json::Value;
@@ -117,6 +117,24 @@ impl FileReads {
         !shown.hashes.is_empty() && seen * 2 > shown.hashes.len()
     }
 
+    /// Keeps only the lines inside `ranges` (first line, past the last): those whole
+    /// results still show. Whether anything is left. Results that were not the usual
+    /// JSON cannot be told from stubbed ones, so they go. When anything went, the
+    /// count starts again: what it counted may be what the model no longer has.
+    fn keep_lines_in(&mut self, ranges: &[(usize, usize)]) -> bool {
+        let before = self.lines.len() + self.results.len();
+        self.lines.retain(|line, _| {
+            ranges
+                .iter()
+                .any(|(first, end)| (*first..*end).contains(line))
+        });
+        self.results.clear();
+        if self.lines.len() < before {
+            self.rereads = 0;
+        }
+        !self.lines.is_empty()
+    }
+
     /// Records a result whose lines could not be read out; whether the same range
     /// returned exactly this before. A different result starts the count again.
     fn record_result(&mut self, range: (usize, usize), output: &str) -> bool {
@@ -185,16 +203,18 @@ impl ProgressWatch {
         self.pending_pause.take()
     }
 
-    /// After the context was pruned or compacted: forgets what was read of each file
-    /// that has no whole `read_file` result left in `messages`. Its results were
+    /// After the context was pruned or compacted: forgets the lines of each file that
+    /// no whole `read_file` result in `messages` shows any more. Those results were
     /// shortened to stubs ("run it again if you need it") or compacted away, so the
-    /// model no longer has what it read, and reading it again is not a re-read.
+    /// model no longer has those lines, and reading them again is not a re-read. A
+    /// large file read in windows keeps the windows still whole.
     pub(super) fn forget_pruned_reads(&mut self, messages: &[ConversationMessage]) {
         if self.reads.is_empty() {
             return;
         }
         let mut read_inputs = HashMap::new();
-        let mut whole = HashSet::new();
+        // Per file, the line ranges (first line, past the last) of its whole results.
+        let mut whole = HashMap::<String, Vec<(usize, usize)>>::new();
         for block in messages.iter().flat_map(|message| message.blocks.iter()) {
             match block {
                 ContentBlock::ToolUse { id, name, input } if name == "read_file" => {
@@ -205,20 +225,29 @@ impl ProgressWatch {
                     output,
                     is_error: false,
                     ..
-                } if shown_lines(output).is_some() => {
+                } => {
+                    let Some(shown) = shown_lines(output) else {
+                        continue;
+                    };
                     let path = read_inputs
                         .get(tool_use_id.as_str())
                         .and_then(|input| serde_json::from_str::<Value>(input).ok())
                         .as_ref()
                         .and_then(path_of);
                     if let Some(path) = path {
-                        whole.insert(path.key);
+                        let end = shown.start_line.saturating_add(shown.hashes.len());
+                        whole
+                            .entry(path.key)
+                            .or_default()
+                            .push((shown.start_line, end));
                     }
                 }
                 _ => {}
             }
         }
-        self.reads.retain(|key, _| whole.contains(key));
+        self.reads.retain(|key, reads| {
+            reads.keep_lines_in(whole.get(key).map_or(&[][..], Vec::as_slice))
+        });
     }
 
     fn observe_cycle(
@@ -864,6 +893,44 @@ mod tests {
         let messages = read_messages("read-3", r#"{"path":"./src/app.py"}"#, &whole);
         watch.forget_pruned_reads(&messages);
         assert!(matches!(read(&mut watch, input), WatchVerdict::Warn(_)));
+    }
+
+    #[test]
+    fn going_back_to_a_stubbed_window_of_a_large_file_is_not_rereading() {
+        // A large file read in windows: the first window's result was stubbed, the
+        // later ones are still whole. Going back to the first window is not a re-read,
+        // however often its result is stubbed again in between.
+        let mut watch = ProgressWatch::default();
+        let window =
+            |offset: usize| format!(r#"{{"path":"big.py","offset":{offset},"limit":100}}"#);
+        for chunk in 0..5 {
+            assert_eq!(
+                read(&mut watch, &window(chunk * 100)),
+                WatchVerdict::Proceed
+            );
+        }
+        let stub = "[tool result: read_file removed to save tokens (9000 chars); run it again if you need it. It began:]";
+        let mut messages = read_messages("read-0", &window(0), stub).to_vec();
+        for chunk in 1..5 {
+            let output = file_output(chunk * 100, 100, 5_000, "line");
+            messages.extend(read_messages(
+                &format!("read-{chunk}"),
+                &window(chunk * 100),
+                &output,
+            ));
+        }
+        for _ in 0..REREAD_PAUSE + 2 {
+            watch.forget_pruned_reads(&messages);
+            assert_eq!(read(&mut watch, &window(0)), WatchVerdict::Proceed);
+        }
+        // The windows still whole keep their count.
+        for _ in 1..REREAD_WARN {
+            assert_eq!(read(&mut watch, &window(300)), WatchVerdict::Proceed);
+        }
+        assert!(matches!(
+            read(&mut watch, &window(300)),
+            WatchVerdict::Warn(_)
+        ));
     }
 
     #[test]
