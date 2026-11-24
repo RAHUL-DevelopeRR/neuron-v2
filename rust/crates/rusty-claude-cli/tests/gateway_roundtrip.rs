@@ -1524,6 +1524,22 @@ fn settings_max_iterations_caps_the_model_calls_of_a_turn() {
         stderr(&output)
     );
     assert_eq!(gateway.count("POST", "/v1/chat/completions"), 5);
+
+    // `--output-format json`: the usual result, outcome `iteration_limit`, and exit 1.
+    let mut command = workspace.command(&gateway);
+    command
+        .env("NEURON_TOKEN", SESSION_TOKEN)
+        .env("NEURON_MAX_ITERATIONS", "2")
+        .args(json_prompt_args("keep reading"));
+    let output = run(command, None);
+    assert!(!output.status.success(), "{}", stderr(&output));
+    let result = json_result(&output);
+    assert_eq!(result["outcome"], "iteration_limit", "{result}");
+    assert_eq!(result["iterations"], 2, "{result}");
+    let errors = stderr(&output);
+    assert!(errors.contains("-p continue"), "{errors}");
+    assert!(!errors.contains("conversation loop exceeded"), "{errors}");
+    assert_eq!(gateway.count("POST", "/v1/chat/completions"), 7);
 }
 
 #[test]

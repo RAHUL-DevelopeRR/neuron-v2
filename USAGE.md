@@ -83,8 +83,8 @@ rather than starting a session.
 
 `--output-format json` prints one JSON object when the turn ends. `message` is the
 final answer text (never the model's reasoning), `outcome` says how the turn ended
-(`completed`, `output_truncated`, `loop_detected`, `no_progress`, `budget_stopped`,
-`cancelled` or `refused`) and
+(`completed`, `output_truncated`, `loop_detected`, `iteration_limit`, `no_progress`,
+`budget_stopped`, `cancelled` or `refused`) and
 `stop_reason` is the provider's last stop reason. When the model declines to continue
 (`outcome` `refused`, `stop_reason` `refusal`; OpenAI-compatible providers call it
 `content_filter`), `message` keeps whatever it wrote before, and `refusal` holds the
