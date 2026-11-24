@@ -20,6 +20,8 @@ import {
   createBatchedMessageUpdater,
   type BatchedMessageUpdater,
 } from '../../utils/message-updater'
+import { fileReferenceText } from '../../utils/attach-routing'
+import { settleFileCopies } from '../../utils/pending-attachments'
 import { createModeDividerMessage } from '../../utils/send-message-helpers'
 import { yieldToEventLoop } from '../../utils/yield-to-event-loop'
 
@@ -148,8 +150,10 @@ export const prepareUserMessage = async (params: {
     (a): a is PendingTextAttachment => a.kind === 'text',
   )
 
-  const pendingFileAttachments = allAttachments.filter(
-    (a): a is PendingFileAttachment => a.kind === 'file',
+  // A document still being copied into the workspace is waited for, so a
+  // prompt sent meanwhile (from any input mode, or the queue) still has it.
+  const pendingFileAttachments = await settleFileCopies(
+    allAttachments.filter((a): a is PendingFileAttachment => a.kind === 'file'),
   )
 
   // Append text attachments to the content
@@ -170,7 +174,9 @@ export const prepareUserMessage = async (params: {
       .map((att) =>
         att.isDirectory
           ? `[Directory: ${att.path}]\n${att.content}`
-          : `[File: ${att.path}]\n${att.content}`,
+          : att.readWith
+            ? fileReferenceText(att.path, att.readWith, att.sourcePath)
+            : `[File: ${att.path}]\n${att.content}`,
       )
       .join('\n\n')
     if (fileAttachmentContent) {
@@ -212,6 +218,7 @@ export const prepareUserMessage = async (params: {
       filename: att.filename,
       isDirectory: att.isDirectory,
       note: att.note,
+      ...(att.readWith ? { readWith: att.readWith } : {}),
     }))
 
   // Pass original content (not finalContent) for display, but finalContent goes to agent

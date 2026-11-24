@@ -3,7 +3,7 @@
 // while shell commands are not implemented (USER_SHELL_AVAILABLE), and nor are
 // the /mode:* commands (AGENT_MODES_AVAILABLE) or /image while images don't
 // reach the model (IMAGES_REACH_THE_MODEL); the git commands are listed only
-// when the engine has their feature; /update is Neuron's.
+// when the engine has their feature; /update and /attach are Neuron's.
 // See ui/neuron-tui/PORTING.md.
 import { IMAGES_REACH_THE_MODEL } from '../engine/attachments'
 import { FEATURE_CHECKPOINTS, FEATURE_GIT_VIEWS } from '../engine/protocol'
@@ -130,10 +130,15 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
           id: 'image',
           label: 'image',
           description: 'Attach an image file (or Ctrl+V to paste from clipboard)',
-          aliases: ['img', 'attach'],
+          aliases: ['img'],
         },
       ]
     : []),
+  {
+    id: 'attach',
+    label: 'attach',
+    description: 'Attach files: documents, code, text (or /attach <path>)',
+  },
   {
     id: 'model',
     label: 'model',

@@ -1,6 +1,7 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: `~`
-// completions keep their `~` form whichever separator HOME uses, and a
-// trailing `/` counts as a separator on Windows. See ui/neuron-tui/PORTING.md.
+// completions keep their `~` form whichever separator HOME uses, a trailing
+// `/` counts as a separator on Windows, and files can be completed too (the
+// attach browser). See ui/neuron-tui/PORTING.md.
 import { existsSync, readdirSync, statSync } from 'fs'
 import os from 'os'
 import path from 'path'
@@ -46,10 +47,13 @@ function toTildeForm(
  * - Hidden directories are skipped unless user typed a dot
  *
  * @param homeDir - The home directory `~` stands for (tests pass their own).
+ * @param options.includeFiles - Complete file names too (a file completes
+ *   without the trailing separator).
  */
 export function getPathCompletion(
   inputPath: string,
   homeDir: string = os.homedir(),
+  options: { includeFiles?: boolean } = {},
 ): string | null {
   if (!inputPath) return null
 
@@ -85,6 +89,7 @@ export function getPathCompletion(
   try {
     const items = readdirSync(parentDir)
     const matches: string[] = []
+    const directories = new Set<string>()
 
     for (const item of items) {
       // Skip hidden files unless user typed a dot
@@ -92,7 +97,9 @@ export function getPathCompletion(
 
       const fullPath = path.join(parentDir, item)
       try {
-        if (!statSync(fullPath).isDirectory()) continue
+        const stats = statSync(fullPath)
+        if (stats.isDirectory()) directories.add(item)
+        else if (!options.includeFiles || !stats.isFile()) continue
       } catch {
         continue
       }
@@ -106,7 +113,8 @@ export function getPathCompletion(
 
     // If exactly one match, complete to it with trailing slash
     if (matches.length === 1) {
-      const completed = path.join(parentDir, matches[0]) + path.sep
+      const completed =
+        path.join(parentDir, matches[0]) + (directories.has(matches[0]) ? path.sep : '')
       // Convert back to ~ format if it was originally using ~
       return inputPath.startsWith('~')
         ? toTildeForm(completed, inputPath, homeDir)

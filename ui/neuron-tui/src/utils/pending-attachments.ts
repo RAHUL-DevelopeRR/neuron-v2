@@ -1,12 +1,14 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the error
-// mark comes from utils/glyphs.ts. See ui/neuron-tui/PORTING.md.
+// mark comes from utils/glyphs.ts, and a file can be attached by reference
+// (addPendingFileReference) or by reference to a copy (addPendingFileCopy).
+// See ui/neuron-tui/PORTING.md.
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 
 import { GLYPHS } from './glyphs'
 import { processImageFile, resolveFilePath, isImageFile } from './image-handler'
 import { useChatStore } from '../state/chat-store'
-import type { PendingAttachment } from '../types/store'
+import type { PendingAttachment, PendingFileAttachment } from '../types/store'
 
 /**
  * Exit image input mode if currently active.
@@ -328,6 +330,109 @@ export function addPendingFileFromPath(
       }))
     }
   }, 0)
+}
+
+/**
+ * Add a file the model reads by path (a document, or text too long to
+ * inline): nothing is read here, the prompt names the path and the tool to
+ * read it with.
+ */
+export function addPendingFileReference(
+  filePath: string,
+  readWith: 'read_document' | 'read_file',
+  size: number,
+): void {
+  useChatStore.getState().addPendingFileAttachment({
+    id: crypto.randomUUID(),
+    path: filePath,
+    filename: path.basename(filePath) || filePath,
+    isDirectory: false,
+    content: '',
+    status: 'ready',
+    note: `${readWith === 'read_document' ? 'document' : 'by path'} · ${formatFileSize(size)}`,
+    readWith,
+  })
+}
+
+/** Copies still being made, by attachment id: whether each was made. */
+const copiesInFlight = new Map<string, Promise<boolean>>()
+
+/**
+ * Add a file picked outside the engine's workspace, by reference to a copy
+ * inside it: the card shows at once as processing, and is ready once `copy`
+ * has written `copyPath`. A prompt sent meanwhile waits for the copy
+ * ({@link settleFileCopies}). If the copy fails the card goes and `onError`
+ * says why. Resolves to whether the copy was made.
+ */
+export function addPendingFileCopy(
+  sourcePath: string,
+  copyPath: string,
+  readWith: 'read_document' | 'read_file',
+  size: number,
+  copy: () => Promise<void>,
+  onError: (reason: string) => void,
+): Promise<boolean> {
+  const id = crypto.randomUUID()
+  const kind = readWith === 'read_document' ? 'document' : 'by path'
+  useChatStore.getState().addPendingFileAttachment({
+    id,
+    path: copyPath,
+    filename: path.basename(sourcePath) || sourcePath,
+    isDirectory: false,
+    content: '',
+    status: 'processing',
+    note: 'copying into the project',
+    readWith,
+    sourcePath,
+  })
+  const run = async (): Promise<boolean> => {
+    try {
+      await copy()
+    } catch (error) {
+      useChatStore.setState((state) => ({
+        pendingAttachments: state.pendingAttachments.filter((att) => att.kind !== 'file' || att.id !== id),
+      }))
+      const code = (error as { code?: string }).code
+      onError(code ?? (error instanceof Error ? error.message : String(error)))
+      return false
+    }
+    useChatStore.setState((state) => ({
+      pendingAttachments: state.pendingAttachments.map((att) =>
+        att.kind === 'file' && att.id === id
+          ? { ...att, status: 'ready' as const, note: copiedNote(kind, size) }
+          : att,
+      ),
+    }))
+    return true
+  }
+  const done = run()
+  copiesInFlight.set(id, done)
+  void done.finally(() => copiesInFlight.delete(id))
+  return done
+}
+
+function copiedNote(kind: string, size: number): string {
+  return `copied · ${kind} · ${formatFileSize(size)}`
+}
+
+/**
+ * File attachments as they will be sent: one whose copy into the workspace
+ * is still being made is waited for, and is ready (or dropped) as the copy
+ * ends. Every send path goes through here (send-message.ts), so a prompt
+ * sent while a large document is copying carries it rather than losing it,
+ * whether the attachments come from the store or a queued snapshot.
+ */
+export async function settleFileCopies(
+  attachments: PendingFileAttachment[],
+): Promise<PendingFileAttachment[]> {
+  const settled = await Promise.all(
+    attachments.map(async (att) => {
+      const inFlight = att.status === 'processing' ? copiesInFlight.get(att.id) : undefined
+      if (!inFlight) return att
+      return (await inFlight) ? { ...att, status: 'ready' as const } : null
+    }),
+  )
+  return settled.filter((att): att is PendingFileAttachment => att !== null)
 }
 
 /**

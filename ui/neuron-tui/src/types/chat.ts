@@ -200,6 +200,8 @@ export type FileAttachment = {
   filename: string
   isDirectory: boolean
   note?: string
+  /** Sent by reference, for the model to read with this tool. */
+  readWith?: 'read_document' | 'read_file'
 }
 
 export type ContentBlock =
