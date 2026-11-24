@@ -3832,7 +3832,9 @@ mod tests {
             args,
             env: BTreeMap::new(),
             tool_call_timeout_ms: None,
-            sandbox: None,
+            // The counter's folder writable (under bubblewrap /tmp is private); still no
+            // network, so the "list the hosts" hint applies.
+            sandbox: Some(log_writable_sandbox(Path::new(&count))),
         }
     }
 
