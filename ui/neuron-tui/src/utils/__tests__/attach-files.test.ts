@@ -251,6 +251,67 @@ describe('the prompt for attached files', () => {
       `[File: ${file!.path}]\n(an attached document, copied from ${path.join(outside, 'deck.pptx')}: read it with the read_document tool.)`,
     )
   })
+
+  test('a prompt sent while a document is still copying waits for it, from a queued snapshot too', async () => {
+    setProjectRoot(workspace)
+    let finish: () => void = () => {}
+    attachFiles([path.join(outside, 'deck.pptx')], {
+      root: workspace,
+      copy: (from, to) =>
+        new Promise<void>((resolve) => {
+          finish = () => {
+            writeFileSync(to, readFileSync(from))
+            resolve()
+          }
+        }),
+    })
+    // Queued as a snapshot while the card is still processing (a skill or plan
+    // prompt, or one sent mid-turn), then the store is cleared.
+    const snapshot = useChatStore.getState().pendingAttachments
+    expect((snapshot[0] as PendingFileAttachment).status).toBe('processing')
+    useChatStore.getState().clearPendingAttachments()
+    const prepared = prepareUserMessage({
+      content: 'summarise the deck',
+      agentMode: 'DEFAULT',
+      attachments: snapshot,
+      deps: {
+        setMessages: () => {},
+        lastMessageMode: 'DEFAULT',
+        setLastMessageMode: () => {},
+        scrollToLatest: () => {},
+        setHasReceivedPlanResponse: () => {},
+      },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    finish()
+    const { finalContent } = await prepared
+    expect(finalContent).toContain(`copied from ${path.join(outside, 'deck.pptx')}: read it with the read_document tool.`)
+  })
+
+  test('a copy that fails while a prompt waits for it is left out of the prompt', async () => {
+    setProjectRoot(workspace)
+    attachFiles([path.join(outside, 'deck.pptx')], {
+      root: workspace,
+      copy: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        throw Object.assign(new Error('denied'), { code: 'EACCES' })
+      },
+    })
+    const { finalContent } = await prepareUserMessage({
+      content: 'summarise the deck',
+      agentMode: 'DEFAULT',
+      attachments: useChatStore.getState().pendingAttachments,
+      deps: {
+        setMessages: () => {},
+        lastMessageMode: 'DEFAULT',
+        setLastMessageMode: () => {},
+        scrollToLatest: () => {},
+        setHasReceivedPlanResponse: () => {},
+      },
+    })
+    expect(finalContent).toBe('summarise the deck')
+    expect(useAttachStore.getState().notices[0]?.text).toContain('(EACCES)')
+  })
 })
 
 function dialogReturning(stdout: string, code = 0): () => SpawnedDialog {

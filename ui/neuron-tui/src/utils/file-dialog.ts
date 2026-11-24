@@ -239,7 +239,7 @@ export function parseDialogOutput(stdout: string): string[] {
  * also prints warnings on an ordinary cancel.
  */
 export const DISPLAY_FAILURE_PATTERN =
-  /cannot open display|could not connect to (any x )?display|failed to connect to (the )?(display|wayland)|unable to init server/i
+  /cannot open display|failed to open display|could not connect to (any x )?display|failed to connect to (the )?(display|wayland)|unable to init server/i
 
 /**
  * What a dialog's exit means. Every tool prints nothing on cancel: PowerShell

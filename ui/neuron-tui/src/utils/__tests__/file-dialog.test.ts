@@ -165,6 +165,8 @@ describe('reading the dialog back', () => {
       interpretDialogExit('kdialog', 1, '', 'Qt: Session management error\nqt.qpa.xcb: could not connect to display :99\n'),
     ).toEqual({ status: 'failed', reason: 'kdialog failed: qt.qpa.xcb: could not connect to display :99' })
     expect(DISPLAY_FAILURE_PATTERN.test('Failed to connect to Wayland display')).toBe(true)
+    // GTK 4 (zenity 4) words it differently from GTK 3.
+    expect(interpretDialogExit('zenity', 1, '', '(zenity:7): Gtk-WARNING **: Failed to open display').status).toBe('failed')
     expect(DISPLAY_FAILURE_PATTERN.test('Gtk-WARNING: Theme parsing error')).toBe(false)
   })
 

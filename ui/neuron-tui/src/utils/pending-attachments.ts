@@ -8,7 +8,7 @@ import path from 'node:path'
 import { GLYPHS } from './glyphs'
 import { processImageFile, resolveFilePath, isImageFile } from './image-handler'
 import { useChatStore } from '../state/chat-store'
-import type { PendingAttachment } from '../types/store'
+import type { PendingAttachment, PendingFileAttachment } from '../types/store'
 
 /**
  * Exit image input mode if currently active.
@@ -354,13 +354,17 @@ export function addPendingFileReference(
   })
 }
 
+/** Copies still being made, by attachment id: whether each was made. */
+const copiesInFlight = new Map<string, Promise<boolean>>()
+
 /**
  * Add a file picked outside the engine's workspace, by reference to a copy
- * inside it: the card shows at once as processing (which holds the send), and
- * is ready once `copy` has written `copyPath`. If the copy fails the card goes
- * and `onError` says why. Resolves to whether the copy was made.
+ * inside it: the card shows at once as processing, and is ready once `copy`
+ * has written `copyPath`. A prompt sent meanwhile waits for the copy
+ * ({@link settleFileCopies}). If the copy fails the card goes and `onError`
+ * says why. Resolves to whether the copy was made.
  */
-export async function addPendingFileCopy(
+export function addPendingFileCopy(
   sourcePath: string,
   copyPath: string,
   readWith: 'read_document' | 'read_file',
@@ -381,24 +385,54 @@ export async function addPendingFileCopy(
     readWith,
     sourcePath,
   })
-  try {
-    await copy()
-  } catch (error) {
+  const run = async (): Promise<boolean> => {
+    try {
+      await copy()
+    } catch (error) {
+      useChatStore.setState((state) => ({
+        pendingAttachments: state.pendingAttachments.filter((att) => att.kind !== 'file' || att.id !== id),
+      }))
+      const code = (error as { code?: string }).code
+      onError(code ?? (error instanceof Error ? error.message : String(error)))
+      return false
+    }
     useChatStore.setState((state) => ({
-      pendingAttachments: state.pendingAttachments.filter((att) => att.kind !== 'file' || att.id !== id),
+      pendingAttachments: state.pendingAttachments.map((att) =>
+        att.kind === 'file' && att.id === id
+          ? { ...att, status: 'ready' as const, note: copiedNote(kind, size) }
+          : att,
+      ),
     }))
-    const code = (error as { code?: string }).code
-    onError(code ?? (error instanceof Error ? error.message : String(error)))
-    return false
+    return true
   }
-  useChatStore.setState((state) => ({
-    pendingAttachments: state.pendingAttachments.map((att) =>
-      att.kind === 'file' && att.id === id
-        ? { ...att, status: 'ready' as const, note: `copied · ${kind} · ${formatFileSize(size)}` }
-        : att,
-    ),
-  }))
-  return true
+  const done = run()
+  copiesInFlight.set(id, done)
+  void done.finally(() => copiesInFlight.delete(id))
+  return done
+}
+
+function copiedNote(kind: string, size: number): string {
+  return `copied · ${kind} · ${formatFileSize(size)}`
+}
+
+/**
+ * File attachments as they will be sent: one whose copy into the workspace
+ * is still being made is waited for, and is ready (or dropped) as the copy
+ * ends. Every send path goes through here (send-message.ts), so a prompt
+ * sent while a large document is copying carries it rather than losing it,
+ * whether the attachments come from the store or a queued snapshot.
+ */
+export async function settleFileCopies(
+  attachments: PendingFileAttachment[],
+): Promise<PendingFileAttachment[]> {
+  const settled = await Promise.all(
+    attachments.map(async (att) => {
+      const inFlight = att.status === 'processing' ? copiesInFlight.get(att.id) : undefined
+      if (!inFlight) return att
+      return (await inFlight) ? { ...att, status: 'ready' as const } : null
+    }),
+  )
+  return settled.filter((att): att is PendingFileAttachment => att !== null)
 }
 
 /**
