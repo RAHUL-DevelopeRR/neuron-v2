@@ -79,6 +79,12 @@ export type PendingFileAttachment = {
    * binary or large files; see utils/attach-routing.ts).
    */
   readWith?: 'read_document' | 'read_file'
+  /**
+   * The file this one is a copy of: a file picked outside the engine's
+   * workspace is copied into it (`.neuron/attachments`) so the model can read
+   * it, and `path` is the copy.
+   */
+  sourcePath?: string
 }
 
 /** Unified attachment type with discriminator */

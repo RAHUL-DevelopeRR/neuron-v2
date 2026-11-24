@@ -27,7 +27,10 @@ const BANNER_REGISTRY: Record<
  * Shows mode-specific banners based on the current input mode.
  *
  * Uses a registry pattern for easy extensibility - add new banners by
- * updating BANNER_REGISTRY above.
+ * updating BANNER_REGISTRY above. A mode without its own banner shows the
+ * attachments banner: the Attach button works in every mode, so what it
+ * attached, and why a file was not attached, always shows. The banner draws
+ * nothing when there is nothing attached.
  */
 export const InputModeBanner = () => {
   const inputMode = useChatStore((state) => state.inputMode)
@@ -35,7 +38,7 @@ export const InputModeBanner = () => {
   const renderBanner = BANNER_REGISTRY[inputMode]
 
   if (!renderBanner) {
-    return null
+    return <PendingAttachmentsBanner />
   }
 
   return <>{renderBanner({ showTime: Date.now() })}</>

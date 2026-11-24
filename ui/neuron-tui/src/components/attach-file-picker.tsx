@@ -10,6 +10,7 @@
  *   enter     open a folder, attach a file (again: remove it)
  *   backspace with nothing typed: the parent folder
  *   esc       clear what was typed, then close
+ *   paste     a pasted or dropped file is attached; other text is typed
  *
  * Every row is clickable, and so are Up and Done.
  */
@@ -18,15 +19,22 @@ import { existsSync, statSync } from 'fs'
 import os from 'os'
 import path from 'path'
 
-import { TextAttributes, type KeyEvent } from '@opentui/core'
-import { useKeyboard } from '@opentui/react'
+import {
+  TextAttributes,
+  decodePasteBytes,
+  stripAnsiSequences,
+  type KeyEvent,
+  type PasteEvent,
+} from '@opentui/core'
+import { useKeyboard, usePaste } from '@opentui/react'
 import React, { useCallback, useMemo, useRef, useState } from 'react'
 
 import { Button } from './button'
 import { truncateToWidth, visibleWindow } from './model-picker'
 import { useTheme } from '../hooks/use-theme'
 import { useChatStore } from '../state/chat-store'
-import { attachFiles } from '../utils/attach-files'
+import { attachFiles, attachedKeys, attachmentKey } from '../utils/attach-files'
+import { parseAttachArgs } from '../utils/attach-routing'
 import { getDirectories, type DirectoryEntry } from '../utils/directory-browser'
 import { GLYPHS } from '../utils/glyphs'
 import { getPathCompletion } from '../utils/path-completion'
@@ -51,11 +59,34 @@ export function resolveTypedPath(query: string, currentDir: string, homeDir: str
   return path.resolve(currentDir, trimmed)
 }
 
-/** The listing's rows: filtered by name unless a path is being typed. */
+/**
+ * The listing's rows: filtered by name unless a path is being typed. The
+ * parent folder is left out while filtering, so Enter on a filter that
+ * matches nothing does nothing rather than leave the folder.
+ */
 export function filterEntries(entries: DirectoryEntry[], query: string): DirectoryEntry[] {
   const trimmed = query.trim().toLowerCase()
   if (!trimmed || isTypedPath(query)) return entries
-  return entries.filter((entry) => entry.isParent || entry.name.toLowerCase().includes(trimmed))
+  return entries.filter((entry) => !entry.isParent && entry.name.toLowerCase().includes(trimmed))
+}
+
+/**
+ * The files a paste names, or `null` when it is not a path to something that
+ * exists. A dropped file arrives as its path, quoted or not, maybe several.
+ */
+export function pastedPaths(
+  text: string,
+  currentDir: string,
+  exists: (absolute: string) => boolean = existsSync,
+): string[] | null {
+  const trimmed = text.replace(/[\r\n]+/g, ' ').trim()
+  if (!trimmed) return null
+  const resolve = (candidate: string) => resolveTypedPath(candidate, currentDir)
+  const unquoted = trimmed.replace(/^(["'])(.*)\1$/, '$2')
+  if (exists(resolve(unquoted))) return [resolve(unquoted)]
+  const pieces = parseAttachArgs(trimmed, (candidate) => exists(resolve(candidate)))
+  if (pieces.length === 0 || !pieces.every((piece) => exists(resolve(piece)))) return null
+  return pieces.map(resolve)
 }
 
 /** Characters a key adds to the typed text, or `null` for a key that types nothing. */
@@ -73,6 +104,14 @@ function formatSize(bytes: number): string {
   const kb = bytes / 1024
   if (kb < 1024) return `${kb.toFixed(1)} KB`
   return `${(kb / 1024).toFixed(1)} MB`
+}
+
+function isDirectory(filePath: string): boolean {
+  try {
+    return statSync(filePath).isDirectory()
+  } catch {
+    return false
+  }
 }
 
 function fileSize(filePath: string): number | null {
@@ -108,15 +147,8 @@ export const AttachFilePicker = ({
   const pendingAttachments = useChatStore((state) => state.pendingAttachments)
   const removePendingAttachment = useChatStore((state) => state.removePendingAttachment)
 
-  const attachedPaths = useMemo(
-    () =>
-      new Set(
-        pendingAttachments
-          .filter((attachment) => attachment.kind !== 'text')
-          .map((attachment) => path.resolve(attachment.path)),
-      ),
-    [pendingAttachments],
-  )
+  // Each attached file's key (its real path, a copy's source) to its stored path.
+  const attachedPaths = useMemo(() => attachedKeys(pendingAttachments), [pendingAttachments])
   const entries = useMemo(() => getDirectories(currentDir, { includeFiles: true }), [currentDir])
   const rows = useMemo(() => filterEntries(entries, query), [entries, query])
   const clamped = Math.min(focus, Math.max(0, rows.length - 1))
@@ -136,8 +168,9 @@ export const AttachFilePicker = ({
   const toggleFile = useCallback(
     (filePath: string) => {
       const resolved = path.resolve(filePath)
-      if (attachedPaths.has(resolved)) {
-        removePendingAttachment(resolved)
+      const stored = attachedPaths.get(attachmentKey(resolved))
+      if (stored !== undefined) {
+        removePendingAttachment(stored)
         setNotice(`Removed ${path.basename(resolved)}`)
         return
       }
@@ -242,12 +275,39 @@ export const AttachFilePicker = ({
           consume()
           const next = queryRef.current + text
           setQuery(next)
-          // The first match, not the parent folder that is always listed.
-          const firstMatch = filterEntries(entries, next).findIndex((entry) => !entry.isParent)
-          setFocus(Math.max(0, firstMatch))
+          setFocus(0)
         }
       },
-      [clamped, complete, entries, goUp, onClose, open, openTypedPath, rows, setQuery],
+      [clamped, complete, goUp, onClose, open, openTypedPath, rows, setQuery],
+    ),
+  )
+
+  // The input bar is not mounted while the browser is open, so a paste or a
+  // file dropped on the terminal comes here: a path is attached (a folder
+  // opened), anything else is typed.
+  usePaste(
+    useCallback(
+      (event: PasteEvent) => {
+        const text = stripAnsiSequences(decodePasteBytes(event.bytes))
+        if (!text) return
+        event.preventDefault()
+        const paths = pastedPaths(text, currentDir)
+        if (paths) {
+          const [first] = paths
+          if (paths.length === 1 && first !== undefined && isDirectory(first)) {
+            goTo(first)
+            return
+          }
+          const files = paths.filter((candidate) => !attachedPaths.has(attachmentKey(candidate)))
+          if (files.length > 0) attachFiles(files)
+          setNotice(null)
+          return
+        }
+        const next = queryRef.current + text.replace(/[\r\n]+/g, ' ')
+        setQuery(next)
+        setFocus(0)
+      },
+      [attachedPaths, currentDir, goTo, setQuery],
     ),
   )
 
@@ -299,7 +359,7 @@ export const AttachFilePicker = ({
         rows.slice(start, end).map((entry, offset) => {
           const index = start + offset
           const focused = index === clamped
-          const attached = entry.isFile === true && attachedPaths.has(path.resolve(entry.path))
+          const attached = entry.isFile === true && attachedPaths.has(attachmentKey(entry.path))
           const icon = entry.isParent
             ? GLYPHS.folderOpen
             : entry.isFile

@@ -1,6 +1,7 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the error
 // mark comes from utils/glyphs.ts, and a file can be attached by reference
-// (addPendingFileReference). See ui/neuron-tui/PORTING.md.
+// (addPendingFileReference) or by reference to a copy (addPendingFileCopy).
+// See ui/neuron-tui/PORTING.md.
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 
@@ -332,8 +333,9 @@ export function addPendingFileFromPath(
 }
 
 /**
- * Add a file the model reads by path (a document, or a binary or large file):
- * nothing is read here, the prompt names the path and the tool to read it with.
+ * Add a file the model reads by path (a document, or text too long to
+ * inline): nothing is read here, the prompt names the path and the tool to
+ * read it with.
  */
 export function addPendingFileReference(
   filePath: string,
@@ -350,6 +352,53 @@ export function addPendingFileReference(
     note: `${readWith === 'read_document' ? 'document' : 'by path'} · ${formatFileSize(size)}`,
     readWith,
   })
+}
+
+/**
+ * Add a file picked outside the engine's workspace, by reference to a copy
+ * inside it: the card shows at once as processing (which holds the send), and
+ * is ready once `copy` has written `copyPath`. If the copy fails the card goes
+ * and `onError` says why. Resolves to whether the copy was made.
+ */
+export async function addPendingFileCopy(
+  sourcePath: string,
+  copyPath: string,
+  readWith: 'read_document' | 'read_file',
+  size: number,
+  copy: () => Promise<void>,
+  onError: (reason: string) => void,
+): Promise<boolean> {
+  const id = crypto.randomUUID()
+  const kind = readWith === 'read_document' ? 'document' : 'by path'
+  useChatStore.getState().addPendingFileAttachment({
+    id,
+    path: copyPath,
+    filename: path.basename(sourcePath) || sourcePath,
+    isDirectory: false,
+    content: '',
+    status: 'processing',
+    note: 'copying into the project',
+    readWith,
+    sourcePath,
+  })
+  try {
+    await copy()
+  } catch (error) {
+    useChatStore.setState((state) => ({
+      pendingAttachments: state.pendingAttachments.filter((att) => att.kind !== 'file' || att.id !== id),
+    }))
+    const code = (error as { code?: string }).code
+    onError(code ?? (error instanceof Error ? error.message : String(error)))
+    return false
+  }
+  useChatStore.setState((state) => ({
+    pendingAttachments: state.pendingAttachments.map((att) =>
+      att.kind === 'file' && att.id === id
+        ? { ...att, status: 'ready' as const, note: `copied · ${kind} · ${formatFileSize(size)}` }
+        : att,
+    ),
+  }))
+  return true
 }
 
 /**

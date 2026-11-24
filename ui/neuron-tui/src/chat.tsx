@@ -85,7 +85,7 @@ import { useReviewStore } from './state/review-store'
 import { updateNotice, useUpdateStore } from './state/update-store'
 import { useMessageBlockStore } from './state/message-block-store'
 import { stopActiveRun } from './utils/active-run'
-import { startAttach } from './utils/attach-files'
+import { attachFiles, startAttach } from './utils/attach-files'
 import { copyTextToClipboard, showClipboardMessage } from './utils/clipboard'
 import { readClipboardImage } from './utils/clipboard-image'
 import { GLYPHS } from './utils/glyphs'
@@ -104,7 +104,6 @@ import { loadLocalAgents } from './utils/local-agent-registry'
 import { logger } from './utils/logger'
 import {
   addClipboardPlaceholder,
-  addPendingFileFromPath,
   addPendingImageFromFile,
   validateAndAddImage,
 } from './utils/pending-attachments'
@@ -1172,8 +1171,11 @@ export const Chat = ({
           showClipboardMessage('Failed to add image', { durationMs: 3000 })
         })
       },
-      onPasteFilePath: (filePath: string, isDirectory: boolean) => {
-        addPendingFileFromPath(filePath, isDirectory)
+      // A dropped or pasted file takes the Attach button's route: documents
+      // by reference (copied in from outside the workspace), unreadable
+      // files refused with a notice.
+      onPasteFilePath: (filePath: string) => {
+        attachFiles([filePath])
       },
       onPasteText: (text: string) => {
         setInputValue((prev) => {

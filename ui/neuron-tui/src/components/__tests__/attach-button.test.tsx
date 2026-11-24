@@ -14,8 +14,16 @@ import { useAttachStore } from '../../state/attach-store'
 import { useChatStore } from '../../state/chat-store'
 import { useEngineStore } from '../../state/engine-store'
 import { getPathCompletion } from '../../utils/path-completion'
-import { AttachFilePicker, filterEntries, isTypedPath, resolveTypedPath, typedText } from '../attach-file-picker'
+import {
+  AttachFilePicker,
+  filterEntries,
+  isTypedPath,
+  pastedPaths,
+  resolveTypedPath,
+  typedText,
+} from '../attach-file-picker'
 import { ChatInputBar, attachButtonLabel } from '../chat-input-bar'
+import { InputModeBanner } from '../input-mode-banner'
 import { PendingAttachmentsBanner } from '../pending-attachments-banner'
 
 import type { RouterParams } from '../../commands/command-registry'
@@ -183,23 +191,70 @@ describe('/attach', () => {
 })
 
 describe('the attachments banner', () => {
-  test('says why a file was not attached, and x dismisses it', async () => {
-    useAttachStore.getState().addNotice('deck.pptx was not attached: it is outside the project folder.')
-    const setup = await createTestRenderer({ width: 80, height: 8 })
+  async function mountBanner(node: React.ReactNode, height = 8) {
+    const setup = await createTestRenderer({ width: 80, height })
     const root = createRoot(setup.renderer)
     cleanup = () => {
       flushSync(() => root.unmount())
       setup.renderer.destroy()
     }
-    flushSync(() => root.render(<PendingAttachmentsBanner />))
+    flushSync(() => root.render(<>{node}</>))
     await setup.renderOnce()
+    return setup
+  }
+
+  /** The close x at the right end of the banner's top rows. */
+  function closeButton(frame: string): { x: number; y: number } {
+    const rows = frame.split('\n')
+    for (let y = 0; y < rows.length; y++) {
+      const x = rows[y]!.lastIndexOf('x')
+      if (x > 60) return { x, y }
+    }
+    throw new Error(`no close button in\n${frame}`)
+  }
+
+  test('says why a file was not attached, and x dismisses it', async () => {
+    useAttachStore.getState().addNotice('app.wasm was not attached: it is a binary file Neuron cannot read.')
+    const setup = await mountBanner(<PendingAttachmentsBanner />)
     const frame = setup.captureCharFrame()
-    expect(frame).toContain('deck.pptx was not attached')
-    const close = frame.split('\n').map((line, y) => ({ x: line.lastIndexOf('x'), y, line })).find((row) =>
-      row.line.includes('deck.pptx'),
-    )!
+    expect(frame).toContain('app.wasm was not attached')
+    const close = closeButton(frame)
     await setup.mockMouse.click(close.x, close.y)
     expect(useAttachStore.getState().notices).toEqual([])
+  })
+
+  test('next to attached files, a notice can be dismissed too, and the cards stay', async () => {
+    useChatStore.getState().addPendingFileAttachment({
+      id: 'a1',
+      path: path.join(tmp, 'report.pdf'),
+      filename: 'report.pdf',
+      isDirectory: false,
+      content: '',
+      status: 'ready',
+      note: 'document',
+      readWith: 'read_document',
+    })
+    useAttachStore.getState().addNotice('app.wasm was not attached: it is a binary file Neuron cannot read.')
+    const setup = await mountBanner(<PendingAttachmentsBanner />, 12)
+    const frame = setup.captureCharFrame()
+    expect(frame).toContain('app.wasm was not attached')
+    expect(frame).toContain('report.pdf')
+    const close = closeButton(frame)
+    await setup.mockMouse.click(close.x, close.y)
+    await setup.renderOnce()
+    expect(useAttachStore.getState().notices).toEqual([])
+    expect(useChatStore.getState().pendingAttachments).toHaveLength(1)
+  })
+
+  test('shows in every input mode, since the Attach button works in every mode', async () => {
+    useAttachStore.getState().addNotice('app.wasm was not attached: it is a binary file Neuron cannot read.')
+    for (const mode of ['plan', 'skill', 'bash'] as const) {
+      useChatStore.getState().setInputMode(mode)
+      const setup = await mountBanner(<InputModeBanner />)
+      expect(setup.captureCharFrame()).toContain('app.wasm was not attached')
+      cleanup?.()
+      cleanup = undefined
+    }
   })
 })
 
@@ -211,16 +266,15 @@ describe('the in-UI file browser', () => {
     expect(isTypedPath('~/x', 'linux')).toBe(true)
     expect(isTypedPath('report', 'linux')).toBe(false)
     expect(resolveTypedPath('~/a', '/ws', '/home/me')).toBe(path.join('/home/me', 'a'))
-    expect(
-      filterEntries(
-        [
-          { name: '..', path: '/', isParent: true, isGitRepo: false },
-          { name: 'plan.docx', path: '/plan.docx', isParent: false, isGitRepo: false, isFile: true },
-          { name: 'notes.md', path: '/notes.md', isParent: false, isGitRepo: false, isFile: true },
-        ],
-        'PLAN',
-      ).map((entry) => entry.name),
-    ).toEqual(['..', 'plan.docx'])
+    const listing = [
+      { name: '..', path: '/', isParent: true, isGitRepo: false },
+      { name: 'plan.docx', path: '/plan.docx', isParent: false, isGitRepo: false, isFile: true },
+      { name: 'notes.md', path: '/notes.md', isParent: false, isGitRepo: false, isFile: true },
+    ]
+    // The parent folder is listed until a filter is typed.
+    expect(filterEntries(listing, '').map((entry) => entry.name)).toEqual(['..', 'plan.docx', 'notes.md'])
+    expect(filterEntries(listing, 'PLAN').map((entry) => entry.name)).toEqual(['plan.docx'])
+    expect(filterEntries(listing, 'zzz')).toEqual([])
     expect(typedText({ name: 'a', sequence: 'a', ctrl: false, meta: false, option: false })).toBe('a')
     expect(typedText({ name: 'c', sequence: '\u0003', ctrl: true, meta: false, option: false })).toBeNull()
   })
@@ -290,5 +344,71 @@ describe('the in-UI file browser', () => {
     ui.mockInput.pressEscape()
     await ui.settle()
     expect(ui.closes()).toBe(1)
+  })
+
+  test('Enter on a filter that matches nothing stays in the folder', async () => {
+    useEngineStore.getState().setStatus({ cwd: tmp } as never)
+    const ui = await mountPicker()
+    await ui.mockInput.typeText('zzz')
+    await ui.settle()
+    expect(ui.captureCharFrame()).toContain('Nothing here matches.')
+    ui.mockInput.pressEnter()
+    await ui.settle()
+    const frame = ui.captureCharFrame()
+    // Still here: the folder's files are listed once the filter is cleared.
+    expect(frame).toContain('zzz')
+    ui.mockInput.pressEscape()
+    await ui.settle()
+    expect(ui.captureCharFrame()).toContain('notes.md')
+    expect(ui.closes()).toBe(0)
+    expect(useChatStore.getState().pendingAttachments).toEqual([])
+  })
+
+  test('a pasted or dropped file is attached; other pasted text filters', async () => {
+    useEngineStore.getState().setStatus({ cwd: tmp } as never)
+    const ui = await mountPicker()
+    await ui.mockInput.pasteBracketedText(`"${path.join(tmp, 'report.pdf')}"`)
+    await ui.settle()
+    const files = useChatStore.getState().pendingAttachments as PendingFileAttachment[]
+    expect(files.map((file) => file.path)).toEqual([path.join(tmp, 'report.pdf')])
+    await ui.mockInput.pasteBracketedText('notes')
+    await ui.settle()
+    const frame = ui.captureCharFrame()
+    expect(frame).toContain('notes.md')
+    expect(frame).not.toContain('report.pdf  ')
+  })
+
+  test('pastedPaths: one path quoted or bare, several dropped, or not a path', () => {
+    const exists = (candidate: string) =>
+      [path.join(tmp, "Rahul's resume.pdf"), path.join(tmp, 'a b.pdf'), path.join(tmp, 'c.pdf')].includes(candidate)
+    expect(pastedPaths(`"${path.join(tmp, 'a b.pdf')}"`, tmp, exists)).toEqual([path.join(tmp, 'a b.pdf')])
+    expect(pastedPaths("Rahul's resume.pdf", tmp, exists)).toEqual([path.join(tmp, "Rahul's resume.pdf")])
+    expect(pastedPaths(`"${path.join(tmp, 'a b.pdf')}" ${path.join(tmp, 'c.pdf')}\r\n`, tmp, exists)).toEqual([
+      path.join(tmp, 'a b.pdf'),
+      path.join(tmp, 'c.pdf'),
+    ])
+    expect(pastedPaths('just some words', tmp, exists)).toBeNull()
+    expect(pastedPaths('   ', tmp, exists)).toBeNull()
+  })
+
+  test.if(process.platform === 'win32')('a file attached in another case shows as attached, and Enter removes it', async () => {
+    useEngineStore.getState().setStatus({ cwd: tmp } as never)
+    // Attached as typed, in another case than the listing shows.
+    useChatStore.getState().addPendingFileAttachment({
+      id: 'r1',
+      path: path.join(tmp, 'REPORT.PDF'),
+      filename: 'report.pdf',
+      isDirectory: false,
+      content: '',
+      status: 'ready',
+      readWith: 'read_document',
+    })
+    const ui = await mountPicker()
+    expect(ui.captureCharFrame()).toContain('attached')
+    await ui.mockInput.typeText('report')
+    await ui.settle()
+    ui.mockInput.pressEnter()
+    await ui.settle()
+    expect(useChatStore.getState().pendingAttachments).toEqual([])
   })
 })

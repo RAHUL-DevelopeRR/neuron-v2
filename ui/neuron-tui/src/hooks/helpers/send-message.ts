@@ -172,7 +172,7 @@ export const prepareUserMessage = async (params: {
         att.isDirectory
           ? `[Directory: ${att.path}]\n${att.content}`
           : att.readWith
-            ? fileReferenceText(att.path, att.readWith)
+            ? fileReferenceText(att.path, att.readWith, att.sourcePath)
             : `[File: ${att.path}]\n${att.content}`,
       )
       .join('\n\n')

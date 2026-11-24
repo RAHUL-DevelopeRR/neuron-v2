@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import os from 'os'
 import path from 'path'
 
@@ -8,7 +8,15 @@ import { prepareUserMessage } from '../../hooks/helpers/send-message'
 import { setProjectRoot } from '../../project-files'
 import { useAttachStore } from '../../state/attach-store'
 import { useChatStore } from '../../state/chat-store'
-import { attachFiles, resolveAttachPath, startAttach } from '../attach-files'
+import {
+  ATTACHMENTS_DIR,
+  attachFiles,
+  attachedKeys,
+  attachmentKey,
+  resolveAttachPath,
+  startAttach,
+  waitForAttachCopies,
+} from '../attach-files'
 
 import type { SpawnedDialog } from '../file-dialog'
 import type { PendingFileAttachment } from '../../types/store'
@@ -28,6 +36,7 @@ beforeEach(() => {
   writeFileSync(path.join(workspace, 'notes.md'), '# Notes\nhello\n')
   writeFileSync(path.join(workspace, 'report.pdf'), '%PDF-1.7\u0000binary')
   writeFileSync(path.join(workspace, 'app.wasm'), Buffer.from([0, 97, 115, 109]))
+  writeFileSync(path.join(workspace, 'long.log'), 'x'.repeat(200 * 1024))
   writeFileSync(path.join(workspace, 'shot.png'), Buffer.from([137, 80, 78, 71, 0]))
   writeFileSync(path.join(outside, 'deck.pptx'), 'PK\u0000\u0003')
   writeFileSync(path.join(outside, 'todo.txt'), 'buy milk')
@@ -69,20 +78,74 @@ describe('attachFiles', () => {
     expect(file?.note).toContain('document')
   })
 
-  test('a binary file goes by path, for read_file', () => {
-    attachFiles(['app.wasm'], { root: workspace })
-    expect(files()[0]?.readWith).toBe('read_file')
+  test('a binary file that is not a document is refused: the engine cannot read it', () => {
+    const outcome = attachFiles(['app.wasm'], { root: workspace })
+    expect(files()).toEqual([])
+    expect(outcome.refused).toEqual(['app.wasm was not attached: it is a binary file Neuron cannot read.'])
+    expect(useAttachStore.getState().notices[0]?.text).toBe(outcome.refused[0])
   })
 
-  test('a document outside the workspace is refused with a notice, not attached', () => {
-    const outcome = attachFiles([path.join(outside, 'deck.pptx'), path.join(tmp, 'ws2', 'sheet.xlsx')], {
+  test('text too long to inline whole goes by path, for read_file to read all of it', () => {
+    attachFiles(['long.log'], { root: workspace })
+    const [file] = files()
+    expect(file?.readWith).toBe('read_file')
+    expect(file?.content).toBe('')
+  })
+
+  test('a document outside the workspace is copied into it, git-ignored, and the copy attached', async () => {
+    const picked = [path.join(outside, 'deck.pptx'), path.join(tmp, 'ws2', 'sheet.xlsx')]
+    const outcome = attachFiles(picked, { root: workspace })
+    expect(outcome.refused).toEqual([])
+    expect(outcome.copied).toEqual(picked)
+    // Shown at once, holding the send while the copy is made.
+    expect(files().map((file) => file.status)).toEqual(['processing', 'processing'])
+    await waitForAttachCopies()
+    const attached = files()
+    expect(attached.map((file) => file.status)).toEqual(['ready', 'ready'])
+    expect(attached.map((file) => file.sourcePath)).toEqual(picked)
+    expect(attached.map((file) => file.filename)).toEqual(['deck.pptx', 'sheet.xlsx'])
+    expect(attached.map((file) => file.readWith)).toEqual(['read_document', 'read_document'])
+    for (const file of attached) {
+      expect(path.dirname(path.dirname(file.path))).toBe(path.join(workspace, ATTACHMENTS_DIR))
+      expect(readFileSync(file.path)).toEqual(readFileSync(file.sourcePath!))
+      expect(file.note).toStartWith('copied · document')
+    }
+    expect(attached[0]!.path).not.toBe(attached[1]!.path)
+    expect(readFileSync(path.join(workspace, ATTACHMENTS_DIR, '.gitignore'), 'utf8')).toContain('\n*\n')
+  })
+
+  test('long text outside the workspace is copied in for read_file', async () => {
+    writeFileSync(path.join(outside, 'server.log'), 'y'.repeat(200 * 1024))
+    attachFiles([path.join(outside, 'server.log')], { root: workspace })
+    await waitForAttachCopies()
+    const [file] = files()
+    expect(file?.readWith).toBe('read_file')
+    expect(file?.sourcePath).toBe(path.join(outside, 'server.log'))
+    expect(existsSync(file!.path)).toBe(true)
+  })
+
+  test('a copy that fails drops the card and says why', async () => {
+    const outcome = attachFiles([path.join(outside, 'deck.pptx')], {
       root: workspace,
+      copy: async () => {
+        throw Object.assign(new Error('no space'), { code: 'ENOSPC' })
+      },
     })
+    expect(outcome.copied).toHaveLength(1)
+    await waitForAttachCopies()
     expect(files()).toEqual([])
-    expect(outcome.refused).toHaveLength(2)
-    const notices = useAttachStore.getState().notices.map((notice) => notice.text)
-    expect(notices[0]).toContain('deck.pptx was not attached')
-    expect(notices[1]).toContain('sheet.xlsx was not attached')
+    expect(useAttachStore.getState().notices.map((notice) => notice.text)).toEqual([
+      'deck.pptx was not attached: it could not be copied into the project (ENOSPC).',
+    ])
+  })
+
+  test('a file outside the workspace attached twice is copied once, and counts as attached', async () => {
+    attachFiles([path.join(outside, 'deck.pptx')], { root: workspace })
+    await waitForAttachCopies()
+    attachFiles([path.join(outside, 'deck.pptx')], { root: workspace })
+    await waitForAttachCopies()
+    expect(files()).toHaveLength(1)
+    expect(attachedKeys().has(attachmentKey(path.join(outside, 'deck.pptx')))).toBe(true)
   })
 
   test('a text file outside the workspace is still inlined', async () => {
@@ -103,15 +166,22 @@ describe('attachFiles', () => {
   })
 
   test('several files at once, each removable', () => {
-    const outcome = attachFiles(['report.pdf', 'app.wasm'], { root: workspace })
+    const outcome = attachFiles(['report.pdf', 'long.log'], { root: workspace })
     expect(outcome.attached).toHaveLength(2)
     useChatStore.getState().removePendingAttachment(path.join(workspace, 'report.pdf'))
-    expect(files().map((file) => path.basename(file.path))).toEqual(['app.wasm'])
+    expect(files().map((file) => path.basename(file.path))).toEqual(['long.log'])
   })
 
   test('the same file twice is attached once', () => {
     attachFiles(['report.pdf', `.${path.sep}report.pdf`], { root: workspace })
     expect(files()).toHaveLength(1)
+  })
+
+  test.if(process.platform === 'win32')('on Windows, the same file in another case is attached once', () => {
+    attachFiles(['report.pdf'], { root: workspace })
+    attachFiles(['REPORT.PDF'], { root: workspace })
+    expect(files()).toHaveLength(1)
+    expect(attachmentKey(path.join(workspace, 'REPORT.PDF'))).toBe(attachmentKey(path.join(workspace, 'report.pdf')))
   })
 
   test('paths are taken literally: brackets, parentheses, quotes and spaces in names', () => {
@@ -159,6 +229,28 @@ describe('the prompt for attached files', () => {
     expect(finalContent).toContain(`[File: ${path.join(workspace, 'notes.md')}]\n# Notes`)
     expect(finalContent).not.toContain('%PDF')
   })
+
+  test('a copied document names the copy and where it came from', async () => {
+    setProjectRoot(workspace)
+    attachFiles([path.join(outside, 'deck.pptx')], { root: workspace })
+    await waitForAttachCopies()
+    const [file] = files()
+    const { finalContent } = await prepareUserMessage({
+      content: 'what is in the deck',
+      agentMode: 'DEFAULT',
+      attachments: useChatStore.getState().pendingAttachments,
+      deps: {
+        setMessages: () => {},
+        lastMessageMode: 'DEFAULT',
+        setLastMessageMode: () => {},
+        scrollToLatest: () => {},
+        setHasReceivedPlanResponse: () => {},
+      },
+    })
+    expect(finalContent).toContain(
+      `[File: ${file!.path}]\n(an attached document, copied from ${path.join(outside, 'deck.pptx')}: read it with the read_document tool.)`,
+    )
+  })
 })
 
 function dialogReturning(stdout: string, code = 0): () => SpawnedDialog {
@@ -185,7 +277,7 @@ describe('startAttach', () => {
   })
 
   test('the dialog attaches what was picked', async () => {
-    const picked = `${path.join(workspace, 'report.pdf')}\n${path.join(workspace, 'app.wasm')}\n`
+    const picked = `${path.join(workspace, 'report.pdf')}\n${path.join(workspace, 'long.log')}\n`
     const result = await startAttach({ root: workspace, ...linuxDesktop, spawner: dialogReturning(picked) })
     expect(result).toBe('dialog')
     expect(files().map((file) => file.readWith)).toEqual(['read_document', 'read_file'])

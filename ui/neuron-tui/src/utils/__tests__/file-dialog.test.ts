@@ -5,6 +5,8 @@ import {
   MAC_DIALOG_SCRIPT_LINES,
   START_DIR_ENV,
   WINDOWS_DIALOG_SCRIPT,
+  windowsDialogFilter,
+  windowsDialogScript,
   buildDialogCommand,
   buildKdialogCommand,
   buildMacDialogCommand,
@@ -13,6 +15,7 @@ import {
   fileDialogAvailability,
   interpretDialogExit,
   parseDialogOutput,
+  DISPLAY_FAILURE_PATTERN,
   runFileDialog,
   type DialogCommand,
   type SpawnedDialog,
@@ -86,6 +89,19 @@ describe('dialog command builders', () => {
     expect(command.env).toEqual({ [START_DIR_ENV]: HOSTILE })
   })
 
+  test('the Windows dialog offers documents, xlsb too, and images only while they reach the model', () => {
+    const without = windowsDialogFilter(false)
+    expect(without).toContain('*.xlsb')
+    expect(without).toContain('*.pdf;*.docx'.split(';')[0]!)
+    expect(without).not.toContain('Images')
+    expect(without).not.toContain('*.png')
+    expect(windowsDialogFilter(true)).toContain('Images|*.png;')
+    // Images do not reach the model yet, so the script the dialog runs leaves them out.
+    expect(WINDOWS_DIALOG_SCRIPT).toBe(windowsDialogScript(false))
+    expect(WINDOWS_DIALOG_SCRIPT).not.toContain('*.png')
+    expect(windowsDialogScript(true)).toContain('*.png')
+  })
+
   test('osascript gets the folder as its own argument, after the script', () => {
     const command = buildMacDialogCommand('osascript', HOSTILE_POSIX)
     expect(command.argv[0]).toBe('osascript')
@@ -135,7 +151,21 @@ describe('reading the dialog back', () => {
 
   test('zenity and kdialog cancel with exit 1, warnings or not', () => {
     expect(interpretDialogExit('zenity', 1, '', 'Gtk-WARNING: something')).toEqual({ status: 'cancelled' })
+    expect(
+      interpretDialogExit('zenity', 1, '', 'Gtk-Message: 10:42:01.123: GtkDialog mapped without a transient parent.'),
+    ).toEqual({ status: 'cancelled' })
     expect(interpretDialogExit('kdialog', 1, '', '')).toEqual({ status: 'cancelled' })
+  })
+
+  test('exit 1 because no window could open is a failure, so the in-UI browser opens', () => {
+    const gtk = '(zenity:4242): Gtk-WARNING **: 10:42:01.123: cannot open display: :99'
+    expect(interpretDialogExit('zenity', 1, '', gtk)).toEqual({ status: 'failed', reason: `zenity failed: ${gtk}` })
+    // The display line is the reason, not a warning before it.
+    expect(
+      interpretDialogExit('kdialog', 1, '', 'Qt: Session management error\nqt.qpa.xcb: could not connect to display :99\n'),
+    ).toEqual({ status: 'failed', reason: 'kdialog failed: qt.qpa.xcb: could not connect to display :99' })
+    expect(DISPLAY_FAILURE_PATTERN.test('Failed to connect to Wayland display')).toBe(true)
+    expect(DISPLAY_FAILURE_PATTERN.test('Gtk-WARNING: Theme parsing error')).toBe(false)
   })
 
   test('any other exit is a failure that names the tool', () => {

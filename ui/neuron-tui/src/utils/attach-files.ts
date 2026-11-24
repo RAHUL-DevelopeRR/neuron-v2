@@ -1,15 +1,23 @@
 /**
- * The Attach button and /attach: open the OS file dialog, or the in-UI file
- * browser when none can open, and attach what was picked. Each file is routed
- * by utils/attach-routing.ts; a file that cannot be attached says why in the
- * attachments banner instead.
+ * The Attach button, /attach and a file dropped on the terminal: open the OS
+ * file dialog, or the in-UI file browser when none can open, and attach what
+ * was picked. Each file is routed by utils/attach-routing.ts; a file that
+ * cannot be attached says why in the attachments banner instead. A file the
+ * model reads by path that is outside the engine's workspace is copied into
+ * `<workspace>/.neuron/attachments/<id>/` (git-ignored) and the copy attached.
  */
 
-import { closeSync, openSync, readSync, realpathSync, statSync } from 'fs'
+import { closeSync, existsSync, mkdirSync, openSync, readSync, realpathSync, statSync, writeFileSync } from 'fs'
+import { copyFile } from 'fs/promises'
 import os from 'os'
 import path from 'path'
 
-import { addPendingFileFromPath, addPendingFileReference, validateAndAddImage } from './pending-attachments'
+import {
+  addPendingFileCopy,
+  addPendingFileFromPath,
+  addPendingFileReference,
+  validateAndAddImage,
+} from './pending-attachments'
 import { routeAttachment, isPathInside, type AttachFacts } from './attach-routing'
 import { showClipboardMessage } from './clipboard'
 import {
@@ -24,7 +32,10 @@ import { IS_TEST } from './runtime-env'
 import { IMAGES_REACH_THE_MODEL } from '../engine/attachments'
 import { tryGetProjectRoot } from '../project-files'
 import { useAttachStore } from '../state/attach-store'
+import { useChatStore } from '../state/chat-store'
 import { useEngineStore } from '../state/engine-store'
+
+import type { PendingAttachment } from '../types/store'
 
 /** How long a "not attached" line stays in the banner. */
 export const ATTACH_NOTICE_MS = 12_000
@@ -55,7 +66,7 @@ export function resolveAttachPath(picked: string, root: string, homeDir: string 
   return path.resolve(root, picked)
 }
 
-/** A NUL byte in the first 8 KB, as pending-attachments.ts judges binary. */
+/** A NUL byte in the first 8 KB, as the engine's `read_file` judges binary. */
 function looksBinary(filePath: string): boolean {
   let fd: number | null = null
   try {
@@ -70,8 +81,71 @@ function looksBinary(filePath: string): boolean {
   }
 }
 
+/**
+ * What identifies an attached file: its real path, case-folded on Windows,
+ * so `readme.md` and `README.md` (or a path through a link) are one file.
+ * Attachments keep the path as picked; only comparisons use this.
+ */
+export function attachmentKey(filePath: string, platform: NodeJS.Platform = process.platform): string {
+  const real = realPath(filePath)
+  return platform === 'win32' ? real.toLowerCase() : real
+}
+
+/** The key of each file or folder already attached (a copy counts as its source), to its stored path. */
+export function attachedKeys(
+  attachments: readonly PendingAttachment[] = useChatStore.getState().pendingAttachments,
+): Map<string, string> {
+  const keys = new Map<string, string>()
+  for (const attachment of attachments) {
+    if (attachment.kind === 'text') continue
+    const source = attachment.kind === 'file' ? (attachment.sourcePath ?? attachment.path) : attachment.path
+    keys.set(attachmentKey(source), attachment.path)
+  }
+  return keys
+}
+
+/** Where copies of files picked outside the workspace go, under the workspace. */
+export const ATTACHMENTS_DIR = path.join('.neuron', 'attachments')
+
+const ATTACHMENTS_GITIGNORE =
+  '# Neuron: copies of files attached from outside this project. Never commit them.\n*\n'
+
+/**
+ * A new path for a copy of `source`: its own folder, so the copy keeps the
+ * file's name and two files with one name never collide.
+ */
+export function copyDestination(root: string, source: string): string {
+  const id = crypto.randomUUID().replace(/-/g, '').slice(0, 12)
+  return path.join(root, ATTACHMENTS_DIR, id, path.basename(source))
+}
+
+/** Makes the attachments folder, git-ignored, before the first copy into it. */
+function prepareAttachmentsDir(root: string): void {
+  const dir = path.join(root, ATTACHMENTS_DIR)
+  mkdirSync(dir, { recursive: true })
+  const gitignore = path.join(dir, '.gitignore')
+  if (!existsSync(gitignore)) writeFileSync(gitignore, ATTACHMENTS_GITIGNORE)
+}
+
+export type CopyFile = (from: string, to: string) => Promise<void>
+
+const defaultCopy: CopyFile = (from, to) => copyFile(from, to)
+
+const pendingCopies = new Set<Promise<boolean>>()
+
+/** Resolves once every copy started so far has finished (for tests; the send waits on the card's status). */
+export async function waitForAttachCopies(): Promise<void> {
+  while (pendingCopies.size > 0) await Promise.all([...pendingCopies])
+}
+
+function copyRefusal(filename: string, reason: string): string {
+  return `${filename} was not attached: it could not be copied into the project (${reason}).`
+}
+
 export interface AttachOutcome {
   attached: string[]
+  /** Of `attached`, the files outside the workspace being copied into it. */
+  copied: string[]
   refused: string[]
 }
 
@@ -85,16 +159,19 @@ export function showAttachNotice(text: string): void {
 
 /**
  * Attach each path (absolute, or relative to the workspace; `~` is home).
- * Nothing is run: a path is only stat'ed and, for a text file, read.
+ * Nothing is run: a path is stat'ed and, for a text file, read; a file the
+ * model reads by path from outside the workspace is copied into it.
  */
 export function attachFiles(
   paths: string[],
-  options: { root?: string; imagesReachModel?: boolean } = {},
+  options: { root?: string; imagesReachModel?: boolean; copy?: CopyFile } = {},
 ): AttachOutcome {
   const root = options.root ?? attachWorkspaceRoot()
   const realRoot = realPath(root)
   const imagesReachModel = options.imagesReachModel ?? IMAGES_REACH_THE_MODEL
-  const outcome: AttachOutcome = { attached: [], refused: [] }
+  const copy = options.copy ?? defaultCopy
+  const outcome: AttachOutcome = { attached: [], copied: [], refused: [] }
+  const known = attachedKeys()
 
   for (const picked of paths) {
     const resolved = resolveAttachPath(picked, root)
@@ -106,6 +183,12 @@ export function attachFiles(
       outcome.refused.push(`${filename} was not attached: it was not found.`)
       continue
     }
+    const key = attachmentKey(resolved)
+    if (known.has(key)) {
+      // Already attached, maybe spelled differently: nothing to add.
+      outcome.attached.push(resolved)
+      continue
+    }
     const isDirectory = stats.isDirectory()
     const facts: AttachFacts = {
       path: resolved,
@@ -114,7 +197,6 @@ export function attachFiles(
       isBinary: isDirectory || stats.size === 0 ? false : looksBinary(resolved),
       insideWorkspace: isPathInside(realPath(resolved), realRoot),
       imagesReachModel,
-      workspaceRoot: root,
     }
     const route = routeAttachment(facts)
     switch (route.kind) {
@@ -132,22 +214,50 @@ export function attachFiles(
       case 'reference':
         addPendingFileReference(resolved, route.tool, stats.size)
         break
+      case 'copy': {
+        let destination: string
+        try {
+          prepareAttachmentsDir(root)
+          destination = copyDestination(root, resolved)
+          mkdirSync(path.dirname(destination), { recursive: true })
+        } catch (error) {
+          const code = (error as { code?: string }).code
+          outcome.refused.push(copyRefusal(filename, code ?? String(error)))
+          continue
+        }
+        const pending = addPendingFileCopy(
+          resolved,
+          destination,
+          route.tool,
+          stats.size,
+          () => copy(resolved, destination),
+          (reason) => {
+            logger.warn({ reason }, '[attach] copy into the workspace failed')
+            showAttachNotice(copyRefusal(filename, reason))
+          },
+        )
+        pendingCopies.add(pending)
+        void pending.finally(() => pendingCopies.delete(pending))
+        outcome.copied.push(resolved)
+        break
+      }
       case 'refuse':
         outcome.refused.push(route.reason)
         continue
     }
+    known.set(key, resolved)
     outcome.attached.push(resolved)
   }
 
   for (const reason of outcome.refused) showAttachNotice(reason)
   if (outcome.attached.length > 0) {
     const count = outcome.attached.length
-    showClipboardMessage(
+    const copies = outcome.copied.length
+    const message =
       count === 1
-        ? `Attached ${path.basename(outcome.attached[0]!)}`
-        : `Attached ${count} files`,
-      { durationMs: 3000 },
-    )
+        ? `Attached ${path.basename(outcome.attached[0]!)}${copies === 1 ? ', copied into the project so Neuron can read it' : ''}`
+        : `Attached ${count} files${copies > 0 ? `, ${copies} copied into the project so Neuron can read them` : ''}`
+    showClipboardMessage(message, { durationMs: 3000 })
   }
   return outcome
 }

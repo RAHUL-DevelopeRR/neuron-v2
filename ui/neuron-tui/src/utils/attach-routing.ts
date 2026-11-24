@@ -1,35 +1,62 @@
 /**
- * Where a file picked with the Attach button (or /attach) goes. Pure: the
- * caller reads the file's facts (attach-files.ts) and acts on the route.
+ * Where a file picked with the Attach button (or /attach, or dropped on the
+ * terminal) goes. Pure: the caller reads the file's facts (attach-files.ts)
+ * and acts on the route.
  *
  * - Images go through the image path, while images reach the model
  *   (IMAGES_REACH_THE_MODEL); until then they are refused with a message.
- * - Text and code files are read and inlined into the prompt, as a dragged or
- *   pasted file is, within the same size limits (pending-attachments.ts).
- * - Office and PDF files, and binary or oversized files, go by reference: the
+ * - Small text and code files are read and inlined into the prompt whole.
+ * - Office and PDF files, and text too long to inline, go by reference: the
  *   prompt names the path and the model reads it with `read_document` or
  *   `read_file`. The engine reads only inside its workspace (the tools check
- *   the boundary), so a reference to a file outside it is refused with a
- *   message instead of attaching a path the model cannot open.
+ *   the boundary), so such a file picked outside it is first copied into
+ *   the workspace's `.neuron/attachments` folder and the copy is referenced.
+ * - A file the engine cannot read is refused with a message, never attached
+ *   with an instruction that cannot work: a binary file that is not a
+ *   document (`read_file` rejects any NUL byte in the first 8 KB, as
+ *   `looksBinary` does), and a file over the engine's size limits.
  */
 
 import path from 'path'
 
 import { isImageFile } from './image-handler'
 
-/** The Office and PDF files the engine's `read_document` tool converts to Markdown. */
+/**
+ * The Office and PDF files the engine's `read_document` tool converts to
+ * Markdown: the engine's `DOCUMENT_KINDS` (rust/crates/runtime/src/file_ops.rs),
+ * which a test keeps this in step with.
+ */
 export const DOCUMENT_EXTENSIONS: ReadonlySet<string> = new Set([
   '.docx',
   '.pptx',
   '.xlsx',
   '.xlsm',
+  '.xlsb',
   '.xls',
   '.ods',
   '.pdf',
 ])
 
-/** A text file larger than this is not read into the prompt (as pending-attachments.ts). */
-export const MAX_INLINE_FILE_BYTES = 1024 * 1024
+const MB = 1024 * 1024
+
+/**
+ * A text file up to this size is inlined into the prompt whole. Larger text
+ * would be cut at pending-attachments.ts's 100 KB, so it goes by reference
+ * for the model to read all of it.
+ */
+export const MAX_INLINE_FILE_BYTES = 100 * 1024
+
+/** The most the engine's `read_file` reads (`MAX_READ_SIZE` in file_ops.rs). */
+export const ENGINE_MAX_READ_BYTES = 10 * MB
+
+/**
+ * The most the engine's `read_document` reads (`document_size_limit` in
+ * file_ops.rs): Word and PowerPoint are streamed, the rest read whole.
+ */
+export function documentSizeLimit(filePath: string): number {
+  const ext = path.extname(filePath).toLowerCase()
+  return ext === '.docx' || ext === '.pptx' ? 200 * MB : 100 * MB
+}
 
 export type ReferenceTool = 'read_document' | 'read_file'
 
@@ -37,7 +64,10 @@ export type AttachRoute =
   | { kind: 'image' }
   | { kind: 'text' }
   | { kind: 'folder' }
+  /** Inside the workspace: the model reads the file where it is. */
   | { kind: 'reference'; tool: ReferenceTool }
+  /** Outside the workspace: copied into it first, and the copy is read. */
+  | { kind: 'copy'; tool: ReferenceTool }
   | { kind: 'refuse'; reason: string }
 
 export interface AttachFacts {
@@ -46,14 +76,16 @@ export interface AttachFacts {
   isDirectory: boolean
   /** Bytes. */
   size: number
-  /** A NUL byte in the first few KB. */
+  /** A NUL byte in the first 8 KB. */
   isBinary: boolean
   /** Inside the engine's workspace, where its tools can read it. */
   insideWorkspace: boolean
   /** Whether a picked image can reach the model (IMAGES_REACH_THE_MODEL). */
   imagesReachModel: boolean
-  /** The workspace folder, for the outside-the-workspace message. */
-  workspaceRoot: string
+}
+
+function formatLimit(bytes: number): string {
+  return `${Math.round(bytes / MB)} MB`
 }
 
 /** Said when an image is picked while images cannot reach the model. */
@@ -61,18 +93,24 @@ export function imageRefusal(filename: string): string {
   return `${filename} was not attached: the model can't see images in Neuron yet. Describe it in words, or paste the text it shows.`
 }
 
-/** Said when a file the model would read by path is outside the workspace. */
-export function outsideWorkspaceRefusal(filename: string, workspaceRoot: string): string {
-  return `${filename} was not attached: it is outside the project folder, and Neuron reads files only inside ${workspaceRoot}. Copy it into the project and attach it again.`
+/** Said when a binary file that is not a document is picked. */
+export function binaryRefusal(filename: string): string {
+  return `${filename} was not attached: it is a binary file Neuron cannot read.`
 }
 
-/** What the prompt says about a file attached by reference. */
-export function fileReferenceText(filePath: string, tool: ReferenceTool): string {
-  const what =
-    tool === 'read_document'
-      ? 'an attached document: read it with the read_document tool'
-      : 'an attached file: read it with the read_file tool'
-  return `[File: ${filePath}]\n(${what}.)`
+/** Said when a file is over the size the engine reads. */
+export function tooLargeRefusal(filename: string, limitBytes: number): string {
+  return `${filename} was not attached: it is larger than ${formatLimit(limitBytes)}, the most Neuron reads.`
+}
+
+/**
+ * What the prompt says about a file attached by reference. A copy names the
+ * file it was copied from, so the model can talk about it by its real name.
+ */
+export function fileReferenceText(filePath: string, tool: ReferenceTool, sourcePath?: string): string {
+  const what = tool === 'read_document' ? 'an attached document' : 'an attached file'
+  const copied = sourcePath ? `, copied from ${sourcePath}` : ''
+  return `[File: ${filePath}]\n(${what}${copied}: read it with the ${tool} tool.)`
 }
 
 export function isDocumentFile(filePath: string): boolean {
@@ -88,11 +126,17 @@ export function routeAttachment(facts: AttachFacts): AttachRoute {
       : { kind: 'refuse', reason: imageRefusal(filename) }
   }
   const byReference = (tool: ReferenceTool): AttachRoute =>
-    facts.insideWorkspace
-      ? { kind: 'reference', tool }
-      : { kind: 'refuse', reason: outsideWorkspaceRefusal(filename, facts.workspaceRoot) }
-  if (isDocumentFile(facts.path)) return byReference('read_document')
-  if (!facts.isBinary && facts.size <= MAX_INLINE_FILE_BYTES) return { kind: 'text' }
+    facts.insideWorkspace ? { kind: 'reference', tool } : { kind: 'copy', tool }
+  if (isDocumentFile(facts.path)) {
+    const limit = documentSizeLimit(facts.path)
+    if (facts.size > limit) return { kind: 'refuse', reason: tooLargeRefusal(filename, limit) }
+    return byReference('read_document')
+  }
+  if (facts.isBinary) return { kind: 'refuse', reason: binaryRefusal(filename) }
+  if (facts.size <= MAX_INLINE_FILE_BYTES) return { kind: 'text' }
+  if (facts.size > ENGINE_MAX_READ_BYTES) {
+    return { kind: 'refuse', reason: tooLargeRefusal(filename, ENGINE_MAX_READ_BYTES) }
+  }
   return byReference('read_file')
 }
 
@@ -116,17 +160,16 @@ export function isPathInside(
 }
 
 /**
- * The paths an `/attach` argument names. Quoted paths may hold spaces;
- * without quotes, the whole argument is one path when it exists (a path with
- * spaces typed bare), else each word is one.
+ * The paths an `/attach` argument (or a paste) names. The whole argument is
+ * one path when it exists, whatever it holds (spaces, an apostrophe as in
+ * `Rahul's resume.pdf`). Otherwise quoted paths may hold spaces and each
+ * unquoted word is one path.
  */
 export function parseAttachArgs(args: string, exists: (candidate: string) => boolean): string[] {
   const trimmed = args.trim()
   if (!trimmed) return []
-  if (!/["']/.test(trimmed)) {
-    if (exists(trimmed)) return [trimmed]
-    return trimmed.split(/\s+/)
-  }
+  if (exists(trimmed)) return [trimmed]
+  if (!/["']/.test(trimmed)) return trimmed.split(/\s+/)
   const paths: string[] = []
   const pattern = /"([^"]*)"|'([^']*)'|(\S+)/g
   for (const match of trimmed.matchAll(pattern)) {

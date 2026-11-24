@@ -96,7 +96,10 @@ export const PendingAttachmentsBanner = () => {
   }
 
   return (
-    <BottomBanner borderColorKey="imageCardBorder">
+    <BottomBanner
+      borderColorKey="imageCardBorder"
+      onClose={attachNotices.length > 0 ? clearAttachNotices : undefined}
+    >
       {noticeLines}
       {/* Error messages shown above the attachments */}
       {errorImages.map((image, index) => (

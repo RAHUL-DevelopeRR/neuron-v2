@@ -13,6 +13,9 @@
  * `NEURON_TUI_FILE_DIALOG=0` turns the dialog off (the in-UI browser opens).
  */
 
+import { DOCUMENT_EXTENSIONS } from './attach-routing'
+import { IMAGES_REACH_THE_MODEL } from '../engine/attachments'
+
 export type DialogTool = 'powershell' | 'osascript' | 'zenity' | 'kdialog'
 
 export interface DialogCommand {
@@ -85,29 +88,47 @@ export function fileDialogAvailability(
 }
 
 /**
+ * The Windows dialog's file-type choices: everything, the documents
+ * `read_document` reads, and images only while an image can reach the model
+ * (until then every picked image is refused, so the dialog does not offer
+ * them).
+ */
+export function windowsDialogFilter(imagesReachModel: boolean): string {
+  const documents = [...DOCUMENT_EXTENSIONS].map((ext) => `*${ext}`).join(';')
+  const choices = ['All files (*.*)|*.*', `Documents (${documents})|${documents}`]
+  if (imagesReachModel) choices.push('Images|*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp')
+  return choices.join('|')
+}
+
+/**
  * The Windows dialog. A fixed script, sent encoded so nothing is quoted; the
  * start folder comes from {@link START_DIR_ENV}. A topmost owner keeps the
  * dialog in front of the terminal, and the output is UTF-8 so non-ASCII names
  * come back intact. One picked path per line; nothing on cancel.
  */
-export const WINDOWS_DIALOG_SCRIPT = [
-  "$ErrorActionPreference = 'Stop'",
-  '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false',
-  'Add-Type -AssemblyName System.Windows.Forms',
-  '[System.Windows.Forms.Application]::EnableVisualStyles()',
-  '$owner = New-Object System.Windows.Forms.Form',
-  '$owner.TopMost = $true',
-  '$owner.ShowInTaskbar = $false',
-  '$dialog = New-Object System.Windows.Forms.OpenFileDialog',
-  '$dialog.Multiselect = $true',
-  `$dialog.Title = '${DIALOG_TITLE}'`,
-  "$dialog.Filter = 'All files (*.*)|*.*|Documents (*.pdf;*.docx;*.pptx;*.xlsx;*.xlsm;*.xls;*.ods)|*.pdf;*.docx;*.pptx;*.xlsx;*.xlsm;*.xls;*.ods|Images|*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp'",
-  `$start = $env:${START_DIR_ENV}`,
-  'if ($start -and (Test-Path -LiteralPath $start -PathType Container)) { $dialog.InitialDirectory = $start }',
-  '$result = $dialog.ShowDialog($owner)',
-  '$owner.Dispose()',
-  'if ($result -eq [System.Windows.Forms.DialogResult]::OK) { foreach ($name in $dialog.FileNames) { [Console]::Out.WriteLine($name) } }',
-].join('\n')
+export function windowsDialogScript(imagesReachModel: boolean = IMAGES_REACH_THE_MODEL): string {
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false',
+    'Add-Type -AssemblyName System.Windows.Forms',
+    '[System.Windows.Forms.Application]::EnableVisualStyles()',
+    '$owner = New-Object System.Windows.Forms.Form',
+    '$owner.TopMost = $true',
+    '$owner.ShowInTaskbar = $false',
+    '$dialog = New-Object System.Windows.Forms.OpenFileDialog',
+    '$dialog.Multiselect = $true',
+    `$dialog.Title = '${DIALOG_TITLE}'`,
+    `$dialog.Filter = '${windowsDialogFilter(imagesReachModel)}'`,
+    `$start = $env:${START_DIR_ENV}`,
+    'if ($start -and (Test-Path -LiteralPath $start -PathType Container)) { $dialog.InitialDirectory = $start }',
+    '$result = $dialog.ShowDialog($owner)',
+    '$owner.Dispose()',
+    'if ($result -eq [System.Windows.Forms.DialogResult]::OK) { foreach ($name in $dialog.FileNames) { [Console]::Out.WriteLine($name) } }',
+  ].join('\n')
+}
+
+/** The script the dialog runs here: images are offered only while they reach the model. */
+export const WINDOWS_DIALOG_SCRIPT = windowsDialogScript()
 
 /** PowerShell's -EncodedCommand form: base64 of the UTF-16LE script. */
 export function encodePowerShellCommand(script: string): string {
@@ -212,8 +233,19 @@ export function parseDialogOutput(stdout: string): string[] {
 }
 
 /**
+ * What stderr says when zenity or kdialog could not open a window at all (a
+ * stale DISPLAY in tmux or screen, a dead Wayland socket). GTK exits 1 then,
+ * as on a cancel, so only this text tells the two apart. Kept narrow: GTK
+ * also prints warnings on an ordinary cancel.
+ */
+export const DISPLAY_FAILURE_PATTERN =
+  /cannot open display|could not connect to (any x )?display|failed to connect to (the )?(display|wayland)|unable to init server/i
+
+/**
  * What a dialog's exit means. Every tool prints nothing on cancel: PowerShell
  * and osascript exit 0 (the scripts handle it), zenity and kdialog exit 1.
+ * Exit 1 because no window could open is a failure, so the in-UI browser
+ * opens instead.
  */
 export function interpretDialogExit(
   tool: DialogTool,
@@ -223,15 +255,18 @@ export function interpretDialogExit(
 ): DialogResult {
   const paths = parseDialogOutput(stdout)
   if (exitCode === 0) return paths.length > 0 ? { status: 'picked', paths } : { status: 'cancelled' }
-  // GTK and KDE often print warnings on stderr, so exit 1 alone decides.
-  if ((tool === 'zenity' || tool === 'kdialog') && exitCode === 1 && paths.length === 0) {
+  // GTK and KDE print warnings on stderr even on a cancel, so exit 1 is a
+  // cancel unless stderr says no window could open.
+  const displayFailed = DISPLAY_FAILURE_PATTERN.test(stderr)
+  if ((tool === 'zenity' || tool === 'kdialog') && exitCode === 1 && paths.length === 0 && !displayFailed) {
     return { status: 'cancelled' }
   }
   // PowerShell writes its progress records to a redirected stderr as CLIXML.
-  const detail = stderr
+  const lines = stderr
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .find((line) => line && !line.startsWith('#<') && !line.startsWith('<'))
+    .filter((line) => line && !line.startsWith('#<') && !line.startsWith('<'))
+  const detail = displayFailed ? lines.find((line) => DISPLAY_FAILURE_PATTERN.test(line)) : lines[0]
   return {
     status: 'failed',
     reason: detail ? `${tool} failed: ${detail.slice(0, 160)}` : `${tool} exited with code ${exitCode}`,
