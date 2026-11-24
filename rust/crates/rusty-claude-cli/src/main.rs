@@ -9815,12 +9815,13 @@ UU conflicted.rs",
         fs::write(
             workspace.join(".neuron").join("settings.json"),
             // The server writes its marker in the workspace: under bubblewrap (Linux
-            // with `bwrap`) it needs the workspace writable.
+            // with `bwrap`) it needs it writable. Absolute: "." would be the sandbox
+            // host's workspace (the test's own directory), not this temp folder.
             json!({"mcpServers": {"alpha": {
                 "command": python,
                 "args": args,
                 "env": {"NEURON_MCP_FRAMING": "content-length"},
-                "sandbox": {"fsWrite": ["."]}
+                "sandbox": {"fsWrite": [workspace.display().to_string()]}
             }}})
             .to_string(),
         )
