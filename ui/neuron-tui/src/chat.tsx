@@ -22,6 +22,7 @@ import {
 import { useShallow } from 'zustand/react/shallow'
 
 import { routeUserPrompt, addBashMessageToHistory } from './commands/router'
+import { AttachFilePicker } from './components/attach-file-picker'
 import { ChatInputBar } from './components/chat-input-bar'
 import { ChatHeader } from './components/chat-header'
 import { ChangesPanel, ChangesSummary } from './components/changes-panel'
@@ -41,6 +42,7 @@ import {
   WorkspacePicker,
 } from './components/status-pickers'
 import { ModelPicker } from './components/model-picker'
+import { PendingAttachmentsBanner } from './components/pending-attachments-banner'
 import { PermissionPrompt } from './components/permission-prompt'
 import { RewindPicker } from './components/rewind-picker'
 import { McpPanel } from './components/mcp-panel'
@@ -73,6 +75,7 @@ import { useInputHistory } from './hooks/use-input-history'
 import { useSuggestionEngine } from './hooks/use-suggestion-engine'
 import { getProjectRoot } from './project-files'
 import { cyclePermissionChoice } from './engine/status-bar-actions'
+import { useAttachStore } from './state/attach-store'
 import { useChatHistoryStore } from './state/chat-history-store'
 import { useChatStore } from './state/chat-store'
 import { useEngineStore } from './state/engine-store'
@@ -82,6 +85,7 @@ import { useReviewStore } from './state/review-store'
 import { updateNotice, useUpdateStore } from './state/update-store'
 import { useMessageBlockStore } from './state/message-block-store'
 import { stopActiveRun } from './utils/active-run'
+import { startAttach } from './utils/attach-files'
 import { copyTextToClipboard, showClipboardMessage } from './utils/clipboard'
 import { readClipboardImage } from './utils/clipboard-image'
 import { GLYPHS } from './utils/glyphs'
@@ -141,6 +145,15 @@ export const Chat = ({
   const [isHeaderVisible, setIsHeaderVisible] = useState(true)
   const [todoPanelOpen, setTodoPanelOpen] = useState(false)
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
+  // The Attach button's in-UI file browser (when no OS file dialog can open).
+  const attachPickerOpen = useAttachStore((state) => state.pickerOpen)
+  const attachPickerStartDir = useAttachStore((state) => state.pickerStartDir)
+  const closeAttachPicker = useCallback(() => useAttachStore.getState().closePicker(), [])
+  const handleAttachClick = useCallback(() => {
+    startAttach().catch((error) => {
+      logger.error({ error }, '[attach] failed to start')
+    })
+  }, [])
   // The status bar's other pickers and its context popover, in the same slot.
   const [statusPanel, setStatusPanel] = useState<
     Exclude<StatusTarget, 'model' | 'account' | 'connectors' | 'update'> | null
@@ -1231,6 +1244,7 @@ export const Chat = ({
       askUserState !== null ||
       permissionRequest !== null ||
       modelPickerOpen ||
+      attachPickerOpen ||
       statusPanel !== null ||
       reviewMode ||
       queuePanelOpen ||
@@ -1493,6 +1507,16 @@ export const Chat = ({
             width={separatorWidth}
             maxVisibleRows={isCompactHeight ? 4 : 8}
           />
+        ) : attachPickerOpen ? (
+          <>
+            <AttachFilePicker
+              startDir={attachPickerStartDir ?? getProjectRoot() ?? process.cwd()}
+              onClose={closeAttachPicker}
+              width={separatorWidth}
+              maxVisibleRows={isCompactHeight ? 4 : 8}
+            />
+            <PendingAttachmentsBanner />
+          </>
         ) : modelPickerOpen ? (
           <ModelPicker
             onClose={() => setModelPickerOpen(false)}
@@ -1613,6 +1637,7 @@ export const Chat = ({
                 cwd: getProjectRoot() ?? process.cwd(),
               })}
               onInterruptStream={chatKeyboardHandlers.onInterruptStream}
+              onAttachClick={handleAttachClick}
             />
           </>
         )}

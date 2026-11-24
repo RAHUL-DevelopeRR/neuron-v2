@@ -90,6 +90,9 @@ const passThrough = [
   // To try the update notice: NEURON_TUI_VERSION=7.0.0-alpha.1 bun run dev:mock
   // (a source run is otherwise 0.0.0, which never checks).
   'NEURON_TUI_VERSION', 'NEURON_UPDATE_MANIFEST_URL', 'NEURON_NO_UPDATE_CHECK',
+  // The Attach button's file dialog needs the desktop session on Linux;
+  // NEURON_TUI_FILE_DIALOG=0 tries the in-UI file browser instead.
+  'DISPLAY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR', 'NEURON_TUI_FILE_DIALOG',
 ]
 const env: Record<string, string> = {}
 for (const name of passThrough) {

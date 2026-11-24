@@ -20,6 +20,7 @@ import {
   createBatchedMessageUpdater,
   type BatchedMessageUpdater,
 } from '../../utils/message-updater'
+import { fileReferenceText } from '../../utils/attach-routing'
 import { createModeDividerMessage } from '../../utils/send-message-helpers'
 import { yieldToEventLoop } from '../../utils/yield-to-event-loop'
 
@@ -170,7 +171,9 @@ export const prepareUserMessage = async (params: {
       .map((att) =>
         att.isDirectory
           ? `[Directory: ${att.path}]\n${att.content}`
-          : `[File: ${att.path}]\n${att.content}`,
+          : att.readWith
+            ? fileReferenceText(att.path, att.readWith)
+            : `[File: ${att.path}]\n${att.content}`,
       )
       .join('\n\n')
     if (fileAttachmentContent) {
@@ -212,6 +215,7 @@ export const prepareUserMessage = async (params: {
       filename: att.filename,
       isDirectory: att.isDirectory,
       note: att.note,
+      ...(att.readWith ? { readWith: att.readWith } : {}),
     }))
 
   // Pass original content (not finalContent) for display, but finalContent goes to agent

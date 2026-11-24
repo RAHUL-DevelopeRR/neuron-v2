@@ -1,5 +1,6 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: the error
-// mark comes from utils/glyphs.ts. See ui/neuron-tui/PORTING.md.
+// mark comes from utils/glyphs.ts, and a file can be attached by reference
+// (addPendingFileReference). See ui/neuron-tui/PORTING.md.
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 
@@ -328,6 +329,27 @@ export function addPendingFileFromPath(
       }))
     }
   }, 0)
+}
+
+/**
+ * Add a file the model reads by path (a document, or a binary or large file):
+ * nothing is read here, the prompt names the path and the tool to read it with.
+ */
+export function addPendingFileReference(
+  filePath: string,
+  readWith: 'read_document' | 'read_file',
+  size: number,
+): void {
+  useChatStore.getState().addPendingFileAttachment({
+    id: crypto.randomUUID(),
+    path: filePath,
+    filename: path.basename(filePath) || filePath,
+    isDirectory: false,
+    content: '',
+    status: 'ready',
+    note: `${readWith === 'read_document' ? 'document' : 'by path'} · ${formatFileSize(size)}`,
+    readWith,
+  })
 }
 
 /**

@@ -73,6 +73,12 @@ export type PendingFileAttachment = {
   content: string
   status: 'processing' | 'ready' | 'error'
   note?: string // e.g. "3.2 KB" / "12 items" / error message
+  /**
+   * Attached by reference: the prompt names the path and the model reads it
+   * with this tool, instead of the content being inlined (documents, and
+   * binary or large files; see utils/attach-routing.ts).
+   */
+  readWith?: 'read_document' | 'read_file'
 }
 
 /** Unified attachment type with discriminator */

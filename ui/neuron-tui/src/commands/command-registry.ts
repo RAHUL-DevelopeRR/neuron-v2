@@ -5,12 +5,14 @@
 // (git-view-commands.ts) are found only when the engine has their feature;
 // /new also starts the engine on a fresh conversation (`clear --confirm`), and
 // the /mode:* commands are not registered (AGENT_MODES_AVAILABLE); /upgrade
-// opens the plans page; /update (Neuron's) reports the release check.
+// opens the plans page; /update (Neuron's) reports the release check; /attach
+// (Neuron's) opens the file dialog or the in-UI file browser.
 // See ui/neuron-tui/PORTING.md.
 import { handleCopyConversationCommand } from './copy-conversation'
 import { handleExportConversationCommand } from './export-conversation'
 import { findGitViewCommand } from './git-view-commands'
 import { handleHelpCommand } from './help'
+import { handleAttachCommand } from './attach'
 import { handleImageCommand } from './image'
 import {
   buildInterviewPrompt,
@@ -277,7 +279,7 @@ const ALL_COMMANDS: CommandDefinition[] = [
   }),
   defineCommandWithArgs({
     name: 'image',
-    aliases: ['img', 'attach'],
+    aliases: ['img'],
     handler: async (params, args) => {
       const trimmedArgs = args.trim()
 
@@ -293,6 +295,17 @@ const ALL_COMMANDS: CommandDefinition[] = [
       useChatStore.getState().setInputMode('image')
       params.saveToHistory(params.inputValue.trim())
       clearInput(params)
+    },
+  }),
+  // What the Attach button does: /attach opens the file dialog (or the in-UI
+  // browser); /attach <path> attaches that file at once.
+  defineCommandWithArgs({
+    name: 'attach',
+    aliases: ['upload'],
+    handler: (params, args) => {
+      params.saveToHistory(params.inputValue.trim())
+      clearInput(params)
+      handleAttachCommand(args)
     },
   }),
   // Mode commands generated from AGENT_MODES

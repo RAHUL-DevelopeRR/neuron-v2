@@ -1,5 +1,6 @@
 // Derived from Codebuff/Freebuff (Apache-2.0); modified for Neuron: no agent
-// mode toggle (AGENT_MODES_AVAILABLE). See ui/neuron-tui/PORTING.md.
+// mode toggle (AGENT_MODES_AVAILABLE), and an Attach button (utils/attach-files.ts).
+// See ui/neuron-tui/PORTING.md.
 import {
   isShallowScanRoot,
   SHALLOW_SCAN_MAX_DEPTH,
@@ -73,6 +74,42 @@ interface ChatInputBarProps {
   handleSubmit: () => Promise<void>
   onPaste: (fallbackText?: string) => void
   onInterruptStream: () => void
+  /** The Attach button: opens the file dialog (or the in-UI browser). */
+  onAttachClick?: () => void
+}
+
+/** The Attach button's label: the paperclip, and the word when there is room. */
+export function attachButtonLabel(narrow: boolean): string {
+  return narrow ? GLYPHS.attachment : `${GLYPHS.attachment} Attach`
+}
+
+/** A clickable "Attach" at the end of the input row. */
+export const AttachButton = ({
+  onClick,
+  narrow,
+  theme,
+}: {
+  onClick: () => void
+  narrow: boolean
+  theme: Theme
+}) => {
+  const [hovered, setHovered] = React.useState(false)
+  return (
+    <Button
+      onClick={(event) => {
+        // Left button only, as the queue preview does.
+        const button = (event as MouseEvent | undefined)?.button
+        if (button === undefined || button === 0) onClick()
+      }}
+      onMouseOver={() => setHovered(true)}
+      onMouseOut={() => setHovered(false)}
+      style={{ flexShrink: 0, paddingLeft: 1 }}
+    >
+      <text style={{ wrapMode: 'none', fg: hovered ? theme.primary : theme.info }}>
+        {attachButtonLabel(narrow)}
+      </text>
+    </Button>
+  )
 }
 
 export const ChatInputBar = ({
@@ -107,6 +144,7 @@ export const ChatInputBar = ({
   handleSubmit,
   onPaste,
   onInterruptStream,
+  onAttachClick,
 }: ChatInputBarProps) => {
   const inputMode = useChatStore((state) => state.inputMode)
   const pendingSkillName = useChatStore((state) => state.pendingSkillName)
@@ -342,19 +380,25 @@ export const ChatInputBar = ({
               <text style={{ fg: theme.primary }}>{GLYPHS.pointer}</text>
             </box>
           )}
-          <MultilineInput
-            value={inputValue}
-            onChange={setInputValue}
-            onSubmit={handleSubmit}
-            onPaste={onPaste}
-            onKeyIntercept={handleKeyIntercept}
-            placeholder={effectivePlaceholder}
-            focused={inputFocused}
-            takesKeysUnfocused
-            maxHeight={compactMaxHeight}
-            ref={inputRef}
-            cursorPosition={cursorPosition}
-          />
+          {/* Grows to leave the Attach button its room. */}
+          <box style={{ flexGrow: 1, minWidth: 0 }}>
+            <MultilineInput
+              value={inputValue}
+              onChange={setInputValue}
+              onSubmit={handleSubmit}
+              onPaste={onPaste}
+              onKeyIntercept={handleKeyIntercept}
+              placeholder={effectivePlaceholder}
+              focused={inputFocused}
+              takesKeysUnfocused
+              maxHeight={compactMaxHeight}
+              ref={inputRef}
+              cursorPosition={cursorPosition}
+            />
+          </box>
+          {onAttachClick && (
+            <AttachButton onClick={onAttachClick} narrow={isNarrowWidth} theme={theme} />
+          )}
         </box>
         <InputModeBanner />
       </>
@@ -453,6 +497,9 @@ export const ChatInputBar = ({
                 cursorPosition={cursorPosition}
               />
             </box>
+            {onAttachClick && (
+              <AttachButton onClick={onAttachClick} narrow={isNarrowWidth} theme={theme} />
+            )}
             {AGENT_MODES_AVAILABLE && modeConfig.showAgentModeToggle && !isNarrowWidth && (
               <box
                 style={{
