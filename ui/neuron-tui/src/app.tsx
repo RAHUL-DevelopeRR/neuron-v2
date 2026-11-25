@@ -28,6 +28,7 @@ import type { TopBannerType } from './types/store'
 import { findGitRoot } from './utils/git'
 
 import type { MultilineInputHandle } from './components/multiline-input'
+import type { ProjectSelectOptions } from './components/project-picker-screen'
 import type { AgentMode } from './utils/constants'
 import type { FileTreeNode } from '@neuron-tui/common/util/file'
 
@@ -38,7 +39,7 @@ interface AppProps {
   continueChatId?: string
   initialMode?: AgentMode
   showProjectPicker: boolean
-  onProjectChange: (projectPath: string) => void
+  onProjectChange: (projectPath: string, options?: ProjectSelectOptions) => void
 }
 
 export const App = ({

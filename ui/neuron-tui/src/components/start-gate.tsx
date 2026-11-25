@@ -22,8 +22,35 @@ import type { TrustPreviewEvent } from '../engine/protocol'
 
 const quit = () => void exitCliCleanly(0)
 
-const signIn = () => {
-  runEngineLogin().catch((error) => logger.warn({ error }, '[onboarding] sign-in did not start'))
+/** The onboarding sign-in under way, if one is. */
+let pendingSignIn: Promise<unknown> | null = null
+
+/**
+ * Onboarding's sign-in (Enter, the sign-in line, the hint's key): one at a
+ * time. The sign-in panel only shows once the engine has a device code, a
+ * network round trip later, so a double click (or Enter twice) would queue a
+ * second `/login` that starts as soon as the first ends or is cancelled. A
+ * new one can start once the last has finished, to try again after a failure.
+ */
+export function startOnboardingSignIn(): void {
+  if (pendingSignIn) return
+  const warn = (error: unknown) => logger.warn({ error }, '[onboarding] sign-in did not start')
+  try {
+    pendingSignIn = runEngineLogin()
+      .catch(warn)
+      .finally(() => {
+        pendingSignIn = null
+      })
+  } catch (error) {
+    // No engine client to ask: nothing is under way.
+    pendingSignIn = null
+    warn(error)
+  }
+}
+
+/** Test seam: forget a sign-in a test left under way. */
+export function resetOnboardingSignInForTesting(): void {
+  pendingSignIn = null
 }
 
 export const StartGate = ({ children }: { children: React.ReactNode }) => {
@@ -65,7 +92,7 @@ export const StartGate = ({ children }: { children: React.ReactNode }) => {
     return (
       <OnboardingSignIn
         width={terminalWidth}
-        onSignIn={signIn}
+        onSignIn={startOnboardingSignIn}
         onLater={gate.skipOnboardingSignIn}
         onQuit={quit}
       />

@@ -26,8 +26,8 @@ exports[`the screens before the chat render plainly onboarding's sign-in at 80x2
   Sign in with your Zero-X account to use Neuron's models. Your browser opens
   the sign-in page; Neuron keeps the login on this computer.
   › Sign in with Zero-X
-  Enter to sign in · Esc for later (/login signs in from the chat) · Ctrl+C
-  to quit"
+  Enter to sign in · Esc for later (/login signs in from the chat) ·
+  Ctrl+C to quit"
 `;
 
 exports[`the screens before the chat render plainly a /usage report at 80x24 1`] = `
@@ -117,6 +117,6 @@ exports[`the screens before the chat render plainly in a classic console (ASCII 
   Sign in with your Zero-X account to use Neuron's models. Your browser opens
   the sign-in page; Neuron keeps the login on this computer.
   > Sign in with Zero-X
-  Enter to sign in · Esc for later (/login signs in from the chat) · Ctrl+C
-  to quit"
+  Enter to sign in · Esc for later (/login signs in from the chat) ·
+  Ctrl+C to quit"
 `;

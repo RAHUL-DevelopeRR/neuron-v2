@@ -6,6 +6,10 @@
  * - Hover highlighting
  * - Scrollbox with configurable height
  * - Theme-aware highlighting (theme.primary background when focused/hovered)
+ * - Optional click selection (`selectedId` + `onItemClick`): a click goes to
+ *   the parent instead of choosing the row, so it can select on one click and
+ *   act on a double click; the selected row keeps its own look while the
+ *   mouse moves on
  */
 
 import { TextAttributes } from '@opentui/core'
@@ -22,6 +26,9 @@ import { Button } from './button'
 import { useTheme } from '../hooks/use-theme'
 
 import type { ScrollBoxRenderable } from '@opentui/core'
+
+/** Text on the selected row's primary-coloured background (as on the Open button). */
+export const SELECTED_TEXT = '#1a1a1a'
 
 export interface SelectableListItem {
   id: string
@@ -44,6 +51,10 @@ export interface SelectableListProps {
   onAction?: (item: SelectableListItem, index: number) => void
   onFocusChange?: (index: number) => void
   emptyMessage?: string
+  /** The row a click selected, drawn apart from the focused/hovered one. */
+  selectedId?: string | null
+  /** When set, a click on a row calls this instead of `onSelect`. */
+  onItemClick?: (item: SelectableListItem, index: number) => void
 }
 
 export interface SelectableListHandle {
@@ -64,6 +75,8 @@ export const SelectableList = forwardRef<
       onAction,
       onFocusChange,
       emptyMessage = 'No items',
+      selectedId = null,
+      onItemClick,
     },
     ref,
   ) => {
@@ -149,13 +162,21 @@ export const SelectableList = forwardRef<
         {items.map((item, idx) => {
           const isFocused = idx === focusedIndex
           const isHovered = idx === hoveredIndex
-          const isHighlighted = isFocused || isHovered
+          const isSelected = selectedId !== null && item.id === selectedId
+          const isHighlighted = isFocused || isHovered || isSelected
 
-          // Use subtle highlight that works in both light and dark themes
-          const backgroundColor = isHighlighted
-            ? theme.surfaceHover
-            : 'transparent'
-          const textColor = isHighlighted ? theme.foreground : theme.muted
+          // Use subtle highlight that works in both light and dark themes;
+          // a clicked (selected) row stands out more.
+          const backgroundColor = isSelected
+            ? theme.primary
+            : isHighlighted
+              ? theme.surfaceHover
+              : 'transparent'
+          const textColor = isSelected
+            ? SELECTED_TEXT
+            : isHighlighted
+              ? theme.foreground
+              : theme.muted
 
           return (
             <box
@@ -178,7 +199,9 @@ export const SelectableList = forwardRef<
               }}
             >
               <Button
-                onClick={() => onSelect(item, idx)}
+                onClick={() =>
+                  onItemClick ? onItemClick(item, idx) : onSelect(item, idx)
+                }
                 style={{
                   flexDirection: 'row',
                   gap: 3,
@@ -195,7 +218,11 @@ export const SelectableList = forwardRef<
                 {item.icon && (
                   <text
                     style={{
-                      fg: isHighlighted ? theme.foreground : theme.muted,
+                      fg: isSelected
+                        ? SELECTED_TEXT
+                        : isHighlighted
+                          ? theme.foreground
+                          : theme.muted,
                     }}
                   >
                     {item.icon}
@@ -214,7 +241,9 @@ export const SelectableList = forwardRef<
                   {item.label}
                 </text>
                 {item.secondary && !item.hideSecondary && (
-                  <text style={{ fg: theme.muted }}>{item.secondary}</text>
+                  <text style={{ fg: isSelected ? SELECTED_TEXT : theme.muted }}>
+                    {item.secondary}
+                  </text>
                 )}
               </Button>
               {actionLabel && onAction && (

@@ -59,6 +59,7 @@ import { detectTerminalTheme } from './utils/terminal-color-detection'
 import { setOscDetectedTheme } from './utils/theme-system'
 
 import type { FileTreeNode } from '@neuron-tui/common/util/file'
+import type { ProjectSelectOptions } from './components/project-picker-screen'
 
 // Configure TanStack Query's focusManager for terminal environments
 // This is required because there's no browser visibility API in terminal apps
@@ -189,13 +190,14 @@ async function main(): Promise<void> {
 
     // Callback for when user selects a new project from the picker
     const handleProjectChange = React.useCallback(
-      async (newProjectPath: string) => {
+      async (newProjectPath: string, options?: ProjectSelectOptions) => {
         // Change process working directory
         process.chdir(newProjectPath)
         // Update the project root in the module state
         setProjectRoot(newProjectPath)
-        // Save to recent projects list
-        saveRecentProject(newProjectPath)
+        // Save to recent projects list; a "No project" scratch folder would
+        // push the real projects out of the few recents shown.
+        if (!options?.scratch) saveRecentProject(newProjectPath)
         // The engine works in one folder: restart it in the new one.
         void startEngineSession({ ...engineFlags, cwd: newProjectPath })
         // Update local state
