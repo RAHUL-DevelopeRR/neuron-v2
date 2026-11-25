@@ -38,6 +38,16 @@ prompts such as `PARITY_SCENARIO:bash_permission_prompt_approved` or
 Both need the engine and the mock service built: `cargo build -p rusty-claude-cli -p
 mock-anthropic-service` in `rust/`.
 
+## Several chats at once
+
+Inside the app, each chat has its own engine (`neuron engine --stdio`) in its own folder, and its own controller in the window. The Rust side keeps them in a registry (`src-tauri/src/registry.rs`): at most 4 engines run at once, the least recently used idle one is stopped to make room, and an engine idle for 20 minutes is stopped too. A stopped chat keeps its session and starts again, where it left off, when you open it. A chat that is working or waiting for you is never stopped.
+
+- **Copies of the project.** `Ctrl+Shift+N` opens a chat in its own git worktree on a `neuron/<name>` branch, kept under the app's data folder (`wt/<hash>/<name>`). Discard asks first about changed files, then about saved changes (commits) the main folder lacks; nothing outside that folder is ever removed (`src-tauri/src/worktree.rs`).
+- **Chats that need you** are listed first in the sidebar, raise a count on the taskbar or dock icon and in the window title, and send a system notification when the window is in the background. Without notification permission the sidebar badge and the count remain.
+- **Shortcuts** live in `src/shortcuts.ts`; `Ctrl+/` shows them. `Ctrl+K` is the command palette (`src/palette.ts`).
+- **Browser dev mode** (`bun run dev` against a host) has one chat, as before.
+- Tests: `test/multichat.test.tsx` (the app with a fake multi-chat platform), `test/chat-host.test.ts` (IPC routing, buffering), `test/chats.test.ts` (pure helpers), and the Rust tests in `registry.rs`, `worktree.rs` and `engine.rs` (including a `kill_tree` test that spawns a child process).
+
 ## Tests
 
 ```bash
@@ -60,3 +70,18 @@ shell.
 
 `src-tauri` is a Cargo project of its own, so the engine's workspace in `rust/` never builds
 Tauri. Its dev profile has no debuginfo, which keeps `target/` near 1 GB instead of several.
+
+## Installing an unsigned build
+
+Until the signing phase, v1 installers are unsigned. Each OS warns on the first run:
+
+- **Windows.** SmartScreen shows "Windows protected your PC": choose More info, then Run anyway.
+  Defender may also quarantine the bundled engine, `neuron.exe`, as a false positive. The app then
+  cannot start its engine: restore the file from Windows Security, Protection history, or reinstall
+  after allowing it.
+- **macOS.** Gatekeeper says the app "cannot be opened because the developer cannot be verified".
+  Open System Settings, Privacy & Security, scroll down and choose Open Anyway. Or remove the
+  quarantine flag: `xattr -dr com.apple.quarantine /Applications/Neuron.app`. (macOS 15 removed
+  the right-click, Open shortcut.)
+- **Linux.** The AppImage must be executable: `chmod +x Neuron_*.AppImage`. The `.deb` and `.rpm`
+  install normally with the package manager.

@@ -25,6 +25,8 @@ export interface ToolView {
   /** Text output worth showing (stdout, a file's content, matches). */
   output?: string
   todos?: ToolTodo[]
+  /** A shell call's exit code, when its result carried one. */
+  exitCode?: number
   /** For `mcp__server__tool` calls. */
   mcp?: { server: string; tool: string }
 }
@@ -131,14 +133,20 @@ const clip = (text: string): string =>
 
 /** The view with the call's result folded in. */
 export function withResult(view: ToolView, name: string, output: string, isError: boolean): ToolView {
-  if (isError) return { ...view, output: clip(output) }
+  const isShell = name === 'bash' || name === 'PowerShell'
+  if (isError) {
+    const failed = isShell ? parseObject(output) : null
+    const code = failed ? exitCodeOf(failed) : undefined
+    return { ...view, output: clip(output), ...(code === undefined ? {} : { exitCode: code }) }
+  }
   const result = parseObject(output)
   if (!result) return { ...view, output: clip(output) }
   switch (name) {
     case 'bash':
     case 'PowerShell': {
       const parts = [str(result.stdout), str(result.stderr)].filter(Boolean)
-      return { ...view, output: clip(parts.join('\n')) }
+      const code = exitCodeOf(result)
+      return { ...view, output: clip(parts.join('\n')), ...(code === undefined ? {} : { exitCode: code }) }
     }
     case 'read_file': {
       const file = (result.file ?? {}) as Record<string, unknown>
@@ -160,4 +168,44 @@ export function withResult(view: ToolView, name: string, output: string, isError
     default:
       return { ...view, output: clip(output) }
   }
+}
+
+/** The exit code a shell result names: `returnCodeInterpretation` (`exit_code:3`, `exit code 3`) or a numeric `exitCode`. */
+function exitCodeOf(result: Record<string, unknown>): number | undefined {
+  const match = /^exit[_ ]code[: ]\s*(-?\d+)$/.exec(str(result.returnCodeInterpretation).trim())
+  if (match) return Number(match[1])
+  const code = result.exitCode ?? result.exit_code
+  return typeof code === 'number' && Number.isInteger(code) ? code : undefined
+}
+
+export type QuietReadKind = 'read' | 'list' | 'search'
+
+/** What a read-only call does, for folding runs of them into one line; null for any other tool. */
+export function quietReadKind(name: string): QuietReadKind | null {
+  switch (name) {
+    case 'read_file':
+      return 'read'
+    case 'list_directory':
+      return 'list'
+    case 'glob_search':
+    case 'grep_search':
+      return 'search'
+    default:
+      return null
+  }
+}
+
+/** "Read 6 files", "Searched 3 times", "Read 2 files, searched once". */
+export function quietReadSummary(names: string[]): string {
+  const count = { read: 0, search: 0, list: 0 }
+  for (const name of names) {
+    const kind = quietReadKind(name)
+    if (kind) count[kind]++
+  }
+  const parts: string[] = []
+  if (count.read) parts.push(`read ${count.read} file${count.read === 1 ? '' : 's'}`)
+  if (count.search) parts.push(count.search === 1 ? 'searched once' : `searched ${count.search} times`)
+  if (count.list) parts.push(`listed ${count.list} folder${count.list === 1 ? '' : 's'}`)
+  const text = parts.join(', ')
+  return text.charAt(0).toUpperCase() + text.slice(1)
 }

@@ -7,9 +7,35 @@ import {
   type UiEvent,
 } from '@neuron/client'
 
-import type { DirListing, FileContent, GitStatusView, Platform, Project, TerminalSession } from '../src/platform'
+import {
+  ChatError,
+  type ChatHost,
+  type ChatInfo,
+  type DirListing,
+  type EngineInfo,
+  type FileContent,
+  type GitStatusView,
+  type LaunchOptions,
+  type Platform,
+  type Project,
+  type TerminalSession,
+  type UpdateInfo,
+  type WorktreeStatus,
+} from '../src/platform'
+import type { Settings } from '../src/settings'
 
-export const ALL_FEATURES = ['capabilities', 'sessions', 'trust_workspace', 'todos', 'subagents', 'extensions']
+export const ALL_FEATURES = [
+  'capabilities',
+  'sessions',
+  'trust_workspace',
+  'todos',
+  'subagents',
+  'extensions',
+  'account',
+  'error_details',
+  'session_scope',
+  'trust_preview',
+]
 
 /** An engine in memory: tests emit its events and read what the UI sent. */
 export class FakeEngine implements EngineTransport {
@@ -77,21 +103,113 @@ export const FILES: Record<string, string> = {
 export interface FakePlatform extends Platform {
   opened: string[]
   restarts: Array<string | null>
+  /** Restarts that trusted the folder for that engine only. */
+  trustedOnce: Array<string | null>
   openedProjects: string[]
+  /** `[path, resume]` for each project opened. */
+  projectOpens: Array<[string, string | null]>
+  launches: LaunchOptions[]
   git: GitStatusView | null
+  /** What the folder picker returns next. */
+  picked: string | null
+  update: UpdateInfo | null
+  /** How many times the updater was asked. */
+  checks: number
+  saved: Map<string, unknown>
+  // L5: extensions and resilience
+  /** What `engineInfo()` returns; `null` is a browser build. */
+  engine: EngineInfo | null
+  /** What `hostDiagnostics()` returns. */
+  hostReport: string | null
+  /** L3: images staged, as `[name, byte length, media type]`. */
+  staged: Array<[string, number, string]>
+  /** L3: chats saved: the suggested name and the content. */
+  exports: Array<{ name: string; content: string }>
+  /** L3: what the save dialog returns next; `null` is a cancel. */
+  exportPath: string | null
+  // L2: review and git
+  /** Paths `gitRevert` was asked for. */
+  reverted: string[]
+  /** Paths `openInEditor` was asked for. */
+  editorOpens: string[]
+  /** L2 + L4: which chat was in view for each revert and editor call (`null` with one chat). */
+  reviewChats: Array<{ call: 'gitRevert' | 'openInEditor'; path: string; chat: string | null }>
+  // L4: multi-chat
+  /** Notifications the app asked for. */
+  notifications: Array<{ chat: string; title: string; body: string }>
+  /** Every count the app put on the taskbar icon. */
+  attention: number[]
+  /** What `notify` answers next. */
+  notifyResult: 'shown' | 'denied' | 'unsupported'
+  /** The chats, when the platform was made with `multiChat`. */
+  fakeChats: FakeChats | null
+}
+
+export interface FakePlatformOptions {
+  /** Settings already saved; the welcome steps count as done unless these say otherwise. */
+  settings?: Partial<Settings>
+  update?: UpdateInfo | null
+  /** A build without an updater key: updates come from the releases page. */
+  manualUpdates?: boolean
+  // L5: extensions and resilience
+  engine?: EngineInfo | null
+  hostReport?: string | null
+  /** L4: several chats at once; the `FakeEngine` passed in is the first chat's. */
+  multiChat?: boolean
+  /** The platform's kind (default `tauri`; the browser build is `host`). */
+  kind?: 'tauri' | 'host'
 }
 
 /** A platform over a {@link FakeEngine} and a small in-memory workspace with git. */
-export function fakePlatform(engine: FakeEngine): FakePlatform {
+export function fakePlatform(engine: FakeEngine, options: FakePlatformOptions = {}): FakePlatform {
   let connecting: Promise<SessionController> | null = null
-  const project: Project = { name: 'app', path: '/work/app' }
+  let project: Project = { name: 'app', path: '/work/app' }
+  const saved = new Map<string, unknown>([['settings', { firstRunDone: true, ...options.settings }]])
   const platform: FakePlatform = {
-    kind: 'host',
+    kind: options.kind ?? 'tauri',
     label: 'test',
-    can: { openProject: true, restart: true, terminal: false, git: true },
+    can: { openProject: true, restart: true, terminal: false, git: true, pickFolder: true, updates: true, multiChat: options.multiChat === true },
     opened: [],
     restarts: [],
+    trustedOnce: [],
     openedProjects: [],
+    projectOpens: [],
+    launches: [],
+    picked: '/work/picked',
+    update: options.update ?? null,
+    checks: 0,
+    manualUpdates: options.manualUpdates ?? false,
+    saved,
+    engine: options.engine === undefined ? { source: 'bundled', path: '/app/neuron', bundledPath: '/app/neuron', bundledPresent: true } : options.engine,
+    hostReport: options.hostReport === undefined ? ['App version: 0.2.0', 'OS: windows x86_64'].join('\n') : options.hostReport,
+    staged: [],
+    exports: [],
+    exportPath: '/saved/chat.md',
+    reverted: [],
+    editorOpens: [],
+    reviewChats: [],
+    notifications: [],
+    attention: [],
+    notifyResult: 'shown',
+    fakeChats: options.multiChat ? new FakeChats(engine) : null,
+    notify: async (notification) => {
+      platform.notifications.push(notification)
+      return platform.notifyResult
+    },
+    setAttention: (count) => void platform.attention.push(count),
+    store: {
+      get: async <T,>(key: string) => saved.get(key) as T | undefined,
+      set: async (key, value) => void saved.set(key, value),
+    },
+    setLaunchOptions(launch) {
+      platform.launches.push(launch)
+    },
+    pickFolder: async () => platform.picked,
+    appVersion: async () => '0.2.0',
+    checkForUpdate: async () => {
+      platform.checks++
+      return platform.update
+    },
     git: {
       branch: 'main',
       changes: [
@@ -109,11 +227,17 @@ export function fakePlatform(engine: FakeEngine): FakePlatform {
     },
     project: () => project,
     recentProjects: async () => [project, { name: 'website', path: '/work/website' }],
-    async openProject(path) {
+    async openProject(path, resume = null) {
       platform.openedProjects.push(path)
+      platform.projectOpens.push([path, resume])
+      project = { name: path.split('/').pop() ?? path, path }
     },
-    async restart(resume) {
+    async restart(resume, options) {
+      if (options?.trustOnce) platform.trustedOnce.push(resume)
       platform.restarts.push(resume)
+      // L4: with several chats, the chat in view gets the new engine (tauri.ts does the same).
+      const active = platform.fakeChats?.activeId()
+      if (platform.fakeChats && active) await platform.fakeChats.resume(active, { resume, trustOnce: options?.trustOnce === true })
     },
     async list(path: string): Promise<DirListing> {
       const prefix = path === '.' ? '' : `${path}/`
@@ -132,7 +256,11 @@ export function fakePlatform(engine: FakeEngine): FakePlatform {
       if (content === undefined) throw new Error(`No such file or folder: ${path}`)
       return { path, content, truncated: false, binary: false, size: content.length }
     },
-    searchFiles: async (query) => Object.keys(FILES).filter((file) => file.includes(query)),
+    // L3: folders come back with a trailing slash, as the host's search lists them.
+    searchFiles: async (query) => {
+      const folders = [...new Set(Object.keys(FILES).filter((file) => file.includes('/')).map((file) => `${file.split('/')[0]}/`))]
+      return [...folders.filter((folder) => query !== '' && folder.includes(query)), ...Object.keys(FILES).filter((file) => file.includes(query))]
+    },
     gitStatus: async () => platform.git,
     gitDiff: async (path) =>
       path === 'src/main.rs' ? '@@ -1,3 +1,3 @@\n fn main() {\n-    println!("hi");\n+    println!("hello");\n }\n' : '',
@@ -142,6 +270,150 @@ export function fakePlatform(engine: FakeEngine): FakePlatform {
     openExternal(url: string) {
       platform.opened.push(url)
     },
+    // L5: extensions and resilience
+    engineInfo: async () => platform.engine,
+    hostDiagnostics: async () => platform.hostReport,
+    // L3: composer
+    async stageAttachment(name, data, mediaType) {
+      platform.staged.push([name, data.length, mediaType])
+      return { path: `/stage/${platform.staged.length}-${name}`, media_type: mediaType }
+    },
+    async exportSave(name, content) {
+      platform.exports.push({ name, content })
+      return platform.exportPath
+    },
+    // L2: review and git
+    async gitRevert(path) {
+      platform.reverted.push(path)
+      platform.reviewChats.push({ call: 'gitRevert', path, chat: platform.fakeChats?.activeId() ?? null })
+      if (platform.git) platform.git = { ...platform.git, changes: platform.git.changes.filter((change) => change.path !== path) }
+    },
+    async openInEditor(path) {
+      platform.editorOpens.push(path)
+      platform.reviewChats.push({ call: 'openInEditor', path, chat: platform.fakeChats?.activeId() ?? null })
+    },
   }
+  if (platform.fakeChats) platform.chats = platform.fakeChats
   return platform
+}
+
+/** The chats of a multi-chat platform: each has its own {@link FakeEngine}. */
+export class FakeChats implements ChatHost {
+  engines = new Map<string, FakeEngine>()
+  controllers = new Map<string, SessionController>()
+  infos = new Map<string, ChatInfo>()
+  opened: Array<{ path?: string; resume?: string | null; worktree?: { name?: string } }> = []
+  activated: Array<string | null> = []
+  stopped: string[] = []
+  closed: string[] = []
+  resumed: Array<{ id: string; options?: { resume?: string | null; trustOnce?: boolean } }> = []
+  activities = new Map<string, { busy: boolean; waiting: boolean }>()
+  discards: Array<{ id: string; force: boolean; deleteUnmerged: boolean }> = []
+  /** What `worktreeStatus` answers, and what a discard checks. */
+  worktreeState: Omit<WorktreeStatus, 'branch' | 'path'> = { dirty: 0, unmerged: 0 }
+  /** Rejects the next `open` with this host error text (`cap_reached`, ...). */
+  failNext: string | null = null
+  /** Rejects `close` of these chats with the host's code `has_worktree` until their copy is discarded. */
+  closeNeedsDiscard = new Set<string>()
+  private count = 0
+  private active: string | null = null
+  private stoppedListeners = new Set<(id: string, reason: string) => void>()
+
+  constructor(private readonly first: FakeEngine) {}
+
+  ids(): string[] {
+    return [...this.infos.keys()]
+  }
+
+  async open(request: { path?: string; resume?: string | null; worktree?: { name?: string } }) {
+    this.opened.push(request)
+    if (this.failNext) {
+      const text = this.failNext
+      this.failNext = null
+      throw text === 'cap_reached' ? new ChatError('4 chats are working. Stop one to open another.', 'cap_reached') : new ChatError(text)
+    }
+    const index = this.count++
+    const id = `c${index + 1}test`
+    const path = request.path ?? '/work/app'
+    const slug = request.worktree ? (request.worktree.name ?? `chat-${index + 1}`).toLowerCase().replace(/[^a-z0-9]+/g, '-') : null
+    const engine = index === 0 ? this.first : new FakeEngine({ cwd: path })
+    const info: ChatInfo = {
+      id,
+      project: { name: path.split('/').pop() ?? path, path },
+      cwd: slug ? `/wt/${slug}` : path,
+      branch: slug ? `neuron/${slug}` : 'main',
+      worktree: slug ? { path: `/wt/${slug}`, branch: `neuron/${slug}`, base: 'main' } : null,
+    }
+    const controller = new SessionController(engine)
+    this.engines.set(id, engine)
+    this.controllers.set(id, controller)
+    this.infos.set(id, info)
+    await controller.start()
+    return { info, controller }
+  }
+
+  async reattach() {
+    return []
+  }
+
+  async resume(id: string, options?: { resume?: string | null; trustOnce?: boolean }) {
+    this.resumed.push({ id, options })
+    const controller = this.controllers.get(id)
+    controller?.apply({ type: 'local/connecting' })
+    await this.engines.get(id)?.start()
+  }
+
+  async stop(id: string) {
+    this.stopped.push(id)
+    this.emitStopped(id, 'exited')
+  }
+
+  async close(id: string) {
+    if (this.closeNeedsDiscard.has(id)) throw new ChatError('This chat works in its own copy of the project. Discard the copy to close the chat, or keep it.', 'has_worktree')
+    this.closed.push(id)
+    this.infos.delete(id)
+  }
+
+  activate(id: string | null) {
+    this.activated.push(id)
+    this.active = id
+  }
+
+  /** The chat in view, as the host knows it. */
+  activeId(): string | null {
+    return this.active
+  }
+
+  reportActivity(id: string, activity: { busy: boolean; waiting: boolean }) {
+    this.activities.set(id, activity)
+  }
+
+  onStopped(listener: (id: string, reason: string) => void) {
+    this.stoppedListeners.add(listener)
+    return () => this.stoppedListeners.delete(listener)
+  }
+
+  /** The host ended a chat's engine (idle, evicted, ...). */
+  emitStopped(id: string, reason: string) {
+    for (const listener of this.engines.get(id)?.closeListeners ?? []) listener({ code: 0, error: null })
+    for (const listener of [...this.stoppedListeners]) listener(id, reason)
+  }
+
+  async list() {
+    return [...this.infos.values()]
+  }
+
+  async worktreeStatus(id: string): Promise<WorktreeStatus> {
+    const info = this.infos.get(id)
+    return { branch: info?.worktree?.branch ?? '', path: info?.worktree?.path ?? '', ...this.worktreeState }
+  }
+
+  async discardWorktree(id: string, options: { force: boolean; deleteUnmerged: boolean }) {
+    // The host checks in this order and removes nothing until both are answered.
+    if (this.worktreeState.unmerged > 0 && !options.deleteUnmerged) throw new ChatError('This copy has saved changes that the main folder lacks.', 'unmerged', this.worktreeState.unmerged)
+    if (this.worktreeState.dirty > 0 && !options.force) throw new ChatError('This copy has unsaved changes.', 'dirty', this.worktreeState.dirty)
+    this.discards.push({ id, ...options })
+    this.closeNeedsDiscard.delete(id)
+    this.infos.delete(id)
+  }
 }

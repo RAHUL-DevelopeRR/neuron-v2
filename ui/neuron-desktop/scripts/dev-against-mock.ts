@@ -47,6 +47,8 @@ const host = new NeuronHost({
   root: home.workspace,
   name: 'Neuron (mock)',
   terminalEnv: { ...home.env },
+  // The browser on this machine is the owner here: a new session and the permission mode are slash commands.
+  ownerOnLoopback: true,
 })
 await host.start()
 

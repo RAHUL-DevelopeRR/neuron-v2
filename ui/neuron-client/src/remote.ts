@@ -15,6 +15,10 @@
  *   small next to the events behind it, and always right.
  * - Terminals (`term.open`) are for clients on the host's own machine only: a
  *   shell would bypass the engine's permission prompts.
+ * - A frame from a peer meets `parseClientMessage` (via {@link parseClientFrame}) first, which passes only
+ *   the commands in `PEER_PASSES` (test/protocol.test.ts). Passing is not permission: the host then
+ *   refuses more (`HOST_POLICY`, `REMOTE_SLASH` and the rest in node/host.ts). Whoever builds the
+ *   zero-x.live relay must apply the host's policy, not only the parser.
  */
 
 import type { TransportClose, EngineTransport } from './controller'

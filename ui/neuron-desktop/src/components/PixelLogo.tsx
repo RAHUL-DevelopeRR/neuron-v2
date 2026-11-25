@@ -9,9 +9,10 @@ const GLYPHS: Record<string, string[]> = {
   O: ['01110', '10001', '10001', '10001', '01110'],
 }
 
-/** The NEURON wordmark, drawn as pixels in the four brand colours. */
-export function PixelLogo({ pixel = 4, title = 'Neuron' }: { pixel?: number; title?: string }) {
-  const width = logoLetters.length * 6 - 1
+/** The NEURON wordmark, drawn as pixels in the four brand colours; `mark` draws its first letter only. */
+export function PixelLogo({ pixel = 4, title = 'Neuron', mark = false }: { pixel?: number; title?: string; mark?: boolean }) {
+  const letters = mark ? logoLetters.slice(0, 1) : logoLetters
+  const width = letters.length * 6 - 1
   return (
     <svg
       role="img"
@@ -22,7 +23,7 @@ export function PixelLogo({ pixel = 4, title = 'Neuron' }: { pixel?: number; tit
       shapeRendering="crispEdges"
       className="pixel-logo"
     >
-      {logoLetters.map(([letter, color], index) =>
+      {letters.map(([letter, color], index) =>
         GLYPHS[letter].flatMap((row, y) =>
           [...row].map((bit, x) =>
             bit === '1' ? <rect key={`${index}-${x}-${y}`} x={index * 6 + x} y={y} width={1} height={1} fill={color} /> : null,

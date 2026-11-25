@@ -1,10 +1,13 @@
-import type { AccountInfo, SignInCodeEvent } from '@neuron/client'
+import type { GatewayProblem, SignInCodeEvent } from '@neuron/client'
+
+import { ProblemCard } from './ProblemCard'
 
 /** The Zero-X sign-in: a device code the user approves in the browser. */
 export function SignInPanel({
   code,
   starting,
   busy,
+  problem,
   onSignIn,
   onCancel,
   onOpen,
@@ -12,6 +15,8 @@ export function SignInPanel({
   code: SignInCodeEvent | null
   starting: boolean
   busy: boolean
+  /** Why the last sign-in failed, when the gateway could not be used. */
+  problem: GatewayProblem | null
   onSignIn: () => void
   onCancel: () => void
   onOpen: (url: string) => void
@@ -58,25 +63,22 @@ export function SignInPanel({
       </div>
     )
   }
+  if (problem && !busy) {
+    return (
+      <div className="sign-in">
+        <ProblemCard problem={problem} actions={{ onSignIn, onRetry: onSignIn, onOpenLink: onOpen }} />
+      </div>
+    )
+  }
   return (
     <div className="sign-in">
       <h2>Sign in to Zero-X</h2>
-      <p>Neuron runs your chats through the Zero-X gateway. Sign in to start.</p>
+      <p>Neuron runs your sessions through the Zero-X gateway. Sign in to start.</p>
       <div className="dialog-buttons">
-        <button className="primary" onClick={onSignIn} disabled={busy}>
+        <button className="primary" onClick={onSignIn} disabled={busy} data-autofocus>
           Sign in
         </button>
       </div>
     </div>
   )
-}
-
-/** Who is signed in, for the title bar. */
-export function accountLabel(account: AccountInfo | null | undefined, signedIn: boolean | undefined, needsSignIn: boolean): string {
-  if (needsSignIn) return 'Signed out'
-  if (account) {
-    const who = account.email ?? 'Zero-X'
-    return account.plan ? `${who} · ${account.plan}` : who
-  }
-  return signedIn ? 'Signed in' : 'Own API key'
 }

@@ -30,6 +30,7 @@ import { useSession } from '../useSession'
 const basename = (path: string) => path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || path
 
 const TOOL_STATE: Record<string, string> = {
+  writing: 'writing',
   running: 'running',
   awaiting_permission: 'needs you',
   done: 'done',
@@ -268,6 +269,9 @@ function Row({ item, onAnswer }: { item: TranscriptItem; onAnswer: (id: number, 
           )}
         </View>
       )
+    case 'report':
+      // Reports are a desktop panel; the phone shows nothing for them.
+      return null
     case 'notice':
       return <Text style={styles.notice}>{item.text}</Text>
     case 'error':
