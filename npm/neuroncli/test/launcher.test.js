@@ -201,6 +201,13 @@ test('postinstall verifies the download and tolerates network failures', {skip},
   const skipped = await runNode(context.postinstall, [], {env: environment(context, await unusedUrl(), {NEURON_SKIP_DOWNLOAD: '1'})});
   assert.equal(skipped.code, 0);
   assert.match(skipped.stderr, /skipping the binary download/);
+  if (process.platform === 'win32') {
+    // npm's neuron.ps1 shim is blocked under PowerShell's default execution policy.
+    assert.match(skipped.stderr, /running scripts is disabled/);
+    assert.match(skipped.stderr, /neuron\.cmd/);
+  } else {
+    assert.doesNotMatch(skipped.stderr, /running scripts is disabled/);
+  }
 
   const bad = await startServer(t, releaseRoutes({asset, data: dummyBinary(), checksum: `${'f'.repeat(64)}  ${asset}\n`}));
   const mismatch = await runNode(context.postinstall, [], {env: environment(context, bad.url)});

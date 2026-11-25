@@ -256,7 +256,9 @@ mod tests {
             let count = calls.len() as u64;
             let indexed = calls.iter().enumerate().collect::<Vec<_>>();
             run_concurrently(&indexed, MAX_CONCURRENT_TOOL_CALLS, |(index, call)| {
-                let delay = 20 * (count - *index as u64);
+                // 150 ms steps: a busy CI machine can start one thread tens of ms after
+                // another, and with 20 ms steps the later call then ended after the first.
+                let delay = 150 * (count - *index as u64);
                 run_one(log, running, peak, &id_of(&call.input), delay)
             })
         }
